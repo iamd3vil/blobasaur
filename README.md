@@ -1,3 +1,9 @@
+<div align="right">
+  <a href="https://zerodha.tech">
+    <img src="https://zerodha.tech/static/images/github-badge.svg" width=140 />
+  </a>
+</div>
+
 # Blobnom
 
 Blobnom is a high-performance, sharded blob storage server written in Rust. It uses Axum for its HTTP server and SQLite as the backend for each shard, providing a simple yet robust solution for storing and retrieving binary large objects (blobs).
