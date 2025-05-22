@@ -2,21 +2,25 @@ use std::sync::Arc;
 
 use axum::{Router, extract::DefaultBodyLimit, routing::get};
 use http_server::AppState;
+use miette::{Context, Result};
 
+mod config;
 mod http_server;
-pub mod shard_manager;
+mod shard_manager;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<()> {
     // initialize tracing
     tracing_subscriber::fmt::init();
 
-    let num_shards = 4;
+    let cfg = config::Cfg::load("config.toml").wrap_err("loading config")?;
+
     // This vector will be populated by AppState::new
-    let mut shard_receivers = Vec::with_capacity(num_shards);
+    let mut shard_receivers = Vec::with_capacity(cfg.num_shards);
 
     // Initialize AppState, AppState::new will populate shard_receivers
-    let shared_state = Arc::new(AppState::new(num_shards, &mut shard_receivers).await);
+    let shared_state =
+        Arc::new(AppState::new(cfg.num_shards, &cfg.data_dir, &mut shard_receivers).await);
 
     // Spawn shard writer tasks using the receivers populated by AppState::new
     for (i, receiver) in shard_receivers.into_iter().enumerate() {
@@ -40,4 +44,6 @@ async fn main() {
     // run our app with hyper, listening globally on port 3000
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     axum::serve(listener, app).await.unwrap();
+
+    Ok(())
 }

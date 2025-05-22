@@ -26,6 +26,7 @@ pub struct AppState {
 impl AppState {
     pub async fn new(
         num_shards: usize,
+        data_dir: &str,
         shard_receivers_out: &mut Vec<mpsc::Receiver<ShardWriteOperation>>,
     ) -> Self {
         let mut shard_senders_vec = Vec::new();
@@ -39,11 +40,11 @@ impl AppState {
         }
 
         // Create data directory if it doesn't exist
-        fs::create_dir_all("data").expect("Failed to create data directory");
+        fs::create_dir_all(data_dir).expect("Failed to create data directory");
 
         let db_pools_futures: Vec<_> = (0..num_shards)
             .map(|i| async move {
-                let db_path = format!("data/shard_{}.db", i);
+                let db_path = format!("{}/shard_{}.db", data_dir, i);
                 let mut connect_options =
                     SqliteConnectOptions::from_str(&format!("sqlite:{}", db_path))
                         .expect(&format!(
@@ -59,8 +60,8 @@ impl AppState {
                 // `cache_size` is negative to indicate KiB, so -4000 is 4MB.
                 // `temp_store = MEMORY` avoids disk I/O for temporary tables.
                 connect_options = connect_options
-                    .pragma("synchronous", "NORMAL")
-                    .pragma("cache_size", "-4000") // 4MB cache per shard
+                    .pragma("synchronous", "OFF")
+                    .pragma("cache_size", "-100000") // 4MB cache per shard
                     .pragma("temp_store", "MEMORY");
 
                 sqlx::SqlitePool::connect_with(connect_options).await
