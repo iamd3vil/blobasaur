@@ -1,5 +1,6 @@
 // In http_server.rs or similar
 
+use async_compression::tokio::write::GzipEncoder;
 use axum::{
     body::Bytes,
     extract::{Path, State},
@@ -12,61 +13,62 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode}; // Added for SQLite
 use std::fs; // Added for directory creation
 use std::str::FromStr; // Added for SqliteConnectOptions
 use std::{hash::Hasher, sync::Arc};
+use tokio::io::AsyncWriteExt; // Required for GzipEncoder
 use tokio::sync::{mpsc, oneshot}; // Added mpsc here as well for clarity, though oneshot was the primary addition for responders // Added for explicit type annotation
 
 // Import ShardWriteOperation from shard_manager
-use crate::shard_manager::ShardWriteOperation;
+use crate::{config::Cfg, shard_manager::ShardWriteOperation};
 
 pub struct AppState {
-    pub num_shards: usize,
+    pub cfg: Cfg,
     pub shard_senders: Vec<mpsc::Sender<ShardWriteOperation>>,
     pub db_pools: Vec<SqlitePool>,
 }
 
 impl AppState {
     pub async fn new(
-        num_shards: usize,
-        data_dir: &str,
+        cfg: Cfg,
         shard_receivers_out: &mut Vec<mpsc::Receiver<ShardWriteOperation>>,
     ) -> Self {
         let mut shard_senders_vec = Vec::new();
         // Clear the output vector first to ensure it's empty
         shard_receivers_out.clear();
 
-        for _ in 0..num_shards {
+        for _ in 0..cfg.num_shards {
             let (sender, receiver) = mpsc::channel(100);
             shard_senders_vec.push(sender);
             shard_receivers_out.push(receiver); // Populate the output vector with receivers
         }
 
         // Create data directory if it doesn't exist
-        fs::create_dir_all(data_dir).expect("Failed to create data directory");
+        fs::create_dir_all(&cfg.data_dir).expect("Failed to create data directory");
 
-        let db_pools_futures: Vec<_> = (0..num_shards)
-            .map(|i| async move {
-                let db_path = format!("{}/shard_{}.db", data_dir, i);
-                let mut connect_options =
-                    SqliteConnectOptions::from_str(&format!("sqlite:{}", db_path))
-                        .expect(&format!(
-                            "Failed to parse connection string for shard {}",
-                            i
-                        ))
-                        .create_if_missing(true)
-                        .journal_mode(SqliteJournalMode::Wal)
-                        .busy_timeout(std::time::Duration::from_millis(5000));
+        let mut db_pools_futures = vec![];
+        for i in 0..cfg.num_shards {
+            let data_dir = cfg.data_dir.clone();
+            let db_path = format!("{}/shard_{}.db", data_dir, i);
 
-                // These PRAGMAs are often set for performance with WAL mode.
-                // `synchronous = NORMAL` is generally safe with WAL.
-                // `cache_size` is negative to indicate KiB, so -4000 is 4MB.
-                // `temp_store = MEMORY` avoids disk I/O for temporary tables.
-                connect_options = connect_options
-                    .pragma("synchronous", "OFF")
-                    .pragma("cache_size", "-100000") // 4MB cache per shard
-                    .pragma("temp_store", "MEMORY");
+            let mut connect_options =
+                SqliteConnectOptions::from_str(&format!("sqlite:{}", db_path))
+                    .expect(&format!(
+                        "Failed to parse connection string for shard {}",
+                        i
+                    ))
+                    .create_if_missing(true)
+                    .journal_mode(SqliteJournalMode::Wal)
+                    .busy_timeout(std::time::Duration::from_millis(5000));
 
-                sqlx::SqlitePool::connect_with(connect_options).await
-            })
-            .collect();
+            // These PRAGMAs are often set for performance with WAL mode.
+            // `synchronous = OFF` is safe except for power loss.
+            // `cache_size` is negative to indicate KiB, so -4000 is 4MB.
+            // `temp_store = MEMORY` avoids disk I/O for temporary tables.
+            connect_options = connect_options
+                .pragma("synchronous", "OFF")
+                .pragma("cache_size", "-100000") // 4MB cache per shard
+                .pragma("temp_store", "MEMORY");
+
+            db_pools_futures.push(sqlx::SqlitePool::connect_with(connect_options))
+        }
 
         let db_pool_results: Vec<Result<SqlitePool, sqlx::Error>> =
             join_all(db_pools_futures).await;
@@ -86,7 +88,7 @@ impl AppState {
         }
 
         AppState {
-            num_shards,
+            cfg,
             shard_senders: shard_senders_vec,
             db_pools,
         }
@@ -96,7 +98,7 @@ impl AppState {
         let mut hasher = fnv::FnvHasher::default();
         hasher.write(key.as_bytes());
         let hash = hasher.finish();
-        hash as usize % self.num_shards
+        hash as usize % self.cfg.num_shards
     }
 }
 
@@ -133,9 +135,31 @@ pub async fn set_blob(
 
     let (responder_tx, responder_rx) = oneshot::channel();
 
+    let compressed_body;
+
+    // Compress the body is compression is enabled.
+    if state.cfg.storage_compression.is_some_and(|v| v) {
+        compressed_body = {
+            let mut encoder = GzipEncoder::new(Vec::new());
+            if let Err(e) = encoder.write_all(body.as_ref()).await {
+                tracing::error!("Failed to write to GzipEncoder for key {}: {}", key, e);
+                return StatusCode::INTERNAL_SERVER_ERROR;
+            }
+            if let Err(e) = encoder.shutdown().await {
+                // Finish encoding and flush remaining data
+                tracing::error!("Failed to shutdown GzipEncoder for key {}: {}", key, e);
+                return StatusCode::INTERNAL_SERVER_ERROR;
+            }
+            Bytes::from(encoder.into_inner())
+        };
+    } else {
+        // If compression is not enabled, use the original body
+        compressed_body = body;
+    }
+
     let operation = ShardWriteOperation::Set {
         key,
-        data: body,
+        data: compressed_body, // Use compressed body
         responder: responder_tx,
     };
 
@@ -188,17 +212,3 @@ pub async fn delete_blob(
         }
     }
 }
-
-// In main.rs, you'd build your app state and router:
-// let num_shards = 4;
-// let mut shard_receivers = Vec::with_capacity(num_shards);
-// let shared_state = Arc::new(AppState::new(num_shards, &mut shard_receivers).await);
-// for i in 0..num_shards {
-//     let pool = shared_state.db_pools[i].clone();
-//     let receiver = shard_receivers.remove(0); // Or drain().next().unwrap()
-//     tokio::spawn(crate::shard_manager::shard_writer_task(i, pool, receiver));
-// }
-// let app = Router::new()
-//     .route("/blob/:key", axum::routing::get(get_blob).post(set_blob).delete(delete_blob))
-//     .with_state(shared_state);
-// axum::serve(listener, app).await.unwrap();

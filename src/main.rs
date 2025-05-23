@@ -19,8 +19,7 @@ async fn main() -> Result<()> {
     let mut shard_receivers = Vec::with_capacity(cfg.num_shards);
 
     // Initialize AppState, AppState::new will populate shard_receivers
-    let shared_state =
-        Arc::new(AppState::new(cfg.num_shards, &cfg.data_dir, &mut shard_receivers).await);
+    let shared_state = Arc::new(AppState::new(cfg.clone(), &mut shard_receivers).await);
 
     // Spawn shard writer tasks using the receivers populated by AppState::new
     for (i, receiver) in shard_receivers.into_iter().enumerate() {
