@@ -24,8 +24,16 @@ async fn main() -> Result<()> {
     // Spawn shard writer tasks using the receivers populated by AppState::new
     for (i, receiver) in shard_receivers.into_iter().enumerate() {
         let pool = shared_state.db_pools[i].clone();
+        let batch_size = cfg.batch_size.unwrap_or(1);
+        let batch_timeout_ms = cfg.batch_timeout_ms.unwrap_or(0);
         // Pass the receiver to the spawned task
-        tokio::spawn(shard_manager::shard_writer_task(i, pool, receiver));
+        tokio::spawn(shard_manager::shard_writer_task(
+            i,
+            pool,
+            receiver,
+            batch_size,
+            batch_timeout_ms,
+        ));
     }
 
     // build our application with a route

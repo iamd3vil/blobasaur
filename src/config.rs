@@ -7,6 +7,9 @@ pub struct Cfg {
     pub num_shards: usize,
     pub storage_compression: Option<bool>,
     pub output_compression: Option<bool>,
+    pub async_write: Option<bool>,
+    pub batch_size: Option<usize>,
+    pub batch_timeout_ms: Option<u64>,
 }
 
 impl Cfg {
@@ -32,6 +35,24 @@ impl Cfg {
 
         if cfg.output_compression.is_some_and(|v| v) {
             println!("Output compression is enabled");
+        }
+
+        if cfg.async_write.is_some_and(|v| v) {
+            println!("Async write is enabled");
+        }
+
+        let batch_size = cfg.batch_size.unwrap_or(1);
+        let batch_timeout = cfg.batch_timeout_ms.unwrap_or(0);
+
+        if batch_size > 1 {
+            println!(
+                "Batching enabled: size={}, timeout={}ms",
+                batch_size, batch_timeout
+            );
+        }
+
+        if batch_size == 0 {
+            return Err(miette::miette!("batch_size must be greater than 0"));
         }
 
         println!("Data directory: {}", cfg.data_dir);

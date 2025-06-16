@@ -35,7 +35,7 @@ impl AppState {
         shard_receivers_out.clear();
 
         for _ in 0..cfg.num_shards {
-            let (sender, receiver) = mpsc::channel(100);
+            let (sender, receiver) = mpsc::channel(cfg.batch_size.unwrap_or(100));
             shard_senders_vec.push(sender);
             shard_receivers_out.push(receiver); // Populate the output vector with receivers
         }
@@ -133,8 +133,6 @@ pub async fn set_blob(
     let shard_index = state.get_shard(&key);
     let sender = &state.shard_senders[shard_index];
 
-    let (responder_tx, responder_rx) = oneshot::channel();
-
     let compressed_body;
 
     // Compress the body is compression is enabled.
@@ -157,26 +155,48 @@ pub async fn set_blob(
         compressed_body = body;
     }
 
-    let operation = ShardWriteOperation::Set {
-        key,
-        data: compressed_body, // Use compressed body
-        responder: responder_tx,
-    };
+    // Check if async_write is enabled
+    if state.cfg.async_write.unwrap_or(false) {
+        // Async mode: respond immediately after queueing
+        let operation = ShardWriteOperation::SetAsync {
+            key,
+            data: compressed_body,
+        };
 
-    if sender.send(operation).await.is_err() {
-        tracing::error!("Failed to send SET operation to shard {}", shard_index);
-        return StatusCode::INTERNAL_SERVER_ERROR;
-    }
-
-    match responder_rx.await {
-        Ok(Ok(())) => StatusCode::CREATED,
-        Ok(Err(e)) => {
-            tracing::error!("Shard writer failed for SET: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
+        if sender.send(operation).await.is_err() {
+            tracing::error!(
+                "Failed to send ASYNC SET operation to shard {}",
+                shard_index
+            );
+            return StatusCode::INTERNAL_SERVER_ERROR;
         }
-        Err(_) => {
-            tracing::error!("Shard writer task cancelled or panicked for SET");
-            StatusCode::INTERNAL_SERVER_ERROR
+
+        StatusCode::ACCEPTED
+    } else {
+        // Sync mode: wait for completion
+        let (responder_tx, responder_rx) = oneshot::channel();
+
+        let operation = ShardWriteOperation::Set {
+            key,
+            data: compressed_body,
+            responder: responder_tx,
+        };
+
+        if sender.send(operation).await.is_err() {
+            tracing::error!("Failed to send SET operation to shard {}", shard_index);
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        }
+
+        match responder_rx.await {
+            Ok(Ok(())) => StatusCode::CREATED,
+            Ok(Err(e)) => {
+                tracing::error!("Shard writer failed for SET: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+            Err(_) => {
+                tracing::error!("Shard writer task cancelled or panicked for SET");
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
         }
     }
 }
@@ -188,27 +208,44 @@ pub async fn delete_blob(
     let shard_index = state.get_shard(&key);
     let sender = &state.shard_senders[shard_index];
 
-    let (responder_tx, responder_rx) = oneshot::channel();
+    // Check if async_write is enabled
+    if state.cfg.async_write.unwrap_or(false) {
+        // Async mode: respond immediately after queueing
+        let operation = ShardWriteOperation::DeleteAsync { key };
 
-    let operation = ShardWriteOperation::Delete {
-        key,
-        responder: responder_tx,
-    };
-
-    if sender.send(operation).await.is_err() {
-        tracing::error!("Failed to send DELETE operation to shard {}", shard_index);
-        return StatusCode::INTERNAL_SERVER_ERROR;
-    }
-
-    match responder_rx.await {
-        Ok(Ok(())) => StatusCode::NO_CONTENT,
-        Ok(Err(e)) => {
-            tracing::error!("Shard writer failed for DELETE: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
+        if sender.send(operation).await.is_err() {
+            tracing::error!(
+                "Failed to send ASYNC DELETE operation to shard {}",
+                shard_index
+            );
+            return StatusCode::INTERNAL_SERVER_ERROR;
         }
-        Err(_) => {
-            tracing::error!("Shard writer task cancelled or panicked for DELETE");
-            StatusCode::INTERNAL_SERVER_ERROR
+
+        StatusCode::ACCEPTED
+    } else {
+        // Sync mode: wait for completion
+        let (responder_tx, responder_rx) = oneshot::channel();
+
+        let operation = ShardWriteOperation::Delete {
+            key,
+            responder: responder_tx,
+        };
+
+        if sender.send(operation).await.is_err() {
+            tracing::error!("Failed to send DELETE operation to shard {}", shard_index);
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        }
+
+        match responder_rx.await {
+            Ok(Ok(())) => StatusCode::NO_CONTENT,
+            Ok(Err(e)) => {
+                tracing::error!("Shard writer failed for DELETE: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+            Err(_) => {
+                tracing::error!("Shard writer task cancelled or panicked for DELETE");
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
         }
     }
 }
