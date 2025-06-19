@@ -1,4 +1,5 @@
 use axum::body::Bytes;
+use chrono::Utc;
 use sqlx::SqlitePool;
 use std::collections::VecDeque;
 use tokio::sync::{mpsc, oneshot};
@@ -132,16 +133,44 @@ async fn process_batch(
                     _ => {}
                 }
 
-                sqlx::query("INSERT OR REPLACE INTO blobs (key, data) VALUES (?, ?)")
+                let now = Utc::now().timestamp();
+
+                // Check if record exists to determine if this is an insert or update
+                let exists = sqlx::query("SELECT 1 FROM blobs WHERE key = ?")
                     .bind(key)
-                    .bind(data.as_ref())
-                    .execute(&mut *tx)
+                    .fetch_optional(&mut *tx)
                     .await
-                    .map(|_| ())
-                    .map_err(|e| {
-                        tracing::error!("[Shard {}] SET error for key {}: {}", shard_id, key, e);
-                        e.to_string()
-                    })
+                    .map(|row| row.is_some())
+                    .unwrap_or(false);
+
+                if exists {
+                    // Update existing record - only update data, updated_at, and version
+                    sqlx::query("UPDATE blobs SET data = ?, updated_at = ?, version = version + 1 WHERE key = ?")
+                        .bind(data.as_ref())
+                        .bind(now)
+                        .bind(key)
+                        .execute(&mut *tx)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| {
+                            tracing::error!("[Shard {}] UPDATE error for key {}: {}", shard_id, key, e);
+                            e.to_string()
+                        })
+                } else {
+                    // Insert new record with metadata
+                    sqlx::query("INSERT INTO blobs (key, data, created_at, updated_at, expires_at, version) VALUES (?, ?, ?, ?, NULL, 0)")
+                        .bind(key)
+                        .bind(data.as_ref())
+                        .bind(now)
+                        .bind(now)
+                        .execute(&mut *tx)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| {
+                            tracing::error!("[Shard {}] INSERT error for key {}: {}", shard_id, key, e);
+                            e.to_string()
+                        })
+                }
             }
             ShardWriteOperation::Delete { key, .. } | ShardWriteOperation::DeleteAsync { key } => {
                 match operation {

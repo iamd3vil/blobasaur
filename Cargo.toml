@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 async-compression = { version = "0.4.9", features = ["tokio", "gzip"] }
 axum = { version = "0.8.4", features = ["http2"] }
+chrono = { version = "0.4.38", features = ["serde"] }
 config = { version = "0.15.11", features = ["toml"] }
 fnv = "1.0.7"
 futures = "0.3.31"

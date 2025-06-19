@@ -45,6 +45,7 @@ async fn main() -> Result<()> {
                 .post(http_server::set_blob)
                 .delete(http_server::delete_blob),
         )
+        .route("/blob/{key}/metadata", get(http_server::get_blob_metadata))
         .layer(DefaultBodyLimit::max(1024 * 1024 * 30)) // 30 MB limit
         .with_state(shared_state);
 

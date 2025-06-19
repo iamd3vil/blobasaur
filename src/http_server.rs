@@ -7,7 +7,9 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
+use chrono;
 use futures::future::join_all;
+use serde::Serialize;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode}; // Added for SQLite specific options
 use std::fs; // Added for directory creation
@@ -18,6 +20,16 @@ use tokio::sync::{mpsc, oneshot}; // Added mpsc here as well for clarity, though
 
 // Import ShardWriteOperation from shard_manager
 use crate::{config::Cfg, shard_manager::ShardWriteOperation};
+
+#[derive(Serialize)]
+pub struct BlobMetadata {
+    pub key: String,
+    pub size: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub expires_at: Option<i64>,
+    pub version: i64,
+}
 
 pub struct AppState {
     pub cfg: Cfg,
@@ -81,10 +93,19 @@ impl AppState {
             .collect();
 
         for (i, pool) in db_pools.iter().enumerate() {
-            sqlx::query("CREATE TABLE IF NOT EXISTS blobs (key TEXT PRIMARY KEY, data BLOB)")
-                .execute(pool)
-                .await
-                .unwrap_or_else(|e| panic!("Failed to create table in shard {} DB: {}", i, e));
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS blobs (
+                    key TEXT PRIMARY KEY,
+                    data BLOB,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    expires_at INTEGER,
+                    version INTEGER NOT NULL DEFAULT 0
+                )",
+            )
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to create table in shard {} DB: {}", i, e));
         }
 
         AppState {
@@ -111,15 +132,52 @@ pub async fn get_blob(
     let shard_index = state.get_shard(&key);
     let pool = &state.db_pools[shard_index];
 
-    match sqlx::query_as::<_, (Vec<u8>,)>("SELECT data FROM blobs WHERE key = ?")
-        .bind(&key)
-        .fetch_optional(pool)
-        .await
+    match sqlx::query_as::<_, (Vec<u8>,)>(
+        "SELECT data FROM blobs WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
+    )
+    .bind(&key)
+    .bind(chrono::Utc::now().timestamp())
+    .fetch_optional(pool)
+    .await
     {
         Ok(Some(row)) => Ok(row.0),
         Ok(None) => Err(StatusCode::NOT_FOUND),
         Err(e) => {
             tracing::error!("Failed to GET blob {}: {}", key, e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+pub async fn get_blob_metadata(
+    Path(key): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let shard_index = state.get_shard(&key);
+    let pool = &state.db_pools[shard_index];
+
+    match sqlx::query_as::<_, (i64, i64, i64, Option<i64>, i64)>(
+        "SELECT LENGTH(data), created_at, updated_at, expires_at, version FROM blobs WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
+    )
+    .bind(&key)
+    .bind(chrono::Utc::now().timestamp())
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(Some((size, created_at, updated_at, expires_at, version))) => {
+            let metadata = BlobMetadata {
+                key,
+                size,
+                created_at,
+                updated_at,
+                expires_at,
+                version,
+            };
+            Ok(axum::Json(metadata))
+        }
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(e) => {
+            tracing::error!("Failed to GET blob metadata {}: {}", key, e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }

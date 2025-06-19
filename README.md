@@ -15,6 +15,7 @@ Blobnom is a high-performance, sharded blob storage server written in Rust. It u
   - `GET /blob/{key}`: Retrieve a blob.
   - `POST /blob/{key}`: Store or replace a blob.
   - `DELETE /blob/{key}`: Delete a blob.
+  - `GET /blob/{key}/metadata`: Retrieve blob metadata without the blob data.
 - **Asynchronous Operations:** Leverages Tokio and async Rust for non-blocking I/O, ensuring efficient handling of concurrent requests.
 - **Configurable:**
   - Number of shards.
@@ -24,6 +25,7 @@ Blobnom is a high-performance, sharded blob storage server written in Rust. It u
   - Asynchronous write mode for improved API response times.
   - Write batching for improved database throughput.
 - **SQLite Backend:** Each shard uses its own SQLite database, simplifying deployment and management.
+- **Metadata Tracking:** Each blob includes metadata such as creation time, update time, expiration time, and version number.
 - **Graceful Shutdown:** (Implicitly handled by Axum and Tokio)
 
 ## Getting Started
@@ -156,6 +158,21 @@ All blob operations are performed via the `/blob/{key}` path.
     - `202 Accepted`: Blob queued for deletion (asynchronous mode when `async_write = true`).
     - `500 Internal Server Error`: If an error occurs during the operation.
 
+- ### `GET /blob/{key}/metadata`
+  - **Description:** Retrieves metadata for a blob without returning the blob data itself.
+  - **Path Parameters:**
+    - `key` (String): The unique identifier for the blob.
+  - **Responses:**
+    - `200 OK`: Returns JSON metadata including:
+      - `key`: The blob identifier
+      - `size`: Size of the blob in bytes
+      - `created_at`: Unix timestamp when the blob was first created
+      - `updated_at`: Unix timestamp when the blob was last updated
+      - `expires_at`: Unix timestamp when the blob expires (null if no expiration)
+      - `version`: Version number (incremented on each update, starts at 0)
+    - `404 Not Found`: If the blob with the given key does not exist or has expired.
+    - `500 Internal Server Error`: If an error occurs during the operation.
+
 ## Project Structure
 
 - `src/main.rs`: Entry point, sets up tracing, configuration, Axum router, and spawns shard writer tasks.
@@ -176,6 +193,7 @@ All blob operations are performed via the `/blob/{key}` path.
 - [Miette](https://crates.io/crates/miette): Fancy diagnostic reporting library.
 - [Fnv](https://crates.io/crates/fnv): For FNV hashing to determine shard index.
 - [Tracing](https://crates.io/crates/tracing): Application-level tracing framework.
+- [Chrono](https://crates.io/crates/chrono): Date and time library for handling timestamps.
 
 ## Performance Features
 
@@ -211,6 +229,27 @@ async_write = false
 batch_size = 1
 ```
 
+## Database Schema
+
+The SQLite database schema for each shard includes the following table:
+
+```sql
+CREATE TABLE blobs (
+    key TEXT PRIMARY KEY,
+    data BLOB,
+    created_at INTEGER NOT NULL,    -- Unix timestamp
+    updated_at INTEGER NOT NULL,    -- Unix timestamp  
+    expires_at INTEGER,             -- Unix timestamp, NULL if no expiration
+    version INTEGER NOT NULL DEFAULT 0  -- Incremented on each update
+);
+```
+
+### Metadata Features
+
+- **Automatic Timestamps**: `created_at` and `updated_at` are automatically managed
+- **Versioning**: Each blob update increments the version number starting from 0
+- **Expiration**: Blobs with `expires_at` set will be automatically filtered out from GET requests
+
 ## Future Enhancements (Ideas)
 
 - Implement actual data compression for `storage_compression` and `output_compression`.
@@ -221,3 +260,5 @@ batch_size = 1
 - Streaming support for very large blobs.
 - Replication or durability options beyond single SQLite files.
 - More comprehensive tests.
+- Blob expiration cleanup background task.
+- Blob listing and search capabilities.
