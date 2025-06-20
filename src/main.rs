@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
-use axum::{Router, extract::DefaultBodyLimit, routing::get};
-use http_server::AppState;
 use miette::{Context, Result};
 
+mod app_state;
 mod config;
-mod http_server;
+mod server;
 mod shard_manager;
+
+use app_state::AppState;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -36,22 +37,15 @@ async fn main() -> Result<()> {
         ));
     }
 
-    // build our application with a route
-    let app = Router::new()
-        // Use method chaining for routes, which is idiomatic Axum
-        .route(
-            "/blob/{key}",
-            get(http_server::get_blob)
-                .post(http_server::set_blob)
-                .delete(http_server::delete_blob),
-        )
-        .route("/blob/{key}/metadata", get(http_server::get_blob_metadata))
-        .layer(DefaultBodyLimit::max(1024 * 1024 * 30)) // 30 MB limit
-        .with_state(shared_state);
-
-    // run our app with hyper, listening globally on port 3000
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    // Run Redis server instead of HTTP server
+    if let Err(e) = server::run_redis_server(
+        shared_state,
+        &cfg.addr.unwrap_or("0.0.0.0:6379".to_string()),
+    )
+    .await
+    {
+        return Err(miette::miette!("Failed to run Redis server: {}", e));
+    }
 
     Ok(())
 }

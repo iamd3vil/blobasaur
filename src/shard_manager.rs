@@ -1,4 +1,3 @@
-use axum::body::Bytes;
 use chrono::Utc;
 use sqlx::SqlitePool;
 use std::collections::VecDeque;
@@ -9,12 +8,12 @@ use tokio::time::{Duration, timeout};
 pub enum ShardWriteOperation {
     Set {
         key: String,
-        data: Bytes,
+        data: Vec<u8>,
         responder: oneshot::Sender<Result<(), String>>,
     },
     SetAsync {
         key: String,
-        data: Bytes,
+        data: Vec<u8>,
     },
     Delete {
         key: String,
@@ -146,7 +145,7 @@ async fn process_batch(
                 if exists {
                     // Update existing record - only update data, updated_at, and version
                     sqlx::query("UPDATE blobs SET data = ?, updated_at = ?, version = version + 1 WHERE key = ?")
-                        .bind(data.as_ref())
+                        .bind(&data[..])
                         .bind(now)
                         .bind(key)
                         .execute(&mut *tx)
@@ -160,7 +159,7 @@ async fn process_batch(
                     // Insert new record with metadata
                     sqlx::query("INSERT INTO blobs (key, data, created_at, updated_at, expires_at, version) VALUES (?, ?, ?, ?, NULL, 0)")
                         .bind(key)
-                        .bind(data.as_ref())
+                        .bind(&data[..])
                         .bind(now)
                         .bind(now)
                         .execute(&mut *tx)

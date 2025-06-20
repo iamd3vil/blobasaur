@@ -10,6 +10,7 @@ pub struct Cfg {
     pub async_write: Option<bool>,
     pub batch_size: Option<usize>,
     pub batch_timeout_ms: Option<u64>,
+    pub addr: Option<String>,
 }
 
 impl Cfg {

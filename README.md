@@ -6,27 +6,26 @@
 
 # Blobnom
 
-Blobnom is a high-performance, sharded blob storage server written in Rust. It uses Axum for its HTTP server and SQLite as the backend for each shard, providing a simple yet robust solution for storing and retrieving binary large objects (blobs).
+Blobnom is a high-performance, sharded blob storage server written in Rust. It implements the Redis protocol for client compatibility and uses SQLite as the backend for each shard, providing a simple yet robust solution for storing and retrieving binary large objects (blobs).
 
 ## Features
 
 - **Sharding:** Distributes data across multiple SQLite databases (shards) for improved concurrency and scalability. The shard for a given key is determined by an FNV hash of the key.
-- **HTTP API:** Provides a simple RESTful API for blob operations:
-  - `GET /blob/{key}`: Retrieve a blob.
-  - `POST /blob/{key}`: Store or replace a blob.
-  - `DELETE /blob/{key}`: Delete a blob.
-  - `GET /blob/{key}/metadata`: Retrieve blob metadata without the blob data.
+- **Redis Protocol:** Implements Redis protocol for client compatibility with the following commands:
+  - `GET key`: Retrieve a blob.
+  - `SET key value`: Store or replace a blob.
+  - `DEL key`: Delete a blob.
 - **Asynchronous Operations:** Leverages Tokio and async Rust for non-blocking I/O, ensuring efficient handling of concurrent requests.
 - **Configurable:**
   - Number of shards.
   - Data directory for storing SQLite files.
   - Optional storage compression (not yet implemented but planned via config).
   - Optional output compression (not yet implemented but planned via config).
-  - Asynchronous write mode for improved API response times.
+  - Asynchronous write mode for improved response times.
   - Write batching for improved database throughput.
 - **SQLite Backend:** Each shard uses its own SQLite database, simplifying deployment and management.
 - **Metadata Tracking:** Each blob includes metadata such as creation time, update time, expiration time, and version number.
-- **Graceful Shutdown:** (Implicitly handled by Axum and Tokio)
+- **Graceful Shutdown:** (Implicitly handled by Tokio)
 
 ## Getting Started
 
@@ -82,11 +81,13 @@ Blobnom is a high-performance, sharded blob storage server written in Rust. It u
       just run
       ```
     - To run the release build:
-      `sh
+      ```sh
       cargo run --release
-    # or
-    just run-release
-    `  The server will start by default on`0.0.0.0:3000`.
+      # or
+      just run-release
+      ```
+    
+    The server will start by default on `0.0.0.0:6379` (standard Redis port).
 
 ### Cross-compilation (Example: Linux MUSL)
 
@@ -108,7 +109,7 @@ Key configuration options:
 - `num_shards` (usize, required): The number of shards to distribute data across. Must be greater than 0.
 - `storage_compression` (bool, optional): If `true`, enables compression for data at rest. (Default: `false` if not specified)
 - `output_compression` (bool, optional): If `true`, enables compression for HTTP responses. (Default: `false` if not specified)
-- `async_write` (bool, optional): If `true`, enables asynchronous write operations where the API responds immediately after queueing the operation instead of waiting for database completion. (Default: `false` if not specified)
+- `async_write` (bool, optional): If `true`, enables asynchronous write operations where the server responds immediately after queueing the operation instead of waiting for database completion. (Default: `false` if not specified)
 - `batch_size` (usize, optional): Maximum number of operations to batch together in a single database transaction. Set to 1 to disable batching. Higher values improve throughput but increase latency. (Default: `1`)
 - `batch_timeout_ms` (u64, optional): Maximum time in milliseconds to wait for additional operations before processing a batch. Only relevant when `batch_size > 1`. (Default: `0`)
 
@@ -124,60 +125,62 @@ batch_size = 50
 batch_timeout_ms = 10
 ```
 
-## API Endpoints
+## Redis Commands
 
-All blob operations are performed via the `/blob/{key}` path.
+Blobnom implements a subset of Redis commands for blob operations:
 
-- ### `POST /blob/{key}`
+- ### `SET key value`
 
   - **Description:** Stores or replaces a blob.
-  - **Path Parameters:**
-    - `key` (String): The unique identifier for the blob.
-  - **Request Body:** The binary data of the blob.
+  - **Parameters:**
+    - `key`: The unique identifier for the blob.
+    - `value`: The binary data of the blob.
   - **Responses:**
-    - `201 Created`: Blob stored successfully (synchronous mode).
-    - `202 Accepted`: Blob queued for storage (asynchronous mode when `async_write = true`).
-    - `500 Internal Server Error`: If an error occurs during the operation.
+    - `+OK`: Blob stored successfully (or queued in async mode).
+    - `-ERR internal error`: If an error occurs during the operation.
 
-- ### `GET /blob/{key}`
+- ### `GET key`
 
   - **Description:** Retrieves a blob.
-  - **Path Parameters:**
-    - `key` (String): The unique identifier for the blob.
+  - **Parameters:**
+    - `key`: The unique identifier for the blob.
   - **Responses:**
-    - `200 OK`: Returns the blob data in the response body.
-    - `404 Not Found`: If the blob with the given key does not exist.
-    - `500 Internal Server Error`: If an error occurs during the operation.
+    - Bulk string with blob data if the key exists.
+    - `$-1` (null bulk string): If the blob with the given key does not exist.
+    - `-ERR database error`: If an error occurs during the operation.
 
-- ### `DELETE /blob/{key}`
+- ### `DEL key`
   - **Description:** Deletes a blob.
-  - **Path Parameters:**
-    - `key` (String): The unique identifier for the blob.
+  - **Parameters:**
+    - `key`: The unique identifier for the blob.
   - **Responses:**
-    - `204 No Content`: Blob deleted successfully (synchronous mode).
-    - `202 Accepted`: Blob queued for deletion (asynchronous mode when `async_write = true`).
-    - `500 Internal Server Error`: If an error occurs during the operation.
+    - `:1`: If the key existed and was deleted.
+    - `:0`: If the key did not exist.
+    - `-ERR internal error`: If an error occurs during the operation.
 
-- ### `GET /blob/{key}/metadata`
-  - **Description:** Retrieves metadata for a blob without returning the blob data itself.
-  - **Path Parameters:**
-    - `key` (String): The unique identifier for the blob.
-  - **Responses:**
-    - `200 OK`: Returns JSON metadata including:
-      - `key`: The blob identifier
-      - `size`: Size of the blob in bytes
-      - `created_at`: Unix timestamp when the blob was first created
-      - `updated_at`: Unix timestamp when the blob was last updated
-      - `expires_at`: Unix timestamp when the blob expires (null if no expiration)
-      - `version`: Version number (incremented on each update, starts at 0)
-    - `404 Not Found`: If the blob with the given key does not exist or has expired.
-    - `500 Internal Server Error`: If an error occurs during the operation.
+### Using Redis Clients
+
+You can use any Redis client to interact with Blobnom:
+
+```bash
+# Using redis-cli
+redis-cli -p 6379 SET mykey "Hello, World!"
+redis-cli -p 6379 GET mykey
+redis-cli -p 6379 DEL mykey
+
+# Using Redis clients in various languages
+# Python: redis-py
+# Node.js: ioredis or node-redis
+# Go: go-redis
+# etc.
+```
 
 ## Project Structure
 
-- `src/main.rs`: Entry point, sets up tracing, configuration, Axum router, and spawns shard writer tasks.
+- `src/main.rs`: Entry point, sets up tracing, configuration, Redis server, and spawns shard writer tasks.
 - `src/config.rs`: Handles loading and validation of the `config.toml` file.
-- `src/http_server.rs`: Defines the Axum `AppState`, HTTP handlers for blob operations, and logic for determining the shard for a key.
+- `src/app_state.rs`: Defines the `AppState` structure and logic for determining the shard for a key.
+- `src/redis_server.rs`: Implements the Redis protocol server and command handlers.
 - `src/shard_manager.rs`: Defines the `ShardWriteOperation` enum and the `shard_writer_task` responsible for handling write operations (Set, Delete) for each shard via a message queue.
 - `config.toml`: Configuration file (user-created).
 - `Justfile`: Contains `just` commands for common development tasks.
@@ -185,7 +188,7 @@ All blob operations are performed via the `/blob/{key}` path.
 
 ## Key Dependencies
 
-- [Axum](https://github.com/tokio-rs/axum): Web framework for building HTTP servers.
+
 - [Tokio](https://tokio.rs/): Asynchronous runtime for Rust.
 - [SQLx](https://github.com/launchbadge/sqlx): Asynchronous SQL toolkit for Rust, used here with SQLite.
 - [Serde](https://serde.rs/): Framework for serializing and deserializing Rust data structures.
@@ -208,10 +211,10 @@ Blobnom supports batching multiple write operations into single database transac
 
 ### Asynchronous Writes
 
-When `async_write = true`, the API responds immediately after queueing operations:
+When `async_write = true`, the server responds immediately after queueing operations:
 
-- **Benefits**: Lower API response times, better user experience
-- **Tradeoffs**: Operations may fail after API responds (check logs)
+- **Benefits**: Lower response times, better user experience
+- **Tradeoffs**: Operations may fail after server responds (check logs)
 - **Use case**: Write-heavy workloads where eventual consistency is acceptable
 
 ### Recommended Configuration
