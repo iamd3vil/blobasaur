@@ -42,15 +42,19 @@ pub enum ParseError {
 }
 
 /// Parse a complete RESP message
+#[allow(dead_code)]
 pub fn parse_resp(input: &[u8]) -> Result<RespValue, ParseError> {
     match resp_value(input) {
-        Ok((remaining, value)) => {
-            if remaining.is_empty() {
-                Ok(value)
-            } else {
-                Err(ParseError::Invalid("Extra data after message".to_string()))
-            }
-        }
+        Ok((_remaining, value)) => Ok(value),
+        Err(nom::Err::Incomplete(_)) => Err(ParseError::Incomplete),
+        Err(e) => Err(ParseError::Invalid(format!("Parse error: {}", e))),
+    }
+}
+
+/// Parse a single RESP message and return both the parsed value and remaining bytes
+pub fn parse_resp_with_remaining(input: &[u8]) -> Result<(RespValue, &[u8]), ParseError> {
+    match resp_value(input) {
+        Ok((remaining, value)) => Ok((value, remaining)),
         Err(nom::Err::Incomplete(_)) => Err(ParseError::Incomplete),
         Err(e) => Err(ParseError::Invalid(format!("Parse error: {}", e))),
     }

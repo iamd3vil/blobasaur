@@ -1,5 +1,5 @@
 use crate::AppState;
-use crate::redis::{ParseError, RedisCommand, RespValue, parse_command, parse_resp};
+use crate::redis::{ParseError, RedisCommand, RespValue, parse_command, parse_resp_with_remaining};
 use crate::shard_manager::ShardWriteOperation;
 use bytes::Bytes;
 use std::sync::Arc;
@@ -47,33 +47,12 @@ async fn handle_connection(
         buffer.extend_from_slice(&temp_buffer[..n]);
 
         // Try to parse complete messages from the buffer
-        let mut processed = 0;
-        loop {
-            // Ensure we don't go out of bounds
-            if processed >= buffer.len() {
-                break;
-            }
+        let mut remaining_data = &buffer[..];
 
-            match parse_resp(&buffer[processed..]) {
-                Ok(resp_value) => {
-                    // Calculate how many bytes were consumed
-                    let serialized = resp_value.serialize();
-                    let consumed = find_message_end(&buffer[processed..], &serialized);
-
-                    if consumed == 0 {
-                        // Couldn't determine message length, wait for more data
-                        break;
-                    }
-
-                    // Validate that consumed doesn't exceed remaining buffer
-                    let remaining = buffer.len() - processed;
-                    let actual_consumed = consumed.min(remaining);
-
-                    if actual_consumed == 0 {
-                        break;
-                    }
-
-                    processed += actual_consumed;
+        while !remaining_data.is_empty() {
+            match parse_resp_with_remaining(remaining_data) {
+                Ok((resp_value, remaining)) => {
+                    remaining_data = remaining;
 
                     // Parse and handle the command
                     match parse_command(resp_value) {
@@ -97,22 +76,26 @@ async fn handle_connection(
                     }
                 }
                 Err(ParseError::Incomplete) => {
-                    // Need more data
+                    // Need more data, keep remaining data in buffer
                     break;
                 }
                 Err(ParseError::Invalid(msg)) => {
                     tracing::warn!("Protocol error: {}", msg);
                     let error_resp = RespValue::Error(format!("ERR {}", msg));
                     stream.write_all(&error_resp.serialize()).await?;
-                    // Skip some data to try to recover
-                    processed += 1;
+                    // Skip one byte to try to recover
+                    if !remaining_data.is_empty() {
+                        remaining_data = &remaining_data[1..];
+                    }
                 }
             }
         }
 
-        // Remove processed data from buffer
-        if processed > 0 {
-            buffer.drain(..processed);
+        // Update buffer to keep only unprocessed data
+        let remaining_len = remaining_data.len();
+        let processed_len = buffer.len() - remaining_len;
+        if processed_len > 0 {
+            buffer.drain(..processed_len);
         }
 
         // Prevent buffer from growing too large
@@ -124,101 +107,6 @@ async fn handle_connection(
 }
 
 // Helper function to find the end of a complete message
-fn find_message_end(buffer: &[u8], _serialized: &[u8]) -> usize {
-    // Use a more robust approach to find message boundaries
-    // We'll parse the RESP protocol step by step to find the exact end
-    let mut pos = 0;
-
-    if buffer.is_empty() {
-        return 0;
-    }
-
-    match buffer[0] {
-        b'*' => {
-            // Array - parse count and then each element
-            pos += 1;
-
-            // Read array count
-            let mut count_str = String::new();
-            while pos < buffer.len() && buffer[pos] != b'\r' {
-                count_str.push(buffer[pos] as char);
-                pos += 1;
-            }
-
-            if pos + 1 >= buffer.len() || buffer[pos] != b'\r' || buffer[pos + 1] != b'\n' {
-                return 0; // Incomplete
-            }
-            pos += 2;
-
-            let count = match count_str.parse::<i32>() {
-                Ok(c) if c >= 0 => c as usize,
-                _ => return 0,
-            };
-
-            // Parse each array element
-            for _ in 0..count {
-                let element_end = find_single_element_end(&buffer[pos..]);
-                if element_end == 0 {
-                    return 0; // Incomplete element
-                }
-                pos += element_end;
-            }
-
-            pos
-        }
-        b'$' => find_single_element_end(buffer),
-        b'+' | b'-' | b':' => find_single_element_end(buffer),
-        _ => 0,
-    }
-}
-
-fn find_single_element_end(buffer: &[u8]) -> usize {
-    if buffer.is_empty() {
-        return 0;
-    }
-
-    match buffer[0] {
-        b'$' => {
-            // Bulk string
-            let mut pos = 1;
-            let mut len_str = String::new();
-
-            while pos < buffer.len() && buffer[pos] != b'\r' {
-                len_str.push(buffer[pos] as char);
-                pos += 1;
-            }
-
-            if pos + 1 >= buffer.len() || buffer[pos] != b'\r' || buffer[pos + 1] != b'\n' {
-                return 0; // Incomplete length
-            }
-            pos += 2;
-
-            let len = match len_str.parse::<i32>() {
-                Ok(-1) => return pos, // Null bulk string
-                Ok(l) if l >= 0 => l as usize,
-                _ => return 0,
-            };
-
-            if pos + len + 2 > buffer.len() {
-                return 0; // Not enough data
-            }
-
-            pos + len + 2 // +2 for final \r\n
-        }
-        b'+' | b'-' | b':' => {
-            // Simple string, error, or integer
-            let mut pos = 1;
-            while pos + 1 < buffer.len() {
-                if buffer[pos] == b'\r' && buffer[pos + 1] == b'\n' {
-                    return pos + 2;
-                }
-                pos += 1;
-            }
-            0 // Incomplete
-        }
-        _ => 0,
-    }
-}
 
 async fn handle_redis_command(
     stream: &mut TcpStream,
