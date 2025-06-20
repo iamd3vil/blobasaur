@@ -4,6 +4,7 @@ use miette::{Context, Result};
 
 mod app_state;
 mod config;
+mod redis;
 mod server;
 mod shard_manager;
 

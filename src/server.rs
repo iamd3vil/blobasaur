@@ -1,20 +1,11 @@
 use crate::AppState;
+use crate::redis::{ParseError, RedisCommand, RespValue, parse_command, parse_resp};
 use crate::shard_manager::ShardWriteOperation;
+use bytes::Bytes;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
-
-const CRLF: &[u8] = b"\r\n";
-
-#[derive(Debug)]
-enum RedisCommand {
-    Get { key: String },
-    Set { key: String, value: Vec<u8> },
-    Del { key: String },
-    Quit,
-    Unknown,
-}
 
 pub async fn run_redis_server(
     state: Arc<AppState>,
@@ -40,10 +31,11 @@ async fn handle_connection(
     mut stream: TcpStream,
     state: Arc<AppState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut buffer = vec![0; 4096];
+    let mut buffer = Vec::new();
+    let mut temp_buffer = vec![0; 4096];
 
     loop {
-        let n = match stream.read(&mut buffer).await {
+        let n = match stream.read(&mut temp_buffer).await {
             Ok(0) => return Ok(()), // Connection closed
             Ok(n) => n,
             Err(e) => {
@@ -52,98 +44,221 @@ async fn handle_connection(
             }
         };
 
-        let command = parse_redis_command(&buffer[..n])?;
+        buffer.extend_from_slice(&temp_buffer[..n]);
 
-        match command {
-            RedisCommand::Get { key } => {
-                handle_get(&mut stream, &state, key).await?;
+        // Try to parse complete messages from the buffer
+        let mut processed = 0;
+        loop {
+            // Ensure we don't go out of bounds
+            if processed >= buffer.len() {
+                break;
             }
-            RedisCommand::Set { key, value } => {
-                handle_set(&mut stream, &state, key, value).await?;
+
+            match parse_resp(&buffer[processed..]) {
+                Ok(resp_value) => {
+                    // Calculate how many bytes were consumed
+                    let serialized = resp_value.serialize();
+                    let consumed = find_message_end(&buffer[processed..], &serialized);
+
+                    if consumed == 0 {
+                        // Couldn't determine message length, wait for more data
+                        break;
+                    }
+
+                    // Validate that consumed doesn't exceed remaining buffer
+                    let remaining = buffer.len() - processed;
+                    let actual_consumed = consumed.min(remaining);
+
+                    if actual_consumed == 0 {
+                        break;
+                    }
+
+                    processed += actual_consumed;
+
+                    // Parse and handle the command
+                    match parse_command(resp_value) {
+                        Ok(command) => {
+                            if let Err(e) = handle_redis_command(&mut stream, &state, command).await
+                            {
+                                tracing::error!("Error handling command: {}", e);
+                                return Err(e);
+                            }
+                        }
+                        Err(ParseError::Invalid(msg)) => {
+                            tracing::warn!("Invalid command: {}", msg);
+                            let error_resp = RespValue::Error(format!("ERR {}", msg));
+                            stream.write_all(&error_resp.serialize()).await?;
+                        }
+                        Err(e) => {
+                            tracing::error!("Command parse error: {}", e);
+                            let error_resp = RespValue::Error("ERR protocol error".to_string());
+                            stream.write_all(&error_resp.serialize()).await?;
+                        }
+                    }
+                }
+                Err(ParseError::Incomplete) => {
+                    // Need more data
+                    break;
+                }
+                Err(ParseError::Invalid(msg)) => {
+                    tracing::warn!("Protocol error: {}", msg);
+                    let error_resp = RespValue::Error(format!("ERR {}", msg));
+                    stream.write_all(&error_resp.serialize()).await?;
+                    // Skip some data to try to recover
+                    processed += 1;
+                }
             }
-            RedisCommand::Del { key } => {
-                handle_del(&mut stream, &state, key).await?;
-            }
-            RedisCommand::Quit => {
-                stream.write_all(b"+OK\r\n").await?;
-                return Ok(());
-            }
-            RedisCommand::Unknown => {
-                stream.write_all(b"-ERR unknown command\r\n").await?;
-            }
+        }
+
+        // Remove processed data from buffer
+        if processed > 0 {
+            buffer.drain(..processed);
+        }
+
+        // Prevent buffer from growing too large
+        if buffer.len() > 1024 * 1024 {
+            tracing::warn!("Buffer too large, closing connection");
+            return Err("Buffer overflow".into());
         }
     }
 }
 
-fn parse_redis_command(data: &[u8]) -> Result<RedisCommand, Box<dyn std::error::Error>> {
-    // Redis uses RESP protocol
-    // Commands come as arrays: *<count>\r\n$<len>\r\n<data>\r\n...
+// Helper function to find the end of a complete message
+fn find_message_end(buffer: &[u8], _serialized: &[u8]) -> usize {
+    // Use a more robust approach to find message boundaries
+    // We'll parse the RESP protocol step by step to find the exact end
+    let mut pos = 0;
 
-    let s = String::from_utf8_lossy(data);
-    let lines: Vec<&str> = s.split("\r\n").collect();
-
-    if lines.is_empty() || !lines[0].starts_with('*') {
-        return Ok(RedisCommand::Unknown);
+    if buffer.is_empty() {
+        return 0;
     }
 
-    let count = lines[0][1..].parse::<usize>().unwrap_or(0);
-    if count == 0 {
-        return Ok(RedisCommand::Unknown);
-    }
+    match buffer[0] {
+        b'*' => {
+            // Array - parse count and then each element
+            pos += 1;
 
-    // Extract command parts
-    let mut parts = Vec::new();
-    let mut i = 1;
-    while i < lines.len() && parts.len() < count {
-        if lines[i].starts_with('$') {
-            i += 1; // Skip length line
-            if i < lines.len() {
-                parts.push(lines[i]);
-                i += 1;
+            // Read array count
+            let mut count_str = String::new();
+            while pos < buffer.len() && buffer[pos] != b'\r' {
+                count_str.push(buffer[pos] as char);
+                pos += 1;
             }
-        } else {
-            i += 1;
+
+            if pos + 1 >= buffer.len() || buffer[pos] != b'\r' || buffer[pos + 1] != b'\n' {
+                return 0; // Incomplete
+            }
+            pos += 2;
+
+            let count = match count_str.parse::<i32>() {
+                Ok(c) if c >= 0 => c as usize,
+                _ => return 0,
+            };
+
+            // Parse each array element
+            for _ in 0..count {
+                let element_end = find_single_element_end(&buffer[pos..]);
+                if element_end == 0 {
+                    return 0; // Incomplete element
+                }
+                pos += element_end;
+            }
+
+            pos
+        }
+        b'$' => find_single_element_end(buffer),
+        b'+' | b'-' | b':' => find_single_element_end(buffer),
+        _ => 0,
+    }
+}
+
+fn find_single_element_end(buffer: &[u8]) -> usize {
+    if buffer.is_empty() {
+        return 0;
+    }
+
+    match buffer[0] {
+        b'$' => {
+            // Bulk string
+            let mut pos = 1;
+            let mut len_str = String::new();
+
+            while pos < buffer.len() && buffer[pos] != b'\r' {
+                len_str.push(buffer[pos] as char);
+                pos += 1;
+            }
+
+            if pos + 1 >= buffer.len() || buffer[pos] != b'\r' || buffer[pos + 1] != b'\n' {
+                return 0; // Incomplete length
+            }
+            pos += 2;
+
+            let len = match len_str.parse::<i32>() {
+                Ok(-1) => return pos, // Null bulk string
+                Ok(l) if l >= 0 => l as usize,
+                _ => return 0,
+            };
+
+            if pos + len + 2 > buffer.len() {
+                return 0; // Not enough data
+            }
+
+            pos + len + 2 // +2 for final \r\n
+        }
+        b'+' | b'-' | b':' => {
+            // Simple string, error, or integer
+            let mut pos = 1;
+            while pos + 1 < buffer.len() {
+                if buffer[pos] == b'\r' && buffer[pos + 1] == b'\n' {
+                    return pos + 2;
+                }
+                pos += 1;
+            }
+            0 // Incomplete
+        }
+        _ => 0,
+    }
+}
+
+async fn handle_redis_command(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+    command: RedisCommand,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        RedisCommand::Get { key } => {
+            handle_get(stream, state, key).await?;
+        }
+        RedisCommand::Set { key, value } => {
+            handle_set(stream, state, key, value).await?;
+        }
+        RedisCommand::Del { key } => {
+            handle_del(stream, state, key).await?;
+        }
+        RedisCommand::Exists { key } => {
+            handle_exists(stream, state, key).await?;
+        }
+        RedisCommand::Ping { message } => {
+            handle_ping(stream, message).await?;
+        }
+        RedisCommand::Info { section } => {
+            handle_info(stream, state, section).await?;
+        }
+        RedisCommand::Command => {
+            handle_command(stream).await?;
+        }
+        RedisCommand::Quit => {
+            let response = RespValue::SimpleString("OK".to_string());
+            stream.write_all(&response.serialize()).await?;
+            return Err("Client quit".into());
+        }
+        RedisCommand::Unknown(cmd) => {
+            tracing::warn!("Unknown command: {}", cmd);
+            let response = RespValue::Error(format!("ERR unknown command '{}'", cmd));
+            stream.write_all(&response.serialize()).await?;
         }
     }
-
-    if parts.is_empty() {
-        return Ok(RedisCommand::Unknown);
-    }
-
-    let cmd = parts[0].to_uppercase();
-
-    match cmd.as_str() {
-        "GET" => {
-            if parts.len() >= 2 {
-                Ok(RedisCommand::Get {
-                    key: parts[1].to_string(),
-                })
-            } else {
-                Ok(RedisCommand::Unknown)
-            }
-        }
-        "SET" => {
-            if parts.len() >= 3 {
-                Ok(RedisCommand::Set {
-                    key: parts[1].to_string(),
-                    value: parts[2].as_bytes().to_vec(),
-                })
-            } else {
-                Ok(RedisCommand::Unknown)
-            }
-        }
-        "DEL" => {
-            if parts.len() >= 2 {
-                Ok(RedisCommand::Del {
-                    key: parts[1].to_string(),
-                })
-            } else {
-                Ok(RedisCommand::Unknown)
-            }
-        }
-        "QUIT" => Ok(RedisCommand::Quit),
-        _ => Ok(RedisCommand::Unknown),
-    }
+    Ok(())
 }
 
 async fn handle_get(
@@ -163,21 +278,17 @@ async fn handle_get(
     .await
     {
         Ok(Some(row)) => {
-            // Return bulk string
-            let data = &row.0;
-            let response = format!("${}\r\n", data.len());
-            stream.write_all(response.as_bytes()).await?;
-            stream.write_all(data).await?;
-            stream.write_all(CRLF).await?;
+            let response = RespValue::BulkString(Some(row.0.into()));
+            stream.write_all(&response.serialize()).await?;
         }
         Ok(None) => {
-            // Null bulk string for not found
-            stream.write_all(b"$-1\r\n").await?;
+            let response = RespValue::BulkString(None);
+            stream.write_all(&response.serialize()).await?;
         }
         Err(e) => {
             tracing::error!("Failed to GET key {}: {}", key, e);
-            let error_msg = format!("-ERR database error\r\n");
-            stream.write_all(error_msg.as_bytes()).await?;
+            let response = RespValue::Error("ERR database error".to_string());
+            stream.write_all(&response.serialize()).await?;
         }
     }
 
@@ -188,7 +299,7 @@ async fn handle_set(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
     key: String,
-    value: Vec<u8>,
+    value: Bytes,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let shard_index = state.get_shard(&key);
     let sender = &state.shard_senders[shard_index];
@@ -196,16 +307,21 @@ async fn handle_set(
     // Check if async_write is enabled
     if state.cfg.async_write.unwrap_or(false) {
         // Async mode: respond immediately after queueing
-        let operation = ShardWriteOperation::SetAsync { key, data: value };
+        let operation = ShardWriteOperation::SetAsync {
+            key,
+            data: value.to_vec(),
+        };
 
         if sender.send(operation).await.is_err() {
             tracing::error!(
                 "Failed to send ASYNC SET operation to shard {}",
                 shard_index
             );
-            stream.write_all(b"-ERR internal error\r\n").await?;
+            let response = RespValue::Error("ERR internal error".to_string());
+            stream.write_all(&response.serialize()).await?;
         } else {
-            stream.write_all(b"+OK\r\n").await?;
+            let response = RespValue::SimpleString("OK".to_string());
+            stream.write_all(&response.serialize()).await?;
         }
     } else {
         // Sync mode: wait for completion
@@ -213,25 +329,29 @@ async fn handle_set(
 
         let operation = ShardWriteOperation::Set {
             key,
-            data: value,
+            data: value.to_vec(),
             responder: responder_tx,
         };
 
         if sender.send(operation).await.is_err() {
             tracing::error!("Failed to send SET operation to shard {}", shard_index);
-            stream.write_all(b"-ERR internal error\r\n").await?;
+            let response = RespValue::Error("ERR internal error".to_string());
+            stream.write_all(&response.serialize()).await?;
         } else {
             match responder_rx.await {
                 Ok(Ok(())) => {
-                    stream.write_all(b"+OK\r\n").await?;
+                    let response = RespValue::SimpleString("OK".to_string());
+                    stream.write_all(&response.serialize()).await?;
                 }
                 Ok(Err(e)) => {
                     tracing::error!("Shard writer failed for SET: {}", e);
-                    stream.write_all(b"-ERR database error\r\n").await?;
+                    let response = RespValue::Error("ERR database error".to_string());
+                    stream.write_all(&response.serialize()).await?;
                 }
                 Err(_) => {
                     tracing::error!("Shard writer task cancelled or panicked for SET");
-                    stream.write_all(b"-ERR internal error\r\n").await?;
+                    let response = RespValue::Error("ERR internal error".to_string());
+                    stream.write_all(&response.serialize()).await?;
                 }
             }
         }
@@ -258,7 +378,8 @@ async fn handle_del(
 
     if !exists {
         // Redis DEL returns the number of keys deleted
-        stream.write_all(b":0\r\n").await?;
+        let response = RespValue::Integer(0);
+        stream.write_all(&response.serialize()).await?;
         return Ok(());
     }
 
@@ -274,10 +395,12 @@ async fn handle_del(
                 "Failed to send ASYNC DELETE operation to shard {}",
                 shard_index
             );
-            stream.write_all(b"-ERR internal error\r\n").await?;
+            let response = RespValue::Error("ERR internal error".to_string());
+            stream.write_all(&response.serialize()).await?;
         } else {
             // Assume success for async mode
-            stream.write_all(b":1\r\n").await?;
+            let response = RespValue::Integer(1);
+            stream.write_all(&response.serialize()).await?;
         }
     } else {
         // Sync mode: wait for completion
@@ -290,23 +413,147 @@ async fn handle_del(
 
         if sender.send(operation).await.is_err() {
             tracing::error!("Failed to send DELETE operation to shard {}", shard_index);
-            stream.write_all(b"-ERR internal error\r\n").await?;
+            let response = RespValue::Error("ERR internal error".to_string());
+            stream.write_all(&response.serialize()).await?;
         } else {
             match responder_rx.await {
                 Ok(Ok(())) => {
-                    stream.write_all(b":1\r\n").await?;
+                    let response = RespValue::Integer(1);
+                    stream.write_all(&response.serialize()).await?;
                 }
                 Ok(Err(e)) => {
                     tracing::error!("Shard writer failed for DELETE: {}", e);
-                    stream.write_all(b"-ERR database error\r\n").await?;
+                    let response = RespValue::Error("ERR database error".to_string());
+                    stream.write_all(&response.serialize()).await?;
                 }
                 Err(_) => {
                     tracing::error!("Shard writer task cancelled or panicked for DELETE");
-                    stream.write_all(b"-ERR internal error\r\n").await?;
+                    let response = RespValue::Error("ERR internal error".to_string());
+                    stream.write_all(&response.serialize()).await?;
                 }
             }
         }
     }
 
+    Ok(())
+}
+
+async fn handle_exists(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+    key: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let shard_index = state.get_shard(&key);
+    let pool = &state.db_pools[shard_index];
+
+    match sqlx::query(
+        "SELECT 1 FROM blobs WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
+    )
+    .bind(&key)
+    .bind(chrono::Utc::now().timestamp())
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(Some(_)) => {
+            let response = RespValue::Integer(1);
+            stream.write_all(&response.serialize()).await?;
+        }
+        Ok(None) => {
+            let response = RespValue::Integer(0);
+            stream.write_all(&response.serialize()).await?;
+        }
+        Err(e) => {
+            tracing::error!("Failed to check EXISTS for key {}: {}", key, e);
+            let response = RespValue::Error("ERR database error".to_string());
+            stream.write_all(&response.serialize()).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_ping(
+    stream: &mut TcpStream,
+    message: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = match message {
+        Some(msg) => RespValue::BulkString(Some(msg.into_bytes().into())),
+        None => RespValue::SimpleString("PONG".to_string()),
+    };
+    stream.write_all(&response.serialize()).await?;
+    Ok(())
+}
+
+async fn handle_info(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+    section: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let info = match section.as_deref() {
+        Some("server") | None => {
+            format!(
+                "# Server\r\n\
+                 redis_version:blobnom-0.1.0\r\n\
+                 redis_mode:standalone\r\n\
+                 process_id:{}\r\n\
+                 tcp_port:6379\r\n\
+                 uptime_in_seconds:unknown\r\n\
+                 \r\n\
+                 # Keyspace\r\n\
+                 db0:keys=unknown,expires=0,avg_ttl=0\r\n\
+                 \r\n\
+                 # Blobnom\r\n\
+                 shards:{}\r\n\
+                 data_dir:{}\r\n\
+                 async_write:{}\r\n\
+                 batch_size:{}\r\n\
+                 batch_timeout_ms:{}\r\n",
+                std::process::id(),
+                state.cfg.num_shards,
+                state.cfg.data_dir,
+                state.cfg.async_write.unwrap_or(false),
+                state.cfg.batch_size.unwrap_or(1),
+                state.cfg.batch_timeout_ms.unwrap_or(0)
+            )
+        }
+        Some("stats") => "# Stats\r\n\
+             total_connections_received:unknown\r\n\
+             total_commands_processed:unknown\r\n\
+             instantaneous_ops_per_sec:unknown\r\n\
+             total_net_input_bytes:unknown\r\n\
+             total_net_output_bytes:unknown\r\n\
+             instantaneous_input_kbps:unknown\r\n\
+             instantaneous_output_kbps:unknown\r\n\
+             rejected_connections:0\r\n\
+             sync_full:0\r\n\
+             sync_partial_ok:0\r\n\
+             sync_partial_err:0\r\n\
+             expired_keys:0\r\n\
+             evicted_keys:0\r\n\
+             keyspace_hits:unknown\r\n\
+             keyspace_misses:unknown\r\n\
+             pubsub_channels:0\r\n\
+             pubsub_patterns:0\r\n\
+             latest_fork_usec:0\r\n\
+             migrate_cached_sockets:0\r\n\
+             slave_expires_tracked_keys:0\r\n\
+             active_defrag_hits:0\r\n\
+             active_defrag_misses:0\r\n\
+             active_defrag_key_hits:0\r\n\
+             active_defrag_key_misses:0\r\n"
+            .to_string(),
+        Some(s) => format!("# {}\r\n(section not implemented)\r\n", s),
+    };
+
+    let response = RespValue::BulkString(Some(info.into_bytes().into()));
+    stream.write_all(&response.serialize()).await?;
+    Ok(())
+}
+
+async fn handle_command(stream: &mut TcpStream) -> Result<(), Box<dyn std::error::Error>> {
+    // Return a minimal COMMAND response - just an empty array for now
+    // A full implementation would return detailed command information
+    let response = RespValue::Array(Some(vec![]));
+    stream.write_all(&response.serialize()).await?;
     Ok(())
 }

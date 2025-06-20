@@ -180,7 +180,10 @@ redis-cli -p 6379 DEL mykey
 - `src/main.rs`: Entry point, sets up tracing, configuration, Redis server, and spawns shard writer tasks.
 - `src/config.rs`: Handles loading and validation of the `config.toml` file.
 - `src/app_state.rs`: Defines the `AppState` structure and logic for determining the shard for a key.
-- `src/redis_server.rs`: Implements the Redis protocol server and command handlers.
+- `src/server.rs`: Implements the Redis protocol server and command handlers.
+- `src/redis/`: Redis protocol implementation module.
+  - `src/redis/protocol.rs`: Robust RESP protocol parser using nom, with comprehensive error handling.
+  - `src/redis/integration_tests.rs`: Extensive integration tests for Redis protocol parsing.
 - `src/shard_manager.rs`: Defines the `ShardWriteOperation` enum and the `shard_writer_task` responsible for handling write operations (Set, Delete) for each shard via a message queue.
 - `config.toml`: Configuration file (user-created).
 - `Justfile`: Contains `just` commands for common development tasks.
@@ -188,12 +191,13 @@ redis-cli -p 6379 DEL mykey
 
 ## Key Dependencies
 
-
 - [Tokio](https://tokio.rs/): Asynchronous runtime for Rust.
 - [SQLx](https://github.com/launchbadge/sqlx): Asynchronous SQL toolkit for Rust, used here with SQLite.
+- [Nom](https://crates.io/crates/nom): High-performance parser combinator library for RESP protocol parsing.
 - [Serde](https://serde.rs/): Framework for serializing and deserializing Rust data structures.
 - [Config](https://crates.io/crates/config): Layered configuration system for Rust applications.
 - [Miette](https://crates.io/crates/miette): Fancy diagnostic reporting library.
+- [Thiserror](https://crates.io/crates/thiserror): Better error handling with derive macros.
 - [Fnv](https://crates.io/crates/fnv): For FNV hashing to determine shard index.
 - [Tracing](https://crates.io/crates/tracing): Application-level tracing framework.
 - [Chrono](https://crates.io/crates/chrono): Date and time library for handling timestamps.
@@ -253,6 +257,25 @@ CREATE TABLE blobs (
 - **Versioning**: Each blob update increments the version number starting from 0
 - **Expiration**: Blobs with `expires_at` set will be automatically filtered out from GET requests
 
+## Testing
+
+Blobnom includes comprehensive test coverage:
+
+- **Unit Tests**: 25 tests covering RESP protocol parsing, serialization, and command validation
+- **Integration Tests**: 19 tests covering command handling, binary data, and protocol compliance
+- **Total Coverage**: 44 tests ensuring robust Redis protocol implementation
+
+Run tests with:
+```sh
+cargo test
+```
+
+For specific test suites:
+```sh
+cargo test redis::protocol      # Protocol parser tests
+cargo test redis::integration   # Integration tests
+```
+
 ## Future Enhancements (Ideas)
 
 - Implement actual data compression for `storage_compression` and `output_compression`.
@@ -262,6 +285,6 @@ CREATE TABLE blobs (
 - Support for different hashing algorithms for sharding.
 - Streaming support for very large blobs.
 - Replication or durability options beyond single SQLite files.
-- More comprehensive tests.
 - Blob expiration cleanup background task.
 - Blob listing and search capabilities.
+- Additional Redis commands relevant to blob storage (EXPIRE, TTL).
