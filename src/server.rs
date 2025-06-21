@@ -1,7 +1,10 @@
 use crate::AppState;
-use crate::redis::{ParseError, RedisCommand, RespValue, parse_command, parse_resp_with_remaining};
+use crate::redis::{
+    ParseError, RedisCommand, parse_command, parse_resp_with_remaining, serialize_frame,
+};
 use crate::shard_manager::ShardWriteOperation;
 use bytes::Bytes;
+use redis_protocol::resp2::types::BytesFrame;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -65,13 +68,13 @@ async fn handle_connection(
                         }
                         Err(ParseError::Invalid(msg)) => {
                             tracing::warn!("Invalid command: {}", msg);
-                            let error_resp = RespValue::Error(format!("ERR {}", msg));
-                            stream.write_all(&error_resp.serialize()).await?;
+                            let error_resp = BytesFrame::Error(format!("ERR {}", msg).into());
+                            stream.write_all(&serialize_frame(&error_resp)).await?;
                         }
                         Err(e) => {
                             tracing::error!("Command parse error: {}", e);
-                            let error_resp = RespValue::Error("ERR protocol error".to_string());
-                            stream.write_all(&error_resp.serialize()).await?;
+                            let error_resp = BytesFrame::Error("ERR protocol error".into());
+                            stream.write_all(&serialize_frame(&error_resp)).await?;
                         }
                     }
                 }
@@ -81,8 +84,8 @@ async fn handle_connection(
                 }
                 Err(ParseError::Invalid(msg)) => {
                     tracing::warn!("Protocol error: {}", msg);
-                    let error_resp = RespValue::Error(format!("ERR {}", msg));
-                    stream.write_all(&error_resp.serialize()).await?;
+                    let error_resp = BytesFrame::Error(format!("ERR {}", msg).into());
+                    stream.write_all(&serialize_frame(&error_resp)).await?;
                     // Skip one byte to try to recover
                     if !remaining_data.is_empty() {
                         remaining_data = &remaining_data[1..];
@@ -136,14 +139,14 @@ async fn handle_redis_command(
             handle_command(stream).await?;
         }
         RedisCommand::Quit => {
-            let response = RespValue::SimpleString("OK".to_string());
-            stream.write_all(&response.serialize()).await?;
+            let response = BytesFrame::SimpleString("OK".into());
+            stream.write_all(&serialize_frame(&response)).await?;
             return Err("Client quit".into());
         }
         RedisCommand::Unknown(cmd) => {
             tracing::warn!("Unknown command: {}", cmd);
-            let response = RespValue::Error(format!("ERR unknown command '{}'", cmd));
-            stream.write_all(&response.serialize()).await?;
+            let response = BytesFrame::Error(format!("ERR unknown command '{}'", cmd).into());
+            stream.write_all(&serialize_frame(&response)).await?;
         }
     }
     Ok(())
@@ -166,17 +169,17 @@ async fn handle_get(
     .await
     {
         Ok(Some(row)) => {
-            let response = RespValue::BulkString(Some(row.0.into()));
-            stream.write_all(&response.serialize()).await?;
+            let response = BytesFrame::BulkString(row.0.into());
+            stream.write_all(&serialize_frame(&response)).await?;
         }
         Ok(None) => {
-            let response = RespValue::BulkString(None);
-            stream.write_all(&response.serialize()).await?;
+            let response = BytesFrame::Null;
+            stream.write_all(&serialize_frame(&response)).await?;
         }
         Err(e) => {
             tracing::error!("Failed to GET key {}: {}", key, e);
-            let response = RespValue::Error("ERR database error".to_string());
-            stream.write_all(&response.serialize()).await?;
+            let response = BytesFrame::Error("ERR database error".into());
+            stream.write_all(&serialize_frame(&response)).await?;
         }
     }
 
@@ -205,11 +208,11 @@ async fn handle_set(
                 "Failed to send ASYNC SET operation to shard {}",
                 shard_index
             );
-            let response = RespValue::Error("ERR internal error".to_string());
-            stream.write_all(&response.serialize()).await?;
+            let response = BytesFrame::Error("ERR internal error".into());
+            stream.write_all(&serialize_frame(&response)).await?;
         } else {
-            let response = RespValue::SimpleString("OK".to_string());
-            stream.write_all(&response.serialize()).await?;
+            let response = BytesFrame::SimpleString("OK".into());
+            stream.write_all(&serialize_frame(&response)).await?;
         }
     } else {
         // Sync mode: wait for completion
@@ -223,23 +226,23 @@ async fn handle_set(
 
         if sender.send(operation).await.is_err() {
             tracing::error!("Failed to send SET operation to shard {}", shard_index);
-            let response = RespValue::Error("ERR internal error".to_string());
-            stream.write_all(&response.serialize()).await?;
+            let response = BytesFrame::Error("ERR internal error".into());
+            stream.write_all(&serialize_frame(&response)).await?;
         } else {
             match responder_rx.await {
                 Ok(Ok(())) => {
-                    let response = RespValue::SimpleString("OK".to_string());
-                    stream.write_all(&response.serialize()).await?;
+                    let response = BytesFrame::SimpleString("OK".into());
+                    stream.write_all(&serialize_frame(&response)).await?;
                 }
                 Ok(Err(e)) => {
                     tracing::error!("Shard writer failed for SET: {}", e);
-                    let response = RespValue::Error("ERR database error".to_string());
-                    stream.write_all(&response.serialize()).await?;
+                    let response = BytesFrame::Error("ERR database error".into());
+                    stream.write_all(&serialize_frame(&response)).await?;
                 }
                 Err(_) => {
                     tracing::error!("Shard writer task cancelled or panicked for SET");
-                    let response = RespValue::Error("ERR internal error".to_string());
-                    stream.write_all(&response.serialize()).await?;
+                    let response = BytesFrame::Error("ERR internal error".into());
+                    stream.write_all(&serialize_frame(&response)).await?;
                 }
             }
         }
@@ -266,8 +269,8 @@ async fn handle_del(
 
     if !exists {
         // Redis DEL returns the number of keys deleted
-        let response = RespValue::Integer(0);
-        stream.write_all(&response.serialize()).await?;
+        let response = BytesFrame::Integer(0);
+        stream.write_all(&serialize_frame(&response)).await?;
         return Ok(());
     }
 
@@ -283,12 +286,12 @@ async fn handle_del(
                 "Failed to send ASYNC DELETE operation to shard {}",
                 shard_index
             );
-            let response = RespValue::Error("ERR internal error".to_string());
-            stream.write_all(&response.serialize()).await?;
+            let response = BytesFrame::Error("ERR internal error".into());
+            stream.write_all(&serialize_frame(&response)).await?;
         } else {
             // Assume success for async mode
-            let response = RespValue::Integer(1);
-            stream.write_all(&response.serialize()).await?;
+            let response = BytesFrame::Integer(1);
+            stream.write_all(&serialize_frame(&response)).await?;
         }
     } else {
         // Sync mode: wait for completion
@@ -301,23 +304,23 @@ async fn handle_del(
 
         if sender.send(operation).await.is_err() {
             tracing::error!("Failed to send DELETE operation to shard {}", shard_index);
-            let response = RespValue::Error("ERR internal error".to_string());
-            stream.write_all(&response.serialize()).await?;
+            let response = BytesFrame::Error("ERR internal error".into());
+            stream.write_all(&serialize_frame(&response)).await?;
         } else {
             match responder_rx.await {
                 Ok(Ok(())) => {
-                    let response = RespValue::Integer(1);
-                    stream.write_all(&response.serialize()).await?;
+                    let response = BytesFrame::Integer(1);
+                    stream.write_all(&serialize_frame(&response)).await?;
                 }
                 Ok(Err(e)) => {
                     tracing::error!("Shard writer failed for DELETE: {}", e);
-                    let response = RespValue::Error("ERR database error".to_string());
-                    stream.write_all(&response.serialize()).await?;
+                    let response = BytesFrame::Error("ERR database error".into());
+                    stream.write_all(&serialize_frame(&response)).await?;
                 }
                 Err(_) => {
                     tracing::error!("Shard writer task cancelled or panicked for DELETE");
-                    let response = RespValue::Error("ERR internal error".to_string());
-                    stream.write_all(&response.serialize()).await?;
+                    let response = BytesFrame::Error("ERR internal error".into());
+                    stream.write_all(&serialize_frame(&response)).await?;
                 }
             }
         }
@@ -343,17 +346,17 @@ async fn handle_exists(
     .await
     {
         Ok(Some(_)) => {
-            let response = RespValue::Integer(1);
-            stream.write_all(&response.serialize()).await?;
+            let response = BytesFrame::Integer(1);
+            stream.write_all(&serialize_frame(&response)).await?;
         }
         Ok(None) => {
-            let response = RespValue::Integer(0);
-            stream.write_all(&response.serialize()).await?;
+            let response = BytesFrame::Integer(0);
+            stream.write_all(&serialize_frame(&response)).await?;
         }
         Err(e) => {
             tracing::error!("Failed to check EXISTS for key {}: {}", key, e);
-            let response = RespValue::Error("ERR database error".to_string());
-            stream.write_all(&response.serialize()).await?;
+            let response = BytesFrame::Error("ERR database error".into());
+            stream.write_all(&serialize_frame(&response)).await?;
         }
     }
 
@@ -365,10 +368,10 @@ async fn handle_ping(
     message: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let response = match message {
-        Some(msg) => RespValue::BulkString(Some(msg.into_bytes().into())),
-        None => RespValue::SimpleString("PONG".to_string()),
+        Some(msg) => BytesFrame::BulkString(msg.into_bytes().into()),
+        None => BytesFrame::SimpleString("PONG".into()),
     };
-    stream.write_all(&response.serialize()).await?;
+    stream.write_all(&serialize_frame(&response)).await?;
     Ok(())
 }
 
@@ -433,15 +436,15 @@ async fn handle_info(
         Some(s) => format!("# {}\r\n(section not implemented)\r\n", s),
     };
 
-    let response = RespValue::BulkString(Some(info.into_bytes().into()));
-    stream.write_all(&response.serialize()).await?;
+    let response = BytesFrame::BulkString(info.into_bytes().into());
+    stream.write_all(&serialize_frame(&response)).await?;
     Ok(())
 }
 
 async fn handle_command(stream: &mut TcpStream) -> Result<(), Box<dyn std::error::Error>> {
     // Return a minimal COMMAND response - just an empty array for now
     // A full implementation would return detailed command information
-    let response = RespValue::Array(Some(vec![]));
-    stream.write_all(&response.serialize()).await?;
+    let response = BytesFrame::Array(vec![]);
+    stream.write_all(&serialize_frame(&response)).await?;
     Ok(())
 }

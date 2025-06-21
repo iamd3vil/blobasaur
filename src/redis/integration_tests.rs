@@ -1,7 +1,9 @@
 #[cfg(test)]
 mod integration_tests {
     use crate::redis::protocol::*;
+    use crate::redis::serialize_frame;
     use bytes::Bytes;
+    use redis_protocol::resp2::types::BytesFrame;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -51,7 +53,7 @@ mod integration_tests {
         assert_eq!(response, mock_response);
 
         // Parse the command to verify our parser works
-        let parsed_resp = parse_resp(get_command).unwrap();
+        let (parsed_resp, _) = parse_resp_with_remaining(get_command).unwrap();
         let parsed_command = parse_command(parsed_resp).unwrap();
         assert_eq!(
             parsed_command,
@@ -73,7 +75,7 @@ mod integration_tests {
         assert_eq!(response, mock_response);
 
         // Parse the command to verify our parser works
-        let parsed_resp = parse_resp(set_command).unwrap();
+        let (parsed_resp, _) = parse_resp_with_remaining(set_command).unwrap();
         let parsed_command = parse_command(parsed_resp).unwrap();
         assert_eq!(
             parsed_command,
@@ -96,7 +98,7 @@ mod integration_tests {
         assert_eq!(response, mock_response);
 
         // Parse the command to verify our parser works
-        let parsed_resp = parse_resp(del_command).unwrap();
+        let (parsed_resp, _) = parse_resp_with_remaining(del_command).unwrap();
         let parsed_command = parse_command(parsed_resp).unwrap();
         assert_eq!(
             parsed_command,
@@ -118,7 +120,7 @@ mod integration_tests {
         assert_eq!(response, mock_response);
 
         // Parse the command to verify our parser works
-        let parsed_resp = parse_resp(exists_command).unwrap();
+        let (parsed_resp, _) = parse_resp_with_remaining(exists_command).unwrap();
         let parsed_command = parse_command(parsed_resp).unwrap();
         assert_eq!(
             parsed_command,
@@ -140,7 +142,7 @@ mod integration_tests {
         assert_eq!(response, mock_response);
 
         // Parse the command to verify our parser works
-        let parsed_resp = parse_resp(ping_command).unwrap();
+        let (parsed_resp, _) = parse_resp_with_remaining(ping_command).unwrap();
         let parsed_command = parse_command(parsed_resp).unwrap();
         assert_eq!(parsed_command, RedisCommand::Ping { message: None });
     }
@@ -157,7 +159,7 @@ mod integration_tests {
         assert_eq!(response, mock_response);
 
         // Parse the command to verify our parser works
-        let parsed_resp = parse_resp(ping_command).unwrap();
+        let (parsed_resp, _) = parse_resp_with_remaining(ping_command).unwrap();
         let parsed_command = parse_command(parsed_resp).unwrap();
         assert_eq!(
             parsed_command,
@@ -179,7 +181,7 @@ mod integration_tests {
         assert_eq!(response, mock_response);
 
         // Parse the command to verify our parser works
-        let parsed_resp = parse_resp(quit_command).unwrap();
+        let (parsed_resp, _) = parse_resp_with_remaining(quit_command).unwrap();
         let parsed_command = parse_command(parsed_resp).unwrap();
         assert_eq!(parsed_command, RedisCommand::Quit);
     }
@@ -196,7 +198,7 @@ mod integration_tests {
         assert_eq!(response, mock_response);
 
         // Parse the command to verify our parser works
-        let parsed_resp = parse_resp(info_command).unwrap();
+        let (parsed_resp, _) = parse_resp_with_remaining(info_command).unwrap();
         let parsed_command = parse_command(parsed_resp).unwrap();
         assert_eq!(parsed_command, RedisCommand::Info { section: None });
     }
@@ -213,7 +215,7 @@ mod integration_tests {
         ];
 
         for cmd_bytes in &commands {
-            let parsed_resp = parse_resp(cmd_bytes).unwrap();
+            let (parsed_resp, _) = parse_resp_with_remaining(cmd_bytes).unwrap();
             let parsed_command = parse_command(parsed_resp).unwrap();
 
             match parsed_command {
@@ -235,7 +237,7 @@ mod integration_tests {
         set_command.extend_from_slice(binary_data);
         set_command.extend_from_slice(b"\r\n");
 
-        let parsed_resp = parse_resp(&set_command).unwrap();
+        let (parsed_resp, _) = parse_resp_with_remaining(&set_command).unwrap();
         let parsed_command = parse_command(parsed_resp).unwrap();
 
         match parsed_command {
@@ -261,7 +263,7 @@ mod integration_tests {
         )
         .into_bytes();
 
-        let parsed_resp = parse_resp(&set_command).unwrap();
+        let (parsed_resp, _) = parse_resp_with_remaining(&set_command).unwrap();
         let parsed_command = parse_command(parsed_resp).unwrap();
 
         match parsed_command {
@@ -277,7 +279,7 @@ mod integration_tests {
     async fn test_empty_values() {
         let set_empty_command = b"*3\r\n$3\r\nSET\r\n$5\r\nempty\r\n$0\r\n\r\n";
 
-        let parsed_resp = parse_resp(set_empty_command).unwrap();
+        let (parsed_resp, _) = parse_resp_with_remaining(set_empty_command).unwrap();
         let parsed_command = parse_command(parsed_resp).unwrap();
 
         match parsed_command {
@@ -292,34 +294,34 @@ mod integration_tests {
     #[tokio::test]
     async fn test_null_bulk_string_handling() {
         let response_with_null = b"$-1\r\n";
-        let parsed_resp = parse_resp(response_with_null).unwrap();
+        let (parsed_resp, _) = parse_resp_with_remaining(response_with_null).unwrap();
 
         match parsed_resp {
-            RespValue::BulkString(None) => {
+            BytesFrame::Null => {
                 // This is expected
             }
             _ => panic!("Expected null bulk string"),
         }
 
         // Test serialization roundtrip
-        let serialized = parsed_resp.serialize();
+        let serialized = serialize_frame(&parsed_resp);
         assert_eq!(serialized.as_ref(), response_with_null);
     }
 
     #[tokio::test]
     async fn test_error_response_handling() {
         let error_response = b"-ERR unknown command 'INVALID'\r\n";
-        let parsed_resp = parse_resp(error_response).unwrap();
+        let (parsed_resp, _) = parse_resp_with_remaining(error_response).unwrap();
 
         match &parsed_resp {
-            RespValue::Error(msg) => {
-                assert_eq!(msg, "ERR unknown command 'INVALID'");
+            BytesFrame::Error(msg) => {
+                assert_eq!(msg.to_string(), "ERR unknown command 'INVALID'");
             }
             _ => panic!("Expected error response"),
         }
 
         // Test serialization roundtrip
-        let serialized = parsed_resp.serialize();
+        let serialized = serialize_frame(&parsed_resp);
         assert_eq!(serialized.as_ref(), error_response);
     }
 
@@ -334,17 +336,17 @@ mod integration_tests {
         ];
 
         for (response_bytes, expected_value) in integer_responses {
-            let parsed_resp = parse_resp(response_bytes).unwrap();
+            let (parsed_resp, _) = parse_resp_with_remaining(response_bytes).unwrap();
 
             match parsed_resp {
-                RespValue::Integer(value) => {
+                BytesFrame::Integer(value) => {
                     assert_eq!(value, expected_value);
                 }
                 _ => panic!("Expected integer response"),
             }
 
             // Test serialization roundtrip
-            let serialized = parsed_resp.serialize();
+            let serialized = serialize_frame(&parsed_resp);
             assert_eq!(serialized, response_bytes);
         }
     }
@@ -352,29 +354,29 @@ mod integration_tests {
     #[tokio::test]
     async fn test_nested_array_handling() {
         let nested_array = b"*2\r\n*3\r\n:1\r\n:2\r\n:3\r\n*2\r\n+OK\r\n-ERR\r\n";
-        let parsed_resp = parse_resp(nested_array).unwrap();
+        let (parsed_resp, _) = parse_resp_with_remaining(nested_array).unwrap();
 
         match &parsed_resp {
-            RespValue::Array(Some(elements)) => {
+            BytesFrame::Array(elements) => {
                 assert_eq!(elements.len(), 2);
 
                 // First element should be an array of integers
                 match &elements[0] {
-                    RespValue::Array(Some(inner)) => {
+                    BytesFrame::Array(inner) => {
                         assert_eq!(inner.len(), 3);
-                        assert_eq!(inner[0], RespValue::Integer(1));
-                        assert_eq!(inner[1], RespValue::Integer(2));
-                        assert_eq!(inner[2], RespValue::Integer(3));
+                        assert_eq!(inner[0], BytesFrame::Integer(1));
+                        assert_eq!(inner[1], BytesFrame::Integer(2));
+                        assert_eq!(inner[2], BytesFrame::Integer(3));
                     }
                     _ => panic!("Expected inner array"),
                 }
 
                 // Second element should be an array of strings
                 match &elements[1] {
-                    RespValue::Array(Some(inner)) => {
+                    BytesFrame::Array(inner) => {
                         assert_eq!(inner.len(), 2);
-                        assert_eq!(inner[0], RespValue::SimpleString("OK".to_string()));
-                        assert_eq!(inner[1], RespValue::Error("ERR".to_string()));
+                        assert_eq!(inner[0], BytesFrame::SimpleString("OK".into()));
+                        assert_eq!(inner[1], BytesFrame::Error("ERR".into()));
                     }
                     _ => panic!("Expected inner array"),
                 }
@@ -383,33 +385,31 @@ mod integration_tests {
         }
 
         // Test serialization roundtrip
-        let serialized = parsed_resp.serialize();
+        let serialized = serialize_frame(&parsed_resp);
         assert_eq!(serialized.as_ref(), nested_array);
     }
 
     #[tokio::test]
     async fn test_command_validation_errors() {
         // Test GET with wrong number of arguments
-        let invalid_get = RespValue::Array(Some(vec![RespValue::BulkString(Some(
-            Bytes::from_static(b"GET"),
-        ))]));
+        let invalid_get =
+            BytesFrame::Array(vec![BytesFrame::BulkString(Bytes::from_static(b"GET"))]);
 
         let result = parse_command(invalid_get);
         assert!(matches!(result, Err(ParseError::Invalid(_))));
 
         // Test SET with wrong number of arguments
-        let invalid_set = RespValue::Array(Some(vec![
-            RespValue::BulkString(Some(Bytes::from_static(b"SET"))),
-            RespValue::BulkString(Some(Bytes::from_static(b"key"))),
-        ]));
+        let invalid_set = BytesFrame::Array(vec![
+            BytesFrame::BulkString(Bytes::from_static(b"SET")),
+            BytesFrame::BulkString(Bytes::from_static(b"key")),
+        ]);
 
         let result = parse_command(invalid_set);
         assert!(matches!(result, Err(ParseError::Invalid(_))));
 
         // Test DEL with wrong number of arguments
-        let invalid_del = RespValue::Array(Some(vec![RespValue::BulkString(Some(
-            Bytes::from_static(b"DEL"),
-        ))]));
+        let invalid_del =
+            BytesFrame::Array(vec![BytesFrame::BulkString(Bytes::from_static(b"DEL"))]);
 
         let result = parse_command(invalid_del);
         assert!(matches!(result, Err(ParseError::Invalid(_))));
@@ -427,7 +427,7 @@ mod integration_tests {
         ];
 
         for (command_bytes, expected_cmd) in test_cases {
-            let parsed_resp = parse_resp(command_bytes).unwrap();
+            let (parsed_resp, _) = parse_resp_with_remaining(command_bytes).unwrap();
             let parsed_command = parse_command(parsed_resp).unwrap();
 
             match (parsed_command, expected_cmd) {
@@ -445,7 +445,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_unknown_command_handling() {
         let unknown_command = b"*2\r\n$7\r\nUNKNOWN\r\n$3\r\narg\r\n";
-        let parsed_resp = parse_resp(unknown_command).unwrap();
+        let (parsed_resp, _) = parse_resp_with_remaining(unknown_command).unwrap();
         let parsed_command = parse_command(parsed_resp).unwrap();
 
         match parsed_command {
