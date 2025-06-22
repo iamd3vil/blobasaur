@@ -1,6 +1,6 @@
 use chrono::Utc;
 use sqlx::SqlitePool;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, timeout};
 
@@ -22,6 +22,26 @@ pub enum ShardWriteOperation {
     DeleteAsync {
         key: String,
     },
+    HSet {
+        namespace: String,
+        key: String,
+        data: Vec<u8>,
+        responder: oneshot::Sender<Result<(), String>>,
+    },
+    HSetAsync {
+        namespace: String,
+        key: String,
+        data: Vec<u8>,
+    },
+    HDelete {
+        namespace: String,
+        key: String,
+        responder: oneshot::Sender<Result<(), String>>,
+    },
+    HDeleteAsync {
+        namespace: String,
+        key: String,
+    },
 }
 
 // Enhanced consumer with batching support
@@ -32,6 +52,8 @@ pub async fn shard_writer_task(
     batch_size: usize,
     batch_timeout_ms: u64,
 ) {
+    // Load existing namespaced tables into memory
+    let mut known_tables = load_existing_tables(&pool, shard_id).await;
     let batch_timeout = Duration::from_millis(batch_timeout_ms);
 
     tracing::info!(
@@ -74,13 +96,13 @@ pub async fn shard_writer_task(
         }
 
         if !batch.is_empty() {
-            process_batch(shard_id, &pool, &mut batch).await;
+            process_batch(shard_id, &pool, &mut batch, &mut known_tables).await;
         }
     }
 
     // Process any remaining operations
     if !batch.is_empty() {
-        process_batch(shard_id, &pool, &mut batch).await;
+        process_batch(shard_id, &pool, &mut batch, &mut known_tables).await;
     }
 
     tracing::info!("Shard {} writer task stopped", shard_id);
@@ -90,6 +112,7 @@ async fn process_batch(
     shard_id: usize,
     pool: &SqlitePool,
     batch: &mut VecDeque<ShardWriteOperation>,
+    known_tables: &mut HashSet<String>,
 ) {
     if batch.is_empty() {
         return;
@@ -187,6 +210,124 @@ async fn process_batch(
                         e.to_string()
                     })
             }
+            ShardWriteOperation::HSet {
+                namespace,
+                key,
+                data,
+                ..
+            }
+            | ShardWriteOperation::HSetAsync {
+                namespace,
+                key,
+                data,
+            } => {
+                match operation {
+                    ShardWriteOperation::HSet { .. } => sync_operations.push(idx),
+                    _ => {}
+                }
+
+                let table_name = format!("blobs_{}", namespace);
+
+                // Ensure table exists
+                if let Err(e) =
+                    ensure_namespaced_table_exists(&mut tx, &table_name, known_tables).await
+                {
+                    tracing::error!("[Shard {}] Failed to ensure table exists: {}", shard_id, e);
+                    Err(e)
+                } else {
+                    let now = Utc::now().timestamp();
+
+                    // Check if record exists to determine if this is an insert or update
+                    let query = format!("SELECT 1 FROM {} WHERE key = ?", table_name);
+                    let exists = sqlx::query(&query)
+                        .bind(key)
+                        .fetch_optional(&mut *tx)
+                        .await
+                        .map(|row| row.is_some())
+                        .unwrap_or(false);
+
+                    if exists {
+                        // Update existing record
+                        let update_query = format!(
+                            "UPDATE {} SET data = ?, updated_at = ?, version = version + 1 WHERE key = ?",
+                            table_name
+                        );
+                        sqlx::query(&update_query)
+                            .bind(&data[..])
+                            .bind(now)
+                            .bind(key)
+                            .execute(&mut *tx)
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| {
+                                tracing::error!(
+                                    "[Shard {}] HSET UPDATE error for namespace {} key {}: {}",
+                                    shard_id,
+                                    namespace,
+                                    key,
+                                    e
+                                );
+                                e.to_string()
+                            })
+                    } else {
+                        // Insert new record
+                        let insert_query = format!(
+                            "INSERT INTO {} (key, data, created_at, updated_at, expires_at, version) VALUES (?, ?, ?, ?, NULL, 0)",
+                            table_name
+                        );
+                        sqlx::query(&insert_query)
+                            .bind(key)
+                            .bind(&data[..])
+                            .bind(now)
+                            .bind(now)
+                            .execute(&mut *tx)
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| {
+                                tracing::error!(
+                                    "[Shard {}] HSET INSERT error for namespace {} key {}: {}",
+                                    shard_id,
+                                    namespace,
+                                    key,
+                                    e
+                                );
+                                e.to_string()
+                            })
+                    }
+                }
+            }
+            ShardWriteOperation::HDelete { namespace, key, .. }
+            | ShardWriteOperation::HDeleteAsync { namespace, key } => {
+                match operation {
+                    ShardWriteOperation::HDelete { .. } => sync_operations.push(idx),
+                    _ => {}
+                }
+
+                let table_name = format!("blobs_{}", namespace);
+
+                // Only delete if table exists
+                if known_tables.contains(&table_name) {
+                    let delete_query = format!("DELETE FROM {} WHERE key = ?", table_name);
+                    sqlx::query(&delete_query)
+                        .bind(key)
+                        .execute(&mut *tx)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| {
+                            tracing::error!(
+                                "[Shard {}] HDEL error for namespace {} key {}: {}",
+                                shard_id,
+                                namespace,
+                                key,
+                                e
+                            );
+                            e.to_string()
+                        })
+                } else {
+                    // Table doesn't exist, operation succeeds (key doesn't exist)
+                    Ok(())
+                }
+            }
         };
 
         results.push((idx, result));
@@ -202,14 +343,19 @@ async fn process_batch(
     for operation in batch.drain(..) {
         match operation {
             ShardWriteOperation::Set { responder, .. }
-            | ShardWriteOperation::Delete { responder, .. } => {
+            | ShardWriteOperation::Delete { responder, .. }
+            | ShardWriteOperation::HSet { responder, .. }
+            | ShardWriteOperation::HDelete { responder, .. } => {
                 let final_result = match &commit_result {
                     Ok(_) => Ok(()),
                     Err(e) => Err(e.clone()),
                 };
                 let _ = responder.send(final_result);
             }
-            ShardWriteOperation::SetAsync { .. } | ShardWriteOperation::DeleteAsync { .. } => {
+            ShardWriteOperation::SetAsync { .. }
+            | ShardWriteOperation::DeleteAsync { .. }
+            | ShardWriteOperation::HSetAsync { .. }
+            | ShardWriteOperation::HDeleteAsync { .. } => {
                 // Async operations don't need responses, but log commit errors
                 if let Err(e) = &commit_result {
                     tracing::error!(
@@ -219,6 +365,72 @@ async fn process_batch(
                     );
                 }
             }
+        }
+    }
+}
+
+// Load existing namespaced tables from the database
+async fn load_existing_tables(pool: &SqlitePool, shard_id: usize) -> HashSet<String> {
+    let mut tables = HashSet::new();
+
+    // Add the default blobs table
+    tables.insert("blobs".to_string());
+
+    match sqlx::query_as::<_, (String,)>(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'blobs_%'",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => {
+            for (table_name,) in rows {
+                tables.insert(table_name);
+            }
+            tracing::info!(
+                "[Shard {}] Loaded {} existing namespaced tables",
+                shard_id,
+                tables.len() - 1
+            );
+        }
+        Err(e) => {
+            tracing::error!("[Shard {}] Failed to load existing tables: {}", shard_id, e);
+        }
+    }
+
+    tables
+}
+
+// Ensure a namespaced table exists, creating it if necessary
+async fn ensure_namespaced_table_exists(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_name: &str,
+    known_tables: &mut HashSet<String>,
+) -> Result<(), String> {
+    if known_tables.contains(table_name) {
+        return Ok(());
+    }
+
+    let create_query = format!(
+        "CREATE TABLE IF NOT EXISTS {} (
+            key TEXT PRIMARY KEY,
+            data BLOB,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            expires_at INTEGER,
+            version INTEGER NOT NULL DEFAULT 0
+        )",
+        table_name
+    );
+
+    match sqlx::query(&create_query).execute(&mut **tx).await {
+        Ok(_) => {
+            known_tables.insert(table_name.to_string());
+            tracing::info!("Created namespaced table: {}", table_name);
+            Ok(())
+        }
+        Err(e) => {
+            tracing::error!("Failed to create namespaced table {}: {}", table_name, e);
+            Err(format!("Failed to create table: {}", e))
         }
     }
 }

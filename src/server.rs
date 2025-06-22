@@ -138,6 +138,22 @@ async fn handle_redis_command(
         RedisCommand::Command => {
             handle_command(stream).await?;
         }
+        RedisCommand::HGet { namespace, key } => {
+            handle_hget(stream, state, namespace, key).await?;
+        }
+        RedisCommand::HSet {
+            namespace,
+            key,
+            value,
+        } => {
+            handle_hset(stream, state, namespace, key, value).await?;
+        }
+        RedisCommand::HDel { namespace, key } => {
+            handle_hdel(stream, state, namespace, key).await?;
+        }
+        RedisCommand::HExists { namespace, key } => {
+            handle_hexists(stream, state, namespace, key).await?;
+        }
         RedisCommand::Quit => {
             let response = BytesFrame::SimpleString("OK".into());
             stream.write_all(&serialize_frame(&response)).await?;
@@ -446,5 +462,238 @@ async fn handle_command(stream: &mut TcpStream) -> Result<(), Box<dyn std::error
     // A full implementation would return detailed command information
     let response = BytesFrame::Array(vec![]);
     stream.write_all(&serialize_frame(&response)).await?;
+    Ok(())
+}
+
+async fn handle_hget(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+    namespace: String,
+    key: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let shard_index = state.get_shard(&key);
+    let pool = &state.db_pools[shard_index];
+    let table_name = format!("blobs_{}", namespace);
+
+    let query = format!(
+        "SELECT data FROM {} WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
+        table_name
+    );
+
+    match sqlx::query_as::<_, (Vec<u8>,)>(&query)
+        .bind(&key)
+        .bind(chrono::Utc::now().timestamp())
+        .fetch_optional(pool)
+        .await
+    {
+        Ok(Some(row)) => {
+            let response = BytesFrame::BulkString(row.0.into());
+            stream.write_all(&serialize_frame(&response)).await?;
+        }
+        Ok(None) => {
+            let response = BytesFrame::Null;
+            stream.write_all(&serialize_frame(&response)).await?;
+        }
+        Err(e) => {
+            tracing::error!("Failed to HGET namespace {} key {}: {}", namespace, key, e);
+            let response = BytesFrame::Error("ERR database error".into());
+            stream.write_all(&serialize_frame(&response)).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_hset(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+    namespace: String,
+    key: String,
+    value: Bytes,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let shard_index = state.get_shard(&key);
+    let sender = &state.shard_senders[shard_index];
+
+    // Check if async_write is enabled
+    if state.cfg.async_write.unwrap_or(false) {
+        // Async mode: respond immediately after queueing
+        let operation = ShardWriteOperation::HSetAsync {
+            namespace,
+            key,
+            data: value.to_vec(),
+        };
+
+        if sender.send(operation).await.is_err() {
+            tracing::error!(
+                "Failed to send ASYNC HSET operation to shard {}",
+                shard_index
+            );
+            let response = BytesFrame::Error("ERR internal error".into());
+            stream.write_all(&serialize_frame(&response)).await?;
+        } else {
+            let response = BytesFrame::SimpleString("OK".into());
+            stream.write_all(&serialize_frame(&response)).await?;
+        }
+    } else {
+        // Sync mode: wait for completion
+        let (responder_tx, responder_rx) = oneshot::channel();
+
+        let operation = ShardWriteOperation::HSet {
+            namespace,
+            key,
+            data: value.to_vec(),
+            responder: responder_tx,
+        };
+
+        if sender.send(operation).await.is_err() {
+            tracing::error!("Failed to send HSET operation to shard {}", shard_index);
+            let response = BytesFrame::Error("ERR internal error".into());
+            stream.write_all(&serialize_frame(&response)).await?;
+        } else {
+            match responder_rx.await {
+                Ok(Ok(())) => {
+                    let response = BytesFrame::SimpleString("OK".into());
+                    stream.write_all(&serialize_frame(&response)).await?;
+                }
+                Ok(Err(e)) => {
+                    tracing::error!("Shard writer failed for HSET: {}", e);
+                    let response = BytesFrame::Error("ERR database error".into());
+                    stream.write_all(&serialize_frame(&response)).await?;
+                }
+                Err(_) => {
+                    tracing::error!("Shard writer task cancelled or panicked for HSET");
+                    let response = BytesFrame::Error("ERR internal error".into());
+                    stream.write_all(&serialize_frame(&response)).await?;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_hdel(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+    namespace: String,
+    key: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let shard_index = state.get_shard(&key);
+    let pool = &state.db_pools[shard_index];
+    let table_name = format!("blobs_{}", namespace);
+
+    // First check if key exists
+    let query = format!("SELECT 1 FROM {} WHERE key = ?", table_name);
+    let exists = sqlx::query(&query)
+        .bind(&key)
+        .fetch_optional(pool)
+        .await
+        .map(|row| row.is_some())
+        .unwrap_or(false);
+
+    if !exists {
+        // Redis HDEL returns the number of keys deleted
+        let response = BytesFrame::Integer(0);
+        stream.write_all(&serialize_frame(&response)).await?;
+        return Ok(());
+    }
+
+    let sender = &state.shard_senders[shard_index];
+
+    // Check if async_write is enabled
+    if state.cfg.async_write.unwrap_or(false) {
+        // Async mode: respond immediately after queueing
+        let operation = ShardWriteOperation::HDeleteAsync { namespace, key };
+
+        if sender.send(operation).await.is_err() {
+            tracing::error!(
+                "Failed to send ASYNC HDEL operation to shard {}",
+                shard_index
+            );
+            let response = BytesFrame::Error("ERR internal error".into());
+            stream.write_all(&serialize_frame(&response)).await?;
+        } else {
+            // Assume success for async mode
+            let response = BytesFrame::Integer(1);
+            stream.write_all(&serialize_frame(&response)).await?;
+        }
+    } else {
+        // Sync mode: wait for completion
+        let (responder_tx, responder_rx) = oneshot::channel();
+
+        let operation = ShardWriteOperation::HDelete {
+            namespace,
+            key,
+            responder: responder_tx,
+        };
+
+        if sender.send(operation).await.is_err() {
+            tracing::error!("Failed to send HDEL operation to shard {}", shard_index);
+            let response = BytesFrame::Error("ERR internal error".into());
+            stream.write_all(&serialize_frame(&response)).await?;
+        } else {
+            match responder_rx.await {
+                Ok(Ok(())) => {
+                    let response = BytesFrame::Integer(1);
+                    stream.write_all(&serialize_frame(&response)).await?;
+                }
+                Ok(Err(e)) => {
+                    tracing::error!("Shard writer failed for HDEL: {}", e);
+                    let response = BytesFrame::Error("ERR database error".into());
+                    stream.write_all(&serialize_frame(&response)).await?;
+                }
+                Err(_) => {
+                    tracing::error!("Shard writer task cancelled or panicked for HDEL");
+                    let response = BytesFrame::Error("ERR internal error".into());
+                    stream.write_all(&serialize_frame(&response)).await?;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_hexists(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+    namespace: String,
+    key: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let shard_index = state.get_shard(&key);
+    let pool = &state.db_pools[shard_index];
+    let table_name = format!("blobs_{}", namespace);
+
+    let query = format!(
+        "SELECT 1 FROM {} WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
+        table_name
+    );
+
+    match sqlx::query(&query)
+        .bind(&key)
+        .bind(chrono::Utc::now().timestamp())
+        .fetch_optional(pool)
+        .await
+    {
+        Ok(Some(_)) => {
+            let response = BytesFrame::Integer(1);
+            stream.write_all(&serialize_frame(&response)).await?;
+        }
+        Ok(None) => {
+            let response = BytesFrame::Integer(0);
+            stream.write_all(&serialize_frame(&response)).await?;
+        }
+        Err(e) => {
+            tracing::error!(
+                "Failed to check HEXISTS for namespace {} key {}: {}",
+                namespace,
+                key,
+                e
+            );
+            let response = BytesFrame::Error("ERR database error".into());
+            stream.write_all(&serialize_frame(&response)).await?;
+        }
+    }
+
     Ok(())
 }

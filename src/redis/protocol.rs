@@ -7,12 +7,42 @@ pub type RespValue = BytesFrame;
 /// Commands supported by Blobnom
 #[derive(Debug, Clone, PartialEq)]
 pub enum RedisCommand {
-    Get { key: String },
-    Set { key: String, value: Bytes },
-    Del { key: String },
-    Exists { key: String },
-    Ping { message: Option<String> },
-    Info { section: Option<String> },
+    Get {
+        key: String,
+    },
+    Set {
+        key: String,
+        value: Bytes,
+    },
+    Del {
+        key: String,
+    },
+    Exists {
+        key: String,
+    },
+    HGet {
+        namespace: String,
+        key: String,
+    },
+    HSet {
+        namespace: String,
+        key: String,
+        value: Bytes,
+    },
+    HDel {
+        namespace: String,
+        key: String,
+    },
+    HExists {
+        namespace: String,
+        key: String,
+    },
+    Ping {
+        message: Option<String>,
+    },
+    Info {
+        section: Option<String>,
+    },
     Command,
     Quit,
     Unknown(String),
@@ -117,6 +147,51 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
             Ok(RedisCommand::Info { section })
         }
         "COMMAND" => Ok(RedisCommand::Command),
+        "HGET" => {
+            if elements.len() != 3 {
+                return Err(ParseError::Invalid(
+                    "HGET requires exactly 2 arguments".to_string(),
+                ));
+            }
+            let namespace = extract_string(&elements[1])?;
+            let key = extract_string(&elements[2])?;
+            Ok(RedisCommand::HGet { namespace, key })
+        }
+        "HSET" => {
+            if elements.len() != 4 {
+                return Err(ParseError::Invalid(
+                    "HSET requires exactly 3 arguments".to_string(),
+                ));
+            }
+            let namespace = extract_string(&elements[1])?;
+            let key = extract_string(&elements[2])?;
+            let value = extract_bytes(&elements[3])?;
+            Ok(RedisCommand::HSet {
+                namespace,
+                key,
+                value,
+            })
+        }
+        "HDEL" => {
+            if elements.len() != 3 {
+                return Err(ParseError::Invalid(
+                    "HDEL requires exactly 2 arguments".to_string(),
+                ));
+            }
+            let namespace = extract_string(&elements[1])?;
+            let key = extract_string(&elements[2])?;
+            Ok(RedisCommand::HDel { namespace, key })
+        }
+        "HEXISTS" => {
+            if elements.len() != 3 {
+                return Err(ParseError::Invalid(
+                    "HEXISTS requires exactly 2 arguments".to_string(),
+                ));
+            }
+            let namespace = extract_string(&elements[1])?;
+            let key = extract_string(&elements[2])?;
+            Ok(RedisCommand::HExists { namespace, key })
+        }
         "QUIT" => Ok(RedisCommand::Quit),
         _ => Ok(RedisCommand::Unknown(command_name)),
     }
@@ -266,6 +341,63 @@ mod tests {
         let (resp, _) = parse_resp_with_remaining(input).unwrap();
         let command = parse_command(resp).unwrap();
         assert_eq!(command, RedisCommand::Command);
+    }
+
+    #[test]
+    fn test_parse_hget_command() {
+        let input = b"*3\r\n$4\r\nHGET\r\n$9\r\nnamespace\r\n$5\r\nmykey\r\n";
+        let (resp, _) = parse_resp_with_remaining(input).unwrap();
+        let command = parse_command(resp).unwrap();
+        assert_eq!(
+            command,
+            RedisCommand::HGet {
+                namespace: "namespace".to_string(),
+                key: "mykey".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_hset_command() {
+        let input = b"*4\r\n$4\r\nHSET\r\n$9\r\nnamespace\r\n$5\r\nmykey\r\n$11\r\nhello world\r\n";
+        let (resp, _) = parse_resp_with_remaining(input).unwrap();
+        let command = parse_command(resp).unwrap();
+        assert_eq!(
+            command,
+            RedisCommand::HSet {
+                namespace: "namespace".to_string(),
+                key: "mykey".to_string(),
+                value: Bytes::from_static(b"hello world")
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_hdel_command() {
+        let input = b"*3\r\n$4\r\nHDEL\r\n$9\r\nnamespace\r\n$5\r\nmykey\r\n";
+        let (resp, _) = parse_resp_with_remaining(input).unwrap();
+        let command = parse_command(resp).unwrap();
+        assert_eq!(
+            command,
+            RedisCommand::HDel {
+                namespace: "namespace".to_string(),
+                key: "mykey".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_hexists_command() {
+        let input = b"*3\r\n$7\r\nHEXISTS\r\n$9\r\nnamespace\r\n$5\r\nmykey\r\n";
+        let (resp, _) = parse_resp_with_remaining(input).unwrap();
+        let command = parse_command(resp).unwrap();
+        assert_eq!(
+            command,
+            RedisCommand::HExists {
+                namespace: "namespace".to_string(),
+                key: "mykey".to_string()
+            }
+        );
     }
 
     #[test]

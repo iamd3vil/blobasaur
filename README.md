@@ -15,6 +15,11 @@ Blobnom is a high-performance, sharded blob storage server written in Rust. It i
   - `GET key`: Retrieve a blob.
   - `SET key value`: Store or replace a blob.
   - `DEL key`: Delete a blob.
+  - `EXISTS key`: Check if a blob exists.
+  - `HGET namespace key`: Retrieve a blob from a namespace.
+  - `HSET namespace key value`: Store or replace a blob in a namespace.
+  - `HDEL namespace key`: Delete a blob from a namespace.
+  - `HEXISTS namespace key`: Check if a blob exists in a namespace.
 - **Asynchronous Operations:** Leverages Tokio and async Rust for non-blocking I/O, ensuring efficient handling of concurrent requests.
 - **Configurable:**
   - Number of shards.
@@ -24,6 +29,7 @@ Blobnom is a high-performance, sharded blob storage server written in Rust. It i
   - Asynchronous write mode for improved response times.
   - Write batching for improved database throughput.
 - **SQLite Backend:** Each shard uses its own SQLite database, simplifying deployment and management.
+- **Namespacing:** Hash-based namespacing using HGET/HSET commands for organizing data into logical groups.
 - **Metadata Tracking:** Each blob includes metadata such as creation time, update time, expiration time, and version number.
 - **Graceful Shutdown:** (Implicitly handled by Tokio)
 
@@ -129,6 +135,8 @@ batch_timeout_ms = 10
 
 Blobnom implements a subset of Redis commands for blob operations:
 
+### Basic Commands
+
 - ### `SET key value`
 
   - **Description:** Stores or replaces a blob.
@@ -158,21 +166,116 @@ Blobnom implements a subset of Redis commands for blob operations:
     - `:0`: If the key did not exist.
     - `-ERR internal error`: If an error occurs during the operation.
 
+- ### `EXISTS key`
+  - **Description:** Checks if a blob exists.
+  - **Parameters:**
+    - `key`: The unique identifier for the blob.
+  - **Responses:**
+    - `:1`: If the key exists.
+    - `:0`: If the key does not exist.
+    - `-ERR database error`: If an error occurs during the operation.
+
+### Namespaced Commands
+
+Blobnom supports Redis-style hash operations for namespacing data. Each namespace creates its own isolated table, allowing you to organize your data into logical groups.
+
+- ### `HSET namespace key value`
+
+  - **Description:** Stores or replaces a blob in a namespace.
+  - **Parameters:**
+    - `namespace`: The namespace identifier (creates table `blobs_namespace`).
+    - `key`: The unique identifier for the blob within the namespace.
+    - `value`: The binary data of the blob.
+  - **Responses:**
+    - `+OK`: Blob stored successfully (or queued in async mode).
+    - `-ERR internal error`: If an error occurs during the operation.
+
+- ### `HGET namespace key`
+
+  - **Description:** Retrieves a blob from a namespace.
+  - **Parameters:**
+    - `namespace`: The namespace identifier.
+    - `key`: The unique identifier for the blob within the namespace.
+  - **Responses:**
+    - Bulk string with blob data if the key exists in the namespace.
+    - `$-1` (null bulk string): If the blob does not exist in the namespace.
+    - `-ERR database error`: If an error occurs during the operation.
+
+- ### `HDEL namespace key`
+
+  - **Description:** Deletes a blob from a namespace.
+  - **Parameters:**
+    - `namespace`: The namespace identifier.
+    - `key`: The unique identifier for the blob within the namespace.
+  - **Responses:**
+    - `:1`: If the key existed in the namespace and was deleted.
+    - `:0`: If the key did not exist in the namespace.
+    - `-ERR internal error`: If an error occurs during the operation.
+
+- ### `HEXISTS namespace key`
+
+  - **Description:** Checks if a blob exists in a namespace.
+  - **Parameters:**
+    - `namespace`: The namespace identifier.
+    - `key`: The unique identifier for the blob within the namespace.
+  - **Responses:**
+    - `:1`: If the key exists in the namespace.
+    - `:0`: If the key does not exist in the namespace.
+    - `-ERR database error`: If an error occurs during the operation.
+
 ### Using Redis Clients
 
 You can use any Redis client to interact with Blobnom:
 
 ```bash
-# Using redis-cli
+# Using redis-cli - Basic operations
 redis-cli -p 6379 SET mykey "Hello, World!"
 redis-cli -p 6379 GET mykey
 redis-cli -p 6379 DEL mykey
+redis-cli -p 6379 EXISTS mykey
+
+# Using redis-cli - Namespaced operations
+redis-cli -p 6379 HSET users:123 name "John Doe"
+redis-cli -p 6379 HSET users:123 email "john@example.com"
+redis-cli -p 6379 HGET users:123 name
+redis-cli -p 6379 HEXISTS users:123 email
+redis-cli -p 6379 HDEL users:123 email
 
 # Using Redis clients in various languages
 # Python: redis-py
 # Node.js: ioredis or node-redis
 # Go: go-redis
 # etc.
+```
+
+### Example Use Cases for Namespacing
+
+#### User Data Storage
+```bash
+HSET user:12345 profile '{"name": "John", "age": 30}'
+HSET user:12345 preferences '{"theme": "dark", "lang": "en"}'
+HGET user:12345 profile
+```
+
+#### Session Management
+```bash
+HSET session:abc123 user_id "12345"
+HSET session:abc123 expires_at "1703980800"
+HEXISTS session:abc123 user_id
+```
+
+#### Configuration Storage
+```bash
+HSET config:app database_url "sqlite:app.db"
+HSET config:app log_level "info"
+HGET config:app database_url
+```
+
+#### Analytics Data
+```bash
+HSET metrics:daily:2024-01-01 page_views "1000"
+HSET metrics:daily:2024-01-01 unique_users "250"
+HGET metrics:daily:2024-01-01 page_views
 ```
 
 ## Project Structure
@@ -238,10 +341,25 @@ batch_size = 1
 
 ## Database Schema
 
-The SQLite database schema for each shard includes the following table:
+The SQLite database schema for each shard includes the following tables:
 
+### Default Table
 ```sql
 CREATE TABLE blobs (
+    key TEXT PRIMARY KEY,
+    data BLOB,
+    created_at INTEGER NOT NULL,    -- Unix timestamp
+    updated_at INTEGER NOT NULL,    -- Unix timestamp  
+    expires_at INTEGER,             -- Unix timestamp, NULL if no expiration
+    version INTEGER NOT NULL DEFAULT 0  -- Incremented on each update
+);
+```
+
+### Namespaced Tables
+Each namespace automatically creates its own table with the naming pattern `blobs_{namespace}`:
+
+```sql
+CREATE TABLE blobs_users (
     key TEXT PRIMARY KEY,
     data BLOB,
     created_at INTEGER NOT NULL,    -- Unix timestamp
@@ -256,6 +374,25 @@ CREATE TABLE blobs (
 - **Automatic Timestamps**: `created_at` and `updated_at` are automatically managed
 - **Versioning**: Each blob update increments the version number starting from 0
 - **Expiration**: Blobs with `expires_at` set will be automatically filtered out from GET requests
+- **Dynamic Table Creation**: Namespaced tables are created automatically when first accessed
+- **Table Caching**: Each shard maintains a cache of known tables to avoid database queries
+
+### Namespace Performance Optimizations
+
+- **Table Existence Caching**: Each shard maintains a HashSet of known tables in memory
+- **Dynamic Creation**: Tables are created only when first accessed
+- **Batched Operations**: Namespaced operations are batched with regular operations
+- **Sharding**: Namespaced data uses the same key-based sharding as regular operations
+
+### Migration Compatibility
+
+Existing GET/SET operations continue to work with the default `blobs` table:
+- `GET key` → uses `blobs` table
+- `SET key value` → uses `blobs` table
+- `HGET namespace key` → uses `blobs_namespace` table
+- `HSET namespace key value` → uses `blobs_namespace` table
+
+This allows for gradual migration to namespaced storage without breaking existing applications.
 
 ## Testing
 
