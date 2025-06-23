@@ -1,0 +1,80 @@
+# Blobnom Cluster Configuration Example
+# Copy this file to config.toml and modify as needed
+
+# Basic server configuration
+data_dir = "data"
+num_shards = 4
+storage_compression = true
+output_compression = false
+async_write = true
+batch_size = 100
+batch_timeout_ms = 10
+addr = "0.0.0.0:6379"
+
+# Cluster configuration
+[cluster]
+# Enable cluster mode
+enabled = true
+
+# Unique node identifier for this node
+# This should be unique across all nodes in the cluster
+node_id = "node-1"
+
+# List of seed nodes to connect to when joining the cluster
+# These should be the gossip addresses (IP:gossip_port) of existing cluster members
+seeds = ["192.168.1.100:7000", "192.168.1.101:7000"]
+
+# Port for gossip protocol communication
+# This is different from the Redis protocol port (addr above)
+port = 7000
+
+# Hash slots assigned to this node (optional)
+# If not specified, slots need to be assigned manually via CLUSTER ADDSLOTS
+# Redis has 16384 total slots (0-16383)
+# Example: assign first 5461 slots to this node
+slots = [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    # ... more slots ...
+    # For a 3-node cluster, you might assign:
+    # Node 1: 0-5460 (5461 slots)
+    # Node 2: 5461-10922 (5462 slots)
+    # Node 3: 10923-16383 (5461 slots)
+]
+
+# Gossip interval in milliseconds (optional, default: 1000)
+gossip_interval_ms = 1000
+
+# Example configurations for different nodes:
+
+# Node 2 configuration (copy to another server):
+# [cluster]
+# enabled = true
+# node_id = "node-2"
+# seeds = ["192.168.1.100:7000", "192.168.1.102:7000"]
+# port = 7000
+# slots = [5461, 5462, ..., 10922]  # Middle range
+
+# Node 3 configuration (copy to another server):
+# [cluster]
+# enabled = true
+# node_id = "node-3"
+# seeds = ["192.168.1.100:7000", "192.168.1.101:7000"]
+# port = 7000
+# slots = [10923, 10924, ..., 16383]  # Last range
+
+# Notes:
+# 1. Each node should have a unique node_id
+# 2. Seeds should include other cluster members (not itself)
+# 3. The gossip port should be different from Redis port and open for UDP
+# 4. Slots can be distributed manually or via CLUSTER ADDSLOTS commands
+# 5. Make sure firewall allows traffic on both Redis port (TCP) and gossip port (UDP)

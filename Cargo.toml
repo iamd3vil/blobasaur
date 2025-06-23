@@ -6,8 +6,10 @@ edition = "2024"
 [dependencies]
 async-compression = { version = "0.4.9", features = ["tokio", "gzip"] }
 bytes = "1.5"
+chitchat = "0.9"
 chrono = { version = "0.4.38", features = ["serde"] }
 config = { version = "0.15.11", features = ["toml"] }
+crc16 = "0.4"
 fnv = "1.0.7"
 futures = "0.3.31"
 miette = { version = "7.6.0", features = ["fancy"] }

@@ -44,6 +44,19 @@ pub enum RedisCommand {
         section: Option<String>,
     },
     Command,
+    // Cluster commands
+    ClusterNodes,
+    ClusterInfo,
+    ClusterSlots,
+    ClusterAddSlots {
+        slots: Vec<u16>,
+    },
+    ClusterDelSlots {
+        slots: Vec<u16>,
+    },
+    ClusterKeySlot {
+        key: String,
+    },
     Quit,
     Unknown(String),
 }
@@ -191,6 +204,61 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
             let namespace = extract_string(&elements[1])?;
             let key = extract_string(&elements[2])?;
             Ok(RedisCommand::HExists { namespace, key })
+        }
+        "CLUSTER" => {
+            if elements.len() < 2 {
+                return Err(ParseError::Invalid(
+                    "CLUSTER requires at least 1 argument".to_string(),
+                ));
+            }
+            let subcommand = extract_string(&elements[1])?.to_uppercase();
+            match subcommand.as_str() {
+                "NODES" => Ok(RedisCommand::ClusterNodes),
+                "INFO" => Ok(RedisCommand::ClusterInfo),
+                "SLOTS" => Ok(RedisCommand::ClusterSlots),
+                "ADDSLOTS" => {
+                    if elements.len() < 3 {
+                        return Err(ParseError::Invalid(
+                            "CLUSTER ADDSLOTS requires at least 1 slot".to_string(),
+                        ));
+                    }
+                    let mut slots = Vec::new();
+                    for slot_arg in &elements[2..] {
+                        let slot_str = extract_string(slot_arg)?;
+                        let slot = slot_str.parse::<u16>().map_err(|_| {
+                            ParseError::Invalid(format!("Invalid slot number: {}", slot_str))
+                        })?;
+                        slots.push(slot);
+                    }
+                    Ok(RedisCommand::ClusterAddSlots { slots })
+                }
+                "DELSLOTS" => {
+                    if elements.len() < 3 {
+                        return Err(ParseError::Invalid(
+                            "CLUSTER DELSLOTS requires at least 1 slot".to_string(),
+                        ));
+                    }
+                    let mut slots = Vec::new();
+                    for slot_arg in &elements[2..] {
+                        let slot_str = extract_string(slot_arg)?;
+                        let slot = slot_str.parse::<u16>().map_err(|_| {
+                            ParseError::Invalid(format!("Invalid slot number: {}", slot_str))
+                        })?;
+                        slots.push(slot);
+                    }
+                    Ok(RedisCommand::ClusterDelSlots { slots })
+                }
+                "KEYSLOT" => {
+                    if elements.len() != 3 {
+                        return Err(ParseError::Invalid(
+                            "CLUSTER KEYSLOT requires exactly 1 argument".to_string(),
+                        ));
+                    }
+                    let key = extract_string(&elements[2])?;
+                    Ok(RedisCommand::ClusterKeySlot { key })
+                }
+                _ => Ok(RedisCommand::Unknown(format!("CLUSTER {}", subcommand))),
+            }
         }
         "QUIT" => Ok(RedisCommand::Quit),
         _ => Ok(RedisCommand::Unknown(command_name)),
@@ -395,6 +463,43 @@ mod tests {
             command,
             RedisCommand::HExists {
                 namespace: "namespace".to_string(),
+                key: "mykey".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_cluster_nodes_command() {
+        let input = b"*2\r\n$7\r\nCLUSTER\r\n$5\r\nNODES\r\n";
+        let (resp, _) = parse_resp_with_remaining(input).unwrap();
+        let command = parse_command(resp).unwrap();
+        assert_eq!(command, RedisCommand::ClusterNodes);
+    }
+
+    #[test]
+    fn test_parse_cluster_info_command() {
+        let input = b"*2\r\n$7\r\nCLUSTER\r\n$4\r\nINFO\r\n";
+        let (resp, _) = parse_resp_with_remaining(input).unwrap();
+        let command = parse_command(resp).unwrap();
+        assert_eq!(command, RedisCommand::ClusterInfo);
+    }
+
+    #[test]
+    fn test_parse_cluster_addslots_command() {
+        let input = b"*4\r\n$7\r\nCLUSTER\r\n$8\r\nADDSLOTS\r\n$1\r\n0\r\n$1\r\n1\r\n";
+        let (resp, _) = parse_resp_with_remaining(input).unwrap();
+        let command = parse_command(resp).unwrap();
+        assert_eq!(command, RedisCommand::ClusterAddSlots { slots: vec![0, 1] });
+    }
+
+    #[test]
+    fn test_parse_cluster_keyslot_command() {
+        let input = b"*3\r\n$7\r\nCLUSTER\r\n$7\r\nKEYSLOT\r\n$5\r\nmykey\r\n";
+        let (resp, _) = parse_resp_with_remaining(input).unwrap();
+        let command = parse_command(resp).unwrap();
+        assert_eq!(
+            command,
+            RedisCommand::ClusterKeySlot {
                 key: "mykey".to_string()
             }
         );

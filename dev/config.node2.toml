@@ -1,0 +1,32 @@
+# Blobnom Cluster Node 2 Configuration
+
+# Basic server configuration
+data_dir = "data"
+num_shards = 4
+storage_compression = true
+output_compression = false
+async_write = true
+batch_size = 100
+batch_timeout_ms = 10
+addr = "0.0.0.0:6379"
+
+# Cluster configuration
+[cluster]
+# Enable cluster mode
+enabled = true
+
+# Unique node identifier for this node
+node_id = "node-2"
+
+# List of seed nodes to connect to when joining the cluster
+# These are the gossip addresses of the other nodes
+seeds = ["node1:7000", "node3:7000"]
+
+# Port for gossip protocol communication
+port = 7000
+
+# Hash slots will be assigned manually via redis-cli CLUSTER ADDSLOTS
+# slots = []
+
+# Gossip interval in milliseconds
+gossip_interval_ms = 1000

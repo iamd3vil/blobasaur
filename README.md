@@ -442,8 +442,53 @@ cargo test redis::protocol      # Protocol parser tests
 cargo test redis::integration   # Integration tests
 ```
 
+## Redis Cluster Compatibility
+
+Blobnom supports Redis cluster protocol for horizontal scaling and distributed storage. This allows Redis cluster-aware clients to connect and automatically handle key distribution across multiple nodes.
+
+### Key Features
+
+- **Hash Slot Distribution**: Uses Redis-compatible CRC16 hash slots (16384 total)
+- **MOVED Redirection**: Automatic client redirection for keys on different nodes
+- **Cluster Commands**: Full support for `CLUSTER NODES`, `CLUSTER INFO`, `CLUSTER SLOTS`, etc.
+- **Slot Management**: Dynamic slot assignment via `CLUSTER ADDSLOTS`/`CLUSTER DELSLOTS`
+
+### Basic Cluster Configuration
+
+```toml
+[cluster]
+enabled = true
+node_id = "node-1"
+port = 7000
+seeds = ["192.168.1.101:7000", "192.168.1.102:7000"]
+slots = [0, 1, 2, 3, 4, 5]  # Assigned hash slots
+```
+
+### Usage with Redis Clients
+
+```bash
+# Redis CLI with cluster support
+redis-cli -c -p 6379
+
+# Check cluster status
+redis-cli -p 6379 CLUSTER NODES
+redis-cli -p 6379 CLUSTER INFO
+```
+
+For detailed setup instructions, see [CLUSTERING_USAGE.md](CLUSTERING_USAGE.md).
+
+### Current Limitations
+
+- No automatic failover (manual intervention required)
+- No replication (single copy per slot)
+- Static slot assignment (no online resharding)
+- Simplified gossip protocol implementation
+
 ## Future Enhancements (Ideas)
 
+- Full chitchat gossip protocol integration
+- Master-slave replication for high availability
+- Online slot migration and rebalancing
 - Implement actual data compression for `storage_compression` and `output_compression`.
 - Add more robust error handling and logging.
 - Implement authentication and authorization.
