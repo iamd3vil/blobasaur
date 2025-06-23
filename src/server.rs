@@ -173,6 +173,13 @@ async fn handle_get(
     state: &Arc<AppState>,
     key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // First check inflight cache for pending writes
+    if let Some(data) = state.inflight_cache.get(&key).await {
+        let response = BytesFrame::BulkString(data.into());
+        stream.write_all(&serialize_frame(&response)).await?;
+        return Ok(());
+    }
+
     let shard_index = state.get_shard(&key);
     let pool = &state.db_pools[shard_index];
 
@@ -213,6 +220,12 @@ async fn handle_set(
 
     // Check if async_write is enabled
     if state.cfg.async_write.unwrap_or(false) {
+        // Store in inflight cache to prevent race conditions
+        state
+            .inflight_cache
+            .insert(key.clone(), value.to_vec())
+            .await;
+
         // Async mode: respond immediately after queueing
         let operation = ShardWriteOperation::SetAsync {
             key,
@@ -294,6 +307,9 @@ async fn handle_del(
 
     // Check if async_write is enabled
     if state.cfg.async_write.unwrap_or(false) {
+        // Remove from inflight cache immediately for delete operations
+        state.inflight_cache.invalidate(&key).await;
+
         // Async mode: respond immediately after queueing
         let operation = ShardWriteOperation::DeleteAsync { key };
 
@@ -471,6 +487,14 @@ async fn handle_hget(
     namespace: String,
     key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // First check inflight cache for pending writes
+    let namespaced_key = state.namespaced_key(&namespace, &key);
+    if let Some(data) = state.inflight_hcache.get(&namespaced_key).await {
+        let response = BytesFrame::BulkString(data.into());
+        stream.write_all(&serialize_frame(&response)).await?;
+        return Ok(());
+    }
+
     let shard_index = state.get_shard(&key);
     let pool = &state.db_pools[shard_index];
     let table_name = format!("blobs_{}", namespace);
@@ -516,6 +540,13 @@ async fn handle_hset(
 
     // Check if async_write is enabled
     if state.cfg.async_write.unwrap_or(false) {
+        // Store in inflight cache to prevent race conditions
+        let namespaced_key = state.namespaced_key(&namespace, &key);
+        state
+            .inflight_hcache
+            .insert(namespaced_key, value.to_vec())
+            .await;
+
         // Async mode: respond immediately after queueing
         let operation = ShardWriteOperation::HSetAsync {
             namespace,
@@ -602,6 +633,10 @@ async fn handle_hdel(
 
     // Check if async_write is enabled
     if state.cfg.async_write.unwrap_or(false) {
+        // Remove from inflight cache immediately for delete operations
+        let namespaced_key = state.namespaced_key(&namespace, &key);
+        state.inflight_hcache.invalidate(&namespaced_key).await;
+
         // Async mode: respond immediately after queueing
         let operation = ShardWriteOperation::HDeleteAsync { namespace, key };
 

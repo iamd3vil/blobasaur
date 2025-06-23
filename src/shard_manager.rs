@@ -1,4 +1,5 @@
 use chrono::Utc;
+use moka::future::Cache;
 use sqlx::SqlitePool;
 use std::collections::{HashSet, VecDeque};
 use tokio::sync::{mpsc, oneshot};
@@ -51,6 +52,8 @@ pub async fn shard_writer_task(
     mut receiver: mpsc::Receiver<ShardWriteOperation>,
     batch_size: usize,
     batch_timeout_ms: u64,
+    inflight_cache: Cache<String, Vec<u8>>,
+    inflight_hcache: Cache<String, Vec<u8>>,
 ) {
     // Load existing namespaced tables into memory
     let mut known_tables = load_existing_tables(&pool, shard_id).await;
@@ -96,13 +99,29 @@ pub async fn shard_writer_task(
         }
 
         if !batch.is_empty() {
-            process_batch(shard_id, &pool, &mut batch, &mut known_tables).await;
+            process_batch(
+                shard_id,
+                &pool,
+                &mut batch,
+                &mut known_tables,
+                &inflight_cache,
+                &inflight_hcache,
+            )
+            .await;
         }
     }
 
     // Process any remaining operations
     if !batch.is_empty() {
-        process_batch(shard_id, &pool, &mut batch, &mut known_tables).await;
+        process_batch(
+            shard_id,
+            &pool,
+            &mut batch,
+            &mut known_tables,
+            &inflight_cache,
+            &inflight_hcache,
+        )
+        .await;
     }
 
     tracing::info!("Shard {} writer task stopped", shard_id);
@@ -113,6 +132,8 @@ async fn process_batch(
     pool: &SqlitePool,
     batch: &mut VecDeque<ShardWriteOperation>,
     known_tables: &mut HashSet<String>,
+    inflight_cache: &Cache<String, Vec<u8>>,
+    inflight_hcache: &Cache<String, Vec<u8>>,
 ) {
     if batch.is_empty() {
         return;
@@ -338,6 +359,36 @@ async fn process_batch(
         tracing::error!("[Shard {}] Transaction commit failed: {}", shard_id, e);
         e.to_string()
     });
+
+    // Clean up inflight cache entries after successful database commit.
+    // This prevents memory leaks and ensures the cache doesn't grow indefinitely.
+    // The inflight cache is used to prevent race conditions in async write mode:
+    // when a SET returns OK immediately, subsequent GET requests check the cache
+    // first before hitting the database. Once the write is committed, we can
+    // safely remove the entry from the cache since it's now in the database.
+    if commit_result.is_ok() {
+        for operation in batch.iter() {
+            match operation {
+                ShardWriteOperation::SetAsync { key, .. } => {
+                    inflight_cache.invalidate(key).await;
+                }
+                ShardWriteOperation::DeleteAsync { key } => {
+                    // Also clean up any SET operations that might have been overridden
+                    inflight_cache.invalidate(key).await;
+                }
+                ShardWriteOperation::HSetAsync { namespace, key, .. } => {
+                    let namespaced_key = format!("{}:{}", namespace, key);
+                    inflight_hcache.invalidate(&namespaced_key).await;
+                }
+                ShardWriteOperation::HDeleteAsync { namespace, key } => {
+                    // Also clean up any HSET operations that might have been overridden
+                    let namespaced_key = format!("{}:{}", namespace, key);
+                    inflight_hcache.invalidate(&namespaced_key).await;
+                }
+                _ => {} // Only async operations use the inflight cache
+            }
+        }
+    }
 
     // Send responses to synchronous operations
     for operation in batch.drain(..) {

@@ -1,0 +1,52 @@
+# Example configuration for Blobnom
+# Copy this file to config.toml and modify as needed
+
+# Directory where SQLite database files will be stored
+data_dir = "blob_data"
+
+# Number of shards to distribute data across
+# More shards = better concurrency but more file handles
+num_shards = 4
+
+# Server address and port (optional, defaults to 0.0.0.0:6379)
+addr = "0.0.0.0:6379"
+
+# Storage compression (not yet implemented)
+# storage_compression = false
+
+# Output compression (not yet implemented)
+# output_compression = false
+
+# Asynchronous write mode (optional, defaults to false)
+# When enabled, SET/HSET/DEL/HDEL operations return immediately after queueing
+# instead of waiting for database completion. This provides better response times
+# but operations may fail after the server responds (check logs).
+#
+# Race condition prevention: An inflight cache stores pending writes so that
+# GET/HGET requests return the correct data even before writes complete.
+async_write = true
+
+# Write batching configuration (optional)
+# batch_size: Maximum operations to batch in a single transaction (defaults to 1)
+# Higher values improve throughput but increase latency per operation
+batch_size = 50
+
+# batch_timeout_ms: Max time to wait for additional operations before processing batch
+# Only relevant when batch_size > 1 (defaults to 0)
+batch_timeout_ms = 10
+
+# Example configurations for different use cases:
+
+# High-throughput async setup:
+# async_write = true
+# batch_size = 100
+# batch_timeout_ms = 5
+
+# Low-latency consistent setup:
+# async_write = false
+# batch_size = 1
+
+# Balanced setup:
+# async_write = false
+# batch_size = 25
+# batch_timeout_ms = 10

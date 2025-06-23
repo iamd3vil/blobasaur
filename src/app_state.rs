@@ -1,4 +1,5 @@
 use futures::future::join_all;
+use moka::future::Cache;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use std::fs;
@@ -13,6 +14,16 @@ pub struct AppState {
     pub cfg: Cfg,
     pub shard_senders: Vec<mpsc::Sender<ShardWriteOperation>>,
     pub db_pools: Vec<SqlitePool>,
+    /// Cache for inflight write operations to prevent race conditions in async mode.
+    /// When async_write=true, SET operations return OK immediately but the actual
+    /// database write happens asynchronously. This cache stores the key-value pairs
+    /// for pending writes so that GET requests can return the correct data even
+    /// before the write completes, preventing race conditions.
+    pub inflight_cache: Cache<String, Vec<u8>>,
+    /// Cache for inflight namespaced write operations (namespace:key -> data).
+    /// Same as inflight_cache but for HSET/HGET operations. The key format is
+    /// "namespace:key" to avoid collisions between namespaces.
+    pub inflight_hcache: Cache<String, Vec<u8>>,
 }
 
 impl AppState {
@@ -86,10 +97,17 @@ impl AppState {
             .unwrap_or_else(|e| panic!("Failed to create table in shard {} DB: {}", i, e));
         }
 
+        // Create caches for inflight operations
+        // Use a reasonable capacity - adjust based on expected load
+        let inflight_cache = Cache::new(10_000);
+        let inflight_hcache = Cache::new(10_000);
+
         AppState {
             cfg,
             shard_senders: shard_senders_vec,
             db_pools,
+            inflight_cache,
+            inflight_hcache,
         }
     }
 
@@ -98,5 +116,10 @@ impl AppState {
         hasher.write(key.as_bytes());
         let hash = hasher.finish();
         hash as usize % self.cfg.num_shards
+    }
+
+    /// Get a namespaced cache key for HGET/HSET operations
+    pub fn namespaced_key(&self, namespace: &str, key: &str) -> String {
+        format!("{}:{}", namespace, key)
     }
 }

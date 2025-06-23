@@ -115,7 +115,7 @@ Key configuration options:
 - `num_shards` (usize, required): The number of shards to distribute data across. Must be greater than 0.
 - `storage_compression` (bool, optional): If `true`, enables compression for data at rest. (Default: `false` if not specified)
 - `output_compression` (bool, optional): If `true`, enables compression for HTTP responses. (Default: `false` if not specified)
-- `async_write` (bool, optional): If `true`, enables asynchronous write operations where the server responds immediately after queueing the operation instead of waiting for database completion. (Default: `false` if not specified)
+- `async_write` (bool, optional): If `true`, enables asynchronous write operations where the server responds immediately after queueing the operation instead of waiting for database completion. Uses an inflight cache to prevent race conditions where GET requests might not find recently SET data. (Default: `false` if not specified)
 - `batch_size` (usize, optional): Maximum number of operations to batch together in a single database transaction. Set to 1 to disable batching. Higher values improve throughput but increase latency. (Default: `1`)
 - `batch_timeout_ms` (u64, optional): Maximum time in milliseconds to wait for additional operations before processing a batch. Only relevant when `batch_size > 1`. (Default: `0`)
 
@@ -297,6 +297,7 @@ HGET metrics:daily:2024-01-01 page_views
 - [Tokio](https://tokio.rs/): Asynchronous runtime for Rust.
 - [SQLx](https://github.com/launchbadge/sqlx): Asynchronous SQL toolkit for Rust, used here with SQLite.
 - [Nom](https://crates.io/crates/nom): High-performance parser combinator library for RESP protocol parsing.
+- [Moka](https://github.com/moka-rs/moka): High-performance concurrent caching library for inflight request tracking in async mode.
 - [Serde](https://serde.rs/): Framework for serializing and deserializing Rust data structures.
 - [Config](https://crates.io/crates/config): Layered configuration system for Rust applications.
 - [Miette](https://crates.io/crates/miette): Fancy diagnostic reporting library.
@@ -321,6 +322,7 @@ Blobnom supports batching multiple write operations into single database transac
 When `async_write = true`, the server responds immediately after queueing operations:
 
 - **Benefits**: Lower response times, better user experience
+- **Race Condition Prevention**: Uses Moka cache to store inflight writes, ensuring GET requests return correct data even before database writes complete
 - **Tradeoffs**: Operations may fail after server responds (check logs)
 - **Use case**: Write-heavy workloads where eventual consistency is acceptable
 
@@ -338,6 +340,33 @@ For low-latency, consistency-focused workloads:
 async_write = false
 batch_size = 1
 ```
+
+## Race Condition Handling
+
+In async write mode (`async_write = true`), Blobnom uses an inflight cache to prevent race conditions:
+
+### The Problem
+```bash
+# Without inflight cache, this sequence could fail:
+SET mykey "value"     # Returns OK immediately
+GET mykey             # Might return NULL if DB write hasn't completed
+```
+
+### The Solution
+- **Inflight Cache**: Stores pending writes using [Moka](https://github.com/moka-rs/moka) cache
+- **GET Operations**: Check inflight cache first, then database
+- **Cache Cleanup**: Entries removed after successful database commit
+- **Memory Efficiency**: Cache has configurable capacity (default: 10,000 entries)
+
+### Cache Behavior
+- `SET key value` in async mode → stores in `inflight_cache`
+- `GET key` → checks `inflight_cache` first, then database
+- `HSET ns key value` in async mode → stores in `inflight_hcache` as `ns:key`
+- `HGET ns key` → checks `inflight_hcache` first, then database
+- `DEL key` in async mode → removes from `inflight_cache` immediately
+- Database commit success → removes entries from inflight caches
+
+This ensures read-after-write consistency even in async mode.
 
 ## Database Schema
 
