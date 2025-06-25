@@ -7,6 +7,7 @@ use std::hash::Hasher;
 use std::str::FromStr;
 use tokio::sync::mpsc;
 
+use crate::compression::{self, Compressor};
 // Import ShardWriteOperation from shard_manager
 use crate::{cluster::ClusterManager, config::Cfg, shard_manager::ShardWriteOperation};
 
@@ -26,6 +27,7 @@ pub struct AppState {
     pub inflight_hcache: Cache<String, Vec<u8>>,
     /// Cluster manager for Redis cluster protocol
     pub cluster_manager: Option<ClusterManager>,
+    pub compressor: Option<Box<dyn Compressor>>,
 }
 
 impl AppState {
@@ -135,6 +137,11 @@ impl AppState {
             None
         };
 
+        let compressor = match &cfg.storage_compression {
+            Some(comp) if comp.enabled => Some(compression::init_compression(comp.clone())),
+            _ => None,
+        };
+
         AppState {
             cfg,
             shard_senders: shard_senders_vec,
@@ -142,6 +149,7 @@ impl AppState {
             inflight_cache,
             inflight_hcache,
             cluster_manager,
+            compressor,
         }
     }
 

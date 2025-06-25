@@ -4,6 +4,7 @@ use miette::{Context, Result};
 
 mod app_state;
 mod cluster;
+mod compression;
 mod config;
 mod redis;
 mod server;

@@ -229,6 +229,30 @@ async fn handle_redis_command(
     Ok(())
 }
 
+async fn compress_if_enabled(
+    state: &Arc<AppState>,
+    data: &[u8],
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    if state.cfg.is_compression() {
+        if let Some(compressor) = &state.compressor {
+            return Ok(compressor.compress(data).await?);
+        }
+    }
+    Ok(data.to_vec())
+}
+
+async fn decompress_if_enabled(
+    state: &Arc<AppState>,
+    data: &[u8],
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    if state.cfg.is_compression() {
+        if let Some(compressor) = &state.compressor {
+            return Ok(compressor.decompress(data).await?);
+        }
+    }
+    Ok(data.to_vec())
+}
+
 async fn handle_get(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
@@ -236,6 +260,9 @@ async fn handle_get(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // First check inflight cache for pending writes
     if let Some(data) = state.inflight_cache.get(&key).await {
+        // Decompress if needed
+        let data = decompress_if_enabled(state, &data).await?;
+
         let response = BytesFrame::BulkString(data.into());
         stream.write_all(&serialize_frame(&response)).await?;
         return Ok(());
@@ -253,7 +280,10 @@ async fn handle_get(
     .await
     {
         Ok(Some(row)) => {
-            let response = BytesFrame::BulkString(row.0.into());
+            // Decompress if needed
+            let data = decompress_if_enabled(state, &row.0).await?;
+
+            let response = BytesFrame::BulkString(data.into());
             stream.write_all(&serialize_frame(&response)).await?;
         }
         Ok(None) => {
@@ -279,19 +309,18 @@ async fn handle_set(
     let shard_index = state.get_shard(&key);
     let sender = &state.shard_senders[shard_index];
 
+    let value = compress_if_enabled(state, &value).await?;
+
     // Check if async_write is enabled
     if state.cfg.async_write.unwrap_or(false) {
         // Store in inflight cache to prevent race conditions
         state
             .inflight_cache
-            .insert(key.clone(), value.to_vec())
+            .insert(key.clone(), value.clone())
             .await;
 
         // Async mode: respond immediately after queueing
-        let operation = ShardWriteOperation::SetAsync {
-            key,
-            data: value.to_vec(),
-        };
+        let operation = ShardWriteOperation::SetAsync { key, data: value };
 
         if sender.send(operation).await.is_err() {
             tracing::error!(
@@ -310,7 +339,7 @@ async fn handle_set(
 
         let operation = ShardWriteOperation::Set {
             key,
-            data: value.to_vec(),
+            data: value,
             responder: responder_tx,
         };
 
@@ -568,6 +597,9 @@ async fn handle_hget(
     // First check inflight cache for pending writes
     let namespaced_key = state.namespaced_key(&namespace, &key);
     if let Some(data) = state.inflight_hcache.get(&namespaced_key).await {
+        // Decompress if needed
+        let data = decompress_if_enabled(state, &data).await?;
+
         let response = BytesFrame::BulkString(data.into());
         stream.write_all(&serialize_frame(&response)).await?;
         return Ok(());
@@ -589,7 +621,10 @@ async fn handle_hget(
         .await
     {
         Ok(Some(row)) => {
-            let response = BytesFrame::BulkString(row.0.into());
+            // Decompress if needed
+            let data = decompress_if_enabled(state, &row.0).await?;
+
+            let response = BytesFrame::BulkString(data.into());
             stream.write_all(&serialize_frame(&response)).await?;
         }
         Ok(None) => {
@@ -633,20 +668,23 @@ async fn handle_hset(
     let shard_index = state.get_shard(&key);
     let sender = &state.shard_senders[shard_index];
 
+    // Compress data if storage compression is enabled
+    let value = compress_if_enabled(state, &value).await?;
+
     // Check if async_write is enabled
     if state.cfg.async_write.unwrap_or(false) {
         // Store in inflight cache to prevent race conditions
         let namespaced_key = state.namespaced_key(&namespace, &key);
         state
             .inflight_hcache
-            .insert(namespaced_key, value.to_vec())
+            .insert(namespaced_key, value.clone())
             .await;
 
         // Async mode: respond immediately after queueing
         let operation = ShardWriteOperation::HSetAsync {
             namespace,
             key,
-            data: value.to_vec(),
+            data: value,
         };
 
         if sender.send(operation).await.is_err() {
@@ -667,7 +705,7 @@ async fn handle_hset(
         let operation = ShardWriteOperation::HSet {
             namespace,
             key,
-            data: value.to_vec(),
+            data: value,
             responder: responder_tx,
         };
 

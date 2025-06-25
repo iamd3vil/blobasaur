@@ -11,11 +11,11 @@ num_shards = 4
 # Server address and port (optional, defaults to 0.0.0.0:6379)
 addr = "0.0.0.0:6379"
 
-# Storage compression (not yet implemented)
-# storage_compression = false
-
-# Output compression (not yet implemented)
-# output_compression = false
+# Storage compression
+[storage_compression]
+enabled = true
+algorithm = "zstd"  # Options: none, gzip, zstd, lz4, snappy, brotli
+level = 3  
 
 # Asynchronous write mode (optional, defaults to false)
 # When enabled, SET/HSET/DEL/HDEL operations return immediately after queueing
