@@ -8,6 +8,7 @@ async-compression = { version = "0.4.9", features = ["tokio", "gzip"] }
 bytes = "1.5"
 chitchat = "0.9"
 chrono = { version = "0.4.38", features = ["serde"] }
+clap = { version = "4.5.4", features = ["derive"] }
 config = { version = "0.15.11", features = ["toml"] }
 crc16 = "0.4"
 fnv = "1.0.7"

@@ -8,7 +8,7 @@ output_compression = false
 async_write = true
 batch_size = 100
 batch_timeout_ms = 10
-addr = "0.0.0.0:6379"
+addr = "0.0.0.0:6383"
 
 # Cluster configuration
 [cluster]
@@ -19,14 +19,20 @@ enabled = true
 node_id = "node-3"
 
 # List of seed nodes to connect to when joining the cluster
-# These are the gossip addresses of the other nodes
-seeds = ["node1:7000", "node2:7000"]
+# These are the gossip addresses of the other nodes (internal Docker network)
+seeds = ["127.0.0.1:7001", "127.0.0.1:7002"]
+
+# Address that other nodes should use to connect to this node
+# For Docker, this should be the internal container hostname
+advertise_addr = "127.0.0.1:7003"
 
 # Port for gossip protocol communication
-port = 7000
+port = 7003
 
-# Hash slots will be assigned manually via redis-cli CLUSTER ADDSLOTS
-# slots = []
+# Hash slot ranges for this node (10923-16383)
+[[cluster.slot_ranges]]
+start = 10923
+end = 16383
 
 # Gossip interval in milliseconds
 gossip_interval_ms = 1000

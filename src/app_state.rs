@@ -107,11 +107,18 @@ impl AppState {
         // Initialize cluster manager if clustering is enabled
         let cluster_manager = if let Some(ref cluster_config) = cfg.cluster {
             if cluster_config.enabled {
-                let bind_addr = format!("0.0.0.0:{}", cluster_config.port)
+                let gossip_bind_addr = format!("0.0.0.0:{}", cluster_config.port)
                     .parse()
                     .expect("Invalid cluster bind address");
 
-                match ClusterManager::new(cluster_config, bind_addr).await {
+                let redis_addr = cfg
+                    .addr
+                    .as_deref()
+                    .unwrap_or("0.0.0.0:6379")
+                    .parse()
+                    .expect("Invalid Redis server address");
+
+                match ClusterManager::new(cluster_config, gossip_bind_addr, redis_addr).await {
                     Ok(manager) => {
                         tracing::info!("Cluster manager initialized successfully");
                         Some(manager)

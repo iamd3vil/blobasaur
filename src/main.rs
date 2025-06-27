@@ -10,13 +10,22 @@ mod server;
 mod shard_manager;
 
 use app_state::AppState;
+use clap::Parser;
+
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    #[arg(short, long, default_value = "config.toml")]
+    config: String,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // initialize tracing
     tracing_subscriber::fmt::init();
 
-    let cfg = config::Cfg::load("config.toml").wrap_err("loading config")?;
+    let args = Args::parse();
+    let cfg = config::Cfg::load(&args.config).wrap_err("loading config")?;
 
     // This vector will be populated by AppState::new
     let mut shard_receivers = Vec::with_capacity(cfg.num_shards);

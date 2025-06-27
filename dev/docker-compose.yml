@@ -2,20 +2,24 @@ services:
   node1:
     image: rust:1.87
     container_name: blobnom-node1
-    hostname: node1
-    ports:
-      - "6381:6379"
-      - "7001:7000"
+    # ports:
+    #   - "6381:6379"
+    #   - "7001:7000"
     volumes:
       - ../:/workspace
       - ./config.node1.toml:/app/config.toml:ro
       - node1_data:/app/data
       - cargo_cache:/usr/local/cargo/registry
-    networks:
-      - blobnom-cluster
+    network_mode: host
     working_dir: /workspace
+    environment:
+      - RUST_LOG=info,blobnom::cluster=debug
     command: >
       bash -c "
+        echo 'Node1 Starting...';
+        echo 'Hostname: $(hostname)';
+        echo 'Network interfaces:';
+        ip addr show;
         echo 'Checking binary compatibility...';
         if [ ! -f target/release/blobnom ] || ! file target/release/blobnom | grep -q 'ELF 64-bit LSB pie executable, x86-64'; then
           echo 'Building blobnom for container architecture...';
@@ -24,26 +28,31 @@ services:
           echo 'Using existing compatible binary...';
         fi;
         mkdir -p /app/data;
+        echo 'Starting blobnom node1...';
         exec ./target/release/blobnom --config /app/config.toml
       "
 
   node2:
     image: rust:1.87
     container_name: blobnom-node2
-    hostname: node2
-    ports:
-      - "6382:6379"
-      - "7002:7000"
+    # ports:
+    #   - "6382:6379"
+    #   - "7002:7000"
     volumes:
       - ../:/workspace
       - ./config.node2.toml:/app/config.toml:ro
       - node2_data:/app/data
       - cargo_cache:/usr/local/cargo/registry
-    networks:
-      - blobnom-cluster
+    network_mode: host
     working_dir: /workspace
+    environment:
+      - RUST_LOG=info,blobnom::cluster=debug
     command: >
       bash -c "
+        echo 'Node2 Starting...';
+        echo 'Hostname: $(hostname)';
+        echo 'Network interfaces:';
+        ip addr show;
         echo 'Checking binary compatibility...';
         if [ ! -f target/release/blobnom ] || ! file target/release/blobnom | grep -q 'ELF 64-bit LSB pie executable, x86-64'; then
           echo 'Building blobnom for container architecture...';
@@ -52,26 +61,31 @@ services:
           echo 'Using existing compatible binary...';
         fi;
         mkdir -p /app/data;
+        echo 'Starting blobnom node2...';
         exec ./target/release/blobnom --config /app/config.toml
       "
 
   node3:
     image: rust:1.87
     container_name: blobnom-node3
-    hostname: node3
-    ports:
-      - "6383:6379"
-      - "7003:7000"
+    # ports:
+    #   - "6383:6379"
+    #   - "7003:7000"
     volumes:
       - ../:/workspace
       - ./config.node3.toml:/app/config.toml:ro
       - node3_data:/app/data
       - cargo_cache:/usr/local/cargo/registry
-    networks:
-      - blobnom-cluster
+    network_mode: host
     working_dir: /workspace
+    environment:
+      - RUST_LOG=info,blobnom::cluster=debug
     command: >
       bash -c "
+        echo 'Node3 Starting...';
+        echo 'Hostname: $(hostname)';
+        echo 'Network interfaces:';
+        ip addr show;
         echo 'Checking binary compatibility...';
         if [ ! -f target/release/blobnom ] || ! file target/release/blobnom | grep -q 'ELF 64-bit LSB pie executable, x86-64'; then
           echo 'Building blobnom for container architecture...';
@@ -80,12 +94,13 @@ services:
           echo 'Using existing compatible binary...';
         fi;
         mkdir -p /app/data;
+        echo 'Starting blobnom node3...';
         exec ./target/release/blobnom --config /app/config.toml
       "
 
-networks:
-  blobnom-cluster:
-    driver: bridge
+# networks:
+#   blobnom-cluster:
+#     driver: bridge
 
 volumes:
   node1_data:

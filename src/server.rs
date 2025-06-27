@@ -20,6 +20,7 @@ pub async fn run_redis_server(
 
     loop {
         let (stream, addr) = listener.accept().await?;
+        tracing::info!("Accepted new connection from {}", addr);
         tracing::debug!("New Blobnom connection from {}", addr);
 
         let state_clone = state.clone();
@@ -49,6 +50,7 @@ async fn handle_connection(
         };
 
         buffer.extend_from_slice(&temp_buffer[..n]);
+        tracing::debug!("Read {} bytes from socket, buffer size is now {}", n, buffer.len());
 
         // Try to parse complete messages from the buffer
         let mut remaining_data = &buffer[..];
@@ -793,6 +795,7 @@ async fn handle_cluster_nodes(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    tracing::info!("Handling CLUSTER NODES command");
     if let Some(ref cluster_manager) = state.cluster_manager {
         let nodes_info = cluster_manager.get_cluster_nodes().await;
         let response = BytesFrame::BulkString(nodes_info.into());
@@ -842,12 +845,17 @@ async fn handle_cluster_slots(
                     end = slot;
                 } else {
                     // Add completed range
+                    let advertise_addr = state.cfg.cluster.as_ref().and_then(|c| c.advertise_addr.clone()).unwrap_or("127.0.0.1:6379".to_string());
+                    let parts: Vec<&str> = advertise_addr.split(':').collect();
+                    let ip = parts.get(0).cloned().unwrap_or("127.0.0.1").to_string();
+                    let port = parts.get(1).and_then(|p| p.parse::<i64>().ok()).unwrap_or(6379);
+
                     let range = BytesFrame::Array(vec![
                         BytesFrame::Integer(start as i64),
                         BytesFrame::Integer(end as i64),
                         BytesFrame::Array(vec![
-                            BytesFrame::BulkString("127.0.0.1".into()),
-                            BytesFrame::Integer(6379),
+                            BytesFrame::BulkString(ip.into()),
+                            BytesFrame::Integer(port),
                         ]),
                     ]);
                     slot_ranges.push(range);
@@ -856,13 +864,18 @@ async fn handle_cluster_slots(
                 }
             }
 
+            let advertise_addr = state.cfg.cluster.as_ref().and_then(|c| c.advertise_addr.clone()).unwrap_or("127.0.0.1:6379".to_string());
+            let parts: Vec<&str> = advertise_addr.split(':').collect();
+            let ip = parts.get(0).cloned().unwrap_or("127.0.0.1").to_string();
+            let port = parts.get(1).and_then(|p| p.parse::<i64>().ok()).unwrap_or(6379);
+
             // Add the last range
             let range = BytesFrame::Array(vec![
                 BytesFrame::Integer(start as i64),
                 BytesFrame::Integer(end as i64),
                 BytesFrame::Array(vec![
-                    BytesFrame::BulkString("127.0.0.1".into()),
-                    BytesFrame::Integer(6379),
+                    BytesFrame::BulkString(ip.into()),
+                    BytesFrame::Integer(port),
                 ]),
             ]);
             slot_ranges.push(range);

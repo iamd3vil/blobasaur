@@ -53,20 +53,10 @@ cluster-status:
     @echo "\nNode 3 (port 6383):"
     -redis-cli -p 6383 CLUSTER INFO
 
-cluster-setup:
-    @echo "Setting up cluster slots..."
-    @echo "Adding slots 0-5460 to node 1..."
-    redis-cli -p 6381 CLUSTER ADDSLOTS $(seq -s ' ' 0 5460)
-    @echo "Adding slots 5461-10922 to node 2..."
-    redis-cli -p 6382 CLUSTER ADDSLOTS $(seq -s ' ' 5461 10922)
-    @echo "Adding slots 10923-16383 to node 3..."
-    redis-cli -p 6383 CLUSTER ADDSLOTS $(seq -s ' ' 10923 16383)
-    @echo "Cluster setup complete!"
-
 cluster-reset:
     @echo "Resetting cluster..."
     cd dev && docker-compose down -v
     just cluster-clean
     cd dev && docker-compose up -d
     sleep 5
-    just cluster-setup
+
