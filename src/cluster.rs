@@ -699,12 +699,14 @@ mod tests {
             seeds: vec!["127.0.0.1:7000".to_string()],
             port: 7000,
             slots: Some(vec![0, 1, 2, 3, 4]),
+            slot_ranges: None,
             gossip_interval_ms: Some(1000),
             advertise_addr: Some("127.0.0.1:7000".to_string()),
         };
 
-        let bind_addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
-        let cluster_manager = ClusterManager::new(&config, bind_addr).await;
+        let gossip_bind_addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+        let redis_addr: SocketAddr = "127.0.0.1:6379".parse().unwrap();
+        let cluster_manager = ClusterManager::new(&config, gossip_bind_addr, redis_addr).await;
 
         // Note: This test might fail in CI due to UDP binding issues
         if cluster_manager.is_ok() {
@@ -727,14 +729,16 @@ mod tests {
             seeds: vec![],
             port: 7000,
             slots: Some(vec![0, 1, 2]),
+            slot_ranges: None,
             gossip_interval_ms: Some(1000),
             advertise_addr: Some("127.0.0.1:7000".to_string()),
         };
 
-        let bind_addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+        let gossip_bind_addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+        let redis_addr: SocketAddr = "127.0.0.1:6379".parse().unwrap();
 
         // This test might fail in CI due to UDP binding, so we'll handle the error gracefully
-        if let Ok(manager) = ClusterManager::new(&config, bind_addr).await {
+        if let Ok(manager) = ClusterManager::new(&config, gossip_bind_addr, redis_addr).await {
             // Test keys that should be handled locally
             for slot in [0, 1, 2] {
                 // Find a key that maps to this slot
@@ -762,14 +766,16 @@ mod tests {
             seeds: vec![],
             port: 7000,
             slots: Some(vec![0, 1, 2]),
+            slot_ranges: None,
             gossip_interval_ms: Some(1000),
             advertise_addr: Some("127.0.0.1:7000".to_string()),
         };
 
-        let bind_addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+        let gossip_bind_addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+        let redis_addr: SocketAddr = "127.0.0.1:6379".parse().unwrap();
 
         // This test might fail in CI due to UDP binding, so we'll handle the error gracefully
-        if let Ok(manager) = ClusterManager::new(&config, bind_addr).await {
+        if let Ok(manager) = ClusterManager::new(&config, gossip_bind_addr, redis_addr).await {
             // Initial slots
             let initial_slots = manager.get_local_slots().await;
             assert_eq!(initial_slots.len(), 3);
