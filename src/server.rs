@@ -1,4 +1,5 @@
 use crate::AppState;
+use crate::cluster::ClusterManager;
 use crate::redis::{
     ParseError, RedisCommand, parse_command, parse_resp_with_remaining, serialize_frame,
 };
@@ -19,6 +20,7 @@ pub async fn run_redis_server(
 
     loop {
         let (stream, addr) = listener.accept().await?;
+        tracing::info!("Accepted new connection from {}", addr);
         tracing::debug!("New Blobnom connection from {}", addr);
 
         let state_clone = state.clone();
@@ -48,6 +50,11 @@ async fn handle_connection(
         };
 
         buffer.extend_from_slice(&temp_buffer[..n]);
+        tracing::debug!(
+            "Read {} bytes from socket, buffer size is now {}",
+            n,
+            buffer.len()
+        );
 
         // Try to parse complete messages from the buffer
         let mut remaining_data = &buffer[..];
@@ -118,15 +125,51 @@ async fn handle_redis_command(
 ) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         RedisCommand::Get { key } => {
+            if let Some(ref cluster_manager) = state.cluster_manager {
+                if !cluster_manager.should_handle_locally(&key).await {
+                    if let Some(redirect) = cluster_manager.get_redirect_response(&key).await {
+                        let response = BytesFrame::Error(redirect.into());
+                        stream.write_all(&serialize_frame(&response)).await?;
+                        return Ok(());
+                    }
+                }
+            }
             handle_get(stream, state, key).await?;
         }
         RedisCommand::Set { key, value } => {
+            if let Some(ref cluster_manager) = state.cluster_manager {
+                if !cluster_manager.should_handle_locally(&key).await {
+                    if let Some(redirect) = cluster_manager.get_redirect_response(&key).await {
+                        let response = BytesFrame::Error(redirect.into());
+                        stream.write_all(&serialize_frame(&response)).await?;
+                        return Ok(());
+                    }
+                }
+            }
             handle_set(stream, state, key, value).await?;
         }
         RedisCommand::Del { key } => {
+            if let Some(ref cluster_manager) = state.cluster_manager {
+                if !cluster_manager.should_handle_locally(&key).await {
+                    if let Some(redirect) = cluster_manager.get_redirect_response(&key).await {
+                        let response = BytesFrame::Error(redirect.into());
+                        stream.write_all(&serialize_frame(&response)).await?;
+                        return Ok(());
+                    }
+                }
+            }
             handle_del(stream, state, key).await?;
         }
         RedisCommand::Exists { key } => {
+            if let Some(ref cluster_manager) = state.cluster_manager {
+                if !cluster_manager.should_handle_locally(&key).await {
+                    if let Some(redirect) = cluster_manager.get_redirect_response(&key).await {
+                        let response = BytesFrame::Error(redirect.into());
+                        stream.write_all(&serialize_frame(&response)).await?;
+                        return Ok(());
+                    }
+                }
+            }
             handle_exists(stream, state, key).await?;
         }
         RedisCommand::Ping { message } => {
@@ -153,6 +196,24 @@ async fn handle_redis_command(
         }
         RedisCommand::HExists { namespace, key } => {
             handle_hexists(stream, state, namespace, key).await?;
+        }
+        RedisCommand::ClusterNodes => {
+            handle_cluster_nodes(stream, state).await?;
+        }
+        RedisCommand::ClusterInfo => {
+            handle_cluster_info(stream, state).await?;
+        }
+        RedisCommand::ClusterSlots => {
+            handle_cluster_slots(stream, state).await?;
+        }
+        RedisCommand::ClusterAddSlots { slots } => {
+            handle_cluster_addslots(stream, state, slots).await?;
+        }
+        RedisCommand::ClusterDelSlots { slots } => {
+            handle_cluster_delslots(stream, state, slots).await?;
+        }
+        RedisCommand::ClusterKeySlot { key } => {
+            handle_cluster_keyslot(stream, key).await?;
         }
         RedisCommand::Quit => {
             let response = BytesFrame::SimpleString("OK".into());
@@ -487,6 +548,23 @@ async fn handle_hget(
     namespace: String,
     key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Check if we should handle this hash operation locally in a cluster
+    if let Some(ref cluster_manager) = state.cluster_manager {
+        if !cluster_manager
+            .should_handle_hash_locally(&namespace, &key)
+            .await
+        {
+            if let Some(redirect) = cluster_manager
+                .get_hash_redirect_response(&namespace, &key)
+                .await
+            {
+                let response = BytesFrame::Error(redirect.into());
+                stream.write_all(&serialize_frame(&response)).await?;
+                return Ok(());
+            }
+        }
+    }
+
     // First check inflight cache for pending writes
     let namespaced_key = state.namespaced_key(&namespace, &key);
     if let Some(data) = state.inflight_hcache.get(&namespaced_key).await {
@@ -535,6 +613,23 @@ async fn handle_hset(
     key: String,
     value: Bytes,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Check if we should handle this hash operation locally in a cluster
+    if let Some(ref cluster_manager) = state.cluster_manager {
+        if !cluster_manager
+            .should_handle_hash_locally(&namespace, &key)
+            .await
+        {
+            if let Some(redirect) = cluster_manager
+                .get_hash_redirect_response(&namespace, &key)
+                .await
+            {
+                let response = BytesFrame::Error(redirect.into());
+                stream.write_all(&serialize_frame(&response)).await?;
+                return Ok(());
+            }
+        }
+    }
+
     let shard_index = state.get_shard(&key);
     let sender = &state.shard_senders[shard_index];
 
@@ -609,6 +704,23 @@ async fn handle_hdel(
     namespace: String,
     key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Check if we should handle this hash operation locally in a cluster
+    if let Some(ref cluster_manager) = state.cluster_manager {
+        if !cluster_manager
+            .should_handle_hash_locally(&namespace, &key)
+            .await
+        {
+            if let Some(redirect) = cluster_manager
+                .get_hash_redirect_response(&namespace, &key)
+                .await
+            {
+                let response = BytesFrame::Error(redirect.into());
+                stream.write_all(&serialize_frame(&response)).await?;
+                return Ok(());
+            }
+        }
+    }
+
     let shard_index = state.get_shard(&key);
     let pool = &state.db_pools[shard_index];
     let table_name = format!("blobs_{}", namespace);
@@ -695,6 +807,23 @@ async fn handle_hexists(
     namespace: String,
     key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Check if we should handle this hash operation locally in a cluster
+    if let Some(ref cluster_manager) = state.cluster_manager {
+        if !cluster_manager
+            .should_handle_hash_locally(&namespace, &key)
+            .await
+        {
+            if let Some(redirect) = cluster_manager
+                .get_hash_redirect_response(&namespace, &key)
+                .await
+            {
+                let response = BytesFrame::Error(redirect.into());
+                stream.write_all(&serialize_frame(&response)).await?;
+                return Ok(());
+            }
+        }
+    }
+
     let shard_index = state.get_shard(&key);
     let pool = &state.db_pools[shard_index];
     let table_name = format!("blobs_{}", namespace);
@@ -730,5 +859,179 @@ async fn handle_hexists(
         }
     }
 
+    Ok(())
+}
+
+// Cluster command handlers
+async fn handle_cluster_nodes(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    tracing::info!("Handling CLUSTER NODES command");
+    if let Some(ref cluster_manager) = state.cluster_manager {
+        let nodes_info = cluster_manager.get_cluster_nodes().await;
+        let response = BytesFrame::BulkString(nodes_info.into());
+        stream.write_all(&serialize_frame(&response)).await?;
+    } else {
+        let response = BytesFrame::Error("ERR This instance has cluster support disabled".into());
+        stream.write_all(&serialize_frame(&response)).await?;
+    }
+    Ok(())
+}
+
+async fn handle_cluster_info(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(ref cluster_manager) = state.cluster_manager {
+        let cluster_info = cluster_manager.get_cluster_info().await;
+        let response = BytesFrame::BulkString(cluster_info.into());
+        stream.write_all(&serialize_frame(&response)).await?;
+    } else {
+        let response = BytesFrame::Error("ERR This instance has cluster support disabled".into());
+        stream.write_all(&serialize_frame(&response)).await?;
+    }
+    Ok(())
+}
+
+async fn handle_cluster_slots(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(ref cluster_manager) = state.cluster_manager {
+        let local_slots = cluster_manager.get_local_slots().await;
+
+        // Build Redis CLUSTER SLOTS response
+        // Format: Array of [start_slot, end_slot, [master_ip, master_port]]
+        let mut slot_ranges = Vec::new();
+
+        if !local_slots.is_empty() {
+            let mut sorted_slots: Vec<u16> = local_slots.iter().copied().collect();
+            sorted_slots.sort();
+
+            let mut start = sorted_slots[0];
+            let mut end = sorted_slots[0];
+
+            for &slot in &sorted_slots[1..] {
+                if slot == end + 1 {
+                    end = slot;
+                } else {
+                    // Add completed range
+                    let advertise_addr = state
+                        .cfg
+                        .cluster
+                        .as_ref()
+                        .and_then(|c| c.advertise_addr.clone())
+                        .unwrap_or("127.0.0.1:6379".to_string());
+                    let parts: Vec<&str> = advertise_addr.split(':').collect();
+                    let ip = parts.get(0).cloned().unwrap_or("127.0.0.1").to_string();
+                    let port = parts
+                        .get(1)
+                        .and_then(|p| p.parse::<i64>().ok())
+                        .unwrap_or(6379);
+
+                    let range = BytesFrame::Array(vec![
+                        BytesFrame::Integer(start as i64),
+                        BytesFrame::Integer(end as i64),
+                        BytesFrame::Array(vec![
+                            BytesFrame::BulkString(ip.into()),
+                            BytesFrame::Integer(port),
+                        ]),
+                    ]);
+                    slot_ranges.push(range);
+                    start = slot;
+                    end = slot;
+                }
+            }
+
+            let advertise_addr = state
+                .cfg
+                .cluster
+                .as_ref()
+                .and_then(|c| c.advertise_addr.clone())
+                .unwrap_or("127.0.0.1:6379".to_string());
+            let parts: Vec<&str> = advertise_addr.split(':').collect();
+            let ip = parts.get(0).cloned().unwrap_or("127.0.0.1").to_string();
+            let port = parts
+                .get(1)
+                .and_then(|p| p.parse::<i64>().ok())
+                .unwrap_or(6379);
+
+            // Add the last range
+            let range = BytesFrame::Array(vec![
+                BytesFrame::Integer(start as i64),
+                BytesFrame::Integer(end as i64),
+                BytesFrame::Array(vec![
+                    BytesFrame::BulkString(ip.into()),
+                    BytesFrame::Integer(port),
+                ]),
+            ]);
+            slot_ranges.push(range);
+        }
+
+        let response = BytesFrame::Array(slot_ranges);
+        stream.write_all(&serialize_frame(&response)).await?;
+    } else {
+        let response = BytesFrame::Error("ERR This instance has cluster support disabled".into());
+        stream.write_all(&serialize_frame(&response)).await?;
+    }
+    Ok(())
+}
+
+async fn handle_cluster_addslots(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+    slots: Vec<u16>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(ref cluster_manager) = state.cluster_manager {
+        match cluster_manager.add_slots(slots).await {
+            Ok(()) => {
+                let response = BytesFrame::SimpleString("OK".into());
+                stream.write_all(&serialize_frame(&response)).await?;
+            }
+            Err(e) => {
+                tracing::error!("Failed to add slots: {}", e);
+                let response = BytesFrame::Error("ERR failed to add slots".into());
+                stream.write_all(&serialize_frame(&response)).await?;
+            }
+        }
+    } else {
+        let response = BytesFrame::Error("ERR This instance has cluster support disabled".into());
+        stream.write_all(&serialize_frame(&response)).await?;
+    }
+    Ok(())
+}
+
+async fn handle_cluster_delslots(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+    slots: Vec<u16>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(ref cluster_manager) = state.cluster_manager {
+        match cluster_manager.remove_slots(slots).await {
+            Ok(()) => {
+                let response = BytesFrame::SimpleString("OK".into());
+                stream.write_all(&serialize_frame(&response)).await?;
+            }
+            Err(e) => {
+                tracing::error!("Failed to remove slots: {}", e);
+                let response = BytesFrame::Error("ERR failed to remove slots".into());
+                stream.write_all(&serialize_frame(&response)).await?;
+            }
+        }
+    } else {
+        let response = BytesFrame::Error("ERR This instance has cluster support disabled".into());
+        stream.write_all(&serialize_frame(&response)).await?;
+    }
+    Ok(())
+}
+
+async fn handle_cluster_keyslot(
+    stream: &mut TcpStream,
+    key: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let slot = ClusterManager::calculate_slot(&key);
+    let response = BytesFrame::Integer(slot as i64);
+    stream.write_all(&serialize_frame(&response)).await?;
     Ok(())
 }

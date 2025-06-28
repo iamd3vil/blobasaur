@@ -11,6 +11,27 @@ pub struct Cfg {
     pub batch_size: Option<usize>,
     pub batch_timeout_ms: Option<u64>,
     pub addr: Option<String>,
+    pub cluster: Option<ClusterConfig>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SlotRange {
+    pub start: u16,
+    pub end: u16,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ClusterConfig {
+    pub enabled: bool,
+    pub node_id: String,
+    #[allow(dead_code)]
+    pub seeds: Vec<String>,
+    pub port: u16,
+    pub slots: Option<Vec<u16>>,
+    pub slot_ranges: Option<Vec<SlotRange>>,
+    #[allow(dead_code)]
+    pub gossip_interval_ms: Option<u64>,
+    pub advertise_addr: Option<String>,
 }
 
 impl Cfg {

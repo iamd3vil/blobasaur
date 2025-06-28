@@ -29,6 +29,7 @@ Blobnom is a high-performance, sharded blob storage server written in Rust. It i
   - Asynchronous write mode for improved response times.
   - Write batching for improved database throughput.
 - **SQLite Backend:** Each shard uses its own SQLite database, simplifying deployment and management.
+- **Redis Cluster Compatibility:** Full Redis cluster protocol support with automatic node discovery, hash slot distribution, and client redirection for horizontal scaling.
 - **Namespacing:** Hash-based namespacing using HGET/HSET commands for organizing data into logical groups.
 - **Metadata Tracking:** Each blob includes metadata such as creation time, update time, expiration time, and version number.
 - **Graceful Shutdown:** (Implicitly handled by Tokio)
@@ -442,8 +443,63 @@ cargo test redis::protocol      # Protocol parser tests
 cargo test redis::integration   # Integration tests
 ```
 
+## Redis Cluster Compatibility
+
+Blobnom implements full Redis cluster protocol compatibility with automatic node discovery via gossip protocol. This allows Redis cluster-aware clients to seamlessly connect and perform operations across a distributed cluster of nodes.
+
+### Key Features
+
+- **Hash Slot Distribution**: Uses Redis-compatible CRC16 hash slots (16384 total) with slot range configuration
+- **Automatic Node Discovery**: Gossip protocol (chitchat) for automatic cluster membership management
+- **MOVED Redirection**: Automatic client redirection for keys on different nodes
+- **Cluster Commands**: Full support for `CLUSTER NODES`, `CLUSTER INFO`, `CLUSTER SLOTS`, etc.
+- **Cross-Node Operations**: Seamless key operations across all cluster nodes with automatic routing
+
+### Basic Cluster Configuration
+
+```toml
+[cluster]
+enabled = true
+node_id = "node-1"
+seeds = ["127.0.0.1:7002", "127.0.0.1:7003"]
+advertise_addr = "127.0.0.1:7001"
+port = 7001
+gossip_interval_ms = 1000
+
+# Hash slot ranges for this node
+[[cluster.slot_ranges]]
+start = 0
+end = 5460
+```
+
+### Usage with Redis Clients
+
+```bash
+# Redis CLI with cluster support
+valkey-cli -c -p 6381
+
+# Check cluster status
+valkey-cli -c -p 6381 CLUSTER NODES
+valkey-cli -c -p 6381 CLUSTER INFO
+
+# Test cross-node operations
+valkey-cli -c -p 6381 SET mykey "myvalue"
+valkey-cli -c -p 6382 GET mykey  # Automatic redirection
+```
+
+For detailed setup instructions, see [CLUSTERING.md](CLUSTERING.md).
+
+### Current Limitations
+
+- No replication support (no master-slave configuration)
+- No automatic failover (manual intervention required for node failures)
+- Static slot assignment (no online resharding or slot migration)
+
 ## Future Enhancements (Ideas)
 
+- Full chitchat gossip protocol integration
+- Master-slave replication for high availability
+- Online slot migration and rebalancing
 - Implement actual data compression for `storage_compression` and `output_compression`.
 - Add more robust error handling and logging.
 - Implement authentication and authorization.

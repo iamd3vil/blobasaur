@@ -8,7 +8,7 @@ use std::str::FromStr;
 use tokio::sync::mpsc;
 
 // Import ShardWriteOperation from shard_manager
-use crate::{config::Cfg, shard_manager::ShardWriteOperation};
+use crate::{cluster::ClusterManager, config::Cfg, shard_manager::ShardWriteOperation};
 
 pub struct AppState {
     pub cfg: Cfg,
@@ -24,6 +24,8 @@ pub struct AppState {
     /// Same as inflight_cache but for HSET/HGET operations. The key format is
     /// "namespace:key" to avoid collisions between namespaces.
     pub inflight_hcache: Cache<String, Vec<u8>>,
+    /// Cluster manager for Redis cluster protocol
+    pub cluster_manager: Option<ClusterManager>,
 }
 
 impl AppState {
@@ -102,12 +104,44 @@ impl AppState {
         let inflight_cache = Cache::new(10_000);
         let inflight_hcache = Cache::new(10_000);
 
+        // Initialize cluster manager if clustering is enabled
+        let cluster_manager = if let Some(ref cluster_config) = cfg.cluster {
+            if cluster_config.enabled {
+                let gossip_bind_addr = format!("0.0.0.0:{}", cluster_config.port)
+                    .parse()
+                    .expect("Invalid cluster bind address");
+
+                let redis_addr = cfg
+                    .addr
+                    .as_deref()
+                    .unwrap_or("0.0.0.0:6379")
+                    .parse()
+                    .expect("Invalid Redis server address");
+
+                match ClusterManager::new(cluster_config, gossip_bind_addr, redis_addr).await {
+                    Ok(manager) => {
+                        tracing::info!("Cluster manager initialized successfully");
+                        Some(manager)
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to initialize cluster manager: {}", e);
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         AppState {
             cfg,
             shard_senders: shard_senders_vec,
             db_pools,
             inflight_cache,
             inflight_hcache,
+            cluster_manager,
         }
     }
 
