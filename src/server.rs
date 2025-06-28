@@ -50,7 +50,11 @@ async fn handle_connection(
         };
 
         buffer.extend_from_slice(&temp_buffer[..n]);
-        tracing::debug!("Read {} bytes from socket, buffer size is now {}", n, buffer.len());
+        tracing::debug!(
+            "Read {} bytes from socket, buffer size is now {}",
+            n,
+            buffer.len()
+        );
 
         // Try to parse complete messages from the buffer
         let mut remaining_data = &buffer[..];
@@ -544,6 +548,23 @@ async fn handle_hget(
     namespace: String,
     key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Check if we should handle this hash operation locally in a cluster
+    if let Some(ref cluster_manager) = state.cluster_manager {
+        if !cluster_manager
+            .should_handle_hash_locally(&namespace, &key)
+            .await
+        {
+            if let Some(redirect) = cluster_manager
+                .get_hash_redirect_response(&namespace, &key)
+                .await
+            {
+                let response = BytesFrame::Error(redirect.into());
+                stream.write_all(&serialize_frame(&response)).await?;
+                return Ok(());
+            }
+        }
+    }
+
     // First check inflight cache for pending writes
     let namespaced_key = state.namespaced_key(&namespace, &key);
     if let Some(data) = state.inflight_hcache.get(&namespaced_key).await {
@@ -592,6 +613,23 @@ async fn handle_hset(
     key: String,
     value: Bytes,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Check if we should handle this hash operation locally in a cluster
+    if let Some(ref cluster_manager) = state.cluster_manager {
+        if !cluster_manager
+            .should_handle_hash_locally(&namespace, &key)
+            .await
+        {
+            if let Some(redirect) = cluster_manager
+                .get_hash_redirect_response(&namespace, &key)
+                .await
+            {
+                let response = BytesFrame::Error(redirect.into());
+                stream.write_all(&serialize_frame(&response)).await?;
+                return Ok(());
+            }
+        }
+    }
+
     let shard_index = state.get_shard(&key);
     let sender = &state.shard_senders[shard_index];
 
@@ -666,6 +704,23 @@ async fn handle_hdel(
     namespace: String,
     key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Check if we should handle this hash operation locally in a cluster
+    if let Some(ref cluster_manager) = state.cluster_manager {
+        if !cluster_manager
+            .should_handle_hash_locally(&namespace, &key)
+            .await
+        {
+            if let Some(redirect) = cluster_manager
+                .get_hash_redirect_response(&namespace, &key)
+                .await
+            {
+                let response = BytesFrame::Error(redirect.into());
+                stream.write_all(&serialize_frame(&response)).await?;
+                return Ok(());
+            }
+        }
+    }
+
     let shard_index = state.get_shard(&key);
     let pool = &state.db_pools[shard_index];
     let table_name = format!("blobs_{}", namespace);
@@ -752,6 +807,23 @@ async fn handle_hexists(
     namespace: String,
     key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Check if we should handle this hash operation locally in a cluster
+    if let Some(ref cluster_manager) = state.cluster_manager {
+        if !cluster_manager
+            .should_handle_hash_locally(&namespace, &key)
+            .await
+        {
+            if let Some(redirect) = cluster_manager
+                .get_hash_redirect_response(&namespace, &key)
+                .await
+            {
+                let response = BytesFrame::Error(redirect.into());
+                stream.write_all(&serialize_frame(&response)).await?;
+                return Ok(());
+            }
+        }
+    }
+
     let shard_index = state.get_shard(&key);
     let pool = &state.db_pools[shard_index];
     let table_name = format!("blobs_{}", namespace);
@@ -845,10 +917,18 @@ async fn handle_cluster_slots(
                     end = slot;
                 } else {
                     // Add completed range
-                    let advertise_addr = state.cfg.cluster.as_ref().and_then(|c| c.advertise_addr.clone()).unwrap_or("127.0.0.1:6379".to_string());
+                    let advertise_addr = state
+                        .cfg
+                        .cluster
+                        .as_ref()
+                        .and_then(|c| c.advertise_addr.clone())
+                        .unwrap_or("127.0.0.1:6379".to_string());
                     let parts: Vec<&str> = advertise_addr.split(':').collect();
                     let ip = parts.get(0).cloned().unwrap_or("127.0.0.1").to_string();
-                    let port = parts.get(1).and_then(|p| p.parse::<i64>().ok()).unwrap_or(6379);
+                    let port = parts
+                        .get(1)
+                        .and_then(|p| p.parse::<i64>().ok())
+                        .unwrap_or(6379);
 
                     let range = BytesFrame::Array(vec![
                         BytesFrame::Integer(start as i64),
@@ -864,10 +944,18 @@ async fn handle_cluster_slots(
                 }
             }
 
-            let advertise_addr = state.cfg.cluster.as_ref().and_then(|c| c.advertise_addr.clone()).unwrap_or("127.0.0.1:6379".to_string());
+            let advertise_addr = state
+                .cfg
+                .cluster
+                .as_ref()
+                .and_then(|c| c.advertise_addr.clone())
+                .unwrap_or("127.0.0.1:6379".to_string());
             let parts: Vec<&str> = advertise_addr.split(':').collect();
             let ip = parts.get(0).cloned().unwrap_or("127.0.0.1").to_string();
-            let port = parts.get(1).and_then(|p| p.parse::<i64>().ok()).unwrap_or(6379);
+            let port = parts
+                .get(1)
+                .and_then(|p| p.parse::<i64>().ok())
+                .unwrap_or(6379);
 
             // Add the last range
             let range = BytesFrame::Array(vec![

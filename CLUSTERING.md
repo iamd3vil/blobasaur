@@ -131,7 +131,7 @@ Blobnom uses two types of ports:
 # On node 1
 ./blobnom --config config.node1.toml
 
-# On node 2  
+# On node 2
 ./blobnom --config config.node2.toml
 
 # On node 3
@@ -170,7 +170,7 @@ valkey-cli -c -p 6381 cluster nodes
 
 # Should show something like:
 # node-1 127.0.0.1:6381 myself,master - 0 0 0 connected 0-5460
-# node-2 127.0.0.1:6382 master - 0 0 0 connected 5461-10922  
+# node-2 127.0.0.1:6382 master - 0 0 0 connected 5461-10922
 # node-3 127.0.0.1:6383 master - 0 0 0 connected 10923-16383
 ```
 
@@ -216,7 +216,7 @@ from redis import RedisCluster
 
 startup_nodes = [
     {"host": "127.0.0.1", "port": 6381},
-    {"host": "127.0.0.1", "port": 6382}, 
+    {"host": "127.0.0.1", "port": 6382},
     {"host": "127.0.0.1", "port": 6383}
 ]
 
@@ -245,13 +245,71 @@ Blobnom uses the same hash slot calculation as Redis:
 
 1. Extract the "hash tag" from the key (text between `{` and `}`)
 2. If no hash tag exists, use the entire key
-3. Calculate CRC16 of the hash key  
+3. Calculate CRC16 of the hash key
 4. Modulo 16384 to get the slot number
 
 Examples:
 - `user:1000` → CRC16("user:1000") % 16384 = slot X
 - `{user:1000}:profile` → CRC16("user:1000") % 16384 = slot Y
 - `{user:1000}:settings` → CRC16("user:1000") % 16384 = slot Y (same as above)
+
+## Distributed Namespace Operations
+
+### The Namespace Scaling Problem
+
+Traditional Redis clustering has a significant limitation when using hash operations for namespacing: if you use a hash key like `users` to store multiple user records, the entire namespace gets confined to a single cluster node.
+
+**Problem Example (Traditional Approach):**
+```bash
+# All these operations would go to the SAME node
+HSET users alice "Alice's data"     # Slot = hash("users") → Node A
+HSET users bob "Bob's data"         # Slot = hash("users") → Node A
+HSET users charlie "Charlie's data" # Slot = hash("users") → Node A
+```
+
+This creates a scaling bottleneck where popular namespaces become single-node hotspots.
+
+### Blobnom's Solution: Key-Based Distribution
+
+Blobnom solves this by using the **individual key** (not the namespace) for slot calculation in hash operations:
+
+**Distributed Example (Blobnom Approach):**
+```bash
+# These operations are distributed across different nodes
+HSET users alice "Alice's data"     # Slot = hash("alice") → Node A
+HSET users bob "Bob's data"         # Slot = hash("bob") → Node B
+HSET users charlie "Charlie's data" # Slot = hash("charlie") → Node C
+```
+
+### Benefits of Distributed Namespaces
+
+✅ **Horizontal Scaling**: Large namespaces can utilize all cluster nodes
+✅ **Load Balancing**: No single-node bottlenecks for popular namespaces
+✅ **Redis Compatibility**: Uses standard Redis cluster redirects
+✅ **Transparent Operation**: Existing client code works unchanged
+
+### Demonstration
+
+Run the included example to see the difference:
+```bash
+cargo run --example namespace_distribution_demo
+```
+
+This shows how 8 users in a `users` namespace are distributed across 3 nodes instead of being confined to 1 node.
+
+### Hash Tag Co-location (When Needed)
+
+If you need related data on the same node, use hash tags:
+```bash
+# Co-locate Alice's data using hash tags
+HSET users {user:alice}:profile "profile data"   # All go to same node
+HSET users {user:alice}:settings "settings data" # Same node as above
+HSET users {user:alice}:cache "cache data"       # Same node as above
+
+# Bob's data goes to a different node
+HSET users {user:bob}:profile "profile data"     # Different node
+HSET users {user:bob}:settings "settings data"   # Same node as Bob's profile
+```
 
 ## Automatic Key Redirection
 
@@ -269,7 +327,7 @@ Redis cluster-aware clients (using `-c` flag or cluster libraries) automatically
 ```bash
 # Set keys from different nodes
 valkey-cli -c -p 6381 SET test1 "from node 1"
-valkey-cli -c -p 6382 SET test2 "from node 2" 
+valkey-cli -c -p 6382 SET test2 "from node 2"
 valkey-cli -c -p 6383 SET test3 "from node 3"
 
 # Get keys from different nodes (tests redirection)
@@ -278,15 +336,32 @@ valkey-cli -c -p 6382 GET test3  # Should redirect to node 3
 valkey-cli -c -p 6383 GET test1  # Should redirect to node 1
 ```
 
-### Hash Tag Test
+### Distributed Namespace Test
+```bash
+# Hash operations are distributed across nodes based on individual keys
+valkey-cli -c -p 6381 HSET users alice "Alice's data"     # May redirect to node owning hash("alice")
+valkey-cli -c -p 6381 HSET users bob "Bob's data"         # May redirect to node owning hash("bob")
+valkey-cli -c -p 6381 HSET users charlie "Charlie's data" # May redirect to node owning hash("charlie")
+
+# Check which node handles each user
+valkey-cli -c -p 6381 CLUSTER KEYSLOT alice    # Shows slot for alice
+valkey-cli -c -p 6381 CLUSTER KEYSLOT bob      # Shows slot for bob
+valkey-cli -c -p 6381 CLUSTER KEYSLOT charlie  # Shows slot for charlie
+
+# Retrieve data (with automatic redirects)
+valkey-cli -c -p 6382 HGET users alice         # Redirects if needed
+valkey-cli -c -p 6383 HGET users bob           # Redirects if needed
+```
+
+### Hash Tag Co-location Test
 ```bash
 # Keys with same hash tag go to same node
-valkey-cli -c -p 6381 SET "{user:1000}:name" "Alice"
-valkey-cli -c -p 6382 SET "{user:1000}:email" "alice@example.com"
+valkey-cli -c -p 6381 HSET users "{user:1000}:name" "Alice"
+valkey-cli -c -p 6382 HSET users "{user:1000}:email" "alice@example.com"
 
 # Both should be on the same node
-valkey-cli -c -p 6383 GET "{user:1000}:name"
-valkey-cli -c -p 6383 GET "{user:1000}:email"
+valkey-cli -c -p 6383 HGET users "{user:1000}:name"
+valkey-cli -c -p 6383 HGET users "{user:1000}:email"
 ```
 
 ## Networking Requirements
@@ -302,7 +377,7 @@ valkey-cli -c -p 6383 GET "{user:1000}:email"
 ```bash
 # Verify all nodes see each other
 valkey-cli -c -p 6381 CLUSTER NODES
-valkey-cli -c -p 6382 CLUSTER NODES  
+valkey-cli -c -p 6382 CLUSTER NODES
 valkey-cli -c -p 6383 CLUSTER NODES
 
 # All should show the same 3 nodes
@@ -336,7 +411,7 @@ docker-compose logs | grep -i gossip
 ## Current Limitations
 
 1. **No Replication:** Each slot is only stored on one node (no master-slave)
-2. **No Online Resharding:** Slot assignments are configured statically  
+2. **No Online Resharding:** Slot assignments are configured statically
 3. **No Automatic Failover:** Manual intervention required for node failures
 4. **Basic Failure Detection:** Uses gossip protocol timeouts for node failure detection
 
@@ -362,10 +437,15 @@ docker-compose logs | grep -i gossip
 
 1. **Even Slot Distribution:** Distribute slots evenly across nodes for balanced load
 2. **Network Reliability:** Ensure stable, low-latency network between cluster nodes
-3. **Monitoring:** Monitor cluster health using CLUSTER INFO and CLUSTER NODES  
+3. **Monitoring:** Monitor cluster health using CLUSTER INFO and CLUSTER NODES
 4. **Client Configuration:** Use cluster-aware Redis clients for automatic redirection
 5. **Testing:** Test cluster behavior thoroughly before production deployment
 6. **Backup Strategy:** Implement backup procedures for each node independently
+7. **Namespace Design:** Take advantage of distributed namespaces for horizontal scaling:
+   - Use simple hash operations (`HSET users alice data`) for automatic distribution
+   - Use hash tags (`HSET users {user:alice}:profile data`) only when co-location is needed
+   - Avoid single large hashes that would be confined to one node
+8. **Key Naming:** Design key names to distribute load evenly across the hash space
 
 ## Example Production Deployment
 

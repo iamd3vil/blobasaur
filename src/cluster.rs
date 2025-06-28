@@ -9,6 +9,24 @@ use tokio::sync::RwLock;
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
+/// Strategy for distributing namespace operations across cluster nodes
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NamespaceDistributionStrategy {
+    /// Use namespace for slot calculation (legacy behavior - confines namespace to one node)
+    #[allow(dead_code)]
+    NamespaceBased,
+    /// Use key for slot calculation (distributes namespace across nodes)
+    KeyBased,
+    /// Use hash tags when present, fallback to key-based
+    HashTagAware,
+}
+
+impl Default for NamespaceDistributionStrategy {
+    fn default() -> Self {
+        Self::KeyBased
+    }
+}
+
 use crate::config::ClusterConfig;
 
 /// Redis cluster has 16384 hash slots
@@ -39,6 +57,7 @@ pub struct ClusterManager {
     config: ClusterConfig,
     chitchat_handle: Arc<Option<ChitchatHandle>>,
     local_addr: SocketAddr,
+    namespace_strategy: NamespaceDistributionStrategy,
 }
 
 impl ClusterManager {
@@ -167,6 +186,7 @@ impl ClusterManager {
             config: config.clone(),
             chitchat_handle: Arc::new(Some(chitchat_handle)),
             local_addr: redis_addr,
+            namespace_strategy: NamespaceDistributionStrategy::default(),
         };
 
         // Start gossip processing task
@@ -342,19 +362,76 @@ impl ClusterManager {
 
     /// Calculate Redis hash slot for a key
     pub fn calculate_slot(key: &str) -> u16 {
-        // Extract hash tag if present (e.g., "user:{123}:profile" -> "123")
-        let hash_key = if let Some(start) = key.find('{') {
-            if let Some(end) = key[start + 1..].find('}') {
-                let tag = &key[start + 1..start + 1 + end];
-                if !tag.is_empty() { tag } else { key }
-            } else {
+        Self::calculate_slot_with_strategy(key, NamespaceDistributionStrategy::HashTagAware)
+    }
+
+    /// Calculate slot with specific distribution strategy
+    pub fn calculate_slot_with_strategy(key: &str, strategy: NamespaceDistributionStrategy) -> u16 {
+        let hash_key = match strategy {
+            NamespaceDistributionStrategy::NamespaceBased => {
+                // Legacy behavior - use full key
                 key
             }
-        } else {
-            key
+            NamespaceDistributionStrategy::KeyBased => {
+                // Use full key (same as legacy for non-namespace operations)
+                key
+            }
+            NamespaceDistributionStrategy::HashTagAware => {
+                // Extract hash tag if present (e.g., "user:{123}:profile" -> "123")
+                if let Some(start) = key.find('{') {
+                    if let Some(end) = key[start + 1..].find('}') {
+                        let tag = &key[start + 1..start + 1 + end];
+                        if !tag.is_empty() { tag } else { key }
+                    } else {
+                        key
+                    }
+                } else {
+                    key
+                }
+            }
         };
 
         crc16::State::<crc16::XMODEM>::calculate(hash_key.as_bytes()) % REDIS_CLUSTER_SLOTS
+    }
+
+    /// Calculate slot for hash operations (HGET, HSET, etc.)
+    pub fn calculate_slot_for_hash(&self, namespace: &str, key: &str) -> u16 {
+        match self.namespace_strategy {
+            NamespaceDistributionStrategy::NamespaceBased => {
+                // Use namespace as the hash key (legacy behavior)
+                Self::calculate_slot_with_strategy(namespace, self.namespace_strategy)
+            }
+            NamespaceDistributionStrategy::KeyBased => {
+                // Use individual key for distribution
+                Self::calculate_slot_with_strategy(key, self.namespace_strategy)
+            }
+            NamespaceDistributionStrategy::HashTagAware => {
+                // Check if key has hash tag, otherwise use key
+                let combined_key = if key.contains('{') && key.contains('}') {
+                    key
+                } else {
+                    key
+                };
+                Self::calculate_slot_with_strategy(combined_key, self.namespace_strategy)
+            }
+        }
+    }
+
+    /// Check if we should handle a hash operation locally
+    pub async fn should_handle_hash_locally(&self, namespace: &str, key: &str) -> bool {
+        let slot = self.calculate_slot_for_hash(namespace, key);
+        let local_slots = self.local_slots.read().await;
+        local_slots.contains(&slot)
+    }
+
+    /// Get redirect response for a hash operation
+    pub async fn get_hash_redirect_response(&self, namespace: &str, key: &str) -> Option<String> {
+        let slot = self.calculate_slot_for_hash(namespace, key);
+        if let Some(node) = self.get_node_for_slot(slot).await {
+            Some(format!("MOVED {} {}", slot, node.addr))
+        } else {
+            None
+        }
     }
 
     /// Get cluster nodes information for CLUSTER NODES command
@@ -586,6 +663,7 @@ impl Clone for ClusterManager {
             config: self.config.clone(),
             chitchat_handle: Arc::clone(&self.chitchat_handle),
             local_addr: self.local_addr,
+            namespace_strategy: self.namespace_strategy,
         }
     }
 }
@@ -719,6 +797,8 @@ mod tests {
             assert!(local_slots.contains(&0));
             assert!(local_slots.contains(&4));
         }
+
+        // Note: Additional namespace distribution tests are in tests/namespace_distribution_test.rs
     }
 
     #[tokio::test]
