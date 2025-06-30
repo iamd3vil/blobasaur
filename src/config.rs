@@ -1,12 +1,13 @@
 use config::Config;
 use miette::{IntoDiagnostic, Result};
 
+use crate::compression;
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Cfg {
     pub data_dir: String,
     pub num_shards: usize,
-    pub storage_compression: Option<bool>,
-    pub output_compression: Option<bool>,
+    pub storage_compression: Option<CompressionConfig>,
     pub async_write: Option<bool>,
     pub batch_size: Option<usize>,
     pub batch_timeout_ms: Option<u64>,
@@ -34,6 +35,23 @@ pub struct ClusterConfig {
     pub advertise_addr: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, serde::Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum CompressionType {
+    None,
+    Gzip,
+    Zstd,
+    Lz4,
+    Brotli,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CompressionConfig {
+    pub enabled: bool,
+    pub algorithm: CompressionType,
+    pub level: Option<u32>,
+}
+
 impl Cfg {
     pub fn load(cfg_path: &str) -> Result<Self> {
         let settings = Config::builder()
@@ -51,12 +69,8 @@ impl Cfg {
             return Err(miette::miette!("data_dir cannot be empty"));
         }
 
-        if cfg.storage_compression.is_some_and(|v| v) {
-            println!("Storage compression is enabled");
-        }
-
-        if cfg.output_compression.is_some_and(|v| v) {
-            println!("Output compression is enabled");
+        if let Some(ref comp) = cfg.storage_compression {
+            compression::validate_config(comp)?;
         }
 
         if cfg.async_write.is_some_and(|v| v) {
@@ -81,5 +95,12 @@ impl Cfg {
         println!("Number of shards: {}", cfg.num_shards);
 
         Ok(cfg)
+    }
+
+    pub fn is_compression(&self) -> bool {
+        match &self.storage_compression {
+            Some(comp) if comp.enabled => true,
+            _ => false,
+        }
     }
 }
