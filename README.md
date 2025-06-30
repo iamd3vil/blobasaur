@@ -24,7 +24,7 @@ Blobnom is a high-performance, sharded blob storage server written in Rust. It i
 - **Configurable:**
   - Number of shards.
   - Data directory for storing SQLite files.
-  - Optional storage compression (not yet implemented but planned via config).
+  - **Storage Compression:** Configurable compression for data at rest with support for multiple algorithms (Gzip, Zstd, Lz4, Brotli).
   - Optional output compression (not yet implemented but planned via config).
   - Asynchronous write mode for improved response times.
   - Write batching for improved database throughput.
@@ -57,8 +57,12 @@ Blobnom is a high-performance, sharded blob storage server written in Rust. It i
     ```toml
     data_dir = "blob_data"
     num_shards = 4
-    # storage_compression = false # Optional
-    # output_compression = false  # Optional
+    
+    # Optional: Enable compression for stored data
+    # [storage_compression]
+    # enabled = true
+    # algorithm = "zstd"
+    # level = 3
     ```
 
 3.  **Build:**
@@ -114,22 +118,53 @@ Key configuration options:
 
 - `data_dir` (String, required): The directory where SQLite database files for each shard will be stored.
 - `num_shards` (usize, required): The number of shards to distribute data across. Must be greater than 0.
-- `storage_compression` (bool, optional): If `true`, enables compression for data at rest. (Default: `false` if not specified)
+- `storage_compression` (object, optional): Configuration for compressing data at rest. When omitted, no compression is applied. See compression configuration below.
 - `output_compression` (bool, optional): If `true`, enables compression for HTTP responses. (Default: `false` if not specified)
 - `async_write` (bool, optional): If `true`, enables asynchronous write operations where the server responds immediately after queueing the operation instead of waiting for database completion. Uses an inflight cache to prevent race conditions where GET requests might not find recently SET data. (Default: `false` if not specified)
 - `batch_size` (usize, optional): Maximum number of operations to batch together in a single database transaction. Set to 1 to disable batching. Higher values improve throughput but increase latency. (Default: `1`)
 - `batch_timeout_ms` (u64, optional): Maximum time in milliseconds to wait for additional operations before processing a batch. Only relevant when `batch_size > 1`. (Default: `0`)
+
+### Storage Compression Configuration
+
+The `storage_compression` section supports the following options:
+
+- `enabled` (bool, required): Whether to enable compression for stored data
+- `algorithm` (string, required): Compression algorithm to use. Options: `"none"`, `"gzip"`, `"zstd"`, `"lz4"`, `"brotli"`
+- `level` (u32, optional): Compression level (algorithm-specific). Higher values typically mean better compression but slower performance
 
 Example `config.toml`:
 
 ```toml
 data_dir = "/var/data/blobnom"
 num_shards = 8
-storage_compression = true
-output_compression = false
 async_write = true
 batch_size = 50
 batch_timeout_ms = 10
+
+[storage_compression]
+enabled = true
+algorithm = "zstd"
+level = 3
+```
+
+Alternative compression configurations:
+```toml
+# High compression for storage-constrained environments
+[storage_compression]
+enabled = true
+algorithm = "brotli"
+level = 9
+
+# Fast compression for performance-critical applications
+[storage_compression]
+enabled = true
+algorithm = "lz4"
+level = 1
+
+# No compression (default behavior)
+[storage_compression]
+enabled = false
+algorithm = "none"
 ```
 
 ## Redis Commands
@@ -309,6 +344,22 @@ HGET metrics:daily:2024-01-01 page_views
 
 ## Performance Features
 
+### Storage Compression
+
+Blobnom supports configurable compression for data stored in SQLite databases:
+
+- **Algorithms**: Gzip, Zstd, Lz4, Brotli, or None
+- **Benefits**: Reduced storage space, potentially lower I/O for large blobs
+- **Tradeoffs**: CPU overhead for compression/decompression operations
+- **Configuration**: Set compression algorithm and level based on your performance vs. storage requirements
+
+**Compression Algorithm Characteristics:**
+- **Zstd**: Best balance of compression ratio and speed (recommended for most use cases)
+- **Lz4**: Fastest compression/decompression, moderate compression ratio
+- **Gzip**: Good compression ratio, moderate speed
+- **Brotli**: Best compression ratio, slower speed
+- **None**: No compression overhead, maximum storage usage
+
 ### Write Batching
 
 Blobnom supports batching multiple write operations into single database transactions for improved throughput:
@@ -334,12 +385,33 @@ For high-throughput write workloads:
 async_write = true
 batch_size = 50
 batch_timeout_ms = 10
+
+[storage_compression]
+enabled = true
+algorithm = "lz4"
+level = 1
+```
+
+For storage-optimized workloads:
+```toml
+async_write = false
+batch_size = 10
+batch_timeout_ms = 5
+
+[storage_compression]
+enabled = true
+algorithm = "zstd"
+level = 6
 ```
 
 For low-latency, consistency-focused workloads:
 ```toml
 async_write = false
 batch_size = 1
+
+[storage_compression]
+enabled = false
+algorithm = "none"
 ```
 
 ## Race Condition Handling
@@ -500,7 +572,7 @@ For detailed setup instructions, see [CLUSTERING.md](CLUSTERING.md).
 - Full chitchat gossip protocol integration
 - Master-slave replication for high availability
 - Online slot migration and rebalancing
-- Implement actual data compression for `storage_compression` and `output_compression`.
+- Implement output compression for HTTP responses (`output_compression`).
 - Add more robust error handling and logging.
 - Implement authentication and authorization.
 - Add metrics and monitoring.
