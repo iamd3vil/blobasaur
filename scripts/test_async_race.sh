@@ -1,11 +1,11 @@
 #!/bin/bash
 
-# Test script to demonstrate async write race condition prevention in Blobnom
+# Test script to demonstrate async write race condition prevention in Blobasaur
 # This script shows how the inflight cache prevents race conditions when async_write=true
 
 set -e
 
-echo "=== Blobnom Async Write Race Condition Test ==="
+echo "=== Blobasaur Async Write Race Condition Test ==="
 echo
 
 # Configuration
@@ -44,15 +44,15 @@ cat $CONFIG_FILE
 echo
 
 # Build the project if needed
-if [ ! -f "target/release/blobnom" ]; then
-    echo "Building Blobnom in release mode..."
+if [ ! -f "target/release/blobasaur" ]; then
+    echo "Building Blobasaur in release mode..."
     cargo build --release
     echo
 fi
 
 # Start the server in the background
-echo "Starting Blobnom server with async writes enabled..."
-./target/release/blobnom &
+echo "Starting Blobasaur server with async writes enabled..."
+./target/release/blobasaur &
 SERVER_PID=$!
 
 # Wait for server to start
@@ -87,7 +87,7 @@ echo "Testing server connectivity..."
 # Test basic connectivity
 if ! test_redis_command "PING" "PONG"; then
     echo "❌ Server is not responding. Check if it started correctly."
-    ps aux | grep blobnom | grep -v grep || echo "No blobnom process found"
+    ps aux | grep blobasaur | grep -v grep || echo "No blobasaur process found"
     exit 1
 fi
 

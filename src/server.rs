@@ -16,12 +16,12 @@ pub async fn run_redis_server(
     addr: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
-    tracing::info!("Blobnom server listening on {}", addr);
+    tracing::info!("Blobasaur server listening on {}", addr);
 
     loop {
         let (stream, addr) = listener.accept().await?;
         tracing::info!("Accepted new connection from {}", addr);
-        tracing::debug!("New Blobnom connection from {}", addr);
+        tracing::debug!("New Blobasaur connection from {}", addr);
 
         let state_clone = state.clone();
         tokio::spawn(async move {
@@ -506,7 +506,7 @@ async fn handle_info(
         Some("server") | None => {
             format!(
                 "# Server\r\n\
-                 redis_version:blobnom-0.1.0\r\n\
+                 redis_version:blobasaur-0.1.0\r\n\
                  redis_mode:standalone\r\n\
                  process_id:{}\r\n\
                  tcp_port:6379\r\n\
@@ -515,7 +515,7 @@ async fn handle_info(
                  # Keyspace\r\n\
                  db0:keys=unknown,expires=0,avg_ttl=0\r\n\
                  \r\n\
-                 # Blobnom\r\n\
+                 # Blobasaur\r\n\
                  shards:{}\r\n\
                  data_dir:{}\r\n\
                  async_write:{}\r\n\

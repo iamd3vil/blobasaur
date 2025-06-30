@@ -1,10 +1,16 @@
 [package]
-name = "blobnom"
+name = "blobasaur"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-async-compression = { version = "0.4.9", features = ["tokio", "gzip", "brotli", "zstd", "lz4"] }
+async-compression = { version = "0.4.9", features = [
+    "tokio",
+    "gzip",
+    "brotli",
+    "zstd",
+    "lz4",
+] }
 async-trait = "0.1.88"
 bytes = "1.5"
 chitchat = "0.9"

@@ -1,7 +1,7 @@
 services:
   node1:
     image: rust:1.87
-    container_name: blobnom-node1
+    container_name: blobasaur-node1
     # ports:
     #   - "6381:6379"
     #   - "7001:7000"
@@ -13,7 +13,7 @@ services:
     network_mode: host
     working_dir: /workspace
     environment:
-      - RUST_LOG=info,blobnom::cluster=debug
+      - RUST_LOG=info,blobasaur::cluster=debug
     command: >
       bash -c "
         echo 'Node1 Starting...';
@@ -21,20 +21,20 @@ services:
         echo 'Network interfaces:';
         ip addr show;
         echo 'Checking binary compatibility...';
-        if [ ! -f target/release/blobnom ] || ! file target/release/blobnom | grep -q 'ELF 64-bit LSB pie executable, x86-64'; then
-          echo 'Building blobnom for container architecture...';
+        if [ ! -f target/release/blobasaur ] || ! file target/release/blobasaur | grep -q 'ELF 64-bit LSB pie executable, x86-64'; then
+          echo 'Building blobasaur for container architecture...';
           cargo build --release;
         else
           echo 'Using existing compatible binary...';
         fi;
         mkdir -p /app/data;
-        echo 'Starting blobnom node1...';
-        exec ./target/release/blobnom --config /app/config.toml
+        echo 'Starting blobasaur node1...';
+        exec ./target/release/blobasaur --config /app/config.toml
       "
 
   node2:
     image: rust:1.87
-    container_name: blobnom-node2
+    container_name: blobasaur-node2
     # ports:
     #   - "6382:6379"
     #   - "7002:7000"
@@ -46,7 +46,7 @@ services:
     network_mode: host
     working_dir: /workspace
     environment:
-      - RUST_LOG=info,blobnom::cluster=debug
+      - RUST_LOG=info,blobasaur::cluster=debug
     command: >
       bash -c "
         echo 'Node2 Starting...';
@@ -54,20 +54,20 @@ services:
         echo 'Network interfaces:';
         ip addr show;
         echo 'Checking binary compatibility...';
-        if [ ! -f target/release/blobnom ] || ! file target/release/blobnom | grep -q 'ELF 64-bit LSB pie executable, x86-64'; then
-          echo 'Building blobnom for container architecture...';
+        if [ ! -f target/release/blobasaur ] || ! file target/release/blobasaur | grep -q 'ELF 64-bit LSB pie executable, x86-64'; then
+          echo 'Building blobasaur for container architecture...';
           cargo build --release;
         else
           echo 'Using existing compatible binary...';
         fi;
         mkdir -p /app/data;
-        echo 'Starting blobnom node2...';
-        exec ./target/release/blobnom --config /app/config.toml
+        echo 'Starting blobasaur node2...';
+        exec ./target/release/blobasaur --config /app/config.toml
       "
 
   node3:
     image: rust:1.87
-    container_name: blobnom-node3
+    container_name: blobasaur-node3
     # ports:
     #   - "6383:6379"
     #   - "7003:7000"
@@ -79,7 +79,7 @@ services:
     network_mode: host
     working_dir: /workspace
     environment:
-      - RUST_LOG=info,blobnom::cluster=debug
+      - RUST_LOG=info,blobasaur::cluster=debug
     command: >
       bash -c "
         echo 'Node3 Starting...';
@@ -87,19 +87,19 @@ services:
         echo 'Network interfaces:';
         ip addr show;
         echo 'Checking binary compatibility...';
-        if [ ! -f target/release/blobnom ] || ! file target/release/blobnom | grep -q 'ELF 64-bit LSB pie executable, x86-64'; then
-          echo 'Building blobnom for container architecture...';
+        if [ ! -f target/release/blobasaur ] || ! file target/release/blobasaur | grep -q 'ELF 64-bit LSB pie executable, x86-64'; then
+          echo 'Building blobasaur for container architecture...';
           cargo build --release;
         else
           echo 'Using existing compatible binary...';
         fi;
         mkdir -p /app/data;
-        echo 'Starting blobnom node3...';
-        exec ./target/release/blobnom --config /app/config.toml
+        echo 'Starting blobasaur node3...';
+        exec ./target/release/blobasaur --config /app/config.toml
       "
 
 # networks:
-#   blobnom-cluster:
+#   blobasaur-cluster:
 #     driver: bridge
 
 volumes:

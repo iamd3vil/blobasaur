@@ -1,10 +1,10 @@
 # Clustering Guide
 
-This document explains how to set up and use Blobnom's Redis cluster-compatible clustering functionality.
+This document explains how to set up and use Blobasaur's Redis cluster-compatible clustering functionality.
 
 ## Overview
 
-Blobnom implements Redis cluster protocol compatibility, allowing Redis cluster-aware clients to connect and perform operations. The clustering system uses hash slots (16384 total) to distribute data across nodes, just like Redis Cluster, with automatic node discovery and gossip protocol communication.
+Blobasaur implements Redis cluster protocol compatibility, allowing Redis cluster-aware clients to connect and perform operations. The clustering system uses hash slots (16384 total) to distribute data across nodes, just like Redis Cluster, with automatic node discovery and gossip protocol communication.
 
 ## Implementation Status
 
@@ -27,7 +27,7 @@ Blobnom implements Redis cluster protocol compatibility, allowing Redis cluster-
 
 ### Slot Range Configuration
 
-Blobnom uses slot ranges for efficient slot assignment. The total 16384 hash slots are distributed across nodes using range specifications.
+Blobasaur uses slot ranges for efficient slot assignment. The total 16384 hash slots are distributed across nodes using range specifications.
 
 ### Multi-Node Setup Example
 
@@ -114,9 +114,9 @@ start = 10923
 end = 16383
 ```
 
-## Port Configuration
+### Port Configuration
 
-Blobnom uses two types of ports:
+Blobasaur uses two types of ports:
 
 - **Redis Protocol Port (`addr`)**: Where clients connect for Redis operations (6381, 6382, 6383)
 - **Gossip Port (`port`)**: For inter-node communication and cluster discovery (7001, 7002, 7003)
@@ -129,13 +129,13 @@ Blobnom uses two types of ports:
 1. Start each node with its configuration:
 ```bash
 # On node 1
-./blobnom --config config.node1.toml
+./blobasaur --config config.node1.toml
 
 # On node 2
-./blobnom --config config.node2.toml
+./blobasaur --config config.node2.toml
 
 # On node 3
-./blobnom --config config.node3.toml
+./blobasaur --config config.node3.toml
 ```
 
 ### Docker Setup
@@ -241,7 +241,7 @@ const value = await cluster.get('mykey');
 
 ## Hash Slot Calculation
 
-Blobnom uses the same hash slot calculation as Redis:
+Blobasaur uses the same hash slot calculation as Redis:
 
 1. Extract the "hash tag" from the key (text between `{` and `}`)
 2. If no hash tag exists, use the entire key
@@ -268,12 +268,13 @@ HSET users charlie "Charlie's data" # Slot = hash("users") → Node A
 ```
 
 This creates a scaling bottleneck where popular namespaces become single-node hotspots.
+**The Problem**: Traditional hash operations in Redis distribute data based on the hash key (namespace), which means all keys in a namespace go to the same slot. This creates an uneven distribution when namespaces have vastly different key counts.
 
-### Blobnom's Solution: Key-Based Distribution
+### Blobasaur's Solution: Key-Based Distribution
 
-Blobnom solves this by using the **individual key** (not the namespace) for slot calculation in hash operations:
+Blobasaur solves this by using the **individual key** (not the namespace) for slot calculation in hash operations:
 
-**Distributed Example (Blobnom Approach):**
+**Distributed Example (Blobasaur Approach):**
 ```bash
 # These operations are distributed across different nodes
 HSET users alice "Alice's data"     # Slot = hash("alice") → Node A
@@ -313,7 +314,7 @@ HSET users {user:bob}:settings "settings data"   # Same node as Bob's profile
 
 ## Automatic Key Redirection
 
-When a client requests a key that doesn't belong to the current node, Blobnom responds with a MOVED error:
+When a client requests a key that doesn't belong to the current node, Blobasaur responds with a MOVED error:
 
 ```
 -MOVED 3999 127.0.0.1:6382

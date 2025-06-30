@@ -7,7 +7,7 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-echo -e "${BLUE}=== Blobnom Cluster Test Script ===${NC}"
+echo -e "${BLUE}=== Blobasaur Cluster Test Script ===${NC}"
 
 # Function to test a node
 test_node() {
@@ -117,9 +117,9 @@ echo -e "\n${BLUE}=== Test Complete ===${NC}"
 if ! check_cluster_health > /dev/null 2>&1; then
     echo -e "\n${YELLOW}Cluster appears unhealthy. Showing recent logs...${NC}"
     echo -e "${BLUE}--- Node 1 logs ---${NC}"
-    docker logs --tail 20 blobnom-node1 2>/dev/null || echo "Could not get node1 logs"
+    docker logs --tail 20 blobasaur-node1 2>/dev/null || echo "Could not get node1 logs"
     echo -e "${BLUE}--- Node 2 logs ---${NC}"
-    docker logs --tail 20 blobnom-node2 2>/dev/null || echo "Could not get node2 logs"
+    docker logs --tail 20 blobasaur-node2 2>/dev/null || echo "Could not get node2 logs"
     echo -e "${BLUE}--- Node 3 logs ---${NC}"
-    docker logs --tail 20 blobnom-node3 2>/dev/null || echo "Could not get node3 logs"
+    docker logs --tail 20 blobasaur-node3 2>/dev/null || echo "Could not get node3 logs"
 fi

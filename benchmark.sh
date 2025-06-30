@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Blobnom Benchmarking Suite
-# This script benchmarks the Blobnom server using multiple tools and approaches
+# Blobasaur Benchmarking Suite
+# This script benchmarks the Blobasaur server using multiple tools and approaches
 
 set -e
 
@@ -38,7 +38,7 @@ log_error() {
 
 # Check if server is running
 check_server() {
-    log_info "Checking if Blobnom server is running on $HOST:$PORT..."
+    log_info "Checking if Blobasaur server is running on $HOST:$PORT..."
     if ! nc -z $HOST $PORT 2>/dev/null; then
         log_error "Server is not running on $HOST:$PORT"
         log_info "Please start the server with: cargo run --release"
@@ -185,7 +185,7 @@ show_system_info() {
 main() {
     echo -e "${GREEN}"
     echo "╔══════════════════════════════════════╗"
-    echo "║        Blobnom Benchmark Suite       ║"
+    echo "║       Blobasaur Benchmark Suite      ║"
     echo "╚══════════════════════════════════════╝"
     echo -e "${NC}"
 

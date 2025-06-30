@@ -114,7 +114,7 @@ impl ClusterManager {
 
         let chitchat_config = ChitchatConfig {
             chitchat_id: chitchat_id.clone(),
-            cluster_id: "blobnom-cluster".to_string(),
+            cluster_id: "blobasaur-cluster".to_string(),
             gossip_interval: Duration::from_millis(config.gossip_interval_ms.unwrap_or(1000)),
             listen_addr: gossip_addr,
             seed_nodes: config.seeds.clone(),

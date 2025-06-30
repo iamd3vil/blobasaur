@@ -1,6 +1,6 @@
-# Blobnom Cluster Development Setup
+# Blobasaur Cluster Development Setup
 
-This directory contains Docker Compose configuration for running a 3-node Blobnom cluster locally for development and testing.
+This directory contains Docker Compose configuration for running a 3-node Blobasaur cluster locally for development and testing.
 
 ## Quick Start
 
@@ -121,14 +121,14 @@ const value = await cluster.get('test:key');
 
 ### Check if nodes are running
 ```bash
-docker ps | grep blobnom
+docker ps | grep blobasaur
 ```
 
 ### View logs for specific node
 ```bash
-docker logs blobnom-node1
-docker logs blobnom-node2
-docker logs blobnom-node3
+docker logs blobasaur-node1
+docker logs blobasaur-node2
+docker logs blobasaur-node3
 ```
 
 ### Verify cluster connectivity
@@ -168,7 +168,7 @@ just cluster-up
 dev/
 ├── README.md              # This file
 ├── docker-compose.yml     # Docker Compose configuration
-├── Dockerfile            # Blobnom container image
+├── Dockerfile            # Blobasaur container image
 ├── config.node1.toml     # Node 1 configuration
 ├── config.node2.toml     # Node 2 configuration
 └── config.node3.toml     # Node 3 configuration

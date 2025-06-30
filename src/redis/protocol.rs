@@ -4,7 +4,7 @@ use redis_protocol::resp2::{decode::decode_bytes_mut, encode::extend_encode, typ
 /// Redis protocol data types (re-export from redis-protocol crate)
 pub type RespValue = BytesFrame;
 
-/// Commands supported by Blobnom
+/// Commands supported by Blobasaur
 #[derive(Debug, Clone, PartialEq)]
 pub enum RedisCommand {
     Get {

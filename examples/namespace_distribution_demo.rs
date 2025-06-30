@@ -1,4 +1,4 @@
-//! Demonstration of Blobnom's distributed namespace functionality
+//! Demonstration of Blobasaur's distributed namespace functionality
 //!
 //! This example shows how namespace operations are distributed across cluster nodes
 //! using key-based slot calculation instead of namespace-based calculation.
@@ -98,7 +98,7 @@ fn simulate_cluster_nodes() -> HashMap<u16, String> {
 }
 
 fn main() {
-    println!("🚀 Blobnom Distributed Namespace Demonstration");
+    println!("🚀 Blobasaur Distributed Namespace Demonstration");
     println!("==============================================\n");
 
     let cluster_nodes = simulate_cluster_nodes();

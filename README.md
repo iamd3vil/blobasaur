@@ -4,9 +4,9 @@
   </a>
 </div>
 
-# Blobnom
+# Blobasaur
 
-Blobnom is a high-performance, sharded blob storage server written in Rust. It implements the Redis protocol for client compatibility and uses SQLite as the backend for each shard, providing a simple yet robust solution for storing and retrieving binary large objects (blobs).
+Blobasaur is a high-performance, sharded blob storage server written in Rust. It implements the Redis protocol for client compatibility and uses SQLite as the backend for each shard, providing a simple yet robust solution for storing and retrieving binary large objects (blobs).
 
 ## Features
 
@@ -108,11 +108,11 @@ The `Justfile` includes targets for cross-compiling, for example, to a static Li
 just build-linux
 ```
 
-This will produce a binary in `target/x86_64-unknown-linux-musl/release/blobnom`.
+This will produce a binary in `target/x86_64-unknown-linux-musl/release/blobasaur`.
 
 ## Configuration
 
-Blobnom is configured via a `config.toml` file located in the project root.
+Blobasaur is configured via a `config.toml` file located in the project root.
 
 Key configuration options:
 
@@ -135,7 +135,7 @@ The `storage_compression` section supports the following options:
 Example `config.toml`:
 
 ```toml
-data_dir = "/var/data/blobnom"
+data_dir = "/var/data/blobasaur"
 num_shards = 8
 async_write = true
 batch_size = 50
@@ -169,7 +169,7 @@ algorithm = "none"
 
 ## Redis Commands
 
-Blobnom implements a subset of Redis commands for blob operations:
+Blobasaur implements a subset of Redis commands for blob operations:
 
 ### Basic Commands
 
@@ -213,7 +213,7 @@ Blobnom implements a subset of Redis commands for blob operations:
 
 ### Namespaced Commands
 
-Blobnom supports Redis-style hash operations for namespacing data. Each namespace creates its own isolated table, allowing you to organize your data into logical groups.
+Blobasaur supports Redis-style hash operations for namespacing data. Each namespace creates its own isolated table, allowing you to organize your data into logical groups.
 
 - ### `HSET namespace key value`
 
@@ -261,7 +261,7 @@ Blobnom supports Redis-style hash operations for namespacing data. Each namespac
 
 ### Using Redis Clients
 
-You can use any Redis client to interact with Blobnom:
+You can use any Redis client to interact with Blobasaur:
 
 ```bash
 # Using redis-cli - Basic operations
@@ -346,7 +346,7 @@ HGET metrics:daily:2024-01-01 page_views
 
 ### Storage Compression
 
-Blobnom supports configurable compression for data stored in SQLite databases:
+Blobasaur supports configurable compression for data stored in SQLite databases:
 
 - **Algorithms**: Gzip, Zstd, Lz4, Brotli, or None
 - **Benefits**: Reduced storage space, potentially lower I/O for large blobs
@@ -362,7 +362,7 @@ Blobnom supports configurable compression for data stored in SQLite databases:
 
 ### Write Batching
 
-Blobnom supports batching multiple write operations into single database transactions for improved throughput:
+Blobasaur supports batching multiple write operations into single database transactions for improved throughput:
 
 - **Benefits**: 2-10x write throughput improvement for high-volume workloads
 - **Configuration**: Set `batch_size > 1` to enable batching
@@ -416,7 +416,7 @@ algorithm = "none"
 
 ## Race Condition Handling
 
-In async write mode (`async_write = true`), Blobnom uses an inflight cache to prevent race conditions:
+In async write mode (`async_write = true`), Blobasaur uses an inflight cache to prevent race conditions:
 
 ### The Problem
 ```bash
@@ -498,7 +498,7 @@ This allows for gradual migration to namespaced storage without breaking existin
 
 ## Testing
 
-Blobnom includes comprehensive test coverage:
+Blobasaur includes comprehensive test coverage:
 
 - **Unit Tests**: 25 tests covering RESP protocol parsing, serialization, and command validation
 - **Integration Tests**: 19 tests covering command handling, binary data, and protocol compliance
@@ -517,7 +517,7 @@ cargo test redis::integration   # Integration tests
 
 ## Redis Cluster Compatibility
 
-Blobnom implements full Redis cluster protocol compatibility with automatic node discovery via gossip protocol. This allows Redis cluster-aware clients to seamlessly connect and perform operations across a distributed cluster of nodes.
+Blobasaur implements full Redis cluster protocol compatibility with automatic node discovery via gossip protocol. This allows Redis cluster-aware clients to seamlessly connect and perform operations across a distributed cluster of nodes.
 
 ### Key Features
 

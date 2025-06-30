@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-COPY --from=builder /usr/src/app/target/release/blobnom /usr/local/bin/blobnom
+COPY --from=builder /usr/src/app/target/release/blobasaur /usr/local/bin/blobasaur
 
 # Create data directory
 RUN mkdir -p /app/data
@@ -20,4 +20,4 @@ RUN mkdir -p /app/data
 # Expose Redis protocol port and gossip port
 EXPOSE 6379 7000
 
-CMD ["blobnom"]
+CMD ["blobasaur"]
