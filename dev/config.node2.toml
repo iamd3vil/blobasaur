@@ -1,14 +1,18 @@
 # Blobnom Cluster Node 2 Configuration
 
 # Basic server configuration
-data_dir = "data"
+data_dir = "/app/data"
 num_shards = 4
-storage_compression = true
-output_compression = false
 async_write = true
 batch_size = 100
 batch_timeout_ms = 10
 addr = "0.0.0.0:6382"
+
+# Storage compression
+[storage_compression]
+enabled = true
+algorithm = "zstd" # Options: gzip, zstd, lz4, brotli
+level = 3
 
 # Cluster configuration
 [cluster]

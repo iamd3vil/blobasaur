@@ -11,12 +11,6 @@ num_shards = 4
 # Server address and port (optional, defaults to 0.0.0.0:6379)
 addr = "0.0.0.0:6379"
 
-# Storage compression
-[storage_compression]
-enabled = true
-algorithm = "zstd"  # Options: none, gzip, zstd, lz4, snappy, brotli
-level = 3  
-
 # Asynchronous write mode (optional, defaults to false)
 # When enabled, SET/HSET/DEL/HDEL operations return immediately after queueing
 # instead of waiting for database completion. This provides better response times
@@ -50,3 +44,9 @@ batch_timeout_ms = 10
 # async_write = false
 # batch_size = 25
 # batch_timeout_ms = 10
+
+# Storage compression
+[storage_compression]
+enabled = true
+algorithm = "zstd" # Options: gzip, zstd, lz4, brotli
+level = 3
