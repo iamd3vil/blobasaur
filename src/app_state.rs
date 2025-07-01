@@ -99,6 +99,14 @@ impl AppState {
             .execute(pool)
             .await
             .unwrap_or_else(|e| panic!("Failed to create table in shard {} DB: {}", i, e));
+
+            // Create index on expires_at for efficient expiry queries
+            sqlx::query(
+                "CREATE INDEX IF NOT EXISTS idx_expires_at ON blobs(expires_at) WHERE expires_at IS NOT NULL",
+            )
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to create expires_at index in shard {} DB: {}", i, e));
         }
 
         // Create caches for inflight operations

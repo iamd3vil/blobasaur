@@ -475,9 +475,31 @@ async fn ensure_namespaced_table_exists(
 
     match sqlx::query(&create_query).execute(&mut **tx).await {
         Ok(_) => {
-            known_tables.insert(table_name.to_string());
-            tracing::info!("Created namespaced table: {}", table_name);
-            Ok(())
+            // Create index on expires_at for efficient expiry queries
+            let index_query = format!(
+                "CREATE INDEX IF NOT EXISTS idx_{}_expires_at ON {}(expires_at) WHERE expires_at IS NOT NULL",
+                table_name.replace("blobs_", ""),
+                table_name
+            );
+
+            match sqlx::query(&index_query).execute(&mut **tx).await {
+                Ok(_) => {
+                    known_tables.insert(table_name.to_string());
+                    tracing::info!(
+                        "Created namespaced table and expires_at index: {}",
+                        table_name
+                    );
+                    Ok(())
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to create expires_at index for table {}: {}",
+                        table_name,
+                        e
+                    );
+                    Err(format!("Failed to create index: {}", e))
+                }
+            }
         }
         Err(e) => {
             tracing::error!("Failed to create namespaced table {}: {}", table_name, e);
