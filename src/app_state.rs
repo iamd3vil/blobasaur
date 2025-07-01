@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 use crate::compression::{self, Compressor};
 // Import ShardWriteOperation from shard_manager
 use crate::{cluster::ClusterManager, config::Cfg, shard_manager::ShardWriteOperation};
+use bytes::Bytes;
 
 pub struct AppState {
     pub cfg: Cfg,
@@ -20,11 +21,11 @@ pub struct AppState {
     /// database write happens asynchronously. This cache stores the key-value pairs
     /// for pending writes so that GET requests can return the correct data even
     /// before the write completes, preventing race conditions.
-    pub inflight_cache: Cache<String, Vec<u8>>,
+    pub inflight_cache: Cache<String, Bytes>,
     /// Cache for inflight namespaced write operations (namespace:key -> data).
     /// Same as inflight_cache but for HSET/HGET operations. The key format is
     /// "namespace:key" to avoid collisions between namespaces.
-    pub inflight_hcache: Cache<String, Vec<u8>>,
+    pub inflight_hcache: Cache<String, Bytes>,
     /// Cluster manager for Redis cluster protocol
     pub cluster_manager: Option<ClusterManager>,
     pub compressor: Option<Box<dyn Compressor>>,

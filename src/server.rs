@@ -231,26 +231,26 @@ async fn handle_redis_command(
 
 async fn compress_if_enabled(
     state: &Arc<AppState>,
-    data: &[u8],
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    data: Bytes,
+) -> Result<Bytes, Box<dyn std::error::Error>> {
     if state.cfg.is_compression() {
         if let Some(compressor) = &state.compressor {
-            return Ok(compressor.compress(data).await?);
+            return Ok(compressor.compress(&data).await?.into());
         }
     }
-    Ok(data.to_vec())
+    Ok(data)
 }
 
 async fn decompress_if_enabled(
     state: &Arc<AppState>,
-    data: &[u8],
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    data: Bytes,
+) -> Result<Bytes, Box<dyn std::error::Error>> {
     if state.cfg.is_compression() {
         if let Some(compressor) = &state.compressor {
-            return Ok(compressor.decompress(data).await?);
+            return Ok(compressor.decompress(&data).await?.into());
         }
     }
-    Ok(data.to_vec())
+    Ok(data)
 }
 
 async fn handle_get(
@@ -261,7 +261,7 @@ async fn handle_get(
     // First check inflight cache for pending writes
     if let Some(data) = state.inflight_cache.get(&key).await {
         // Decompress if needed
-        let data = decompress_if_enabled(state, &data).await?;
+        let data = decompress_if_enabled(state, data).await?;
 
         let response = BytesFrame::BulkString(data.into());
         stream.write_all(&serialize_frame(&response)).await?;
@@ -281,7 +281,7 @@ async fn handle_get(
     {
         Ok(Some(row)) => {
             // Decompress if needed
-            let data = decompress_if_enabled(state, &row.0).await?;
+            let data = decompress_if_enabled(state, row.0.into()).await?;
 
             let response = BytesFrame::BulkString(data.into());
             stream.write_all(&serialize_frame(&response)).await?;
@@ -292,7 +292,7 @@ async fn handle_get(
         }
         Err(e) => {
             tracing::error!("Failed to GET key {}: {}", key, e);
-            let response = BytesFrame::Error("ERR database error".into());
+            let response = BytesFrame::Error("ERR database error ".into());
             stream.write_all(&serialize_frame(&response)).await?;
         }
     }
@@ -309,7 +309,7 @@ async fn handle_set(
     let shard_index = state.get_shard(&key);
     let sender = &state.shard_senders[shard_index];
 
-    let value = compress_if_enabled(state, &value).await?;
+    let value = compress_if_enabled(state, value).await?;
 
     // Check if async_write is enabled
     if state.cfg.async_write.unwrap_or(false) {
@@ -327,7 +327,7 @@ async fn handle_set(
                 "Failed to send ASYNC SET operation to shard {}",
                 shard_index
             );
-            let response = BytesFrame::Error("ERR internal error".into());
+            let response = BytesFrame::Error("ERR internal error ".into());
             stream.write_all(&serialize_frame(&response)).await?;
         } else {
             let response = BytesFrame::SimpleString("OK".into());
@@ -345,7 +345,7 @@ async fn handle_set(
 
         if sender.send(operation).await.is_err() {
             tracing::error!("Failed to send SET operation to shard {}", shard_index);
-            let response = BytesFrame::Error("ERR internal error".into());
+            let response = BytesFrame::Error("ERR internal error ".into());
             stream.write_all(&serialize_frame(&response)).await?;
         } else {
             match responder_rx.await {
@@ -355,12 +355,12 @@ async fn handle_set(
                 }
                 Ok(Err(e)) => {
                     tracing::error!("Shard writer failed for SET: {}", e);
-                    let response = BytesFrame::Error("ERR database error".into());
+                    let response = BytesFrame::Error("ERR database error ".into());
                     stream.write_all(&serialize_frame(&response)).await?;
                 }
                 Err(_) => {
-                    tracing::error!("Shard writer task cancelled or panicked for SET");
-                    let response = BytesFrame::Error("ERR internal error".into());
+                    tracing::error!("Shard writer task cancelled or panicked for SET ");
+                    let response = BytesFrame::Error("ERR internal error ".into());
                     stream.write_all(&serialize_frame(&response)).await?;
                 }
             }
@@ -408,7 +408,7 @@ async fn handle_del(
                 "Failed to send ASYNC DELETE operation to shard {}",
                 shard_index
             );
-            let response = BytesFrame::Error("ERR internal error".into());
+            let response = BytesFrame::Error("ERR internal error ".into());
             stream.write_all(&serialize_frame(&response)).await?;
         } else {
             // Assume success for async mode
@@ -426,7 +426,7 @@ async fn handle_del(
 
         if sender.send(operation).await.is_err() {
             tracing::error!("Failed to send DELETE operation to shard {}", shard_index);
-            let response = BytesFrame::Error("ERR internal error".into());
+            let response = BytesFrame::Error("ERR internal error ".into());
             stream.write_all(&serialize_frame(&response)).await?;
         } else {
             match responder_rx.await {
@@ -436,12 +436,12 @@ async fn handle_del(
                 }
                 Ok(Err(e)) => {
                     tracing::error!("Shard writer failed for DELETE: {}", e);
-                    let response = BytesFrame::Error("ERR database error".into());
+                    let response = BytesFrame::Error("ERR database error ".into());
                     stream.write_all(&serialize_frame(&response)).await?;
                 }
                 Err(_) => {
-                    tracing::error!("Shard writer task cancelled or panicked for DELETE");
-                    let response = BytesFrame::Error("ERR internal error".into());
+                    tracing::error!("Shard writer task cancelled or panicked for DELETE ");
+                    let response = BytesFrame::Error("ERR internal error ".into());
                     stream.write_all(&serialize_frame(&response)).await?;
                 }
             }
@@ -477,7 +477,7 @@ async fn handle_exists(
         }
         Err(e) => {
             tracing::error!("Failed to check EXISTS for key {}: {}", key, e);
-            let response = BytesFrame::Error("ERR database error".into());
+            let response = BytesFrame::Error("ERR database error ".into());
             stream.write_all(&serialize_frame(&response)).await?;
         }
     }
@@ -598,7 +598,7 @@ async fn handle_hget(
     let namespaced_key = state.namespaced_key(&namespace, &key);
     if let Some(data) = state.inflight_hcache.get(&namespaced_key).await {
         // Decompress if needed
-        let data = decompress_if_enabled(state, &data).await?;
+        let data = decompress_if_enabled(state, data).await?;
 
         let response = BytesFrame::BulkString(data.into());
         stream.write_all(&serialize_frame(&response)).await?;
@@ -622,7 +622,7 @@ async fn handle_hget(
     {
         Ok(Some(row)) => {
             // Decompress if needed
-            let data = decompress_if_enabled(state, &row.0).await?;
+            let data = decompress_if_enabled(state, row.0.into()).await?;
 
             let response = BytesFrame::BulkString(data.into());
             stream.write_all(&serialize_frame(&response)).await?;
@@ -633,7 +633,7 @@ async fn handle_hget(
         }
         Err(e) => {
             tracing::error!("Failed to HGET namespace {} key {}: {}", namespace, key, e);
-            let response = BytesFrame::Error("ERR database error".into());
+            let response = BytesFrame::Error("ERR database error ".into());
             stream.write_all(&serialize_frame(&response)).await?;
         }
     }
@@ -669,7 +669,7 @@ async fn handle_hset(
     let sender = &state.shard_senders[shard_index];
 
     // Compress data if storage compression is enabled
-    let value = compress_if_enabled(state, &value).await?;
+    let value = compress_if_enabled(state, value).await?;
 
     // Check if async_write is enabled
     if state.cfg.async_write.unwrap_or(false) {
@@ -692,7 +692,7 @@ async fn handle_hset(
                 "Failed to send ASYNC HSET operation to shard {}",
                 shard_index
             );
-            let response = BytesFrame::Error("ERR internal error".into());
+            let response = BytesFrame::Error("ERR internal error ".into());
             stream.write_all(&serialize_frame(&response)).await?;
         } else {
             let response = BytesFrame::SimpleString("OK".into());
@@ -711,7 +711,7 @@ async fn handle_hset(
 
         if sender.send(operation).await.is_err() {
             tracing::error!("Failed to send HSET operation to shard {}", shard_index);
-            let response = BytesFrame::Error("ERR internal error".into());
+            let response = BytesFrame::Error("ERR internal error ".into());
             stream.write_all(&serialize_frame(&response)).await?;
         } else {
             match responder_rx.await {
@@ -721,12 +721,12 @@ async fn handle_hset(
                 }
                 Ok(Err(e)) => {
                     tracing::error!("Shard writer failed for HSET: {}", e);
-                    let response = BytesFrame::Error("ERR database error".into());
+                    let response = BytesFrame::Error("ERR database error ".into());
                     stream.write_all(&serialize_frame(&response)).await?;
                 }
                 Err(_) => {
-                    tracing::error!("Shard writer task cancelled or panicked for HSET");
-                    let response = BytesFrame::Error("ERR internal error".into());
+                    tracing::error!("Shard writer task cancelled or panicked for HSET ");
+                    let response = BytesFrame::Error("ERR internal error ".into());
                     stream.write_all(&serialize_frame(&response)).await?;
                 }
             }
@@ -795,7 +795,7 @@ async fn handle_hdel(
                 "Failed to send ASYNC HDEL operation to shard {}",
                 shard_index
             );
-            let response = BytesFrame::Error("ERR internal error".into());
+            let response = BytesFrame::Error("ERR internal error ".into());
             stream.write_all(&serialize_frame(&response)).await?;
         } else {
             // Assume success for async mode
@@ -814,7 +814,7 @@ async fn handle_hdel(
 
         if sender.send(operation).await.is_err() {
             tracing::error!("Failed to send HDEL operation to shard {}", shard_index);
-            let response = BytesFrame::Error("ERR internal error".into());
+            let response = BytesFrame::Error("ERR internal error ".into());
             stream.write_all(&serialize_frame(&response)).await?;
         } else {
             match responder_rx.await {
@@ -824,12 +824,12 @@ async fn handle_hdel(
                 }
                 Ok(Err(e)) => {
                     tracing::error!("Shard writer failed for HDEL: {}", e);
-                    let response = BytesFrame::Error("ERR database error".into());
+                    let response = BytesFrame::Error("ERR database error ".into());
                     stream.write_all(&serialize_frame(&response)).await?;
                 }
                 Err(_) => {
-                    tracing::error!("Shard writer task cancelled or panicked for HDEL");
-                    let response = BytesFrame::Error("ERR internal error".into());
+                    tracing::error!("Shard writer task cancelled or panicked for HDEL ");
+                    let response = BytesFrame::Error("ERR internal error ".into());
                     stream.write_all(&serialize_frame(&response)).await?;
                 }
             }
@@ -892,7 +892,7 @@ async fn handle_hexists(
                 key,
                 e
             );
-            let response = BytesFrame::Error("ERR database error".into());
+            let response = BytesFrame::Error("ERR database error ".into());
             stream.write_all(&serialize_frame(&response)).await?;
         }
     }
@@ -905,13 +905,13 @@ async fn handle_cluster_nodes(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    tracing::info!("Handling CLUSTER NODES command");
+    tracing::info!("Handling CLUSTER NODES command ");
     if let Some(ref cluster_manager) = state.cluster_manager {
         let nodes_info = cluster_manager.get_cluster_nodes().await;
         let response = BytesFrame::BulkString(nodes_info.into());
         stream.write_all(&serialize_frame(&response)).await?;
     } else {
-        let response = BytesFrame::Error("ERR This instance has cluster support disabled".into());
+        let response = BytesFrame::Error("ERR This instance has cluster support disabled ".into());
         stream.write_all(&serialize_frame(&response)).await?;
     }
     Ok(())
@@ -926,7 +926,7 @@ async fn handle_cluster_info(
         let response = BytesFrame::BulkString(cluster_info.into());
         stream.write_all(&serialize_frame(&response)).await?;
     } else {
-        let response = BytesFrame::Error("ERR This instance has cluster support disabled".into());
+        let response = BytesFrame::Error("ERR This instance has cluster support disabled ".into());
         stream.write_all(&serialize_frame(&response)).await?;
     }
     Ok(())
@@ -1010,7 +1010,7 @@ async fn handle_cluster_slots(
         let response = BytesFrame::Array(slot_ranges);
         stream.write_all(&serialize_frame(&response)).await?;
     } else {
-        let response = BytesFrame::Error("ERR This instance has cluster support disabled".into());
+        let response = BytesFrame::Error("ERR This instance has cluster support disabled ".into());
         stream.write_all(&serialize_frame(&response)).await?;
     }
     Ok(())
@@ -1029,12 +1029,12 @@ async fn handle_cluster_addslots(
             }
             Err(e) => {
                 tracing::error!("Failed to add slots: {}", e);
-                let response = BytesFrame::Error("ERR failed to add slots".into());
+                let response = BytesFrame::Error("ERR failed to add slots ".into());
                 stream.write_all(&serialize_frame(&response)).await?;
             }
         }
     } else {
-        let response = BytesFrame::Error("ERR This instance has cluster support disabled".into());
+        let response = BytesFrame::Error("ERR This instance has cluster support disabled ".into());
         stream.write_all(&serialize_frame(&response)).await?;
     }
     Ok(())
@@ -1053,12 +1053,12 @@ async fn handle_cluster_delslots(
             }
             Err(e) => {
                 tracing::error!("Failed to remove slots: {}", e);
-                let response = BytesFrame::Error("ERR failed to remove slots".into());
+                let response = BytesFrame::Error("ERR failed to remove slots ".into());
                 stream.write_all(&serialize_frame(&response)).await?;
             }
         }
     } else {
-        let response = BytesFrame::Error("ERR This instance has cluster support disabled".into());
+        let response = BytesFrame::Error("ERR This instance has cluster support disabled ".into());
         stream.write_all(&serialize_frame(&response)).await?;
     }
     Ok(())

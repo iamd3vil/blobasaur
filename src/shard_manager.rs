@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use chrono::Utc;
 use moka::future::Cache;
 use sqlx::SqlitePool;
@@ -9,12 +10,12 @@ use tokio::time::{Duration, timeout};
 pub enum ShardWriteOperation {
     Set {
         key: String,
-        data: Vec<u8>,
+        data: Bytes,
         responder: oneshot::Sender<Result<(), String>>,
     },
     SetAsync {
         key: String,
-        data: Vec<u8>,
+        data: Bytes,
     },
     Delete {
         key: String,
@@ -26,13 +27,13 @@ pub enum ShardWriteOperation {
     HSet {
         namespace: String,
         key: String,
-        data: Vec<u8>,
+        data: Bytes,
         responder: oneshot::Sender<Result<(), String>>,
     },
     HSetAsync {
         namespace: String,
         key: String,
-        data: Vec<u8>,
+        data: Bytes,
     },
     HDelete {
         namespace: String,
@@ -52,8 +53,8 @@ pub async fn shard_writer_task(
     mut receiver: mpsc::Receiver<ShardWriteOperation>,
     batch_size: usize,
     batch_timeout_ms: u64,
-    inflight_cache: Cache<String, Vec<u8>>,
-    inflight_hcache: Cache<String, Vec<u8>>,
+    inflight_cache: Cache<String, Bytes>,
+    inflight_hcache: Cache<String, Bytes>,
 ) {
     // Load existing namespaced tables into memory
     let mut known_tables = load_existing_tables(&pool, shard_id).await;
@@ -132,8 +133,8 @@ async fn process_batch(
     pool: &SqlitePool,
     batch: &mut VecDeque<ShardWriteOperation>,
     known_tables: &mut HashSet<String>,
-    inflight_cache: &Cache<String, Vec<u8>>,
-    inflight_hcache: &Cache<String, Vec<u8>>,
+    inflight_cache: &Cache<String, Bytes>,
+    inflight_hcache: &Cache<String, Bytes>,
 ) {
     if batch.is_empty() {
         return;
