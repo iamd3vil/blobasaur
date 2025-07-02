@@ -10,7 +10,7 @@ Blobasaur is a high-performance, sharded blob storage server written in Rust. It
 
 ## Features
 
-- **Sharding:** Distributes data across multiple SQLite databases (shards) for improved concurrency and scalability. The shard for a given key is determined by an FNV hash of the key.
+- **Sharding:** Distributes data across multiple SQLite databases (shards) for improved concurrency and scalability. The shard for a given key is determined by multi-probe consistent hashing.
 - **Redis Protocol:** Implements Redis protocol for client compatibility with the following commands:
   - `GET key`: Retrieve a blob.
   - `SET key value`: Store or replace a blob.
@@ -57,7 +57,7 @@ Blobasaur is a high-performance, sharded blob storage server written in Rust. It
     ```toml
     data_dir = "blob_data"
     num_shards = 4
-    
+
     # Optional: Enable compression for stored data
     # [storage_compression]
     # enabled = true
@@ -97,7 +97,7 @@ Blobasaur is a high-performance, sharded blob storage server written in Rust. It
       # or
       just run-release
       ```
-    
+
     The server will start by default on `0.0.0.0:6379` (standard Redis port).
 
 ### Cross-compilation (Example: Linux MUSL)
@@ -338,7 +338,7 @@ HGET metrics:daily:2024-01-01 page_views
 - [Config](https://crates.io/crates/config): Layered configuration system for Rust applications.
 - [Miette](https://crates.io/crates/miette): Fancy diagnostic reporting library.
 - [Thiserror](https://crates.io/crates/thiserror): Better error handling with derive macros.
-- [Fnv](https://crates.io/crates/fnv): For FNV hashing to determine shard index.
+- [mpchash](https://crates.io/crates/mpchash): Multi-probe consistent hashing library for determining shard index.
 - [Tracing](https://crates.io/crates/tracing): Application-level tracing framework.
 - [Chrono](https://crates.io/crates/chrono): Date and time library for handling timestamps.
 
@@ -451,7 +451,7 @@ CREATE TABLE blobs (
     key TEXT PRIMARY KEY,
     data BLOB,
     created_at INTEGER NOT NULL,    -- Unix timestamp
-    updated_at INTEGER NOT NULL,    -- Unix timestamp  
+    updated_at INTEGER NOT NULL,    -- Unix timestamp
     expires_at INTEGER,             -- Unix timestamp, NULL if no expiration
     version INTEGER NOT NULL DEFAULT 0  -- Incremented on each update
 );
@@ -465,7 +465,7 @@ CREATE TABLE blobs_users (
     key TEXT PRIMARY KEY,
     data BLOB,
     created_at INTEGER NOT NULL,    -- Unix timestamp
-    updated_at INTEGER NOT NULL,    -- Unix timestamp  
+    updated_at INTEGER NOT NULL,    -- Unix timestamp
     expires_at INTEGER,             -- Unix timestamp, NULL if no expiration
     version INTEGER NOT NULL DEFAULT 0  -- Incremented on each update
 );
@@ -566,19 +566,3 @@ For detailed setup instructions, see [CLUSTERING.md](CLUSTERING.md).
 - No replication support (no master-slave configuration)
 - No automatic failover (manual intervention required for node failures)
 - Static slot assignment (no online resharding or slot migration)
-
-## Future Enhancements (Ideas)
-
-- Full chitchat gossip protocol integration
-- Master-slave replication for high availability
-- Online slot migration and rebalancing
-- Implement output compression for HTTP responses (`output_compression`).
-- Add more robust error handling and logging.
-- Implement authentication and authorization.
-- Add metrics and monitoring.
-- Support for different hashing algorithms for sharding.
-- Streaming support for very large blobs.
-- Replication or durability options beyond single SQLite files.
-- Blob expiration cleanup background task.
-- Blob listing and search capabilities.
-- Additional Redis commands relevant to blob storage (EXPIRE, TTL).

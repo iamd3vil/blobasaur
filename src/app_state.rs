@@ -1,9 +1,9 @@
 use futures::future::join_all;
 use moka::future::Cache;
+use mpchash::HashRing;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use std::fs;
-use std::hash::Hasher;
 use std::str::FromStr;
 use tokio::sync::mpsc;
 
@@ -11,6 +11,9 @@ use crate::compression::{self, Compressor};
 // Import ShardWriteOperation from shard_manager
 use crate::{cluster::ClusterManager, config::Cfg, shard_manager::ShardWriteOperation};
 use bytes::Bytes;
+
+#[derive(Hash)]
+struct ShardNode(u64);
 
 pub struct AppState {
     pub cfg: Cfg,
@@ -29,6 +32,8 @@ pub struct AppState {
     /// Cluster manager for Redis cluster protocol
     pub cluster_manager: Option<ClusterManager>,
     pub compressor: Option<Box<dyn Compressor>>,
+
+    ring: HashRing<ShardNode>,
 }
 
 impl AppState {
@@ -151,6 +156,11 @@ impl AppState {
             _ => None,
         };
 
+        let ring = HashRing::new();
+        for i in 0..cfg.num_shards {
+            ring.add(ShardNode(i as u64));
+        }
+
         AppState {
             cfg,
             shard_senders: shard_senders_vec,
@@ -159,14 +169,13 @@ impl AppState {
             inflight_hcache,
             cluster_manager,
             compressor,
+            ring,
         }
     }
 
     pub fn get_shard(&self, key: &str) -> usize {
-        let mut hasher = fnv::FnvHasher::default();
-        hasher.write(key.as_bytes());
-        let hash = hasher.finish();
-        hash as usize % self.cfg.num_shards
+        let token = self.ring.node(&key).unwrap();
+        token.node().0 as usize
     }
 
     /// Get a namespaced cache key for HGET/HSET operations
