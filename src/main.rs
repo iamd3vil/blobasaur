@@ -11,12 +11,14 @@ mod server;
 mod shard_manager;
 
 use app_state::AppState;
-use clap::Parser;
+use gumdrop::Options;
 
-#[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
+#[derive(Options, Debug)]
 struct Args {
-    #[arg(short, long, default_value = "config.toml")]
+    #[options(help = "print help message")]
+    help: bool,
+
+    #[options(help = "Path to the configuration file", short = "c", long = "config", default = "config.toml")]
     config: String,
 }
 
@@ -25,7 +27,7 @@ async fn main() -> Result<()> {
     // initialize tracing
     tracing_subscriber::fmt::init();
 
-    let args = Args::parse();
+    let args = Args::parse_args_default_or_exit();
     let cfg = config::Cfg::load(&args.config).wrap_err("loading config")?;
 
     // This vector will be populated by AppState::new
