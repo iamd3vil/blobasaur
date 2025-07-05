@@ -1,5 +1,6 @@
 use crate::AppState;
 use crate::cluster::ClusterManager;
+use crate::metrics::Timer;
 use crate::redis::{
     ParseError, RedisCommand, parse_command, parse_resp_with_remaining, serialize_frame,
 };
@@ -24,10 +25,16 @@ pub async fn run_redis_server(
         tracing::debug!("New Blobasaur connection from {}", addr);
 
         let state_clone = state.clone();
+        // Record new connection
+        state.metrics.record_connection();
+
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, state_clone).await {
+            if let Err(e) = handle_connection(stream, state_clone.clone()).await {
                 tracing::error!("Error handling connection from {}: {}", addr, e);
+                state_clone.metrics.record_error("connection");
             }
+            // Record dropped connection
+            state_clone.metrics.record_connection_dropped();
         });
     }
 }
@@ -119,6 +126,26 @@ async fn handle_connection(
 // Helper function to find the end of a complete message
 
 async fn handle_redis_command(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+    command: RedisCommand,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let timer = Timer::start();
+    let cmd_name = command.name();
+
+    let result = handle_redis_command_inner(stream, state, command).await;
+
+    // Record command metrics
+    state.metrics.record_command(&cmd_name, timer.start);
+
+    if result.is_err() {
+        state.metrics.record_error("protocol");
+    }
+
+    result
+}
+
+async fn handle_redis_command_inner(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
     command: RedisCommand,
@@ -265,6 +292,7 @@ async fn handle_get(
 
         let response = BytesFrame::BulkString(data.into());
         stream.write_all(&serialize_frame(&response)).await?;
+        state.metrics.record_cache_hit();
         return Ok(());
     }
 
@@ -285,15 +313,18 @@ async fn handle_get(
 
             let response = BytesFrame::BulkString(data.into());
             stream.write_all(&serialize_frame(&response)).await?;
+            state.metrics.record_cache_hit();
         }
         Ok(None) => {
             let response = BytesFrame::Null;
             stream.write_all(&serialize_frame(&response)).await?;
+            state.metrics.record_cache_miss();
         }
         Err(e) => {
             tracing::error!("Failed to GET key {}: {}", key, e);
             let response = BytesFrame::Error("ERR database error ".into());
             stream.write_all(&serialize_frame(&response)).await?;
+            state.metrics.record_error("storage");
         }
     }
 
@@ -329,9 +360,11 @@ async fn handle_set(
             );
             let response = BytesFrame::Error("ERR internal error ".into());
             stream.write_all(&serialize_frame(&response)).await?;
+            state.metrics.record_error("storage");
         } else {
             let response = BytesFrame::SimpleString("OK".into());
             stream.write_all(&serialize_frame(&response)).await?;
+            state.metrics.record_storage_operation();
         }
     } else {
         // Sync mode: wait for completion
@@ -347,21 +380,25 @@ async fn handle_set(
             tracing::error!("Failed to send SET operation to shard {}", shard_index);
             let response = BytesFrame::Error("ERR internal error ".into());
             stream.write_all(&serialize_frame(&response)).await?;
+            state.metrics.record_error("storage");
         } else {
             match responder_rx.await {
                 Ok(Ok(())) => {
                     let response = BytesFrame::SimpleString("OK".into());
                     stream.write_all(&serialize_frame(&response)).await?;
+                    state.metrics.record_storage_operation();
                 }
                 Ok(Err(e)) => {
                     tracing::error!("Shard writer failed for SET: {}", e);
                     let response = BytesFrame::Error("ERR database error ".into());
                     stream.write_all(&serialize_frame(&response)).await?;
+                    state.metrics.record_error("storage");
                 }
                 Err(_) => {
                     tracing::error!("Shard writer task cancelled or panicked for SET ");
                     let response = BytesFrame::Error("ERR internal error ".into());
                     stream.write_all(&serialize_frame(&response)).await?;
+                    state.metrics.record_error("storage");
                 }
             }
         }

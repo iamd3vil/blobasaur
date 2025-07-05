@@ -9,7 +9,9 @@ use tokio::sync::mpsc;
 
 use crate::compression::{self, Compressor};
 // Import ShardWriteOperation from shard_manager
-use crate::{cluster::ClusterManager, config::Cfg, shard_manager::ShardWriteOperation};
+use crate::{
+    cluster::ClusterManager, config::Cfg, metrics::Metrics, shard_manager::ShardWriteOperation,
+};
 use bytes::Bytes;
 
 #[derive(Hash)]
@@ -32,6 +34,8 @@ pub struct AppState {
     /// Cluster manager for Redis cluster protocol
     pub cluster_manager: Option<ClusterManager>,
     pub compressor: Option<Box<dyn Compressor>>,
+    /// Metrics collector
+    pub metrics: Metrics,
 
     ring: HashRing<ShardNode>,
 }
@@ -156,6 +160,9 @@ impl AppState {
             _ => None,
         };
 
+        // Initialize metrics
+        let metrics = Metrics::new();
+
         let ring = HashRing::new();
         for i in 0..cfg.num_shards {
             ring.add(ShardNode(i as u64));
@@ -169,6 +176,7 @@ impl AppState {
             inflight_hcache,
             cluster_manager,
             compressor,
+            metrics,
             ring,
         }
     }

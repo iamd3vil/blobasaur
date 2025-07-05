@@ -1,3 +1,4 @@
+use crate::metrics::Metrics;
 use bytes::Bytes;
 use chrono::Utc;
 use moka::future::Cache;
@@ -55,6 +56,7 @@ pub async fn shard_writer_task(
     batch_timeout_ms: u64,
     inflight_cache: Cache<String, Bytes>,
     inflight_hcache: Cache<String, Bytes>,
+    metrics: Metrics,
 ) {
     // Load existing namespaced tables into memory
     let mut known_tables = load_existing_tables(&pool, shard_id).await;
@@ -100,6 +102,7 @@ pub async fn shard_writer_task(
         }
 
         if !batch.is_empty() {
+            let batch_start = std::time::Instant::now();
             process_batch(
                 shard_id,
                 &pool,
@@ -109,11 +112,14 @@ pub async fn shard_writer_task(
                 &inflight_hcache,
             )
             .await;
+            let batch_duration = batch_start.elapsed();
+            metrics.record_batch_operation(batch.len(), batch_duration);
         }
     }
 
     // Process any remaining operations
     if !batch.is_empty() {
+        let batch_start = std::time::Instant::now();
         process_batch(
             shard_id,
             &pool,
@@ -123,6 +129,8 @@ pub async fn shard_writer_task(
             &inflight_hcache,
         )
         .await;
+        let batch_duration = batch_start.elapsed();
+        metrics.record_batch_operation(batch.len(), batch_duration);
     }
 
     tracing::info!("Shard {} writer task stopped", shard_id);

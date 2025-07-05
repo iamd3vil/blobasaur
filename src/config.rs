@@ -13,6 +13,7 @@ pub struct Cfg {
     pub batch_timeout_ms: Option<u64>,
     pub addr: Option<String>,
     pub cluster: Option<ClusterConfig>,
+    pub metrics: Option<MetricsConfig>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -50,6 +51,12 @@ pub struct CompressionConfig {
     pub enabled: bool,
     pub algorithm: CompressionType,
     pub level: Option<u32>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct MetricsConfig {
+    pub enabled: bool,
+    pub addr: Option<String>,
 }
 
 impl Cfg {
@@ -93,6 +100,15 @@ impl Cfg {
 
         println!("Data directory: {}", cfg.data_dir);
         println!("Number of shards: {}", cfg.num_shards);
+
+        if let Some(ref metrics) = cfg.metrics {
+            if metrics.enabled {
+                println!(
+                    "Metrics enabled on: {}",
+                    metrics.addr.as_deref().unwrap_or("0.0.0.0:9090")
+                );
+            }
+        }
 
         Ok(cfg)
     }

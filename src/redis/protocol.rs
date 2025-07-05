@@ -61,6 +61,33 @@ pub enum RedisCommand {
     Unknown(String),
 }
 
+impl RedisCommand {
+    /// Get the command name for metrics
+    pub fn name(&self) -> String {
+        match self {
+            RedisCommand::Get { .. } => "GET".to_string(),
+            RedisCommand::Set { .. } => "SET".to_string(),
+            RedisCommand::Del { .. } => "DEL".to_string(),
+            RedisCommand::Exists { .. } => "EXISTS".to_string(),
+            RedisCommand::HGet { .. } => "HGET".to_string(),
+            RedisCommand::HSet { .. } => "HSET".to_string(),
+            RedisCommand::HDel { .. } => "HDEL".to_string(),
+            RedisCommand::HExists { .. } => "HEXISTS".to_string(),
+            RedisCommand::Ping { .. } => "PING".to_string(),
+            RedisCommand::Info { .. } => "INFO".to_string(),
+            RedisCommand::Command => "COMMAND".to_string(),
+            RedisCommand::ClusterNodes => "CLUSTER NODES".to_string(),
+            RedisCommand::ClusterInfo => "CLUSTER INFO".to_string(),
+            RedisCommand::ClusterSlots => "CLUSTER SLOTS".to_string(),
+            RedisCommand::ClusterAddSlots { .. } => "CLUSTER ADDSLOTS".to_string(),
+            RedisCommand::ClusterDelSlots { .. } => "CLUSTER DELSLOTS".to_string(),
+            RedisCommand::ClusterKeySlot { .. } => "CLUSTER KEYSLOT".to_string(),
+            RedisCommand::Quit => "QUIT".to_string(),
+            RedisCommand::Unknown(cmd) => cmd.clone(),
+        }
+    }
+}
+
 /// Parse error types
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {

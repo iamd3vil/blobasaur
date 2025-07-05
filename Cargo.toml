@@ -31,3 +31,6 @@ tokio = { version = "1.45.0", features = ["full"] }
 tokio-util = { version = "0.7.11", features = ["io"] }
 tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
+axum = "0.7"
+metrics = "0.23"
+metrics-exporter-prometheus = "0.15"

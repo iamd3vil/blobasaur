@@ -50,3 +50,9 @@ batch_timeout_ms = 10
 enabled = true
 algorithm = "zstd" # Options: gzip, zstd, lz4, brotli
 level = 3
+
+# Metrics configuration (optional)
+# Enable Prometheus-compatible metrics endpoint
+[metrics]
+enabled = true
+addr = "0.0.0.0:9090" # Address for metrics HTTP server
