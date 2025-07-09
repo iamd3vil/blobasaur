@@ -60,3 +60,21 @@ cluster-reset:
     cd dev && docker-compose up -d
     sleep 5
 
+# Shard migration commands
+migrate old_count new_count data_dir='./data':
+    cargo run -- shard migrate {{old_count}} {{new_count}} --data-dir {{data_dir}}
+
+migrate-verify old_count new_count data_dir='./data':
+    cargo run -- shard migrate {{old_count}} {{new_count}} --data-dir {{data_dir}} --verify
+
+migrate-release old_count new_count data_dir='./data':
+    cargo run --release -- shard migrate {{old_count}} {{new_count}} --data-dir {{data_dir}}
+
+migrate-verify-release old_count new_count data_dir='./data':
+    cargo run --release -- shard migrate {{old_count}} {{new_count}} --data-dir {{data_dir}} --verify
+
+# Example migration commands (commented)
+# just migrate 4 8                    # Migrate from 4 to 8 shards using ./data
+# just migrate-verify 4 8 /var/data   # Migrate and verify using custom data dir
+# just migrate-release 4 8            # Use release build for better performance
+
