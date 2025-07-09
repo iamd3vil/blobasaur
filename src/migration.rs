@@ -33,7 +33,7 @@ impl MigrationManager {
             ));
         }
 
-        // Create hash rings for old and new configurations
+        // Create hash rings for new configuration.
         let new_ring = HashRing::new();
         for i in 0..new_shard_count {
             new_ring.add(ShardNode(i as u64));
@@ -45,17 +45,6 @@ impl MigrationManager {
             data_dir,
             new_ring,
         })
-    }
-
-    #[allow(dead_code)]
-    fn get_old_shard(&self, key: &str) -> usize {
-        // Create old hash ring on the fly to calculate original shard
-        let old_ring = HashRing::new();
-        for i in 0..self.old_shard_count {
-            old_ring.add(ShardNode(i as u64));
-        }
-        let token = old_ring.node(&key).unwrap();
-        token.node().0 as usize
     }
 
     fn get_new_shard(&self, key: &str) -> usize {
@@ -217,79 +206,68 @@ impl MigrationManager {
         table_name: &str,
         current_old_shard: usize,
     ) -> Result<()> {
-        // Read all records from the old table
-        let query = format!(
-            "SELECT key, data, created_at, updated_at, expires_at, version FROM {}",
-            table_name
-        );
-        let rows = sqlx::query(&query).fetch_all(old_pool).await.map_err(|e| {
-            sqlx_to_miette(
-                e,
-                &format!("Failed to read records from table {}", table_name),
-            )
-        })?;
+        // First, read only keys to determine which ones need to be migrated
+        let keys_query = format!("SELECT key FROM {}", table_name);
+        let key_rows = sqlx::query(&keys_query)
+            .fetch_all(old_pool)
+            .await
+            .map_err(|e| {
+                sqlx_to_miette(e, &format!("Failed to read keys from table {}", table_name))
+            })?;
 
         tracing::info!(
-            "Found {} records in table {} of old shard {}",
-            rows.len(),
+            "Found {} keys in table {} of old shard {}",
+            key_rows.len(),
             table_name,
             current_old_shard
         );
 
-        // Group records by their new shard destination
-        let mut shard_data: HashMap<usize, Vec<(String, Vec<u8>, i64, i64, Option<i64>, i64)>> =
-            HashMap::new();
-        let mut keys_to_move: Vec<String> = Vec::new();
+        // Identify keys that need to be migrated (those moving to different shards)
+        let mut keys_to_migrate: HashMap<usize, Vec<String>> = HashMap::new();
+        let mut keys_to_delete: Vec<String> = Vec::new();
 
-        for row in rows {
+        for row in key_rows {
             let key: String = row.get("key");
-            let data: Vec<u8> = row.get("data");
-            let created_at: i64 = row.get("created_at");
-            let updated_at: i64 = row.get("updated_at");
-            let expires_at: Option<i64> = row.get("expires_at");
-            let version: i64 = row.get("version");
-
             let new_shard_id = self.get_new_shard(&key);
 
+            if new_shard_id != current_old_shard {
+                // Key needs to be migrated to a different shard
+                keys_to_migrate
+                    .entry(new_shard_id)
+                    .or_insert_with(Vec::new)
+                    .push(key.clone());
+                keys_to_delete.push(key);
+            }
+        }
+
+        if keys_to_migrate.is_empty() {
             tracing::info!(
-                "Key '{}' from old shard {} -> new shard {}",
-                key,
+                "No keys need migration from old shard {} table {} (all keys remain in same shard)",
                 current_old_shard,
-                new_shard_id
+                table_name
             );
-
-            // All keys in this shard database belong to current_old_shard by definition
-            shard_data
-                .entry(new_shard_id)
-                .or_insert_with(Vec::new)
-                .push((
-                    key.clone(),
-                    data,
-                    created_at,
-                    updated_at,
-                    expires_at,
-                    version,
-                ));
-
-            keys_to_move.push(key);
+            return Ok(());
         }
 
         tracing::info!(
-            "Distributing {} keys from old shard {} to {} new shards",
-            keys_to_move.len(),
+            "Need to migrate {} keys from old shard {} to {} different shards",
+            keys_to_delete.len(),
             current_old_shard,
-            shard_data.len()
+            keys_to_migrate.len()
         );
 
-        // First, write data to new shards
-        for (new_shard_id, records) in shard_data {
-            if records.is_empty() {
+        // Process migration in batches for each destination shard
+        const BATCH_SIZE: usize = 1000;
+
+        for (new_shard_id, keys) in keys_to_migrate {
+            if keys.is_empty() {
                 continue;
             }
 
             tracing::info!(
-                "Writing {} records to new shard {}",
-                records.len(),
+                "Migrating {} keys from old shard {} to new shard {}",
+                keys.len(),
+                current_old_shard,
                 new_shard_id
             );
 
@@ -346,64 +324,91 @@ impl MigrationManager {
                     })?;
             }
 
-            // Insert records in batches
-            let mut tx = new_pool.begin().await.map_err(|e| {
-                sqlx_to_miette(
-                    e,
-                    &format!("Failed to start transaction for new shard {}", new_shard_id),
-                )
-            })?;
+            // Process keys in batches
+            for batch in keys.chunks(BATCH_SIZE) {
+                // Read the full record data for this batch
+                let placeholders = batch.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                let batch_query = format!(
+                    "SELECT key, data, created_at, updated_at, expires_at, version FROM {} WHERE key IN ({})",
+                    table_name, placeholders
+                );
 
-            let insert_query = format!(
-                "INSERT OR REPLACE INTO {} (key, data, created_at, updated_at, expires_at, version) VALUES (?, ?, ?, ?, ?, ?)",
-                table_name
-            );
+                let mut query = sqlx::query(&batch_query);
+                for key in batch {
+                    query = query.bind(key);
+                }
 
-            for (key, data, created_at, updated_at, expires_at, version) in records {
-                sqlx::query(&insert_query)
-                    .bind(&key)
-                    .bind(&data)
-                    .bind(created_at)
-                    .bind(updated_at)
-                    .bind(expires_at)
-                    .bind(version)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| {
-                        sqlx_to_miette(
-                            e,
-                            &format!(
-                                "Failed to insert record {} into new shard {}",
-                                key, new_shard_id
-                            ),
-                        )
-                    })?;
+                let records = query.fetch_all(old_pool).await.map_err(|e| {
+                    sqlx_to_miette(
+                        e,
+                        &format!("Failed to read batch of records from table {}", table_name),
+                    )
+                })?;
+
+                let records_len = records.len();
+
+                // Insert records in a transaction
+                let mut tx = new_pool.begin().await.map_err(|e| {
+                    sqlx_to_miette(
+                        e,
+                        &format!("Failed to start transaction for new shard {}", new_shard_id),
+                    )
+                })?;
+
+                let insert_query = format!(
+                    "INSERT OR REPLACE INTO {} (key, data, created_at, updated_at, expires_at, version) VALUES (?, ?, ?, ?, ?, ?)",
+                    table_name
+                );
+
+                for record in records {
+                    let key: String = record.get("key");
+                    let data: Vec<u8> = record.get("data");
+                    let created_at: i64 = record.get("created_at");
+                    let updated_at: i64 = record.get("updated_at");
+                    let expires_at: Option<i64> = record.get("expires_at");
+                    let version: i64 = record.get("version");
+
+                    sqlx::query(&insert_query)
+                        .bind(&key)
+                        .bind(&data)
+                        .bind(created_at)
+                        .bind(updated_at)
+                        .bind(expires_at)
+                        .bind(version)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| {
+                            sqlx_to_miette(
+                                e,
+                                &format!(
+                                    "Failed to insert record {} into new shard {}",
+                                    key, new_shard_id
+                                ),
+                            )
+                        })?;
+                }
+
+                tx.commit().await.map_err(|e| {
+                    sqlx_to_miette(
+                        e,
+                        &format!(
+                            "Failed to commit transaction for new shard {}",
+                            new_shard_id
+                        ),
+                    )
+                })?;
+
+                tracing::info!(
+                    "Migrated batch of {} records to new shard {}",
+                    records_len,
+                    new_shard_id
+                );
             }
-
-            tx.commit().await.map_err(|e| {
-                sqlx_to_miette(
-                    e,
-                    &format!(
-                        "Failed to commit transaction for new shard {}",
-                        new_shard_id
-                    ),
-                )
-            })?;
 
             new_pool.close().await;
         }
 
-        // Delete moved keys from the current old shard only
-        // But only delete keys that are actually moving to a different shard
-        let mut keys_to_delete = Vec::new();
-        for key in &keys_to_move {
-            let new_shard_id = self.get_new_shard(key);
-            // Only delete if the key is moving to a different shard
-            if new_shard_id != current_old_shard {
-                keys_to_delete.push(key);
-            }
-        }
-
+        // Delete migrated keys from the old shard in batches
         if !keys_to_delete.is_empty() {
             tracing::info!(
                 "Deleting {} keys from old shard {} table {} (keys that moved to different shards)",
@@ -412,49 +417,51 @@ impl MigrationManager {
                 table_name
             );
 
-            let mut tx = old_pool.begin().await.map_err(|e| {
-                sqlx_to_miette(
-                    e,
-                    &format!(
-                        "Failed to start cleanup transaction for shard {}",
-                        current_old_shard
-                    ),
-                )
-            })?;
+            for batch in keys_to_delete.chunks(BATCH_SIZE) {
+                let mut tx = old_pool.begin().await.map_err(|e| {
+                    sqlx_to_miette(
+                        e,
+                        &format!(
+                            "Failed to start cleanup transaction for shard {}",
+                            current_old_shard
+                        ),
+                    )
+                })?;
 
-            let delete_query = format!("DELETE FROM {} WHERE key = ?", table_name);
+                let delete_query = format!("DELETE FROM {} WHERE key = ?", table_name);
 
-            for key in &keys_to_delete {
-                sqlx::query(&delete_query)
-                    .bind(key)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| {
-                        sqlx_to_miette(
-                            e,
-                            &format!(
-                                "Failed to delete key {} from shard {}",
-                                key, current_old_shard
-                            ),
-                        )
-                    })?;
+                for key in batch {
+                    sqlx::query(&delete_query)
+                        .bind(key)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| {
+                            sqlx_to_miette(
+                                e,
+                                &format!(
+                                    "Failed to delete key {} from shard {}",
+                                    key, current_old_shard
+                                ),
+                            )
+                        })?;
+                }
+
+                tx.commit().await.map_err(|e| {
+                    sqlx_to_miette(
+                        e,
+                        &format!(
+                            "Failed to commit cleanup transaction for shard {}",
+                            current_old_shard
+                        ),
+                    )
+                })?;
+
+                tracing::info!(
+                    "Deleted batch of {} keys from old shard {}",
+                    batch.len(),
+                    current_old_shard
+                );
             }
-
-            tx.commit().await.map_err(|e| {
-                sqlx_to_miette(
-                    e,
-                    &format!(
-                        "Failed to commit cleanup transaction for shard {}",
-                        current_old_shard
-                    ),
-                )
-            })?;
-        } else {
-            tracing::info!(
-                "No keys to delete from old shard {} table {} (all keys remain in same shard)",
-                current_old_shard,
-                table_name
-            );
         }
 
         Ok(())
