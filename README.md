@@ -4,7 +4,9 @@
   </a>
 </div>
 
-# Blobasaur
+<p align="center">
+  <img src="Blobasaur.svg" alt="Blobasaur Logo" width="200"/>
+</p>
 
 Blobasaur is a high-performance, sharded blob storage server written in Rust. It implements the Redis protocol for client compatibility and uses SQLite as the backend for each shard, providing a simple yet robust solution for storing and retrieving binary large objects (blobs).
 
@@ -83,6 +85,7 @@ Blobasaur is a high-performance, sharded blob storage server written in Rust. It
       ```
 
 4.  **Run:**
+
     - Using Cargo:
       ```sh
       cargo run
@@ -148,6 +151,7 @@ level = 3
 ```
 
 Alternative compression configurations:
+
 ```toml
 # High compression for storage-constrained environments
 [storage_compression]
@@ -194,6 +198,7 @@ Blobasaur implements a subset of Redis commands for blob operations:
     - `-ERR database error`: If an error occurs during the operation.
 
 - ### `DEL key`
+
   - **Description:** Deletes a blob.
   - **Parameters:**
     - `key`: The unique identifier for the blob.
@@ -287,6 +292,7 @@ redis-cli -p 6379 HDEL users:123 email
 ### Example Use Cases for Namespacing
 
 #### User Data Storage
+
 ```bash
 HSET user:12345 profile '{"name": "John", "age": 30}'
 HSET user:12345 preferences '{"theme": "dark", "lang": "en"}'
@@ -294,6 +300,7 @@ HGET user:12345 profile
 ```
 
 #### Session Management
+
 ```bash
 HSET session:abc123 user_id "12345"
 HSET session:abc123 expires_at "1703980800"
@@ -301,6 +308,7 @@ HEXISTS session:abc123 user_id
 ```
 
 #### Configuration Storage
+
 ```bash
 HSET config:app database_url "sqlite:app.db"
 HSET config:app log_level "info"
@@ -308,6 +316,7 @@ HGET config:app database_url
 ```
 
 #### Analytics Data
+
 ```bash
 HSET metrics:daily:2024-01-01 page_views "1000"
 HSET metrics:daily:2024-01-01 unique_users "250"
@@ -354,6 +363,7 @@ Blobasaur supports configurable compression for data stored in SQLite databases:
 - **Configuration**: Set compression algorithm and level based on your performance vs. storage requirements
 
 **Compression Algorithm Characteristics:**
+
 - **Zstd**: Best balance of compression ratio and speed (recommended for most use cases)
 - **Lz4**: Fastest compression/decompression, moderate compression ratio
 - **Gzip**: Good compression ratio, moderate speed
@@ -381,6 +391,7 @@ When `async_write = true`, the server responds immediately after queueing operat
 ### Recommended Configuration
 
 For high-throughput write workloads:
+
 ```toml
 async_write = true
 batch_size = 50
@@ -393,6 +404,7 @@ level = 1
 ```
 
 For storage-optimized workloads:
+
 ```toml
 async_write = false
 batch_size = 10
@@ -405,6 +417,7 @@ level = 6
 ```
 
 For low-latency, consistency-focused workloads:
+
 ```toml
 async_write = false
 batch_size = 1
@@ -419,6 +432,7 @@ algorithm = "none"
 In async write mode (`async_write = true`), Blobasaur uses an inflight cache to prevent race conditions:
 
 ### The Problem
+
 ```bash
 # Without inflight cache, this sequence could fail:
 SET mykey "value"     # Returns OK immediately
@@ -426,12 +440,14 @@ GET mykey             # Might return NULL if DB write hasn't completed
 ```
 
 ### The Solution
+
 - **Inflight Cache**: Stores pending writes using [Moka](https://github.com/moka-rs/moka) cache
 - **GET Operations**: Check inflight cache first, then database
 - **Cache Cleanup**: Entries removed after successful database commit
 - **Memory Efficiency**: Cache has configurable capacity (default: 10,000 entries)
 
 ### Cache Behavior
+
 - `SET key value` in async mode → stores in `inflight_cache`
 - `GET key` → checks `inflight_cache` first, then database
 - `HSET ns key value` in async mode → stores in `inflight_hcache` as `ns:key`
@@ -446,6 +462,7 @@ This ensures read-after-write consistency even in async mode.
 The SQLite database schema for each shard includes the following tables:
 
 ### Default Table
+
 ```sql
 CREATE TABLE blobs (
     key TEXT PRIMARY KEY,
@@ -458,6 +475,7 @@ CREATE TABLE blobs (
 ```
 
 ### Namespaced Tables
+
 Each namespace automatically creates its own table with the naming pattern `blobs_{namespace}`:
 
 ```sql
@@ -489,6 +507,7 @@ CREATE TABLE blobs_users (
 ### Migration Compatibility
 
 Existing GET/SET operations continue to work with the default `blobs` table:
+
 - `GET key` → uses `blobs` table
 - `SET key value` → uses `blobs` table
 - `HGET namespace key` → uses `blobs_namespace` table
@@ -505,11 +524,13 @@ Blobasaur includes comprehensive test coverage:
 - **Total Coverage**: 44 tests ensuring robust Redis protocol implementation
 
 Run tests with:
+
 ```sh
 cargo test
 ```
 
 For specific test suites:
+
 ```sh
 cargo test redis::protocol      # Protocol parser tests
 cargo test redis::integration   # Integration tests
