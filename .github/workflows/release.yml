@@ -1,25 +1,26 @@
+on: [push, pull_request]
 jobs:
   release:
-    name: Release - ${{ matrix.platform.release_for }}
+    name: Release - ${{ matrix.platform.os-name }}
     strategy:
       matrix:
         platform:
-          - os_name: Linux-x86_64
-            os: ubuntu-24.04
+          - os-name: Linux-x86_64
+            runs-on: ubuntu-24.04
             target: x86_64-unknown-linux-musl
-    runs-on: ${{ matrix.platform.os }}
+    runs-on: ${{ matrix.platform.runs-on }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
-      - name: Build executable
-        uses: houseabsolute/actions-rust-cross@v0
+        uses: actions/checkout@v4
+      - name: Build binary
+        uses: houseabsolute/actions-rust-cross@v1
         with:
+          command: build
           target: ${{ matrix.platform.target }}
           args: "--locked --release"
           strip: true
       - name: Publish artifacts and release
         uses: houseabsolute/actions-rust-release@v0
         with:
-          executable-name: ubi
+          executable-name: blobasaur
           target: ${{ matrix.platform.target }}
-        if: matrix.toolchain == 'stable'
