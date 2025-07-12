@@ -507,8 +507,6 @@ cargo test -- --nocapture
 
 ## License
 
-[Add your license information here]
+This project is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0) - see the [LICENSE](LICENSE) file for details.
 
-## Contributing
-
-[Add contributing guidelines here]
+The AGPL-3.0 is a copyleft license that requires anyone who distributes the code or runs it on a server to provide the source code to users, including any modifications.
