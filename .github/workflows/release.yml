@@ -1,4 +1,6 @@
-on: [push, pull_request]
+on:
+  push:
+    tags: ["v*"]
 jobs:
   release:
     name: Release - ${{ matrix.platform.os-name }}
@@ -23,4 +25,5 @@ jobs:
         uses: houseabsolute/actions-rust-release@v0
         with:
           executable-name: blobasaur
+          changes-file: ""
           target: ${{ matrix.platform.target }}
