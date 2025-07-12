@@ -62,6 +62,28 @@ Blobasaur is a high-performance, sharded blob storage server written in Rust. It
 
 ## Installation
 
+### From GitHub Releases
+
+You can download pre-compiled binaries for Linux from the [GitHub Releases page](https://github.com/iamd3vil/blobasaur/releases).
+
+1.  **Download the latest release:**
+
+    For example, to download version `v0.1.0`:
+    ```bash
+    wget https://github.com/iamd3vil/blobasaur/releases/download/v0.1.0/blobasaur-Linux-musl-x86_64.tar.gz
+    ```
+
+2.  **Extract the archive:**
+    ```bash
+    tar -xvf blobasaur-Linux-musl-x86_64.tar.gz
+    ```
+
+3.  **Run the binary:**
+    The binary inside the archive is named `blobasaur`. You can run it directly:
+    ```bash
+    ./blobasaur
+    ```
+
 ### Prerequisites
 
 - **Rust toolchain** (latest stable recommended) - [Install Rust](https://rustup.rs/)
@@ -166,6 +188,20 @@ blobasaur --help
 **Global Options:**
 - `--config, -c`: Path to configuration file (default: `config.toml`)
 - `--help`: Display help information
+
+## Metrics
+
+Blobasaur exposes a wide range of metrics for monitoring, compatible with Prometheus. You can track command latency, connection counts, cache performance, and much more.
+
+To enable the metrics server, add the following to your `config.toml`:
+
+```toml
+[metrics]
+enabled = true
+addr = "0.0.0.0:9090"
+```
+
+For a complete list of available metrics and example usage with Prometheus and Grafana, please see the [METRICS.md](METRICS.md) documentation.
 
 ## Configuration
 
