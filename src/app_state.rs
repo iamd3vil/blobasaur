@@ -1,4 +1,5 @@
 use futures::future::join_all;
+use miette::Result;
 use moka::future::Cache;
 use mpchash::HashRing;
 use sqlx::SqlitePool;
@@ -44,7 +45,7 @@ impl AppState {
     pub async fn new(
         cfg: Cfg,
         shard_receivers_out: &mut Vec<mpsc::Receiver<ShardWriteOperation>>,
-    ) -> Self {
+    ) -> Result<Self> {
         let mut shard_senders_vec = Vec::new();
         // Clear the output vector first to ensure it's empty
         shard_receivers_out.clear();
@@ -57,6 +58,9 @@ impl AppState {
 
         // Create data directory if it doesn't exist
         fs::create_dir_all(&cfg.data_dir).expect("Failed to create data directory");
+
+        // Validate the number of shards in the data directory
+        validate_shard_count(&cfg.data_dir, cfg.num_shards)?;
 
         let mut db_pools_futures = vec![];
         for i in 0..cfg.num_shards {
@@ -168,7 +172,7 @@ impl AppState {
             ring.add(ShardNode(i as u64));
         }
 
-        AppState {
+        Ok(AppState {
             cfg,
             shard_senders: shard_senders_vec,
             db_pools,
@@ -178,7 +182,7 @@ impl AppState {
             compressor,
             metrics,
             ring,
-        }
+        })
     }
 
     pub fn get_shard(&self, key: &str) -> usize {
@@ -190,4 +194,77 @@ impl AppState {
     pub fn namespaced_key(&self, namespace: &str, key: &str) -> String {
         format!("{}:{}", namespace, key)
     }
+}
+
+/// Validates that the number of shard files in the data directory matches the expected count
+fn validate_shard_count(data_dir: &str, expected_shards: usize) -> Result<()> {
+    use std::path::Path;
+
+    let data_path = Path::new(data_dir);
+
+    // If the directory doesn't exist yet, that's fine - it will be created
+    if !data_path.exists() {
+        return Ok(());
+    }
+
+    // If the directory is empty, that's also fine - no validation needed
+    if let Ok(entries) = fs::read_dir(data_path) {
+        if entries.count() == 0 {
+            return Ok(());
+        }
+    }
+
+    // Count existing shard files
+    let mut actual_shards = 0;
+    for i in 0..expected_shards {
+        let shard_path = data_path.join(format!("shard_{}.db", i));
+        if shard_path.exists() {
+            actual_shards += 1;
+        }
+    }
+
+    // Check if we have more shards than expected
+    // Look for any shard files beyond the expected range
+    let mut extra_shards = Vec::new();
+    if let Ok(entries) = fs::read_dir(data_path) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let file_name_str = file_name.to_string_lossy();
+            if file_name_str.starts_with("shard_") && file_name_str.ends_with(".db") {
+                if let Some(num_str) = file_name_str
+                    .strip_prefix("shard_")
+                    .and_then(|s| s.strip_suffix(".db"))
+                {
+                    if let Ok(shard_num) = num_str.parse::<usize>() {
+                        if shard_num >= expected_shards {
+                            extra_shards.push(shard_num);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Report any mismatches
+    if actual_shards != expected_shards || !extra_shards.is_empty() {
+        let mut error_msg = format!(
+            "Shard count mismatch: expected {} shards, but found {} existing shards",
+            expected_shards, actual_shards
+        );
+
+        if !extra_shards.is_empty() {
+            error_msg.push_str(&format!(". Found extra shard files: {:?}", extra_shards));
+        }
+
+        if actual_shards < expected_shards {
+            error_msg.push_str(&format!(
+                ". Missing {} shard files.",
+                expected_shards - actual_shards
+            ));
+        }
+
+        return Err(miette::miette!(error_msg));
+    }
+
+    Ok(())
 }

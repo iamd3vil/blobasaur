@@ -80,9 +80,7 @@ async fn main() -> Result<()> {
 
     // Handle different commands
     match args.command {
-        Some(Command::Shard(shard_cmd)) => {
-            handle_shard_command(shard_cmd, &args.config).await
-        }
+        Some(Command::Shard(shard_cmd)) => handle_shard_command(shard_cmd, &args.config).await,
         Some(Command::Serve(_)) | None => {
             // Default to serving if no command specified
             run_server(&args.config).await
@@ -132,7 +130,11 @@ async fn run_server(config_path: &str) -> Result<()> {
     let mut shard_receivers = Vec::with_capacity(cfg.num_shards);
 
     // Initialize AppState, AppState::new will populate shard_receivers
-    let shared_state = Arc::new(AppState::new(cfg.clone(), &mut shard_receivers).await);
+    let shared_state = Arc::new(
+        AppState::new(cfg.clone(), &mut shard_receivers)
+            .await
+            .wrap_err("initializing AppState")?,
+    );
 
     // Initialize metrics
     shared_state.metrics.record_server_startup();
