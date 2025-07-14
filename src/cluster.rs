@@ -263,17 +263,10 @@ impl ClusterManager {
                         continue; // Skip self
                     }
 
-                    debug!(
-                        "Processing node: {} with keys: {:?}",
-                        chitchat_id.node_id,
-                        node_state.key_values().map(|(k, _)| k).collect::<Vec<_>>()
-                    );
+                    debug!("Processing node: {}", chitchat_id.node_id);
 
                     if let Some(node_info_value) = node_state.get("node_info") {
-                        debug!(
-                            "Node {} gossip data: {}",
-                            chitchat_id.node_id, node_info_value
-                        );
+                        debug!("Node {} has gossip data", chitchat_id.node_id);
                         match serde_json::from_str::<NodeGossipData>(node_info_value) {
                             Ok(gossip_data) => {
                                 if let Ok(addr) = gossip_data.addr.parse::<SocketAddr>() {
@@ -322,9 +315,7 @@ impl ClusterManager {
                         "Cluster membership changed for {}: {} -> {} nodes",
                         self.node_id, prev_count, new_count
                     );
-                    for (id, node) in nodes.iter() {
-                        info!("  Node {}: {} ({} slots)", id, node.addr, node.slots.len());
-                    }
+                    debug!("Cluster nodes: {} total", new_count);
                 } else if new_count > 0 {
                     debug!(
                         "Cluster membership stable for {}: {} nodes",
