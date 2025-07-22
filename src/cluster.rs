@@ -459,7 +459,7 @@ impl ClusterManager {
             result.push(node_info);
         }
 
-        result.join("\n")
+        format!("{}\n", result.join("\n"))
     }
 
     /// Convert slots set to Redis slot ranges format
@@ -527,7 +527,7 @@ impl ClusterManager {
              cluster_current_epoch:1\n\
              cluster_my_epoch:1\n\
              cluster_stats_messages_sent:0\n\
-             cluster_stats_messages_received:0",
+             cluster_stats_messages_received:0\n",
             cluster_state, total_assigned_slots, total_assigned_slots, total_nodes, total_nodes
         )
     }
