@@ -81,7 +81,8 @@ mod integration_tests {
             parsed_command,
             RedisCommand::Set {
                 key: "mykey".to_string(),
-                value: Bytes::from_static(b"hello world")
+                value: Bytes::from_static(b"hello world"),
+                ttl_seconds: None
             }
         );
     }
@@ -220,9 +221,10 @@ mod integration_tests {
 
             match parsed_command {
                 RedisCommand::Get { key } => assert_eq!(key, "key1"),
-                RedisCommand::Set { key, value } => {
+                RedisCommand::Set { key, value, ttl_seconds } => {
                     assert_eq!(key, "key2");
                     assert_eq!(value, Bytes::from_static(b"value"));
+                    assert_eq!(ttl_seconds, None);
                 }
                 RedisCommand::Del { key } => assert_eq!(key, "key3"),
                 _ => panic!("Unexpected command"),
@@ -241,9 +243,10 @@ mod integration_tests {
         let parsed_command = parse_command(parsed_resp).unwrap();
 
         match parsed_command {
-            RedisCommand::Set { key, value } => {
+            RedisCommand::Set { key, value, ttl_seconds } => {
                 assert_eq!(key, "binary");
                 assert_eq!(value, Bytes::copy_from_slice(binary_data));
+                assert_eq!(ttl_seconds, None);
             }
             _ => panic!("Expected SET command"),
         }
@@ -267,9 +270,10 @@ mod integration_tests {
         let parsed_command = parse_command(parsed_resp).unwrap();
 
         match parsed_command {
-            RedisCommand::Set { key, value } => {
+            RedisCommand::Set { key, value, ttl_seconds } => {
                 assert_eq!(key, large_key);
                 assert_eq!(value, Bytes::from(large_value.into_bytes()));
+                assert_eq!(ttl_seconds, None);
             }
             _ => panic!("Expected SET command"),
         }
@@ -283,9 +287,10 @@ mod integration_tests {
         let parsed_command = parse_command(parsed_resp).unwrap();
 
         match parsed_command {
-            RedisCommand::Set { key, value } => {
+            RedisCommand::Set { key, value, ttl_seconds } => {
                 assert_eq!(key, "empty");
                 assert_eq!(value, Bytes::new());
+                assert_eq!(ttl_seconds, None);
             }
             _ => panic!("Expected SET command"),
         }
@@ -413,6 +418,105 @@ mod integration_tests {
 
         let result = parse_command(invalid_del);
         assert!(matches!(result, Err(ParseError::Invalid(_))));
+    }
+
+    #[tokio::test]
+    async fn test_set_with_ttl_integration() {
+        // Test SET with EX option
+        let set_ex_command = b"*5\r\n$3\r\nSET\r\n$8\r\nttl_test\r\n$5\r\nvalue\r\n$2\r\nEX\r\n$2\r\n60\r\n";
+        let (parsed_resp, _) = parse_resp_with_remaining(set_ex_command).unwrap();
+        let parsed_command = parse_command(parsed_resp).unwrap();
+        match parsed_command {
+            RedisCommand::Set { key, value, ttl_seconds } => {
+                assert_eq!(key, "ttl_test");
+                assert_eq!(value, Bytes::from_static(b"value"));
+                assert_eq!(ttl_seconds, Some(60));
+            }
+            _ => panic!("Expected SET command with TTL"),
+        }
+
+        // Test SET with PX option
+        let set_px_command = b"*5\r\n$3\r\nSET\r\n$8\r\nttl_test\r\n$5\r\nvalue\r\n$2\r\nPX\r\n$5\r\n60000\r\n";
+        let (parsed_resp, _) = parse_resp_with_remaining(set_px_command).unwrap();
+        let parsed_command = parse_command(parsed_resp).unwrap();
+        match parsed_command {
+            RedisCommand::Set { key, value, ttl_seconds } => {
+                assert_eq!(key, "ttl_test");
+                assert_eq!(value, Bytes::from_static(b"value"));
+                assert_eq!(ttl_seconds, Some(60)); // 60000ms = 60s
+            }
+            _ => panic!("Expected SET command with TTL"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ttl_command_integration() {
+        let ttl_command = b"*2\r\n$3\r\nTTL\r\n$7\r\nmykey42\r\n";
+        let mock_response = b":-1\r\n"; // Key exists but no expiration
+
+        let port = create_mock_server(vec![mock_response.to_vec()]).await;
+        let addr = format!("127.0.0.1:{}", port);
+
+        let response = send_command_and_receive(&addr, ttl_command).await;
+        assert_eq!(response, mock_response);
+
+        // Parse the command to verify our parser works
+        let (parsed_resp, _) = parse_resp_with_remaining(ttl_command).unwrap();
+        let parsed_command = parse_command(parsed_resp).unwrap();
+        assert_eq!(
+            parsed_command,
+            RedisCommand::Ttl {
+                key: "mykey42".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_expire_command_integration() {
+        let expire_command = b"*3\r\n$6\r\nEXPIRE\r\n$7\r\nmykey42\r\n$3\r\n120\r\n";
+        let mock_response = b":1\r\n"; // Key exists and expiration was set
+
+        let port = create_mock_server(vec![mock_response.to_vec()]).await;
+        let addr = format!("127.0.0.1:{}", port);
+
+        let response = send_command_and_receive(&addr, expire_command).await;
+        assert_eq!(response, mock_response);
+
+        // Parse the command to verify our parser works
+        let (parsed_resp, _) = parse_resp_with_remaining(expire_command).unwrap();
+        let parsed_command = parse_command(parsed_resp).unwrap();
+        assert_eq!(
+            parsed_command,
+            RedisCommand::Expire {
+                key: "mykey42".to_string(),
+                seconds: 120
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ttl_edge_cases() {
+        // Test TTL for non-existent key
+        let ttl_command = b"*2\r\n$3\r\nTTL\r\n$11\r\nnonexistent\r\n";
+        let mock_response = b":-2\r\n"; // Key doesn't exist
+
+        let port = create_mock_server(vec![mock_response.to_vec()]).await;
+        let addr = format!("127.0.0.1:{}", port);
+
+        let response = send_command_and_receive(&addr, ttl_command).await;
+        assert_eq!(response, mock_response);
+    }
+
+    #[tokio::test]
+    async fn test_expire_on_nonexistent_key() {
+        let expire_command = b"*3\r\n$6\r\nEXPIRE\r\n$11\r\nnonexistent\r\n$2\r\n60\r\n";
+        let mock_response = b":0\r\n"; // Key doesn't exist
+
+        let port = create_mock_server(vec![mock_response.to_vec()]).await;
+        let addr = format!("127.0.0.1:{}", port);
+
+        let response = send_command_and_receive(&addr, expire_command).await;
+        assert_eq!(response, mock_response);
     }
 
     #[tokio::test]

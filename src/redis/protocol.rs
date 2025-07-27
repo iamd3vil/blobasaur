@@ -13,6 +13,7 @@ pub enum RedisCommand {
     Set {
         key: String,
         value: Bytes,
+        ttl_seconds: Option<u64>,
     },
     Del {
         key: String,
@@ -57,6 +58,13 @@ pub enum RedisCommand {
     ClusterKeySlot {
         key: String,
     },
+    Ttl {
+        key: String,
+    },
+    Expire {
+        key: String,
+        seconds: u64,
+    },
     Quit,
     Unknown(String),
 }
@@ -82,6 +90,8 @@ impl RedisCommand {
             RedisCommand::ClusterAddSlots { .. } => "CLUSTER ADDSLOTS".to_string(),
             RedisCommand::ClusterDelSlots { .. } => "CLUSTER DELSLOTS".to_string(),
             RedisCommand::ClusterKeySlot { .. } => "CLUSTER KEYSLOT".to_string(),
+            RedisCommand::Ttl { .. } => "TTL".to_string(),
+            RedisCommand::Expire { .. } => "EXPIRE".to_string(),
             RedisCommand::Quit => "QUIT".to_string(),
             RedisCommand::Unknown(cmd) => cmd.clone(),
         }
@@ -143,14 +153,50 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
             Ok(RedisCommand::Get { key })
         }
         "SET" => {
-            if elements.len() != 3 {
+            if elements.len() < 3 || elements.len() > 5 {
                 return Err(ParseError::Invalid(
-                    "SET requires exactly 2 arguments".to_string(),
+                    "SET requires 2-4 arguments".to_string(),
                 ));
             }
             let key = extract_string(&elements[1])?;
             let value = extract_bytes(&elements[2])?;
-            Ok(RedisCommand::Set { key, value })
+            
+            let mut ttl_seconds = None;
+            
+            // Parse optional TTL arguments (EX seconds or PX milliseconds)
+            let mut i = 3;
+            while i < elements.len() {
+                let option = extract_string(&elements[i])?.to_uppercase();
+                match option.as_str() {
+                    "EX" => {
+                        if i + 1 >= elements.len() {
+                            return Err(ParseError::Invalid("EX requires a value".to_string()));
+                        }
+                        let seconds_str = extract_string(&elements[i + 1])?;
+                        let seconds = seconds_str.parse::<u64>().map_err(|_| {
+                            ParseError::Invalid(format!("Invalid EX value: {}", seconds_str))
+                        })?;
+                        ttl_seconds = Some(seconds);
+                        i += 2;
+                    }
+                    "PX" => {
+                        if i + 1 >= elements.len() {
+                            return Err(ParseError::Invalid("PX requires a value".to_string()));
+                        }
+                        let millis_str = extract_string(&elements[i + 1])?;
+                        let millis = millis_str.parse::<u64>().map_err(|_| {
+                            ParseError::Invalid(format!("Invalid PX value: {}", millis_str))
+                        })?;
+                        ttl_seconds = Some(millis / 1000); // Convert to seconds
+                        i += 2;
+                    }
+                    _ => {
+                        return Err(ParseError::Invalid(format!("Unknown SET option: {}", option)));
+                    }
+                }
+            }
+            
+            Ok(RedisCommand::Set { key, value, ttl_seconds })
         }
         "DEL" => {
             if elements.len() != 2 {
@@ -287,6 +333,28 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
                 _ => Ok(RedisCommand::Unknown(format!("CLUSTER {}", subcommand))),
             }
         }
+        "TTL" => {
+            if elements.len() != 2 {
+                return Err(ParseError::Invalid(
+                    "TTL requires exactly 1 argument".to_string(),
+                ));
+            }
+            let key = extract_string(&elements[1])?;
+            Ok(RedisCommand::Ttl { key })
+        }
+        "EXPIRE" => {
+            if elements.len() != 3 {
+                return Err(ParseError::Invalid(
+                    "EXPIRE requires exactly 2 arguments".to_string(),
+                ));
+            }
+            let key = extract_string(&elements[1])?;
+            let seconds_str = extract_string(&elements[2])?;
+            let seconds = seconds_str.parse::<u64>().map_err(|_| {
+                ParseError::Invalid(format!("Invalid seconds value: {}", seconds_str))
+            })?;
+            Ok(RedisCommand::Expire { key, seconds })
+        }
         "QUIT" => Ok(RedisCommand::Quit),
         _ => Ok(RedisCommand::Unknown(command_name)),
     }
@@ -351,9 +419,153 @@ mod tests {
             command,
             RedisCommand::Set {
                 key: "mykey".to_string(),
-                value: Bytes::from_static(b"hello world")
+                value: Bytes::from_static(b"hello world"),
+                ttl_seconds: None
             }
         );
+    }
+
+    #[test]
+    fn test_parse_set_command_with_ex() {
+        let input = b"*5\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$11\r\nhello world\r\n$2\r\nEX\r\n$2\r\n60\r\n";
+        let (resp, _) = parse_resp_with_remaining(input).unwrap();
+        let command = parse_command(resp).unwrap();
+        assert_eq!(
+            command,
+            RedisCommand::Set {
+                key: "mykey".to_string(),
+                value: Bytes::from_static(b"hello world"),
+                ttl_seconds: Some(60)
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_set_command_with_px() {
+        let input = b"*5\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$11\r\nhello world\r\n$2\r\nPX\r\n$5\r\n60000\r\n";
+        let (resp, _) = parse_resp_with_remaining(input).unwrap();
+        let command = parse_command(resp).unwrap();
+        assert_eq!(
+            command,
+            RedisCommand::Set {
+                key: "mykey".to_string(),
+                value: Bytes::from_static(b"hello world"),
+                ttl_seconds: Some(60)
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_ttl_command() {
+        let input = b"*2\r\n$3\r\nTTL\r\n$5\r\nmykey\r\n";
+        let (resp, _) = parse_resp_with_remaining(input).unwrap();
+        let command = parse_command(resp).unwrap();
+        assert_eq!(
+            command,
+            RedisCommand::Ttl {
+                key: "mykey".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_expire_command() {
+        let input = b"*3\r\n$6\r\nEXPIRE\r\n$5\r\nmykey\r\n$2\r\n60\r\n";
+        let (resp, _) = parse_resp_with_remaining(input).unwrap();
+        let command = parse_command(resp).unwrap();
+        assert_eq!(
+            command,
+            RedisCommand::Expire {
+                key: "mykey".to_string(),
+                seconds: 60
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_set_command_invalid_ttl_options() {
+        // Test SET with invalid EX value
+        let input = b"*5\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$5\r\nvalue\r\n$2\r\nEX\r\n$3\r\nabc\r\n";
+        let (resp, _) = parse_resp_with_remaining(input).unwrap();
+        let result = parse_command(resp);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Invalid EX value"));
+
+        // Test SET with invalid PX value
+        let input = b"*5\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$5\r\nvalue\r\n$2\r\nPX\r\n$3\r\n-10\r\n";
+        let (resp, _) = parse_resp_with_remaining(input).unwrap();
+        let result = parse_command(resp);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Invalid PX value"));
+    }
+
+    #[test]
+    fn test_parse_set_command_missing_ttl_value() {
+        // Test SET with EX but no value
+        let input = b"*4\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$5\r\nvalue\r\n$2\r\nEX\r\n";
+        let (resp, _) = parse_resp_with_remaining(input).unwrap();
+        let result = parse_command(resp);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("EX requires a value"));
+
+        // Test SET with PX but no value
+        let input = b"*4\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$5\r\nvalue\r\n$2\r\nPX\r\n";
+        let (resp, _) = parse_resp_with_remaining(input).unwrap();
+        let result = parse_command(resp);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("PX requires a value"));
+    }
+
+    #[test]
+    fn test_parse_set_command_unknown_option() {
+        let input = b"*5\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$5\r\nvalue\r\n$2\r\nXX\r\n$2\r\n60\r\n";
+        let (resp, _) = parse_resp_with_remaining(input).unwrap();
+        let result = parse_command(resp);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Unknown SET option: XX"));
+    }
+
+    #[test]
+    fn test_parse_expire_command_invalid_seconds() {
+        let input = b"*3\r\n$6\r\nEXPIRE\r\n$5\r\nmykey\r\n$3\r\nabc\r\n";
+        let (resp, _) = parse_resp_with_remaining(input).unwrap();
+        let result = parse_command(resp);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Invalid seconds value"));
+    }
+
+    #[test]
+    fn test_parse_ttl_command_wrong_args() {
+        // Too many arguments
+        let input = b"*3\r\n$3\r\nTTL\r\n$5\r\nmykey\r\n$5\r\nextra\r\n";
+        let (resp, _) = parse_resp_with_remaining(input).unwrap();
+        let result = parse_command(resp);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("TTL requires exactly 1 argument"));
+
+        // Too few arguments
+        let input = b"*1\r\n$3\r\nTTL\r\n";
+        let (resp, _) = parse_resp_with_remaining(input).unwrap();
+        let result = parse_command(resp);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("TTL requires exactly 1 argument"));
+    }
+
+    #[test]
+    fn test_parse_expire_command_wrong_args() {
+        // Too many arguments
+        let input = b"*4\r\n$6\r\nEXPIRE\r\n$5\r\nmykey\r\n$2\r\n60\r\n$5\r\nextra\r\n";
+        let (resp, _) = parse_resp_with_remaining(input).unwrap();
+        let result = parse_command(resp);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("EXPIRE requires exactly 2 arguments"));
+
+        // Too few arguments
+        let input = b"*2\r\n$6\r\nEXPIRE\r\n$5\r\nmykey\r\n";
+        let (resp, _) = parse_resp_with_remaining(input).unwrap();
+        let result = parse_command(resp);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("EXPIRE requires exactly 2 arguments"));
     }
 
     #[test]

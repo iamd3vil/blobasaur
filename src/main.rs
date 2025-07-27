@@ -160,6 +160,17 @@ async fn run_server(config_path: &str) -> Result<()> {
         ));
     }
 
+    // Spawn cleanup tasks for each shard
+    let cleanup_interval_secs = 60; // Clean up expired keys every 60 seconds
+    for i in 0..cfg.num_shards {
+        let pool = shared_state.db_pools[i].clone();
+        tokio::spawn(shard_manager::shard_cleanup_task(
+            i,
+            pool,
+            cleanup_interval_secs,
+        ));
+    }
+
     // Start HTTP metrics server if enabled
     if let Some(handle) = prometheus_handle {
         let metrics_addr = cfg

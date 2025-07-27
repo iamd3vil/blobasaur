@@ -40,6 +40,7 @@ Blobasaur is a high-performance, sharded blob storage server written in Rust. It
   - [Storage Compression](#storage-compression-1)
 - [Advanced Topics](#advanced-topics)
   - [Database Schema](#database-schema)
+  - [TTL and Key Expiration](#ttl-and-key-expiration)
   - [Race Condition Handling](#race-condition-handling)
   - [Redis Cluster Compatibility](#redis-cluster-compatibility)
 - [Development](#development)
@@ -57,6 +58,7 @@ Blobasaur is a high-performance, sharded blob storage server written in Rust. It
 - **🗜️ Storage Compression**: Configurable compression with multiple algorithms (Gzip, Zstd, Lz4, Brotli)
 - **📊 Namespacing**: Hash-based namespacing using `HGET`/`HSET` commands for logical data organization
 - **🏷️ Metadata Tracking**: Automatic tracking of creation time, update time, expiration, and version numbers
+- **⏰ TTL Support**: Redis-compatible key expiration with `SET EX/PX`, `TTL`, and `EXPIRE` commands plus automatic background cleanup
 - **🌐 Redis Cluster Support**: Full cluster protocol support with automatic node discovery and client redirection
 - **⚙️ Highly Configurable**: Flexible configuration for shards, compression, batching, and performance tuning
 
@@ -159,6 +161,11 @@ just build-linux
    ```bash
    redis-cli -p 6379 SET mykey "Hello, World!"
    redis-cli -p 6379 GET mykey
+   
+   # Test TTL functionality
+   redis-cli -p 6379 SET session:123 "user_data" EX 60  # Expires in 60 seconds
+   redis-cli -p 6379 TTL session:123                    # Check remaining time
+   redis-cli -p 6379 EXPIRE mykey 300                   # Set 5 minute expiration
    ```
 
 ## CLI Usage
@@ -260,12 +267,19 @@ level = 1
 
 Blobasaur implements core Redis commands for blob operations:
 
-- **`SET key value`**: Store or replace a blob
+- **`SET key value [EX seconds] [PX milliseconds]`**: Store or replace a blob with optional TTL
   ```bash
+  # Basic SET
   redis-cli SET mykey "Hello, World!"
+  
+  # SET with TTL in seconds
+  redis-cli SET mykey "Hello, World!" EX 60
+  
+  # SET with TTL in milliseconds  
+  redis-cli SET mykey "Hello, World!" PX 30000
   ```
 
-- **`GET key`**: Retrieve a blob
+- **`GET key`**: Retrieve a blob (excludes expired keys)
   ```bash
   redis-cli GET mykey
   ```
@@ -275,9 +289,26 @@ Blobasaur implements core Redis commands for blob operations:
   redis-cli DEL mykey
   ```
 
-- **`EXISTS key`**: Check if a blob exists
+- **`EXISTS key`**: Check if a blob exists (excludes expired keys)
   ```bash
   redis-cli EXISTS mykey
+  ```
+
+- **`TTL key`**: Get the remaining time to live for a key
+  ```bash
+  redis-cli TTL mykey
+  # Returns:
+  # -1 if key exists but has no expiration
+  # -2 if key does not exist or has expired
+  # positive number: remaining TTL in seconds
+  ```
+
+- **`EXPIRE key seconds`**: Set expiration time for an existing key
+  ```bash
+  redis-cli EXPIRE mykey 120  # Expire in 2 minutes
+  # Returns:
+  # 1 if expiration was set successfully
+  # 0 if key does not exist
   ```
 
 ### Namespaced Commands
@@ -460,6 +491,32 @@ CREATE TABLE blobs (
 - Created automatically on first access
 - Same schema as default table
 - Isolated from other namespaces
+
+### TTL and Key Expiration
+
+**Features:**
+- **Redis-Compatible TTL**: Full support for `SET EX/PX`, `TTL`, and `EXPIRE` commands
+- **Automatic Expiry**: All read operations (`GET`, `EXISTS`, `TTL`) automatically filter expired keys
+- **Background Cleanup**: Per-shard cleanup tasks run every 60 seconds to remove expired keys
+- **Efficient Storage**: Uses indexed `expires_at` timestamps for fast expiry queries
+
+**Implementation Details:**
+- Expiration timestamps stored as Unix epoch seconds in `expires_at` column
+- Database indexes on `expires_at` for efficient cleanup queries  
+- Background cleanup processes both main `blobs` table and namespaced tables
+- Race-free expiry checking: keys are considered expired at query time
+
+**Usage Examples:**
+```bash
+# Set with 60 second expiration
+redis-cli SET session:abc123 "user_data" EX 60
+
+# Check remaining TTL  
+redis-cli TTL session:abc123
+
+# Add expiration to existing key
+redis-cli EXPIRE permanent_key 3600
+```
 
 ### Race Condition Handling
 

@@ -163,7 +163,7 @@ async fn handle_redis_command_inner(
             }
             handle_get(stream, state, key).await?;
         }
-        RedisCommand::Set { key, value } => {
+        RedisCommand::Set { key, value, ttl_seconds } => {
             if let Some(ref cluster_manager) = state.cluster_manager {
                 if !cluster_manager.should_handle_locally(&key).await {
                     if let Some(redirect) = cluster_manager.get_redirect_response(&key).await {
@@ -173,7 +173,7 @@ async fn handle_redis_command_inner(
                     }
                 }
             }
-            handle_set(stream, state, key, value).await?;
+            handle_set(stream, state, key, value, ttl_seconds).await?;
         }
         RedisCommand::Del { key } => {
             if let Some(ref cluster_manager) = state.cluster_manager {
@@ -241,6 +241,30 @@ async fn handle_redis_command_inner(
         }
         RedisCommand::ClusterKeySlot { key } => {
             handle_cluster_keyslot(stream, key).await?;
+        }
+        RedisCommand::Ttl { key } => {
+            if let Some(ref cluster_manager) = state.cluster_manager {
+                if !cluster_manager.should_handle_locally(&key).await {
+                    if let Some(redirect) = cluster_manager.get_redirect_response(&key).await {
+                        let response = BytesFrame::Error(redirect.into());
+                        stream.write_all(&serialize_frame(&response)).await?;
+                        return Ok(());
+                    }
+                }
+            }
+            handle_ttl(stream, state, key).await?;
+        }
+        RedisCommand::Expire { key, seconds } => {
+            if let Some(ref cluster_manager) = state.cluster_manager {
+                if !cluster_manager.should_handle_locally(&key).await {
+                    if let Some(redirect) = cluster_manager.get_redirect_response(&key).await {
+                        let response = BytesFrame::Error(redirect.into());
+                        stream.write_all(&serialize_frame(&response)).await?;
+                        return Ok(());
+                    }
+                }
+            }
+            handle_expire(stream, state, key, seconds).await?;
         }
         RedisCommand::Quit => {
             let response = BytesFrame::SimpleString("OK".into());
@@ -336,6 +360,7 @@ async fn handle_set(
     state: &Arc<AppState>,
     key: String,
     value: Bytes,
+    ttl_seconds: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let shard_index = state.get_shard(&key);
     let sender = &state.shard_senders[shard_index];
@@ -350,8 +375,11 @@ async fn handle_set(
             .insert(key.clone(), value.clone())
             .await;
 
+        // Calculate expires_at timestamp if TTL is provided
+        let expires_at = ttl_seconds.map(|ttl| chrono::Utc::now().timestamp() + ttl as i64);
+        
         // Async mode: respond immediately after queueing
-        let operation = ShardWriteOperation::SetAsync { key, data: value };
+        let operation = ShardWriteOperation::SetAsync { key, data: value, expires_at };
 
         if sender.send(operation).await.is_err() {
             tracing::error!(
@@ -367,12 +395,16 @@ async fn handle_set(
             state.metrics.record_storage_operation();
         }
     } else {
+        // Calculate expires_at timestamp if TTL is provided
+        let expires_at = ttl_seconds.map(|ttl| chrono::Utc::now().timestamp() + ttl as i64);
+        
         // Sync mode: wait for completion
         let (responder_tx, responder_rx) = oneshot::channel();
 
         let operation = ShardWriteOperation::Set {
             key,
             data: value,
+            expires_at,
             responder: responder_tx,
         };
 
@@ -1108,5 +1140,101 @@ async fn handle_cluster_keyslot(
     let slot = ClusterManager::calculate_slot(&key);
     let response = BytesFrame::Integer(slot as i64);
     stream.write_all(&serialize_frame(&response)).await?;
+    Ok(())
+}
+
+async fn handle_ttl(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+    key: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let shard_index = state.get_shard(&key);
+    let pool = &state.db_pools[shard_index];
+    let now = chrono::Utc::now().timestamp();
+
+    match sqlx::query_as::<_, (Option<i64>,)>(
+        "SELECT expires_at FROM blobs WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
+    )
+    .bind(&key)
+    .bind(now)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(Some((expires_at,))) => {
+            let ttl = match expires_at {
+                Some(expires_at) => expires_at - now,
+                None => -1, // Key exists but has no expiration
+            };
+            let response = BytesFrame::Integer(ttl);
+            stream.write_all(&serialize_frame(&response)).await?;
+        }
+        Ok(None) => {
+            // Key doesn't exist or is expired
+            let response = BytesFrame::Integer(-2);
+            stream.write_all(&serialize_frame(&response)).await?;
+        }
+        Err(e) => {
+            tracing::error!("TTL query error for key {}: {}", key, e);
+            let response = BytesFrame::Error("ERR internal error".into());
+            stream.write_all(&serialize_frame(&response)).await?;
+            state.metrics.record_error("storage");
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_expire(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+    key: String,
+    seconds: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let shard_index = state.get_shard(&key);
+    let sender = &state.shard_senders[shard_index];
+    let expires_at = chrono::Utc::now().timestamp() + seconds as i64;
+
+    let (responder_tx, responder_rx) = oneshot::channel();
+
+    let operation = ShardWriteOperation::Expire {
+        key,
+        expires_at,
+        responder: responder_tx,
+    };
+
+    if sender.send(operation).await.is_err() {
+        tracing::error!("Failed to send EXPIRE operation to shard {}", shard_index);
+        let response = BytesFrame::Error("ERR internal error".into());
+        stream.write_all(&serialize_frame(&response)).await?;
+        state.metrics.record_error("storage");
+    } else {
+        match responder_rx.await {
+            Ok(Ok(true)) => {
+                // Key was found and expiration was set
+                let response = BytesFrame::Integer(1);
+                stream.write_all(&serialize_frame(&response)).await?;
+                state.metrics.record_storage_operation();
+            }
+            Ok(Ok(false)) => {
+                // Key was not found
+                let response = BytesFrame::Integer(0);
+                stream.write_all(&serialize_frame(&response)).await?;
+                state.metrics.record_storage_operation();
+            }
+            Ok(Err(e)) => {
+                tracing::error!("EXPIRE operation failed: {}", e);
+                let response = BytesFrame::Error("ERR internal error".into());
+                stream.write_all(&serialize_frame(&response)).await?;
+                state.metrics.record_error("storage");
+            }
+            Err(_) => {
+                tracing::error!("Shard writer task cancelled or panicked for EXPIRE");
+                let response = BytesFrame::Error("ERR internal error".into());
+                stream.write_all(&serialize_frame(&response)).await?;
+                state.metrics.record_error("storage");
+            }
+        }
+    }
+
     Ok(())
 }
