@@ -26,9 +26,9 @@ node_id = "node-1"
 # These are the gossip addresses of the other nodes (internal Docker network)
 seeds = ["127.0.0.1:7002", "127.0.0.1:7003"]
 
-# Address that other nodes should use to connect to this node
-# For Docker, this should be the internal container hostname
-advertise_addr = "127.0.0.1:7001"
+# Address that Redis clients should use to connect to this node
+# This should be the Redis port, not the gossip port
+advertise_addr = "127.0.0.1:6381"
 
 # Port for gossip protocol communication
 port = 7001

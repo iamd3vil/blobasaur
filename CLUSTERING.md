@@ -50,7 +50,7 @@ addr = "0.0.0.0:6381"
 enabled = true
 node_id = "node-1"
 seeds = ["127.0.0.1:7002", "127.0.0.1:7003"]
-advertise_addr = "127.0.0.1:7001"
+advertise_addr = "127.0.0.1:6381"
 port = 7001
 gossip_interval_ms = 1000
 
@@ -77,7 +77,7 @@ addr = "0.0.0.0:6382"
 enabled = true
 node_id = "node-2"
 seeds = ["127.0.0.1:7001", "127.0.0.1:7003"]
-advertise_addr = "127.0.0.1:7002"
+advertise_addr = "127.0.0.1:6382"
 port = 7002
 gossip_interval_ms = 1000
 
@@ -104,7 +104,7 @@ addr = "0.0.0.0:6383"
 enabled = true
 node_id = "node-3"
 seeds = ["127.0.0.1:7001", "127.0.0.1:7002"]
-advertise_addr = "127.0.0.1:7003"
+advertise_addr = "127.0.0.1:6383"
 port = 7003
 gossip_interval_ms = 1000
 
@@ -120,7 +120,7 @@ Blobasaur uses two types of ports:
 
 - **Redis Protocol Port (`addr`)**: Where clients connect for Redis operations (6381, 6382, 6383)
 - **Gossip Port (`port`)**: For inter-node communication and cluster discovery (7001, 7002, 7003)
-- **Advertise Address (`advertise_addr`)**: How this node announces itself to other nodes in the gossip network
+- **Advertise Address (`advertise_addr`)**: The Redis address that clients should use to connect to this node (uses Redis port, not gossip port)
 
 ## Starting the Cluster
 

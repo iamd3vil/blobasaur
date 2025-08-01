@@ -126,15 +126,13 @@ impl ClusterManager {
 
         // Create initial gossip data for this node
         let initial_gossip_data = NodeGossipData {
-            addr: format!(
-                "{}:{}",
-                if redis_addr.ip().is_unspecified() {
-                    "127.0.0.1".to_string()
-                } else {
-                    redis_addr.ip().to_string()
-                },
-                redis_addr.port()
-            ),
+            addr: if let Some(ref advertise_addr) = config.advertise_addr {
+                advertise_addr.clone()
+            } else if redis_addr.ip().is_unspecified() {
+                format!("127.0.0.1:{}", redis_addr.port())
+            } else {
+                format!("{}:{}", redis_addr.ip(), redis_addr.port())
+            },
             slots: {
                 let mut slots = Vec::new();
                 // Add slots from slots array if present
@@ -605,16 +603,13 @@ impl ClusterManager {
         if let Some(handle) = self.chitchat_handle.as_ref() {
             let updated_slots: Vec<u16> = self.local_slots.read().await.iter().copied().collect();
             let gossip_data = NodeGossipData {
-                addr: self
-                    .config
-                    .advertise_addr
-                    .as_deref()
-                    .unwrap_or(&format!(
-                        "{}:{}",
-                        self.local_addr.ip(),
-                        self.local_addr.port()
-                    ))
-                    .to_string(),
+                addr: if let Some(ref advertise_addr) = self.config.advertise_addr {
+                    advertise_addr.clone()
+                } else if self.local_addr.ip().is_unspecified() {
+                    format!("127.0.0.1:{}", self.local_addr.port())
+                } else {
+                    format!("{}:{}", self.local_addr.ip(), self.local_addr.port())
+                },
                 slots: updated_slots,
                 state: "master".to_string(),
             };

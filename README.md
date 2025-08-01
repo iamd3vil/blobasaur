@@ -542,8 +542,8 @@ Full Redis cluster protocol support with:
 enabled = true
 node_id = "node1"
 seeds = ["127.0.0.1:6380"]
-advertise_addr = "127.0.0.1"
-port = 6379
+advertise_addr = "127.0.0.1:6379"  # Redis address for clients
+port = 6380                        # Gossip port for cluster communication
 
 [[cluster.slot_ranges]]
 start = 0
