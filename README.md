@@ -104,7 +104,7 @@ You'll need to build from source:
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/zerodha/blobasaur.git
+   git clone https://github.com/iamd3vil/blobasaur.git
    cd blobasaur
    ```
 
@@ -161,7 +161,7 @@ just build-linux
    ```bash
    redis-cli -p 6379 SET mykey "Hello, World!"
    redis-cli -p 6379 GET mykey
-   
+
    # Test TTL functionality
    redis-cli -p 6379 SET session:123 "user_data" EX 60  # Expires in 60 seconds
    redis-cli -p 6379 TTL session:123                    # Check remaining time
@@ -271,11 +271,11 @@ Blobasaur implements core Redis commands for blob operations:
   ```bash
   # Basic SET
   redis-cli SET mykey "Hello, World!"
-  
+
   # SET with TTL in seconds
   redis-cli SET mykey "Hello, World!" EX 60
-  
-  # SET with TTL in milliseconds  
+
+  # SET with TTL in milliseconds
   redis-cli SET mykey "Hello, World!" PX 30000
   ```
 
@@ -288,7 +288,7 @@ Blobasaur implements core Redis commands for blob operations:
   ```bash
   # Delete single key
   redis-cli DEL mykey
-  
+
   # Delete multiple keys
   redis-cli DEL key1 key2 key3
   ```
@@ -329,16 +329,16 @@ Use namespaces to organize data into logical groups:
   ```bash
   # Set single field with 60 second expiration
   redis-cli HSETEX sessions EX 60 FIELDS 1 user123 "session_data"
-  
+
   # Set multiple fields with expiration
   redis-cli HSETEX cache EX 300 FIELDS 2 key1 "value1" key2 "value2"
-  
+
   # Set with millisecond precision
   redis-cli HSETEX temp PX 5000 FIELDS 1 data "temporary"
-  
+
   # Only set if field doesn't exist (FNX option)
   redis-cli HSETEX users FNX EX 3600 FIELDS 1 newuser "data"
-  
+
   # Only set if field exists (FXX option)
   redis-cli HSETEX users FXX EX 3600 FIELDS 1 existinguser "updated"
   ```
@@ -531,7 +531,7 @@ CREATE TABLE blobs (
 
 **Implementation Details:**
 - Expiration timestamps stored as Unix epoch seconds in `expires_at` column
-- Database indexes on `expires_at` for efficient cleanup queries  
+- Database indexes on `expires_at` for efficient cleanup queries
 - Background cleanup processes both main `blobs` table and namespaced tables
 - Race-free expiry checking: keys are considered expired at query time
 
@@ -540,7 +540,7 @@ CREATE TABLE blobs (
 # Set with 60 second expiration
 redis-cli SET session:abc123 "user_data" EX 60
 
-# Check remaining TTL  
+# Check remaining TTL
 redis-cli TTL session:abc123
 
 # Add expiration to existing key
