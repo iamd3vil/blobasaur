@@ -4,6 +4,16 @@ use redis_protocol::resp2::{decode::decode_bytes_mut, encode::extend_encode, typ
 /// Redis protocol data types (re-export from redis-protocol crate)
 pub type RespValue = BytesFrame;
 
+/// Expiration options for commands
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExpireOption {
+    Ex(u64),        // seconds
+    Px(u64),        // milliseconds  
+    ExAt(i64),      // unix timestamp in seconds
+    PxAt(i64),      // unix timestamp in milliseconds
+    KeepTtl,
+}
+
 /// Commands supported by Blobasaur
 #[derive(Debug, Clone, PartialEq)]
 pub enum RedisCommand {
@@ -16,7 +26,7 @@ pub enum RedisCommand {
         ttl_seconds: Option<u64>,
     },
     Del {
-        key: String,
+        keys: Vec<String>,
     },
     Exists {
         key: String,
@@ -29,6 +39,13 @@ pub enum RedisCommand {
         namespace: String,
         key: String,
         value: Bytes,
+    },
+    HSetEx {
+        key: String,
+        fnx: bool,
+        fxx: bool,
+        expire_option: Option<ExpireOption>,
+        fields: Vec<(String, Bytes)>,
     },
     HDel {
         namespace: String,
@@ -79,6 +96,7 @@ impl RedisCommand {
             RedisCommand::Exists { .. } => "EXISTS".to_string(),
             RedisCommand::HGet { .. } => "HGET".to_string(),
             RedisCommand::HSet { .. } => "HSET".to_string(),
+            RedisCommand::HSetEx { .. } => "HSETEX".to_string(),
             RedisCommand::HDel { .. } => "HDEL".to_string(),
             RedisCommand::HExists { .. } => "HEXISTS".to_string(),
             RedisCommand::Ping { .. } => "PING".to_string(),
@@ -199,13 +217,16 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
             Ok(RedisCommand::Set { key, value, ttl_seconds })
         }
         "DEL" => {
-            if elements.len() != 2 {
+            if elements.len() < 2 {
                 return Err(ParseError::Invalid(
-                    "DEL requires exactly 1 argument".to_string(),
+                    "DEL requires at least 1 argument".to_string(),
                 ));
             }
-            let key = extract_string(&elements[1])?;
-            Ok(RedisCommand::Del { key })
+            let mut keys = Vec::new();
+            for key_element in &elements[1..] {
+                keys.push(extract_string(key_element)?);
+            }
+            Ok(RedisCommand::Del { keys })
         }
         "EXISTS" => {
             if elements.len() != 2 {
@@ -256,6 +277,123 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
                 namespace,
                 key,
                 value,
+            })
+        }
+        "HSETEX" => {
+            if elements.len() < 5 {
+                return Err(ParseError::Invalid(
+                    "HSETEX requires at least key, FIELDS, numfields, and one field-value pair".to_string(),
+                ));
+            }
+            
+            let key = extract_string(&elements[1])?;
+            let mut idx = 2;
+            let mut fnx = false;
+            let mut fxx = false;
+            let mut expire_option = None;
+            
+            // Parse options
+            while idx < elements.len() {
+                let opt = extract_string(&elements[idx])?.to_uppercase();
+                match opt.as_str() {
+                    "FNX" => {
+                        fnx = true;
+                        idx += 1;
+                    }
+                    "FXX" => {
+                        fxx = true;
+                        idx += 1;
+                    }
+                    "EX" => {
+                        if idx + 1 >= elements.len() {
+                            return Err(ParseError::Invalid("EX requires a value".to_string()));
+                        }
+                        let seconds = extract_string(&elements[idx + 1])?
+                            .parse::<u64>()
+                            .map_err(|_| ParseError::Invalid("Invalid EX value".to_string()))?;
+                        expire_option = Some(ExpireOption::Ex(seconds));
+                        idx += 2;
+                    }
+                    "PX" => {
+                        if idx + 1 >= elements.len() {
+                            return Err(ParseError::Invalid("PX requires a value".to_string()));
+                        }
+                        let millis = extract_string(&elements[idx + 1])?
+                            .parse::<u64>()
+                            .map_err(|_| ParseError::Invalid("Invalid PX value".to_string()))?;
+                        expire_option = Some(ExpireOption::Px(millis));
+                        idx += 2;
+                    }
+                    "EXAT" => {
+                        if idx + 1 >= elements.len() {
+                            return Err(ParseError::Invalid("EXAT requires a value".to_string()));
+                        }
+                        let timestamp = extract_string(&elements[idx + 1])?
+                            .parse::<i64>()
+                            .map_err(|_| ParseError::Invalid("Invalid EXAT value".to_string()))?;
+                        expire_option = Some(ExpireOption::ExAt(timestamp));
+                        idx += 2;
+                    }
+                    "PXAT" => {
+                        if idx + 1 >= elements.len() {
+                            return Err(ParseError::Invalid("PXAT requires a value".to_string()));
+                        }
+                        let timestamp = extract_string(&elements[idx + 1])?
+                            .parse::<i64>()
+                            .map_err(|_| ParseError::Invalid("Invalid PXAT value".to_string()))?;
+                        expire_option = Some(ExpireOption::PxAt(timestamp));
+                        idx += 2;
+                    }
+                    "KEEPTTL" => {
+                        expire_option = Some(ExpireOption::KeepTtl);
+                        idx += 1;
+                    }
+                    "FIELDS" => {
+                        break; // Found FIELDS keyword, exit options parsing
+                    }
+                    _ => {
+                        return Err(ParseError::Invalid(format!("Unknown option: {}", opt)));
+                    }
+                }
+            }
+            
+            // Check for FIELDS keyword
+            if idx >= elements.len() || extract_string(&elements[idx])?.to_uppercase() != "FIELDS" {
+                return Err(ParseError::Invalid("HSETEX requires FIELDS keyword".to_string()));
+            }
+            idx += 1;
+            
+            // Get number of fields
+            if idx >= elements.len() {
+                return Err(ParseError::Invalid("HSETEX requires field count after FIELDS".to_string()));
+            }
+            let num_fields = extract_string(&elements[idx])?
+                .parse::<usize>()
+                .map_err(|_| ParseError::Invalid("Invalid field count".to_string()))?;
+            idx += 1;
+            
+            // Parse field-value pairs
+            let mut fields = Vec::new();
+            for _ in 0..num_fields {
+                if idx + 1 >= elements.len() {
+                    return Err(ParseError::Invalid("Not enough field-value pairs".to_string()));
+                }
+                let field = extract_string(&elements[idx])?;
+                let value = extract_bytes(&elements[idx + 1])?;
+                fields.push((field, value));
+                idx += 2;
+            }
+            
+            if fields.is_empty() {
+                return Err(ParseError::Invalid("HSETEX requires at least one field-value pair".to_string()));
+            }
+            
+            Ok(RedisCommand::HSetEx {
+                key,
+                fnx,
+                fxx,
+                expire_option,
+                fields,
             })
         }
         "HDEL" => {
@@ -576,7 +714,7 @@ mod tests {
         assert_eq!(
             command,
             RedisCommand::Del {
-                key: "mykey".to_string()
+                keys: vec!["mykey".to_string()]
             }
         );
     }

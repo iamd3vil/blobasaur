@@ -104,7 +104,7 @@ mod integration_tests {
         assert_eq!(
             parsed_command,
             RedisCommand::Del {
-                key: "mykey".to_string()
+                keys: vec!["mykey".to_string()]
             }
         );
     }
@@ -221,12 +221,16 @@ mod integration_tests {
 
             match parsed_command {
                 RedisCommand::Get { key } => assert_eq!(key, "key1"),
-                RedisCommand::Set { key, value, ttl_seconds } => {
+                RedisCommand::Set {
+                    key,
+                    value,
+                    ttl_seconds,
+                } => {
                     assert_eq!(key, "key2");
                     assert_eq!(value, Bytes::from_static(b"value"));
                     assert_eq!(ttl_seconds, None);
                 }
-                RedisCommand::Del { key } => assert_eq!(key, "key3"),
+                RedisCommand::Del { keys } => assert_eq!(keys, vec!["key3"]),
                 _ => panic!("Unexpected command"),
             }
         }
@@ -243,7 +247,11 @@ mod integration_tests {
         let parsed_command = parse_command(parsed_resp).unwrap();
 
         match parsed_command {
-            RedisCommand::Set { key, value, ttl_seconds } => {
+            RedisCommand::Set {
+                key,
+                value,
+                ttl_seconds,
+            } => {
                 assert_eq!(key, "binary");
                 assert_eq!(value, Bytes::copy_from_slice(binary_data));
                 assert_eq!(ttl_seconds, None);
@@ -270,7 +278,11 @@ mod integration_tests {
         let parsed_command = parse_command(parsed_resp).unwrap();
 
         match parsed_command {
-            RedisCommand::Set { key, value, ttl_seconds } => {
+            RedisCommand::Set {
+                key,
+                value,
+                ttl_seconds,
+            } => {
                 assert_eq!(key, large_key);
                 assert_eq!(value, Bytes::from(large_value.into_bytes()));
                 assert_eq!(ttl_seconds, None);
@@ -287,7 +299,11 @@ mod integration_tests {
         let parsed_command = parse_command(parsed_resp).unwrap();
 
         match parsed_command {
-            RedisCommand::Set { key, value, ttl_seconds } => {
+            RedisCommand::Set {
+                key,
+                value,
+                ttl_seconds,
+            } => {
                 assert_eq!(key, "empty");
                 assert_eq!(value, Bytes::new());
                 assert_eq!(ttl_seconds, None);
@@ -423,11 +439,16 @@ mod integration_tests {
     #[tokio::test]
     async fn test_set_with_ttl_integration() {
         // Test SET with EX option
-        let set_ex_command = b"*5\r\n$3\r\nSET\r\n$8\r\nttl_test\r\n$5\r\nvalue\r\n$2\r\nEX\r\n$2\r\n60\r\n";
+        let set_ex_command =
+            b"*5\r\n$3\r\nSET\r\n$8\r\nttl_test\r\n$5\r\nvalue\r\n$2\r\nEX\r\n$2\r\n60\r\n";
         let (parsed_resp, _) = parse_resp_with_remaining(set_ex_command).unwrap();
         let parsed_command = parse_command(parsed_resp).unwrap();
         match parsed_command {
-            RedisCommand::Set { key, value, ttl_seconds } => {
+            RedisCommand::Set {
+                key,
+                value,
+                ttl_seconds,
+            } => {
                 assert_eq!(key, "ttl_test");
                 assert_eq!(value, Bytes::from_static(b"value"));
                 assert_eq!(ttl_seconds, Some(60));
@@ -436,11 +457,16 @@ mod integration_tests {
         }
 
         // Test SET with PX option
-        let set_px_command = b"*5\r\n$3\r\nSET\r\n$8\r\nttl_test\r\n$5\r\nvalue\r\n$2\r\nPX\r\n$5\r\n60000\r\n";
+        let set_px_command =
+            b"*5\r\n$3\r\nSET\r\n$8\r\nttl_test\r\n$5\r\nvalue\r\n$2\r\nPX\r\n$5\r\n60000\r\n";
         let (parsed_resp, _) = parse_resp_with_remaining(set_px_command).unwrap();
         let parsed_command = parse_command(parsed_resp).unwrap();
         match parsed_command {
-            RedisCommand::Set { key, value, ttl_seconds } => {
+            RedisCommand::Set {
+                key,
+                value,
+                ttl_seconds,
+            } => {
                 assert_eq!(key, "ttl_test");
                 assert_eq!(value, Bytes::from_static(b"value"));
                 assert_eq!(ttl_seconds, Some(60)); // 60000ms = 60s

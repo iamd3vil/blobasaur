@@ -38,6 +38,19 @@ pub enum ShardWriteOperation {
         key: String,
         data: Bytes,
     },
+    HSetEx {
+        namespace: String,
+        key: String,
+        data: Bytes,
+        expires_at: i64,
+        responder: oneshot::Sender<Result<(), String>>,
+    },
+    HSetExAsync {
+        namespace: String,
+        key: String,
+        data: Bytes,
+        expires_at: i64,
+    },
     HDelete {
         namespace: String,
         key: String,
@@ -336,6 +349,96 @@ async fn process_batch(
                     }
                 }
             }
+            ShardWriteOperation::HSetEx {
+                namespace,
+                key,
+                data,
+                expires_at,
+                ..
+            }
+            | ShardWriteOperation::HSetExAsync {
+                namespace,
+                key,
+                data,
+                expires_at,
+            } => {
+                match operation {
+                    ShardWriteOperation::HSetEx { .. } => sync_operations.push(idx),
+                    _ => {}
+                }
+
+                let table_name = format!("blobs_{}", namespace);
+
+                // Ensure table exists
+                if let Err(e) =
+                    ensure_namespaced_table_exists(&mut tx, &table_name, known_tables).await
+                {
+                    tracing::error!("[Shard {}] Failed to ensure table exists: {}", shard_id, e);
+                    Err(e)
+                } else {
+                    let now = Utc::now().timestamp();
+
+                    // Check if record exists to determine if this is an insert or update
+                    let query = format!("SELECT 1 FROM {} WHERE key = ?", table_name);
+                    let exists = sqlx::query(&query)
+                        .bind(key)
+                        .fetch_optional(&mut *tx)
+                        .await
+                        .map(|row| row.is_some())
+                        .unwrap_or(false);
+
+                    if exists {
+                        // Update existing record with expiration
+                        let update_query = format!(
+                            "UPDATE {} SET data = ?, updated_at = ?, expires_at = ?, version = version + 1 WHERE key = ?",
+                            table_name
+                        );
+                        sqlx::query(&update_query)
+                            .bind(&data[..])
+                            .bind(now)
+                            .bind(*expires_at)
+                            .bind(key)
+                            .execute(&mut *tx)
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| {
+                                tracing::error!(
+                                    "[Shard {}] HSETEX UPDATE error for namespace {} key {}: {}",
+                                    shard_id,
+                                    namespace,
+                                    key,
+                                    e
+                                );
+                                e.to_string()
+                            })
+                    } else {
+                        // Insert new record with expiration
+                        let insert_query = format!(
+                            "INSERT INTO {} (key, data, created_at, updated_at, expires_at, version) VALUES (?, ?, ?, ?, ?, 0)",
+                            table_name
+                        );
+                        sqlx::query(&insert_query)
+                            .bind(key)
+                            .bind(&data[..])
+                            .bind(now)
+                            .bind(now)
+                            .bind(*expires_at)
+                            .execute(&mut *tx)
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| {
+                                tracing::error!(
+                                    "[Shard {}] HSETEX INSERT error for namespace {} key {}: {}",
+                                    shard_id,
+                                    namespace,
+                                    key,
+                                    e
+                                );
+                                e.to_string()
+                            })
+                    }
+                }
+            }
             ShardWriteOperation::HDelete { namespace, key, .. }
             | ShardWriteOperation::HDeleteAsync { namespace, key } => {
                 match operation {
@@ -421,6 +524,10 @@ async fn process_batch(
                     let namespaced_key = format!("{}:{}", namespace, key);
                     inflight_hcache.invalidate(&namespaced_key).await;
                 }
+                ShardWriteOperation::HSetExAsync { namespace, key, .. } => {
+                    let namespaced_key = format!("{}:{}", namespace, key);
+                    inflight_hcache.invalidate(&namespaced_key).await;
+                }
                 ShardWriteOperation::HDeleteAsync { namespace, key } => {
                     // Also clean up any HSET operations that might have been overridden
                     let namespaced_key = format!("{}:{}", namespace, key);
@@ -438,6 +545,7 @@ async fn process_batch(
             ShardWriteOperation::Set { responder, .. }
             | ShardWriteOperation::Delete { responder, .. }
             | ShardWriteOperation::HSet { responder, .. }
+            | ShardWriteOperation::HSetEx { responder, .. }
             | ShardWriteOperation::HDelete { responder, .. } => {
                 let final_result = match &commit_result {
                     Ok(_) => Ok(()),
@@ -461,6 +569,7 @@ async fn process_batch(
             ShardWriteOperation::SetAsync { .. }
             | ShardWriteOperation::DeleteAsync { .. }
             | ShardWriteOperation::HSetAsync { .. }
+            | ShardWriteOperation::HSetExAsync { .. }
             | ShardWriteOperation::HDeleteAsync { .. } => {
                 // Async operations don't need responses, but log commit errors
                 if let Err(e) = &commit_result {

@@ -52,7 +52,7 @@ Blobasaur is a high-performance, sharded blob storage server written in Rust. It
 
 - **🚀 High Performance Sharding**: Distributes data across multiple SQLite databases using multi-probe consistent hashing for optimal concurrency and scalability
 - **🔄 Shard Migration**: Built-in support for migrating data between different shard configurations with data integrity verification
-- **🔌 Redis Protocol Compatible**: Full compatibility with Redis clients using standard commands (`GET`, `SET`, `DEL`, `EXISTS`, `HGET`, `HSET`, `HDEL`, `HEXISTS`)
+- **🔌 Redis Protocol Compatible**: Full compatibility with Redis clients using standard commands (`GET`, `SET`, `DEL`, `EXISTS`, `HGET`, `HSET`, `HSETEX`, `HDEL`, `HEXISTS`)
 - **⚡ Asynchronous Operations**: Built on Tokio for non-blocking I/O and efficient concurrent request handling
 - **💾 SQLite Backend**: Each shard uses its own SQLite database for simple deployment and reliable storage
 - **🗜️ Storage Compression**: Configurable compression with multiple algorithms (Gzip, Zstd, Lz4, Brotli)
@@ -284,9 +284,13 @@ Blobasaur implements core Redis commands for blob operations:
   redis-cli GET mykey
   ```
 
-- **`DEL key`**: Delete a blob
+- **`DEL key [key ...]`**: Delete one or more blobs (returns count of deleted keys)
   ```bash
+  # Delete single key
   redis-cli DEL mykey
+  
+  # Delete multiple keys
+  redis-cli DEL key1 key2 key3
   ```
 
 - **`EXISTS key`**: Check if a blob exists (excludes expired keys)
@@ -321,6 +325,24 @@ Use namespaces to organize data into logical groups:
   redis-cli HSET users:123 email "john@example.com"
   ```
 
+- **`HSETEX key [options] FIELDS numfields field value [field value ...]`**: Store fields with TTL
+  ```bash
+  # Set single field with 60 second expiration
+  redis-cli HSETEX sessions EX 60 FIELDS 1 user123 "session_data"
+  
+  # Set multiple fields with expiration
+  redis-cli HSETEX cache EX 300 FIELDS 2 key1 "value1" key2 "value2"
+  
+  # Set with millisecond precision
+  redis-cli HSETEX temp PX 5000 FIELDS 1 data "temporary"
+  
+  # Only set if field doesn't exist (FNX option)
+  redis-cli HSETEX users FNX EX 3600 FIELDS 1 newuser "data"
+  
+  # Only set if field exists (FXX option)
+  redis-cli HSETEX users FXX EX 3600 FIELDS 1 existinguser "updated"
+  ```
+
 - **`HGET namespace key`**: Retrieve from namespace
   ```bash
   redis-cli HGET users:123 name
@@ -350,6 +372,13 @@ value = r.get('mykey')
 # Namespaced operations
 r.hset('users:123', 'name', 'John Doe')
 name = r.hget('users:123', 'name')
+
+# Namespaced operations with TTL (Redis 8.0 compatible)
+# HSETEX syntax: key [options] FIELDS numfields field value [field value ...]
+r.execute_command('HSETEX', 'sessions', 'EX', '3600', 'FIELDS', '1', 'user456', 'session_data')
+
+# Set multiple fields with expiration
+r.execute_command('HSETEX', 'cache', 'EX', '300', 'FIELDS', '2', 'key1', 'val1', 'key2', 'val2')
 ```
 
 ## Shard Migration

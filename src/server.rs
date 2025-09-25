@@ -163,7 +163,11 @@ async fn handle_redis_command_inner(
             }
             handle_get(stream, state, key).await?;
         }
-        RedisCommand::Set { key, value, ttl_seconds } => {
+        RedisCommand::Set {
+            key,
+            value,
+            ttl_seconds,
+        } => {
             if let Some(ref cluster_manager) = state.cluster_manager {
                 if !cluster_manager.should_handle_locally(&key).await {
                     if let Some(redirect) = cluster_manager.get_redirect_response(&key).await {
@@ -175,17 +179,8 @@ async fn handle_redis_command_inner(
             }
             handle_set(stream, state, key, value, ttl_seconds).await?;
         }
-        RedisCommand::Del { key } => {
-            if let Some(ref cluster_manager) = state.cluster_manager {
-                if !cluster_manager.should_handle_locally(&key).await {
-                    if let Some(redirect) = cluster_manager.get_redirect_response(&key).await {
-                        let response = BytesFrame::Error(redirect.into());
-                        stream.write_all(&serialize_frame(&response)).await?;
-                        return Ok(());
-                    }
-                }
-            }
-            handle_del(stream, state, key).await?;
+        RedisCommand::Del { keys } => {
+            handle_del_multiple(stream, state, keys).await?;
         }
         RedisCommand::Exists { key } => {
             if let Some(ref cluster_manager) = state.cluster_manager {
@@ -217,6 +212,15 @@ async fn handle_redis_command_inner(
             value,
         } => {
             handle_hset(stream, state, namespace, key, value).await?;
+        }
+        RedisCommand::HSetEx {
+            key,
+            fnx,
+            fxx,
+            expire_option,
+            fields,
+        } => {
+            handle_hsetex(stream, state, key, fnx, fxx, expire_option, fields).await?;
         }
         RedisCommand::HDel { namespace, key } => {
             handle_hdel(stream, state, namespace, key).await?;
@@ -377,9 +381,13 @@ async fn handle_set(
 
         // Calculate expires_at timestamp if TTL is provided
         let expires_at = ttl_seconds.map(|ttl| chrono::Utc::now().timestamp() + ttl as i64);
-        
+
         // Async mode: respond immediately after queueing
-        let operation = ShardWriteOperation::SetAsync { key, data: value, expires_at };
+        let operation = ShardWriteOperation::SetAsync {
+            key,
+            data: value,
+            expires_at,
+        };
 
         if sender.send(operation).await.is_err() {
             tracing::error!(
@@ -397,7 +405,7 @@ async fn handle_set(
     } else {
         // Calculate expires_at timestamp if TTL is provided
         let expires_at = ttl_seconds.map(|ttl| chrono::Utc::now().timestamp() + ttl as i64);
-        
+
         // Sync mode: wait for completion
         let (responder_tx, responder_rx) = oneshot::channel();
 
@@ -439,84 +447,101 @@ async fn handle_set(
     Ok(())
 }
 
-async fn handle_del(
+async fn handle_del_multiple(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
-    key: String,
+    keys: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let shard_index = state.get_shard(&key);
+    let mut deleted_count = 0;
 
-    // First check if key exists
-    let pool = &state.db_pools[shard_index];
-    let exists = sqlx::query("SELECT 1 FROM blobs WHERE key = ?")
-        .bind(&key)
-        .fetch_optional(pool)
-        .await
-        .map(|row| row.is_some())
-        .unwrap_or(false);
-
-    if !exists {
-        // Redis DEL returns the number of keys deleted
-        let response = BytesFrame::Integer(0);
-        stream.write_all(&serialize_frame(&response)).await?;
-        return Ok(());
-    }
-
-    let sender = &state.shard_senders[shard_index];
-
-    // Check if async_write is enabled
-    if state.cfg.async_write.unwrap_or(false) {
-        // Remove from inflight cache immediately for delete operations
-        state.inflight_cache.invalidate(&key).await;
-
-        // Async mode: respond immediately after queueing
-        let operation = ShardWriteOperation::DeleteAsync { key };
-
-        if sender.send(operation).await.is_err() {
-            tracing::error!(
-                "Failed to send ASYNC DELETE operation to shard {}",
-                shard_index
-            );
-            let response = BytesFrame::Error("ERR internal error ".into());
-            stream.write_all(&serialize_frame(&response)).await?;
-        } else {
-            // Assume success for async mode
-            let response = BytesFrame::Integer(1);
-            stream.write_all(&serialize_frame(&response)).await?;
+    for key in keys {
+        // Check cluster routing for each key
+        if let Some(ref cluster_manager) = state.cluster_manager {
+            if !cluster_manager.should_handle_locally(&key).await {
+                if let Some(redirect) = cluster_manager.get_redirect_response(&key).await {
+                    let response = BytesFrame::Error(redirect.into());
+                    stream.write_all(&serialize_frame(&response)).await?;
+                    return Ok(());
+                }
+            }
         }
-    } else {
-        // Sync mode: wait for completion
-        let (responder_tx, responder_rx) = oneshot::channel();
 
-        let operation = ShardWriteOperation::Delete {
-            key,
-            responder: responder_tx,
-        };
+        let shard_index = state.get_shard(&key);
+        let pool = &state.db_pools[shard_index];
 
-        if sender.send(operation).await.is_err() {
-            tracing::error!("Failed to send DELETE operation to shard {}", shard_index);
-            let response = BytesFrame::Error("ERR internal error ".into());
-            stream.write_all(&serialize_frame(&response)).await?;
+        // Check if key exists first
+        let exists = sqlx::query("SELECT 1 FROM blobs WHERE key = ?")
+            .bind(&key)
+            .fetch_optional(pool)
+            .await
+            .map(|row| row.is_some())
+            .unwrap_or(false);
+
+        if !exists {
+            continue; // Key doesn't exist, skip
+        }
+
+        let sender = &state.shard_senders[shard_index];
+
+        // Check if async_write is enabled
+        if state.cfg.async_write.unwrap_or(false) {
+            // Remove from inflight cache immediately for delete operations
+            state.inflight_cache.invalidate(&key).await;
+
+            // Async mode: respond immediately after queueing
+            let operation = ShardWriteOperation::DeleteAsync { key };
+
+            if sender.send(operation).await.is_err() {
+                tracing::error!(
+                    "Failed to send ASYNC DELETE operation to shard {}",
+                    shard_index
+                );
+                let response = BytesFrame::Error("ERR internal error".into());
+                stream.write_all(&serialize_frame(&response)).await?;
+                return Ok(());
+            } else {
+                // Assume success for async mode
+                deleted_count += 1;
+            }
         } else {
-            match responder_rx.await {
-                Ok(Ok(())) => {
-                    let response = BytesFrame::Integer(1);
-                    stream.write_all(&serialize_frame(&response)).await?;
-                }
-                Ok(Err(e)) => {
-                    tracing::error!("Shard writer failed for DELETE: {}", e);
-                    let response = BytesFrame::Error("ERR database error ".into());
-                    stream.write_all(&serialize_frame(&response)).await?;
-                }
-                Err(_) => {
-                    tracing::error!("Shard writer task cancelled or panicked for DELETE ");
-                    let response = BytesFrame::Error("ERR internal error ".into());
-                    stream.write_all(&serialize_frame(&response)).await?;
+            // Sync mode: wait for completion
+            let (responder_tx, responder_rx) = oneshot::channel();
+
+            let operation = ShardWriteOperation::Delete {
+                key,
+                responder: responder_tx,
+            };
+
+            if sender.send(operation).await.is_err() {
+                tracing::error!("Failed to send DELETE operation to shard {}", shard_index);
+                let response = BytesFrame::Error("ERR internal error".into());
+                stream.write_all(&serialize_frame(&response)).await?;
+                return Ok(());
+            } else {
+                match responder_rx.await {
+                    Ok(Ok(())) => {
+                        deleted_count += 1;
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!("Shard writer failed for DELETE: {}", e);
+                        let response = BytesFrame::Error("ERR database error".into());
+                        stream.write_all(&serialize_frame(&response)).await?;
+                        return Ok(());
+                    }
+                    Err(_) => {
+                        tracing::error!("Shard writer task cancelled or panicked for DELETE");
+                        let response = BytesFrame::Error("ERR internal error".into());
+                        stream.write_all(&serialize_frame(&response)).await?;
+                        return Ok(());
+                    }
                 }
             }
         }
     }
 
+    // Return the total number of keys deleted
+    let response = BytesFrame::Integer(deleted_count);
+    stream.write_all(&serialize_frame(&response)).await?;
     Ok(())
 }
 
@@ -801,6 +826,185 @@ async fn handle_hset(
             }
         }
     }
+
+    Ok(())
+}
+
+async fn handle_hsetex(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+    key: String,
+    fnx: bool,
+    fxx: bool,
+    expire_option: Option<crate::redis::protocol::ExpireOption>,
+    fields: Vec<(String, Bytes)>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::redis::protocol::ExpireOption;
+
+    // In Blobasaur, the hash key is the namespace, and fields are the actual keys
+    let namespace = key;
+
+    // Calculate expires_at timestamp from expire option
+    let expires_at = match expire_option {
+        Some(ExpireOption::Ex(seconds)) => Some(chrono::Utc::now().timestamp() + seconds as i64),
+        Some(ExpireOption::Px(millis)) => {
+            Some(chrono::Utc::now().timestamp() + (millis as i64 / 1000))
+        }
+        Some(ExpireOption::ExAt(timestamp)) => Some(timestamp),
+        Some(ExpireOption::PxAt(timestamp)) => Some(timestamp / 1000),
+        Some(ExpireOption::KeepTtl) => {
+            // For KEEPTTL, we'd need to fetch existing TTL - for now, skip TTL setting
+            None
+        }
+        None => None,
+    };
+
+    // Process multiple fields
+    let mut fields_set = 0;
+    let total_fields = fields.len();
+
+    for (field_key, field_value) in fields {
+        // Check if we should handle this hash operation locally in a cluster
+        if let Some(ref cluster_manager) = state.cluster_manager {
+            if !cluster_manager
+                .should_handle_hash_locally(&namespace, &field_key)
+                .await
+            {
+                if let Some(redirect) = cluster_manager
+                    .get_hash_redirect_response(&namespace, &field_key)
+                    .await
+                {
+                    let response = BytesFrame::Error(redirect.into());
+                    stream.write_all(&serialize_frame(&response)).await?;
+                    return Ok(());
+                }
+            }
+        }
+
+        let shard_index = state.get_shard(&field_key);
+        let sender = &state.shard_senders[shard_index];
+        let pool = &state.db_pools[shard_index];
+        let table_name = format!("blobs_{}", namespace);
+
+        // Check FNX/FXX conditions if specified
+        if fnx || fxx {
+            let query = format!("SELECT 1 FROM {} WHERE key = ?", table_name);
+            let exists = sqlx::query(&query)
+                .bind(&field_key)
+                .fetch_optional(pool)
+                .await
+                .map(|row| row.is_some())
+                .unwrap_or(false);
+
+            if fnx && exists {
+                // FNX: Only set if field doesn't exist, return 0 for entire operation
+                let response = BytesFrame::Integer(0);
+                stream.write_all(&serialize_frame(&response)).await?;
+                return Ok(());
+            }
+            if fxx && !exists {
+                // FXX: Only set if field exists, return 0 for entire operation
+                let response = BytesFrame::Integer(0);
+                stream.write_all(&serialize_frame(&response)).await?;
+                return Ok(());
+            }
+        }
+
+        // Compress data if storage compression is enabled
+        let compressed_value = compress_if_enabled(state, field_value).await?;
+
+        // Send the operation
+        if state.cfg.async_write.unwrap_or(false) {
+            // Store in inflight cache to prevent race conditions
+            let namespaced_key = state.namespaced_key(&namespace, &field_key);
+            state
+                .inflight_hcache
+                .insert(namespaced_key, compressed_value.clone())
+                .await;
+
+            let operation = if let Some(exp) = expires_at {
+                ShardWriteOperation::HSetExAsync {
+                    namespace: namespace.clone(),
+                    key: field_key,
+                    data: compressed_value,
+                    expires_at: exp,
+                }
+            } else {
+                ShardWriteOperation::HSetAsync {
+                    namespace: namespace.clone(),
+                    key: field_key,
+                    data: compressed_value,
+                }
+            };
+
+            if sender.send(operation).await.is_err() {
+                tracing::error!(
+                    "Failed to send ASYNC HSETEX operation to shard {}",
+                    shard_index
+                );
+                let response = BytesFrame::Error("ERR internal error".into());
+                stream.write_all(&serialize_frame(&response)).await?;
+                return Ok(());
+            }
+            fields_set += 1;
+        } else {
+            // Sync mode: wait for completion
+            let (responder_tx, responder_rx) = oneshot::channel();
+
+            let operation = if let Some(exp) = expires_at {
+                ShardWriteOperation::HSetEx {
+                    namespace: namespace.clone(),
+                    key: field_key,
+                    data: compressed_value,
+                    expires_at: exp,
+                    responder: responder_tx,
+                }
+            } else {
+                ShardWriteOperation::HSet {
+                    namespace: namespace.clone(),
+                    key: field_key,
+                    data: compressed_value,
+                    responder: responder_tx,
+                }
+            };
+
+            if sender.send(operation).await.is_err() {
+                tracing::error!("Failed to send HSETEX operation to shard {}", shard_index);
+                let response = BytesFrame::Error("ERR internal error".into());
+                stream.write_all(&serialize_frame(&response)).await?;
+                return Ok(());
+            }
+
+            match responder_rx.await {
+                Ok(Ok(())) => {
+                    fields_set += 1;
+                }
+                Ok(Err(e)) => {
+                    tracing::error!("Shard writer failed for HSETEX: {}", e);
+                    let response = BytesFrame::Error("ERR database error".into());
+                    stream.write_all(&serialize_frame(&response)).await?;
+                    return Ok(());
+                }
+                Err(_) => {
+                    tracing::error!("Shard writer task cancelled or panicked for HSETEX");
+                    let response = BytesFrame::Error("ERR internal error".into());
+                    stream.write_all(&serialize_frame(&response)).await?;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    // Return 1 if all fields were set, 0 if none
+    let result = if fields_set == total_fields {
+        1
+    } else if fields_set == 0 {
+        0
+    } else {
+        1
+    };
+    let response = BytesFrame::Integer(result);
+    stream.write_all(&serialize_frame(&response)).await?;
 
     Ok(())
 }
