@@ -7,6 +7,7 @@ use crate::compression;
 pub struct Cfg {
     pub data_dir: String,
     pub num_shards: usize,
+    pub storage_backend: Option<StorageBackend>,
     pub storage_compression: Option<CompressionConfig>,
     pub async_write: Option<bool>,
     pub batch_size: Option<usize>,
@@ -14,6 +15,13 @@ pub struct Cfg {
     pub addr: Option<String>,
     pub cluster: Option<ClusterConfig>,
     pub metrics: Option<MetricsConfig>,
+}
+
+#[derive(Debug, Clone, Copy, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum StorageBackend {
+    Sqlite,
+    Turso,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -100,6 +108,13 @@ impl Cfg {
 
         println!("Data directory: {}", cfg.data_dir);
         println!("Number of shards: {}", cfg.num_shards);
+        println!(
+            "Storage backend: {}",
+            match cfg.storage_backend.unwrap_or(StorageBackend::Sqlite) {
+                StorageBackend::Sqlite => "sqlite",
+                StorageBackend::Turso => "turso",
+            }
+        );
 
         if let Some(ref metrics) = cfg.metrics {
             if metrics.enabled {
@@ -118,5 +133,9 @@ impl Cfg {
             Some(comp) if comp.enabled => true,
             _ => false,
         }
+    }
+
+    pub fn backend(&self) -> StorageBackend {
+        self.storage_backend.unwrap_or(StorageBackend::Sqlite)
     }
 }

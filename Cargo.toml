@@ -3,6 +3,11 @@ name = "blobasaur"
 version = "0.2.0"
 edition = "2024"
 
+[features]
+default = ["backend-sqlite"]
+backend-sqlite = []
+backend-turso = ["turso"]
+
 [dependencies]
 async-compression = { version = "0.4.9", features = [
     "tokio",
@@ -34,6 +39,7 @@ tracing-subscriber = "0.3.19"
 axum = "0.7"
 metrics = "0.23"
 metrics-exporter-prometheus = "0.15"
+turso = { version = "0.2.2", optional = true }
 
 [dev-dependencies]
 tempfile = "3.0"

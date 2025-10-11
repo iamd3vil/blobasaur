@@ -434,7 +434,10 @@ impl ClusterManager {
         let (local_ip, local_port) = if let Some(ref advertise_addr) = self.config.advertise_addr {
             // Parse advertise_addr which is in "ip:port" format
             if let Some((ip, port)) = advertise_addr.split_once(':') {
-                (ip.to_string(), port.parse().unwrap_or(self.local_addr.port()))
+                (
+                    ip.to_string(),
+                    port.parse().unwrap_or(self.local_addr.port()),
+                )
             } else {
                 // If no port in advertise_addr, use the IP with local port
                 (advertise_addr.clone(), self.local_addr.port())
@@ -444,13 +447,10 @@ impl ClusterManager {
         } else {
             (self.local_addr.ip().to_string(), self.local_addr.port())
         };
-        
+
         let local_info = format!(
             "{} {}:{} myself,master - 0 0 0 connected {}",
-            self.node_id,
-            local_ip,
-            local_port,
-            local_slots_ranges
+            self.node_id, local_ip, local_port, local_slots_ranges
         );
         result.push(local_info);
 

@@ -7,10 +7,10 @@ pub type RespValue = BytesFrame;
 /// Expiration options for commands
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExpireOption {
-    Ex(u64),        // seconds
-    Px(u64),        // milliseconds  
-    ExAt(i64),      // unix timestamp in seconds
-    PxAt(i64),      // unix timestamp in milliseconds
+    Ex(u64),   // seconds
+    Px(u64),   // milliseconds
+    ExAt(i64), // unix timestamp in seconds
+    PxAt(i64), // unix timestamp in milliseconds
     KeepTtl,
 }
 
@@ -178,9 +178,9 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
             }
             let key = extract_string(&elements[1])?;
             let value = extract_bytes(&elements[2])?;
-            
+
             let mut ttl_seconds = None;
-            
+
             // Parse optional TTL arguments (EX seconds or PX milliseconds)
             let mut i = 3;
             while i < elements.len() {
@@ -209,12 +209,19 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
                         i += 2;
                     }
                     _ => {
-                        return Err(ParseError::Invalid(format!("Unknown SET option: {}", option)));
+                        return Err(ParseError::Invalid(format!(
+                            "Unknown SET option: {}",
+                            option
+                        )));
                     }
                 }
             }
-            
-            Ok(RedisCommand::Set { key, value, ttl_seconds })
+
+            Ok(RedisCommand::Set {
+                key,
+                value,
+                ttl_seconds,
+            })
         }
         "DEL" => {
             if elements.len() < 2 {
@@ -282,16 +289,17 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
         "HSETEX" => {
             if elements.len() < 5 {
                 return Err(ParseError::Invalid(
-                    "HSETEX requires at least key, FIELDS, numfields, and one field-value pair".to_string(),
+                    "HSETEX requires at least key, FIELDS, numfields, and one field-value pair"
+                        .to_string(),
                 ));
             }
-            
+
             let key = extract_string(&elements[1])?;
             let mut idx = 2;
             let mut fnx = false;
             let mut fxx = false;
             let mut expire_option = None;
-            
+
             // Parse options
             while idx < elements.len() {
                 let opt = extract_string(&elements[idx])?.to_uppercase();
@@ -356,38 +364,46 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
                     }
                 }
             }
-            
+
             // Check for FIELDS keyword
             if idx >= elements.len() || extract_string(&elements[idx])?.to_uppercase() != "FIELDS" {
-                return Err(ParseError::Invalid("HSETEX requires FIELDS keyword".to_string()));
+                return Err(ParseError::Invalid(
+                    "HSETEX requires FIELDS keyword".to_string(),
+                ));
             }
             idx += 1;
-            
+
             // Get number of fields
             if idx >= elements.len() {
-                return Err(ParseError::Invalid("HSETEX requires field count after FIELDS".to_string()));
+                return Err(ParseError::Invalid(
+                    "HSETEX requires field count after FIELDS".to_string(),
+                ));
             }
             let num_fields = extract_string(&elements[idx])?
                 .parse::<usize>()
                 .map_err(|_| ParseError::Invalid("Invalid field count".to_string()))?;
             idx += 1;
-            
+
             // Parse field-value pairs
             let mut fields = Vec::new();
             for _ in 0..num_fields {
                 if idx + 1 >= elements.len() {
-                    return Err(ParseError::Invalid("Not enough field-value pairs".to_string()));
+                    return Err(ParseError::Invalid(
+                        "Not enough field-value pairs".to_string(),
+                    ));
                 }
                 let field = extract_string(&elements[idx])?;
                 let value = extract_bytes(&elements[idx + 1])?;
                 fields.push((field, value));
                 idx += 2;
             }
-            
+
             if fields.is_empty() {
-                return Err(ParseError::Invalid("HSETEX requires at least one field-value pair".to_string()));
+                return Err(ParseError::Invalid(
+                    "HSETEX requires at least one field-value pair".to_string(),
+                ));
             }
-            
+
             Ok(RedisCommand::HSetEx {
                 key,
                 fnx,
@@ -565,7 +581,8 @@ mod tests {
 
     #[test]
     fn test_parse_set_command_with_ex() {
-        let input = b"*5\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$11\r\nhello world\r\n$2\r\nEX\r\n$2\r\n60\r\n";
+        let input =
+            b"*5\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$11\r\nhello world\r\n$2\r\nEX\r\n$2\r\n60\r\n";
         let (resp, _) = parse_resp_with_remaining(input).unwrap();
         let command = parse_command(resp).unwrap();
         assert_eq!(
@@ -580,7 +597,8 @@ mod tests {
 
     #[test]
     fn test_parse_set_command_with_px() {
-        let input = b"*5\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$11\r\nhello world\r\n$2\r\nPX\r\n$5\r\n60000\r\n";
+        let input =
+            b"*5\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$11\r\nhello world\r\n$2\r\nPX\r\n$5\r\n60000\r\n";
         let (resp, _) = parse_resp_with_remaining(input).unwrap();
         let command = parse_command(resp).unwrap();
         assert_eq!(
@@ -644,14 +662,24 @@ mod tests {
         let (resp, _) = parse_resp_with_remaining(input).unwrap();
         let result = parse_command(resp);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("EX requires a value"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("EX requires a value")
+        );
 
         // Test SET with PX but no value
         let input = b"*4\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$5\r\nvalue\r\n$2\r\nPX\r\n";
         let (resp, _) = parse_resp_with_remaining(input).unwrap();
         let result = parse_command(resp);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("PX requires a value"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("PX requires a value")
+        );
     }
 
     #[test]
@@ -660,7 +688,12 @@ mod tests {
         let (resp, _) = parse_resp_with_remaining(input).unwrap();
         let result = parse_command(resp);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Unknown SET option: XX"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Unknown SET option: XX")
+        );
     }
 
     #[test]
@@ -669,7 +702,12 @@ mod tests {
         let (resp, _) = parse_resp_with_remaining(input).unwrap();
         let result = parse_command(resp);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Invalid seconds value"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid seconds value")
+        );
     }
 
     #[test]
@@ -679,14 +717,24 @@ mod tests {
         let (resp, _) = parse_resp_with_remaining(input).unwrap();
         let result = parse_command(resp);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("TTL requires exactly 1 argument"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("TTL requires exactly 1 argument")
+        );
 
         // Too few arguments
         let input = b"*1\r\n$3\r\nTTL\r\n";
         let (resp, _) = parse_resp_with_remaining(input).unwrap();
         let result = parse_command(resp);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("TTL requires exactly 1 argument"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("TTL requires exactly 1 argument")
+        );
     }
 
     #[test]
@@ -696,14 +744,24 @@ mod tests {
         let (resp, _) = parse_resp_with_remaining(input).unwrap();
         let result = parse_command(resp);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("EXPIRE requires exactly 2 arguments"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("EXPIRE requires exactly 2 arguments")
+        );
 
         // Too few arguments
         let input = b"*2\r\n$6\r\nEXPIRE\r\n$5\r\nmykey\r\n";
         let (resp, _) = parse_resp_with_remaining(input).unwrap();
         let result = parse_command(resp);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("EXPIRE requires exactly 2 arguments"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("EXPIRE requires exactly 2 arguments")
+        );
     }
 
     #[test]

@@ -4,6 +4,11 @@
 # Directory where SQLite database files will be stored
 data_dir = "blob_data"
 
+# Storage backend to use. Options: "sqlite" (default) or "turso"
+# Turso support currently requires the binary to be built with the
+# `backend-turso` cargo feature and is experimental.
+storage_backend = "sqlite"
+
 # Number of shards to distribute data across
 # More shards = better concurrency but more file handles
 num_shards = 4

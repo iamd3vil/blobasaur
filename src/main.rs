@@ -12,6 +12,7 @@ mod migration;
 mod redis;
 mod server;
 mod shard_manager;
+mod storage;
 
 use app_state::AppState;
 use gumdrop::Options;
@@ -141,7 +142,7 @@ async fn run_server(config_path: &str) -> Result<()> {
 
     // Spawn shard writer tasks using the receivers populated by AppState::new
     for (i, receiver) in shard_receivers.into_iter().enumerate() {
-        let pool = shared_state.db_pools[i].clone();
+        let store = shared_state.storage[i].clone();
         let batch_size = cfg.batch_size.unwrap_or(1);
         let batch_timeout_ms = cfg.batch_timeout_ms.unwrap_or(0);
         let inflight_cache = shared_state.inflight_cache.clone();
@@ -150,7 +151,7 @@ async fn run_server(config_path: &str) -> Result<()> {
         // Pass the receiver to the spawned task
         tokio::spawn(shard_manager::shard_writer_task(
             i,
-            pool,
+            store,
             receiver,
             batch_size,
             batch_timeout_ms,
@@ -163,10 +164,10 @@ async fn run_server(config_path: &str) -> Result<()> {
     // Spawn cleanup tasks for each shard
     let cleanup_interval_secs = 60; // Clean up expired keys every 60 seconds
     for i in 0..cfg.num_shards {
-        let pool = shared_state.db_pools[i].clone();
+        let store = shared_state.storage[i].clone();
         tokio::spawn(shard_manager::shard_cleanup_task(
             i,
-            pool,
+            store,
             cleanup_interval_secs,
         ));
     }

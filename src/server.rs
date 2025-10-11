@@ -325,19 +325,13 @@ async fn handle_get(
     }
 
     let shard_index = state.get_shard(&key);
-    let pool = &state.db_pools[shard_index];
+    let store = &state.storage[shard_index];
+    let now = chrono::Utc::now().timestamp();
 
-    match sqlx::query_as::<_, (Vec<u8>,)>(
-        "SELECT data FROM blobs WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
-    )
-    .bind(&key)
-    .bind(chrono::Utc::now().timestamp())
-    .fetch_optional(pool)
-    .await
-    {
-        Ok(Some(row)) => {
+    match store.fetch_blob(&key, now).await {
+        Ok(Some(bytes)) => {
             // Decompress if needed
-            let data = decompress_if_enabled(state, row.0.into()).await?;
+            let data = decompress_if_enabled(state, Bytes::from(bytes)).await?;
 
             let response = BytesFrame::BulkString(data.into());
             stream.write_all(&serialize_frame(&response)).await?;
@@ -467,15 +461,16 @@ async fn handle_del_multiple(
         }
 
         let shard_index = state.get_shard(&key);
-        let pool = &state.db_pools[shard_index];
+        let store = &state.storage[shard_index];
 
         // Check if key exists first
-        let exists = sqlx::query("SELECT 1 FROM blobs WHERE key = ?")
-            .bind(&key)
-            .fetch_optional(pool)
-            .await
-            .map(|row| row.is_some())
-            .unwrap_or(false);
+        let exists = match store.blob_exists(&key).await {
+            Ok(flag) => flag,
+            Err(e) => {
+                tracing::error!("Failed to check key existence for {}: {}", key, e);
+                false
+            }
+        };
 
         if !exists {
             continue; // Key doesn't exist, skip
@@ -551,21 +546,15 @@ async fn handle_exists(
     key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let shard_index = state.get_shard(&key);
-    let pool = &state.db_pools[shard_index];
+    let store = &state.storage[shard_index];
+    let now = chrono::Utc::now().timestamp();
 
-    match sqlx::query(
-        "SELECT 1 FROM blobs WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
-    )
-    .bind(&key)
-    .bind(chrono::Utc::now().timestamp())
-    .fetch_optional(pool)
-    .await
-    {
-        Ok(Some(_)) => {
+    match store.blob_exists_with_expiry(&key, now).await {
+        Ok(true) => {
             let response = BytesFrame::Integer(1);
             stream.write_all(&serialize_frame(&response)).await?;
         }
-        Ok(None) => {
+        Ok(false) => {
             let response = BytesFrame::Integer(0);
             stream.write_all(&serialize_frame(&response)).await?;
         }
@@ -700,23 +689,13 @@ async fn handle_hget(
     }
 
     let shard_index = state.get_shard(&key);
-    let pool = &state.db_pools[shard_index];
-    let table_name = format!("blobs_{}", namespace);
+    let store = &state.storage[shard_index];
+    let now = chrono::Utc::now().timestamp();
 
-    let query = format!(
-        "SELECT data FROM {} WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
-        table_name
-    );
-
-    match sqlx::query_as::<_, (Vec<u8>,)>(&query)
-        .bind(&key)
-        .bind(chrono::Utc::now().timestamp())
-        .fetch_optional(pool)
-        .await
-    {
-        Ok(Some(row)) => {
+    match store.fetch_namespace_blob(&namespace, &key, now).await {
+        Ok(Some(bytes)) => {
             // Decompress if needed
-            let data = decompress_if_enabled(state, row.0.into()).await?;
+            let data = decompress_if_enabled(state, Bytes::from(bytes)).await?;
 
             let response = BytesFrame::BulkString(data.into());
             stream.write_all(&serialize_frame(&response)).await?;
@@ -883,18 +862,22 @@ async fn handle_hsetex(
 
         let shard_index = state.get_shard(&field_key);
         let sender = &state.shard_senders[shard_index];
-        let pool = &state.db_pools[shard_index];
-        let table_name = format!("blobs_{}", namespace);
+        let store = &state.storage[shard_index];
 
         // Check FNX/FXX conditions if specified
         if fnx || fxx {
-            let query = format!("SELECT 1 FROM {} WHERE key = ?", table_name);
-            let exists = sqlx::query(&query)
-                .bind(&field_key)
-                .fetch_optional(pool)
-                .await
-                .map(|row| row.is_some())
-                .unwrap_or(false);
+            let exists = match store.namespace_key_exists(&namespace, &field_key).await {
+                Ok(flag) => flag,
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to check FNX/FXX condition for namespace {} key {}: {}",
+                        namespace,
+                        field_key,
+                        e
+                    );
+                    false
+                }
+            };
 
             if fnx && exists {
                 // FNX: Only set if field doesn't exist, return 0 for entire operation
@@ -1033,17 +1016,21 @@ async fn handle_hdel(
     }
 
     let shard_index = state.get_shard(&key);
-    let pool = &state.db_pools[shard_index];
-    let table_name = format!("blobs_{}", namespace);
+    let store = &state.storage[shard_index];
 
     // First check if key exists
-    let query = format!("SELECT 1 FROM {} WHERE key = ?", table_name);
-    let exists = sqlx::query(&query)
-        .bind(&key)
-        .fetch_optional(pool)
-        .await
-        .map(|row| row.is_some())
-        .unwrap_or(false);
+    let exists = match store.namespace_key_exists(&namespace, &key).await {
+        Ok(flag) => flag,
+        Err(e) => {
+            tracing::error!(
+                "Failed to check namespace {} key {} existence: {}",
+                namespace,
+                key,
+                e
+            );
+            false
+        }
+    };
 
     if !exists {
         // Redis HDEL returns the number of keys deleted
@@ -1136,25 +1123,18 @@ async fn handle_hexists(
     }
 
     let shard_index = state.get_shard(&key);
-    let pool = &state.db_pools[shard_index];
-    let table_name = format!("blobs_{}", namespace);
+    let store = &state.storage[shard_index];
+    let now = chrono::Utc::now().timestamp();
 
-    let query = format!(
-        "SELECT 1 FROM {} WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
-        table_name
-    );
-
-    match sqlx::query(&query)
-        .bind(&key)
-        .bind(chrono::Utc::now().timestamp())
-        .fetch_optional(pool)
+    match store
+        .namespace_key_exists_with_expiry(&namespace, &key, now)
         .await
     {
-        Ok(Some(_)) => {
+        Ok(true) => {
             let response = BytesFrame::Integer(1);
             stream.write_all(&serialize_frame(&response)).await?;
         }
-        Ok(None) => {
+        Ok(false) => {
             let response = BytesFrame::Integer(0);
             stream.write_all(&serialize_frame(&response)).await?;
         }
@@ -1353,27 +1333,20 @@ async fn handle_ttl(
     key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let shard_index = state.get_shard(&key);
-    let pool = &state.db_pools[shard_index];
+    let store = &state.storage[shard_index];
     let now = chrono::Utc::now().timestamp();
 
-    match sqlx::query_as::<_, (Option<i64>,)>(
-        "SELECT expires_at FROM blobs WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
-    )
-    .bind(&key)
-    .bind(now)
-    .fetch_optional(pool)
-    .await
-    {
-        Ok(Some((expires_at,))) => {
-            let ttl = match expires_at {
-                Some(expires_at) => expires_at - now,
-                None => -1, // Key exists but has no expiration
-            };
+    match store.fetch_ttl(&key, now).await {
+        Ok(Some(Some(expires_at))) => {
+            let ttl = expires_at - now;
             let response = BytesFrame::Integer(ttl);
             stream.write_all(&serialize_frame(&response)).await?;
         }
+        Ok(Some(None)) => {
+            let response = BytesFrame::Integer(-1);
+            stream.write_all(&serialize_frame(&response)).await?;
+        }
         Ok(None) => {
-            // Key doesn't exist or is expired
             let response = BytesFrame::Integer(-2);
             stream.write_all(&serialize_frame(&response)).await?;
         }

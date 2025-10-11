@@ -1,17 +1,30 @@
+#[cfg(feature = "backend-sqlite")]
 use futures::future::join_all;
 use miette::Result;
 use moka::future::Cache;
 use mpchash::HashRing;
+#[cfg(feature = "backend-sqlite")]
 use sqlx::SqlitePool;
+#[cfg(feature = "backend-sqlite")]
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use std::fs;
+#[cfg(feature = "backend-sqlite")]
 use std::str::FromStr;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::compression::{self, Compressor};
 // Import ShardWriteOperation from shard_manager
+#[cfg(feature = "backend-sqlite")]
+use crate::storage::sqlite::SqliteStorage;
+#[cfg(feature = "backend-turso")]
+use crate::storage::turso::TursoStorage;
 use crate::{
-    cluster::ClusterManager, config::Cfg, metrics::Metrics, shard_manager::ShardWriteOperation,
+    cluster::ClusterManager,
+    config::{Cfg, StorageBackend},
+    metrics::Metrics,
+    shard_manager::ShardWriteOperation,
+    storage::Storage,
 };
 use bytes::Bytes;
 
@@ -21,7 +34,7 @@ struct ShardNode(u64);
 pub struct AppState {
     pub cfg: Cfg,
     pub shard_senders: Vec<mpsc::Sender<ShardWriteOperation>>,
-    pub db_pools: Vec<SqlitePool>,
+    pub storage: Vec<Arc<dyn Storage>>,
     /// Cache for inflight write operations to prevent race conditions in async mode.
     /// When async_write=true, SET operations return OK immediately but the actual
     /// database write happens asynchronously. This cache stores the key-value pairs
@@ -62,65 +75,91 @@ impl AppState {
         // Validate the number of shards in the data directory
         validate_shard_count(&cfg.data_dir, cfg.num_shards)?;
 
-        let mut db_pools_futures = vec![];
-        for i in 0..cfg.num_shards {
-            let data_dir = cfg.data_dir.clone();
-            let db_path = format!("{}/shard_{}.db", data_dir, i);
+        let mut storage_handles: Vec<Arc<dyn Storage>> = Vec::new();
+        let backend = cfg.backend();
 
-            let mut connect_options =
-                SqliteConnectOptions::from_str(&format!("sqlite:{}", db_path))
-                    .expect(&format!(
-                        "Failed to parse connection string for shard {}",
-                        i
-                    ))
-                    .create_if_missing(true)
-                    .journal_mode(SqliteJournalMode::Wal)
-                    .busy_timeout(std::time::Duration::from_millis(5000));
+        match backend {
+            StorageBackend::Sqlite => {
+                #[cfg(not(feature = "backend-sqlite"))]
+                {
+                    return Err(miette::miette!(
+                        "The binary was built without the 'backend-sqlite' feature"
+                    ));
+                }
 
-            // These PRAGMAs are often set for performance with WAL mode.
-            // `synchronous = OFF` is safe except for power loss.
-            // `cache_size` is negative to indicate KiB, so -4000 is 4MB.
-            // `temp_store = MEMORY` avoids disk I/O for temporary tables.
-            connect_options = connect_options
-                .pragma("synchronous", "OFF")
-                .pragma("cache_size", "-100000") // 4MB cache per shard
-                .pragma("temp_store", "MEMORY");
+                #[cfg(feature = "backend-sqlite")]
+                {
+                    let mut db_pools_futures = vec![];
+                    for i in 0..cfg.num_shards {
+                        let data_dir = cfg.data_dir.clone();
+                        let db_path = format!("{}/shard_{}.db", data_dir, i);
 
-            db_pools_futures.push(sqlx::SqlitePool::connect_with(connect_options))
-        }
+                        let mut connect_options =
+                            SqliteConnectOptions::from_str(&format!("sqlite:{}", db_path))
+                                .expect(&format!(
+                                    "Failed to parse connection string for shard {}",
+                                    i
+                                ))
+                                .create_if_missing(true)
+                                .journal_mode(SqliteJournalMode::Wal)
+                                .busy_timeout(std::time::Duration::from_millis(5000));
 
-        let db_pool_results: Vec<Result<SqlitePool, sqlx::Error>> =
-            join_all(db_pools_futures).await;
-        let db_pools: Vec<SqlitePool> = db_pool_results
-            .into_iter()
-            .enumerate()
-            .map(|(i, res)| {
-                res.unwrap_or_else(|e| panic!("Failed to connect to shard {} DB: {}", i, e))
-            })
-            .collect();
+                        connect_options = connect_options
+                            .pragma("synchronous", "OFF")
+                            .pragma("cache_size", "-100000")
+                            .pragma("temp_store", "MEMORY");
 
-        for (i, pool) in db_pools.iter().enumerate() {
-            sqlx::query(
-                "CREATE TABLE IF NOT EXISTS blobs (
-                    key TEXT PRIMARY KEY,
-                    data BLOB,
-                    created_at INTEGER NOT NULL,
-                    updated_at INTEGER NOT NULL,
-                    expires_at INTEGER,
-                    version INTEGER NOT NULL DEFAULT 0
-                )",
-            )
-            .execute(pool)
-            .await
-            .unwrap_or_else(|e| panic!("Failed to create table in shard {} DB: {}", i, e));
+                        db_pools_futures.push(sqlx::SqlitePool::connect_with(connect_options))
+                    }
 
-            // Create index on expires_at for efficient expiry queries
-            sqlx::query(
-                "CREATE INDEX IF NOT EXISTS idx_expires_at ON blobs(expires_at) WHERE expires_at IS NOT NULL",
-            )
-            .execute(pool)
-            .await
-            .unwrap_or_else(|e| panic!("Failed to create expires_at index in shard {} DB: {}", i, e));
+                    let db_pool_results: Vec<Result<SqlitePool, sqlx::Error>> =
+                        join_all(db_pools_futures).await;
+                    let db_pools: Vec<SqlitePool> = db_pool_results
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, res)| {
+                            res.unwrap_or_else(|e| {
+                                panic!("Failed to connect to shard {} DB: {}", i, e)
+                            })
+                        })
+                        .collect();
+
+                    for pool in db_pools.into_iter() {
+                        let storage = Arc::new(SqliteStorage::new(pool));
+                        storage.ensure_base_schema().await.unwrap_or_else(|e| {
+                            panic!("Failed to initialize storage backend: {}", e)
+                        });
+                        storage_handles.push(storage as Arc<dyn Storage>);
+                    }
+                }
+            }
+            StorageBackend::Turso => {
+                #[cfg(not(feature = "backend-turso"))]
+                {
+                    return Err(miette::miette!(
+                        "Turso backend requested but the binary was built without the 'backend-turso' feature"
+                    ));
+                }
+
+                #[cfg(feature = "backend-turso")]
+                {
+                    for i in 0..cfg.num_shards {
+                        let data_dir = cfg.data_dir.clone();
+                        let db_path = format!("{}/shard_{}.db", data_dir, i);
+                        let storage = Arc::new(TursoStorage::new(&db_path).await.map_err(|e| {
+                            miette::miette!("Failed to initialize Turso shard {}: {}", i, e)
+                        })?);
+                        storage.ensure_base_schema().await.map_err(|e| {
+                            miette::miette!(
+                                "Failed to initialize Turso schema for shard {}: {}",
+                                i,
+                                e
+                            )
+                        })?;
+                        storage_handles.push(storage as Arc<dyn Storage>);
+                    }
+                }
+            }
         }
 
         // Create caches for inflight operations
@@ -175,7 +214,7 @@ impl AppState {
         Ok(AppState {
             cfg,
             shard_senders: shard_senders_vec,
-            db_pools,
+            storage: storage_handles,
             inflight_cache,
             inflight_hcache,
             cluster_manager,

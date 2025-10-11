@@ -18,6 +18,7 @@ pub mod migration;
 pub mod redis;
 pub mod server;
 pub mod shard_manager;
+pub mod storage;
 
 pub use app_state::AppState;
 pub use config::Cfg;
