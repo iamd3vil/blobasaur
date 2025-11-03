@@ -67,6 +67,12 @@ impl AppState {
             let data_dir = cfg.data_dir.clone();
             let db_path = format!("{}/shard_{}.db", data_dir, i);
 
+            // Get SQLite configuration with defaults
+            let cache_size_mb = cfg.sqlite_cache_size_per_shard_mb();
+            let busy_timeout_ms = cfg.sqlite_busy_timeout_ms();
+            let synchronous = cfg.sqlite_synchronous();
+            let mmap_size = cfg.sqlite_mmap_per_shard_bytes();
+
             let mut connect_options =
                 SqliteConnectOptions::from_str(&format!("sqlite:{}", db_path))
                     .expect(&format!(
@@ -75,16 +81,19 @@ impl AppState {
                     ))
                     .create_if_missing(true)
                     .journal_mode(SqliteJournalMode::Wal)
-                    .busy_timeout(std::time::Duration::from_millis(5000));
+                    .busy_timeout(std::time::Duration::from_millis(busy_timeout_ms));
 
-            // These PRAGMAs are often set for performance with WAL mode.
-            // `synchronous = OFF` is safe except for power loss.
-            // `cache_size` is negative to indicate KiB, so -4000 is 4MB.
-            // `temp_store = MEMORY` avoids disk I/O for temporary tables.
+            // Configure SQLite PRAGMAs for optimal server performance
             connect_options = connect_options
-                .pragma("synchronous", "OFF")
-                .pragma("cache_size", "-100000") // 4MB cache per shard
-                .pragma("temp_store", "MEMORY");
+                .pragma("synchronous", synchronous.as_str())
+                .pragma("cache_size", format!("-{}", cache_size_mb * 1024)) // Negative means KiB
+                .pragma("temp_store", "MEMORY")
+                .pragma("foreign_keys", "true");
+
+            // Enable memory-mapped I/O if configured
+            if mmap_size > 0 {
+                connect_options = connect_options.pragma("mmap_size", mmap_size.to_string());
+            }
 
             db_pools_futures.push(sqlx::SqlitePool::connect_with(connect_options))
         }

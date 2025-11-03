@@ -5,7 +5,7 @@ use moka::future::Cache;
 use sqlx::SqlitePool;
 use std::collections::{HashSet, VecDeque};
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::{Duration, timeout, interval};
+use tokio::time::{Duration, interval, timeout};
 
 // Message type for writer consumers
 pub enum ShardWriteOperation {
@@ -199,8 +199,17 @@ async fn process_batch(
     // Execute all operations in the transaction
     for (idx, operation) in batch.iter().enumerate() {
         let result = match operation {
-            ShardWriteOperation::Set { key, data, expires_at, .. }
-            | ShardWriteOperation::SetAsync { key, data, expires_at } => {
+            ShardWriteOperation::Set {
+                key,
+                data,
+                expires_at,
+                ..
+            }
+            | ShardWriteOperation::SetAsync {
+                key,
+                data,
+                expires_at,
+            } => {
                 match operation {
                     ShardWriteOperation::Set { .. } => sync_operations.push(idx),
                     _ => {}
@@ -471,9 +480,11 @@ async fn process_batch(
                     Ok(())
                 }
             }
-            ShardWriteOperation::Expire { key, expires_at, .. } => {
+            ShardWriteOperation::Expire {
+                key, expires_at, ..
+            } => {
                 sync_operations.push(idx);
-                
+
                 // Update the expires_at field for the key if it exists
                 match sqlx::query("UPDATE blobs SET expires_at = ? WHERE key = ?")
                     .bind(expires_at)
@@ -556,14 +567,18 @@ async fn process_batch(
             ShardWriteOperation::Expire { responder, .. } => {
                 // For expire operations, we need to send the actual result (bool)
                 // Find the corresponding expire result using current operation index
-                if let Some((_, success)) = expire_results.iter().find(|(idx, _)| *idx == operation_idx) {
+                if let Some((_, success)) =
+                    expire_results.iter().find(|(idx, _)| *idx == operation_idx)
+                {
                     let final_result = match &commit_result {
                         Ok(_) => Ok(*success),
                         Err(e) => Err(e.clone()),
                     };
                     let _ = responder.send(final_result);
                 } else {
-                    let _ = responder.send(Err("Internal error: could not find expire result".to_string()));
+                    let _ = responder.send(Err(
+                        "Internal error: could not find expire result".to_string()
+                    ));
                 }
             }
             ShardWriteOperation::SetAsync { .. }
@@ -674,20 +689,20 @@ async fn ensure_namespaced_table_exists(
 }
 
 /// Background task to clean up expired keys from a shard
-pub async fn shard_cleanup_task(
-    shard_id: usize,
-    pool: SqlitePool,
-    cleanup_interval_secs: u64,
-) {
+pub async fn shard_cleanup_task(shard_id: usize, pool: SqlitePool, cleanup_interval_secs: u64) {
     let mut interval = interval(Duration::from_secs(cleanup_interval_secs));
-    
-    tracing::info!("[Shard {}] Starting cleanup task with interval {} seconds", shard_id, cleanup_interval_secs);
-    
+
+    tracing::info!(
+        "[Shard {}] Starting cleanup task with interval {} seconds",
+        shard_id,
+        cleanup_interval_secs
+    );
+
     loop {
         interval.tick().await;
-        
+
         let now = chrono::Utc::now().timestamp();
-        
+
         // Clean up expired keys from the main blobs table
         match sqlx::query("DELETE FROM blobs WHERE expires_at IS NOT NULL AND expires_at <= ?")
             .bind(now)
@@ -697,45 +712,66 @@ pub async fn shard_cleanup_task(
             Ok(result) => {
                 let deleted_count = result.rows_affected();
                 if deleted_count > 0 {
-                    tracing::info!("[Shard {}] Cleaned up {} expired keys from blobs table", shard_id, deleted_count);
+                    tracing::info!(
+                        "[Shard {}] Cleaned up {} expired keys from blobs table",
+                        shard_id,
+                        deleted_count
+                    );
                 }
             }
             Err(e) => {
-                tracing::error!("[Shard {}] Error during cleanup of blobs table: {}", shard_id, e);
+                tracing::error!(
+                    "[Shard {}] Error during cleanup of blobs table: {}",
+                    shard_id,
+                    e
+                );
             }
         }
-        
+
         // Clean up expired keys from namespaced tables
         // First, get all table names that start with "blobs_"
         let tables_result = sqlx::query_as::<_, (String,)>(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'blobs_%'"
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'blobs_%'",
         )
         .fetch_all(&pool)
         .await;
-        
+
         match tables_result {
             Ok(tables) => {
                 for (table_name,) in tables {
-                    let query = format!("DELETE FROM {} WHERE expires_at IS NOT NULL AND expires_at <= ?", table_name);
-                    match sqlx::query(&query)
-                        .bind(now)
-                        .execute(&pool)
-                        .await
-                    {
+                    let query = format!(
+                        "DELETE FROM {} WHERE expires_at IS NOT NULL AND expires_at <= ?",
+                        table_name
+                    );
+                    match sqlx::query(&query).bind(now).execute(&pool).await {
                         Ok(result) => {
                             let deleted_count = result.rows_affected();
                             if deleted_count > 0 {
-                                tracing::info!("[Shard {}] Cleaned up {} expired keys from table {}", shard_id, deleted_count, table_name);
+                                tracing::info!(
+                                    "[Shard {}] Cleaned up {} expired keys from table {}",
+                                    shard_id,
+                                    deleted_count,
+                                    table_name
+                                );
                             }
                         }
                         Err(e) => {
-                            tracing::error!("[Shard {}] Error during cleanup of table {}: {}", shard_id, table_name, e);
+                            tracing::error!(
+                                "[Shard {}] Error during cleanup of table {}: {}",
+                                shard_id,
+                                table_name,
+                                e
+                            );
                         }
                     }
                 }
             }
             Err(e) => {
-                tracing::error!("[Shard {}] Error querying table names for cleanup: {}", shard_id, e);
+                tracing::error!(
+                    "[Shard {}] Error querying table names for cleanup: {}",
+                    shard_id,
+                    e
+                );
             }
         }
     }
