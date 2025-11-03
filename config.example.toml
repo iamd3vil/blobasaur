@@ -59,6 +59,10 @@ level = 3
 # Example: 16GB RAM dedicated at 70% → cache_size_mb ≈ 11468 (≈2867 MB per shard for 4 shards)
 cache_size_mb = 400
 
+# Maximum SQLite connections per shard (default: 10)
+# Increase for higher concurrency; remember total cache/mmap budgets are divided across shards * connections
+# max_connections = 10
+
 # Busy timeout in milliseconds (default: 5000 = 5 seconds)
 # Increase for high-contention workloads
 busy_timeout_ms = 5000

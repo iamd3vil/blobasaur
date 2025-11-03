@@ -41,6 +41,11 @@ pub struct SqliteConfig {
     /// Only useful for large databases that don't fit in cache
     /// Example: 3000 (≈3 GB total)
     pub mmap_size: Option<u64>,
+
+    /// Maximum number of SQLite connections per shard (pool size)
+    /// Default: 10 (sqlx default)
+    /// Increase for higher concurrency at the cost of RAM
+    pub max_connections: Option<u32>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -158,26 +163,30 @@ impl Cfg {
         // Print SQLite configuration
         let cache_total_mb = cfg.sqlite_cache_total_mb();
         let cache_per_shard_mb = cfg.sqlite_cache_size_per_shard_mb();
+        let cache_per_connection_mb = cfg.sqlite_cache_size_per_connection_mb();
         let busy_timeout = cfg.sqlite_busy_timeout_ms();
         let synchronous = cfg.sqlite_synchronous();
         let mmap_total_mb = cfg.sqlite_mmap_total_mb();
         let mmap_per_shard_mb = cfg.sqlite_mmap_per_shard_mb();
+        let mmap_per_connection_mb = cfg.sqlite_mmap_per_connection_mb();
+        let pool_max_connections = cfg.sqlite_pool_max_connections();
 
         println!("SQLite configuration:");
         println!(
-            "  cache_size: {} MB total ({} MB per shard, floor)",
-            cache_total_mb, cache_per_shard_mb
+            "  cache_size: {} MB total ({} MB per shard, {} MB per connection; floor)",
+            cache_total_mb, cache_per_shard_mb, cache_per_connection_mb
         );
         println!("  busy_timeout: {} ms", busy_timeout);
         println!("  synchronous: {}", synchronous.as_str());
         if mmap_total_mb > 0 {
             println!(
-                "  mmap_size: {} MB total ({} MB per shard, floor)",
-                mmap_total_mb, mmap_per_shard_mb
+                "  mmap_size: {} MB total ({} MB per shard, {} MB per connection; floor)",
+                mmap_total_mb, mmap_per_shard_mb, mmap_per_connection_mb
             );
         } else {
             println!("  mmap_size: disabled");
         }
+        println!("  pool_max_connections: {}", pool_max_connections);
 
         Ok(cfg)
     }
@@ -211,13 +220,26 @@ impl Cfg {
             return 0;
         }
 
-        let shards = self.num_shards as i32;
-        if shards <= 0 {
+        let shards = self.num_shards.max(1) as i64;
+        let per_shard = (total as i64) / shards;
+        per_shard.clamp(i32::MIN as i64, i32::MAX as i64).max(0) as i32
+    }
+
+    /// Derived SQLite cache size in MB per connection (floor division).
+    pub fn sqlite_cache_size_per_connection_mb(&self) -> i32 {
+        let total = self.sqlite_cache_total_mb();
+        if total <= 0 {
             return 0;
         }
 
-        let per_shard = total / shards;
-        per_shard.max(0)
+        let shards = self.num_shards.max(1) as i64;
+        let connections = self.sqlite_pool_max_connections().max(1) as i64;
+        let divisor = shards.saturating_mul(connections);
+
+        let per_connection = (total as i64) / divisor;
+        per_connection
+            .clamp(i32::MIN as i64, i32::MAX as i64)
+            .max(0) as i32
     }
 
     /// Get SQLite busy timeout in milliseconds (default: 5000 ms = 5 seconds)
@@ -248,21 +270,50 @@ impl Cfg {
             return 0;
         }
 
-        let shards = self.num_shards as u64;
-        if shards == 0 {
-            return 0;
-        }
-
+        let shards = self.num_shards.max(1) as u64;
         total / shards
     }
 
-    /// Derived SQLite mmap size in bytes per shard (floor division).
-    pub fn sqlite_mmap_per_shard_bytes(&self) -> u64 {
-        let per_shard_mb = self.sqlite_mmap_per_shard_mb();
-        if per_shard_mb == 0 {
+    /// Derived SQLite mmap size in MB per connection (floor division).
+    pub fn sqlite_mmap_per_connection_mb(&self) -> u64 {
+        let total = self.sqlite_mmap_total_mb();
+        if total == 0 {
             return 0;
         }
 
-        per_shard_mb.saturating_mul(1024).saturating_mul(1024)
+        let shards = self.num_shards.max(1) as u64;
+        let connections = self.sqlite_pool_max_connections().max(1) as u64;
+        let divisor = shards.saturating_mul(connections);
+
+        if divisor == 0 {
+            return 0;
+        }
+
+        total / divisor
+    }
+
+    /// Derived SQLite mmap size in bytes per connection (floor division).
+    pub fn sqlite_mmap_per_connection_bytes(&self) -> u64 {
+        let per_connection_mb = self.sqlite_mmap_per_connection_mb();
+        if per_connection_mb == 0 {
+            return 0;
+        }
+
+        per_connection_mb.saturating_mul(1024).saturating_mul(1024)
+    }
+
+    /// Maximum number of SQLite connections per shard (pool size).
+    pub fn sqlite_pool_max_connections(&self) -> u32 {
+        let default = 10;
+        let configured = self
+            .sqlite
+            .as_ref()
+            .and_then(|s| s.max_connections)
+            .unwrap_or(default);
+
+        match configured {
+            0 => 1,
+            value => value,
+        }
     }
 }

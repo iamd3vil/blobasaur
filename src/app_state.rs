@@ -3,7 +3,7 @@ use miette::Result;
 use moka::future::Cache;
 use mpchash::HashRing;
 use sqlx::SqlitePool;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use std::fs;
 use std::str::FromStr;
 use tokio::sync::mpsc;
@@ -63,15 +63,16 @@ impl AppState {
         validate_shard_count(&cfg.data_dir, cfg.num_shards)?;
 
         let mut db_pools_futures = vec![];
+        let pool_max_connections = cfg.sqlite_pool_max_connections();
         for i in 0..cfg.num_shards {
             let data_dir = cfg.data_dir.clone();
             let db_path = format!("{}/shard_{}.db", data_dir, i);
 
             // Get SQLite configuration with defaults
-            let cache_size_mb = cfg.sqlite_cache_size_per_shard_mb();
+            let cache_size_mb = cfg.sqlite_cache_size_per_connection_mb();
             let busy_timeout_ms = cfg.sqlite_busy_timeout_ms();
             let synchronous = cfg.sqlite_synchronous();
-            let mmap_size = cfg.sqlite_mmap_per_shard_bytes();
+            let mmap_size = cfg.sqlite_mmap_per_connection_bytes();
 
             let mut connect_options =
                 SqliteConnectOptions::from_str(&format!("sqlite:{}", db_path))
@@ -95,7 +96,11 @@ impl AppState {
                 connect_options = connect_options.pragma("mmap_size", mmap_size.to_string());
             }
 
-            db_pools_futures.push(sqlx::SqlitePool::connect_with(connect_options))
+            db_pools_futures.push(
+                SqlitePoolOptions::new()
+                    .max_connections(pool_max_connections)
+                    .connect_with(connect_options),
+            )
         }
 
         let db_pool_results: Vec<Result<SqlitePool, sqlx::Error>> =
