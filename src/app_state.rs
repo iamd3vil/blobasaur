@@ -3,7 +3,7 @@ use miette::Result;
 use moka::future::Cache;
 use mpchash::HashRing;
 use sqlx::SqlitePool;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use std::fs;
 use std::str::FromStr;
 use tokio::sync::mpsc;
@@ -63,9 +63,16 @@ impl AppState {
         validate_shard_count(&cfg.data_dir, cfg.num_shards)?;
 
         let mut db_pools_futures = vec![];
+        let pool_max_connections = cfg.sqlite_pool_max_connections();
         for i in 0..cfg.num_shards {
             let data_dir = cfg.data_dir.clone();
             let db_path = format!("{}/shard_{}.db", data_dir, i);
+
+            // Get SQLite configuration with defaults
+            let cache_size_mb = cfg.sqlite_cache_size_per_connection_mb();
+            let busy_timeout_ms = cfg.sqlite_busy_timeout_ms();
+            let synchronous = cfg.sqlite_synchronous();
+            let mmap_size = cfg.sqlite_mmap_per_connection_bytes();
 
             let mut connect_options =
                 SqliteConnectOptions::from_str(&format!("sqlite:{}", db_path))
@@ -75,18 +82,25 @@ impl AppState {
                     ))
                     .create_if_missing(true)
                     .journal_mode(SqliteJournalMode::Wal)
-                    .busy_timeout(std::time::Duration::from_millis(5000));
+                    .busy_timeout(std::time::Duration::from_millis(busy_timeout_ms));
 
-            // These PRAGMAs are often set for performance with WAL mode.
-            // `synchronous = OFF` is safe except for power loss.
-            // `cache_size` is negative to indicate KiB, so -4000 is 4MB.
-            // `temp_store = MEMORY` avoids disk I/O for temporary tables.
+            // Configure SQLite PRAGMAs for optimal server performance
             connect_options = connect_options
-                .pragma("synchronous", "OFF")
-                .pragma("cache_size", "-100000") // 4MB cache per shard
-                .pragma("temp_store", "MEMORY");
+                .pragma("synchronous", synchronous.as_str())
+                .pragma("cache_size", format!("-{}", cache_size_mb * 1024)) // Negative means KiB
+                .pragma("temp_store", "MEMORY")
+                .pragma("foreign_keys", "true");
 
-            db_pools_futures.push(sqlx::SqlitePool::connect_with(connect_options))
+            // Enable memory-mapped I/O if configured
+            if mmap_size > 0 {
+                connect_options = connect_options.pragma("mmap_size", mmap_size.to_string());
+            }
+
+            db_pools_futures.push(
+                SqlitePoolOptions::new()
+                    .max_connections(pool_max_connections)
+                    .connect_with(connect_options),
+            )
         }
 
         let db_pool_results: Vec<Result<SqlitePool, sqlx::Error>> =

@@ -55,14 +55,17 @@ impl MigrationManager {
     async fn create_connection_pool(&self, shard_id: usize) -> Result<SqlitePool> {
         let db_path = format!("{}/shard_{}.db", self.data_dir, shard_id);
 
+        // Use recommended SQLite settings for migration operations
+        // See: https://kerkour.com/sqlite-for-servers
         let connect_options = SqliteConnectOptions::from_str(&format!("sqlite:{}", db_path))
             .map_err(|e| sqlx_to_miette(e, "Failed to parse connection string"))?
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .busy_timeout(std::time::Duration::from_millis(5000))
-            .pragma("synchronous", "OFF")
-            .pragma("cache_size", "-100000")
-            .pragma("temp_store", "MEMORY");
+            .pragma("synchronous", "NORMAL") // NORMAL is safer than OFF
+            .pragma("cache_size", "-1024000") // 1GB cache for better performance during migration
+            .pragma("temp_store", "MEMORY")
+            .pragma("foreign_keys", "true");
 
         SqlitePool::connect_with(connect_options)
             .await

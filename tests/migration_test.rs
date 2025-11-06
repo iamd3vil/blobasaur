@@ -19,13 +19,16 @@ struct ShardNode(u64);
 
 // Helper function to create a test database pool
 async fn create_test_pool(path: &str) -> Result<SqlitePool, sqlx::Error> {
+    // Use recommended SQLite settings even in tests
+    // See: https://kerkour.com/sqlite-for-servers
     let connect_options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path))?
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
         .busy_timeout(std::time::Duration::from_millis(5000))
-        .pragma("synchronous", "OFF")
-        .pragma("cache_size", "-100000")
-        .pragma("temp_store", "MEMORY");
+        .pragma("synchronous", "NORMAL") // NORMAL is safer than OFF
+        .pragma("cache_size", "-1024000") // 1GB cache
+        .pragma("temp_store", "MEMORY")
+        .pragma("foreign_keys", "true");
 
     SqlitePool::connect_with(connect_options).await
 }

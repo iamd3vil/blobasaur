@@ -51,6 +51,33 @@ enabled = true
 algorithm = "zstd" # Options: gzip, zstd, lz4, brotli
 level = 3
 
+# SQLite performance tuning (optional)
+# Based on: https://kerkour.com/sqlite-for-servers
+[sqlite]
+# Cache size across all shards in MB (default ≈ 100 MB per shard)
+# Tuning tip: cache_size_mb ≈ (Available RAM in GB * 0.7 * 1024)
+# Example: 16GB RAM dedicated at 70% → cache_size_mb ≈ 11468 (≈2867 MB per shard for 4 shards)
+cache_size_mb = 400
+
+# Maximum SQLite connections per shard (default: 10)
+# Increase for higher concurrency; remember total cache/mmap budgets are divided across shards * connections
+# max_connections = 10
+
+# Busy timeout in milliseconds (default: 5000 = 5 seconds)
+# Increase for high-contention workloads
+busy_timeout_ms = 5000
+
+# Synchronous mode (default: NORMAL)
+# OFF: Fastest, but risk of corruption on power loss (not recommended)
+# NORMAL: Recommended - good performance with corruption safety in WAL mode
+# FULL: Safest but slower, use for critical data
+synchronous = "NORMAL"
+
+# Total memory-mapped I/O size in MB (default: 0 = disabled)
+# Only useful for databases larger than cache_size
+# Example: 3000 (≈3 GB total budget)
+# mmap_size = 0
+
 # Metrics configuration (optional)
 # Enable Prometheus-compatible metrics endpoint
 [metrics]
