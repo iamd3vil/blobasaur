@@ -665,6 +665,32 @@ async fn handle_command(stream: &mut TcpStream) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
+async fn hash_table_exists(pool: &sqlx::SqlitePool, table_name: &str) -> Result<bool, sqlx::Error> {
+    sqlx::query("SELECT name FROM sqlite_master WHERE type='table' AND name = ?")
+        .bind(table_name)
+        .fetch_optional(pool)
+        .await
+        .map(|row| row.is_some())
+}
+
+async fn hash_field_exists(
+    pool: &sqlx::SqlitePool,
+    table_name: &str,
+    key: &str,
+    table_exists: bool,
+) -> Result<bool, sqlx::Error> {
+    if !table_exists {
+        return Ok(false);
+    }
+
+    let query = format!("SELECT 1 FROM {} WHERE key = ?", table_name);
+    sqlx::query(&query)
+        .bind(key)
+        .fetch_optional(pool)
+        .await
+        .map(|row| row.is_some())
+}
+
 async fn handle_hget(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
@@ -760,6 +786,38 @@ async fn handle_hset(
     }
 
     let shard_index = state.get_shard(&key);
+    let pool = &state.db_pools[shard_index];
+    let table_name = format!("blobs_{}", namespace);
+
+    let table_exists = match hash_table_exists(pool, &table_name).await {
+        Ok(exists) => exists,
+        Err(e) => {
+            tracing::error!(
+                "Failed to check table existence for namespace {}: {}",
+                table_name,
+                e
+            );
+            let response = BytesFrame::Error("ERR database error ".into());
+            stream.write_all(&serialize_frame(&response)).await?;
+            return Ok(());
+        }
+    };
+
+    let existed_before = match hash_field_exists(pool, &table_name, &key, table_exists).await {
+        Ok(exists) => exists,
+        Err(e) => {
+            tracing::error!(
+                "Failed to check HSET existence for namespace {} key {}: {}",
+                namespace,
+                key,
+                e
+            );
+            let response = BytesFrame::Error("ERR database error ".into());
+            stream.write_all(&serialize_frame(&response)).await?;
+            return Ok(());
+        }
+    };
+
     let sender = &state.shard_senders[shard_index];
 
     // Compress data if storage compression is enabled
@@ -789,7 +847,7 @@ async fn handle_hset(
             let response = BytesFrame::Error("ERR internal error ".into());
             stream.write_all(&serialize_frame(&response)).await?;
         } else {
-            let response = BytesFrame::SimpleString("OK".into());
+            let response = BytesFrame::Integer(if existed_before { 0 } else { 1 });
             stream.write_all(&serialize_frame(&response)).await?;
         }
     } else {
@@ -810,7 +868,7 @@ async fn handle_hset(
         } else {
             match responder_rx.await {
                 Ok(Ok(())) => {
-                    let response = BytesFrame::SimpleString("OK".into());
+                    let response = BytesFrame::Integer(if existed_before { 0 } else { 1 });
                     stream.write_all(&serialize_frame(&response)).await?;
                 }
                 Ok(Err(e)) => {
@@ -860,8 +918,7 @@ async fn handle_hsetex(
     };
 
     // Process multiple fields
-    let mut fields_set = 0;
-    let total_fields = fields.len();
+    let mut new_fields_added = 0;
 
     for (field_key, field_value) in fields {
         // Check if we should handle this hash operation locally in a cluster
@@ -886,16 +943,37 @@ async fn handle_hsetex(
         let pool = &state.db_pools[shard_index];
         let table_name = format!("blobs_{}", namespace);
 
+        let table_exists = match hash_table_exists(pool, &table_name).await {
+            Ok(exists) => exists,
+            Err(e) => {
+                tracing::error!(
+                    "Failed to check table existence for namespace {}: {}",
+                    table_name,
+                    e
+                );
+                let response = BytesFrame::Error("ERR database error".into());
+                stream.write_all(&serialize_frame(&response)).await?;
+                return Ok(());
+            }
+        };
+
+        let exists = match hash_field_exists(pool, &table_name, &field_key, table_exists).await {
+            Ok(exists) => exists,
+            Err(e) => {
+                tracing::error!(
+                    "Failed to check field existence for namespace {} key {}: {}",
+                    namespace,
+                    field_key,
+                    e
+                );
+                let response = BytesFrame::Error("ERR database error".into());
+                stream.write_all(&serialize_frame(&response)).await?;
+                return Ok(());
+            }
+        };
+
         // Check FNX/FXX conditions if specified
         if fnx || fxx {
-            let query = format!("SELECT 1 FROM {} WHERE key = ?", table_name);
-            let exists = sqlx::query(&query)
-                .bind(&field_key)
-                .fetch_optional(pool)
-                .await
-                .map(|row| row.is_some())
-                .unwrap_or(false);
-
             if fnx && exists {
                 // FNX: Only set if field doesn't exist, return 0 for entire operation
                 let response = BytesFrame::Integer(0);
@@ -909,6 +987,8 @@ async fn handle_hsetex(
                 return Ok(());
             }
         }
+
+        let is_new_field = !exists;
 
         // Compress data if storage compression is enabled
         let compressed_value = compress_if_enabled(state, field_value).await?;
@@ -946,7 +1026,9 @@ async fn handle_hsetex(
                 stream.write_all(&serialize_frame(&response)).await?;
                 return Ok(());
             }
-            fields_set += 1;
+            if is_new_field {
+                new_fields_added += 1;
+            }
         } else {
             // Sync mode: wait for completion
             let (responder_tx, responder_rx) = oneshot::channel();
@@ -977,7 +1059,9 @@ async fn handle_hsetex(
 
             match responder_rx.await {
                 Ok(Ok(())) => {
-                    fields_set += 1;
+                    if is_new_field {
+                        new_fields_added += 1;
+                    }
                 }
                 Ok(Err(e)) => {
                     tracing::error!("Shard writer failed for HSETEX: {}", e);
@@ -995,15 +1079,7 @@ async fn handle_hsetex(
         }
     }
 
-    // Return 1 if all fields were set, 0 if none
-    let result = if fields_set == total_fields {
-        1
-    } else if fields_set == 0 {
-        0
-    } else {
-        1
-    };
-    let response = BytesFrame::Integer(result);
+    let response = BytesFrame::Integer(new_fields_added);
     stream.write_all(&serialize_frame(&response)).await?;
 
     Ok(())
@@ -1441,4 +1517,601 @@ async fn handle_expire(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cluster::ClusterManager;
+    use crate::{config::Cfg, shard_manager};
+    use futures::future::BoxFuture;
+    use tempfile::TempDir;
+    use tokio::net::{TcpListener, TcpStream};
+
+    struct TestContext {
+        state: Arc<AppState>,
+        writer_handles: Vec<tokio::task::JoinHandle<()>>,
+        _temp_dir: TempDir,
+    }
+
+    impl TestContext {
+        async fn new(async_write: bool) -> Self {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let cfg = Cfg {
+                data_dir: temp_dir.path().to_string_lossy().into_owned(),
+                num_shards: 1,
+                storage_compression: None,
+                async_write: Some(async_write),
+                batch_size: Some(1),
+                batch_timeout_ms: Some(0),
+                addr: None,
+                cluster: None,
+                metrics: None,
+                sqlite: None,
+            };
+
+            let mut receivers = Vec::new();
+            let state = Arc::new(AppState::new(cfg.clone(), &mut receivers).await.unwrap());
+
+            let batch_size = cfg.batch_size.unwrap_or(1);
+            let batch_timeout = cfg.batch_timeout_ms.unwrap_or(0);
+            let mut writer_handles = Vec::new();
+            for (i, receiver) in receivers.into_iter().enumerate() {
+                let pool = state.db_pools[i].clone();
+                let inflight_cache = state.inflight_cache.clone();
+                let inflight_hcache = state.inflight_hcache.clone();
+                let metrics = state.metrics.clone();
+                writer_handles.push(tokio::spawn(shard_manager::shard_writer_task(
+                    i,
+                    pool,
+                    receiver,
+                    batch_size,
+                    batch_timeout,
+                    inflight_cache,
+                    inflight_hcache,
+                    metrics,
+                )));
+            }
+
+            TestContext {
+                state,
+                writer_handles,
+                _temp_dir: temp_dir,
+            }
+        }
+
+        async fn shutdown(self) {
+            let TestContext {
+                state,
+                writer_handles,
+                ..
+            } = self;
+            drop(state);
+            for handle in writer_handles {
+                let _ = handle.await;
+            }
+        }
+    }
+
+    async fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let client = TcpStream::connect(addr).await.expect("connect client");
+        let (server, _) = listener.accept().await.expect("accept server");
+        (server, client)
+    }
+
+    async fn read_response(mut client: TcpStream) -> BytesFrame {
+        let mut buf = Vec::new();
+        client
+            .read_to_end(&mut buf)
+            .await
+            .expect("read response bytes");
+        let (frame, _) = parse_resp_with_remaining(&buf).expect("parse response");
+        frame
+    }
+
+    async fn respond_with<F>(ctx: &TestContext, f: F) -> BytesFrame
+    where
+        F: FnOnce(
+            Arc<AppState>,
+            TcpStream,
+        ) -> BoxFuture<'static, Result<(), Box<dyn std::error::Error>>>,
+    {
+        let (server_stream, client_stream) = tcp_pair().await;
+        let state = ctx.state.clone();
+        f(state, server_stream).await.unwrap();
+        read_response(client_stream).await
+    }
+
+    fn assert_integer_response(frame: BytesFrame, expected: i64) {
+        match frame {
+            BytesFrame::Integer(v) => assert_eq!(v, expected),
+            other => panic!("Expected integer {}, got {:?}", expected, other),
+        }
+    }
+
+    fn assert_simple_string(frame: BytesFrame, expected: &str) {
+        match frame {
+            BytesFrame::SimpleString(s) => assert_eq!(s, expected),
+            other => panic!("Expected simple string {}, got {:?}", expected, other),
+        }
+    }
+
+    fn assert_bulk_string(frame: BytesFrame, expected: &[u8]) {
+        match frame {
+            BytesFrame::BulkString(data) => assert_eq!(data.as_ref(), expected),
+            other => panic!(
+                "Expected bulk string {:?}, got {:?}",
+                String::from_utf8_lossy(expected),
+                other
+            ),
+        }
+    }
+
+    fn assert_null(frame: BytesFrame) {
+        match frame {
+            BytesFrame::Null => {}
+            other => panic!("Expected null bulk string, got {:?}", other),
+        }
+    }
+
+    fn assert_array_len(frame: BytesFrame, expected_len: usize) {
+        match frame {
+            BytesFrame::Array(items) => assert_eq!(items.len(), expected_len),
+            other => panic!("Expected array len {}, got {:?}", expected_len, other),
+        }
+    }
+
+    fn assert_error_contains(frame: BytesFrame, expected: &str) {
+        match frame {
+            BytesFrame::Error(msg) => {
+                assert!(
+                    msg.to_string().contains(expected),
+                    "expected error to contain '{}', got '{}'",
+                    expected,
+                    msg
+                )
+            }
+            other => panic!("Expected error containing {}, got {:?}", expected, other),
+        }
+    }
+
+    #[tokio::test]
+    async fn hset_returns_added_field_count() {
+        let ctx = TestContext::new(false).await;
+
+        let (mut server_stream, client_stream) = tcp_pair().await;
+        handle_hset(
+            &mut server_stream,
+            &ctx.state,
+            "users".to_string(),
+            "alice".to_string(),
+            Bytes::from_static(b"one"),
+        )
+        .await
+        .unwrap();
+        server_stream.shutdown().await.unwrap();
+        assert_integer_response(read_response(client_stream).await, 1);
+
+        let (mut server_stream, client_stream) = tcp_pair().await;
+        handle_hset(
+            &mut server_stream,
+            &ctx.state,
+            "users".to_string(),
+            "alice".to_string(),
+            Bytes::from_static(b"two"),
+        )
+        .await
+        .unwrap();
+        server_stream.shutdown().await.unwrap();
+        assert_integer_response(read_response(client_stream).await, 0);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn hsetex_returns_new_field_count() {
+        let ctx = TestContext::new(false).await;
+
+        let (mut server_stream, client_stream) = tcp_pair().await;
+        handle_hsetex(
+            &mut server_stream,
+            &ctx.state,
+            "sessions".to_string(),
+            false,
+            false,
+            None,
+            vec![
+                ("user1".to_string(), Bytes::from_static(b"alpha")),
+                ("user2".to_string(), Bytes::from_static(b"beta")),
+            ],
+        )
+        .await
+        .unwrap();
+        server_stream.shutdown().await.unwrap();
+        assert_integer_response(read_response(client_stream).await, 2);
+
+        let (mut server_stream, client_stream) = tcp_pair().await;
+        handle_hsetex(
+            &mut server_stream,
+            &ctx.state,
+            "sessions".to_string(),
+            false,
+            false,
+            None,
+            vec![
+                ("user1".to_string(), Bytes::from_static(b"updated")),
+                ("user3".to_string(), Bytes::from_static(b"gamma")),
+            ],
+        )
+        .await
+        .unwrap();
+        server_stream.shutdown().await.unwrap();
+        assert_integer_response(read_response(client_stream).await, 1);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn hset_async_returns_integer_count() {
+        let ctx = TestContext::new(true).await;
+
+        let (mut server_stream, client_stream) = tcp_pair().await;
+        handle_hset(
+            &mut server_stream,
+            &ctx.state,
+            "flags".to_string(),
+            "feature".to_string(),
+            Bytes::from_static(b"enabled"),
+        )
+        .await
+        .unwrap();
+        server_stream.shutdown().await.unwrap();
+        assert_integer_response(read_response(client_stream).await, 1);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn set_and_get_return_expected_frames() {
+        let ctx = TestContext::new(false).await;
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_set(
+                    &mut stream,
+                    &state,
+                    "k1".to_string(),
+                    Bytes::from_static(b"v1"),
+                    None,
+                )
+                .await
+            })
+        })
+        .await;
+        assert_simple_string(frame, "OK");
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_get(&mut stream, &state, "k1".to_string()).await
+            })
+        })
+        .await;
+        assert_bulk_string(frame, b"v1");
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_get(&mut stream, &state, "missing".to_string()).await
+            })
+        })
+        .await;
+        assert_null(frame);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn del_and_exists_return_counts() {
+        let ctx = TestContext::new(false).await;
+
+        respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_set(
+                    &mut stream,
+                    &state,
+                    "to_delete".to_string(),
+                    Bytes::from_static(b"v"),
+                    None,
+                )
+                .await
+            })
+        })
+        .await;
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_del_multiple(&mut stream, &state, vec!["to_delete".to_string()]).await
+            })
+        })
+        .await;
+        assert_integer_response(frame, 1);
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_del_multiple(&mut stream, &state, vec!["absent".to_string()]).await
+            })
+        })
+        .await;
+        assert_integer_response(frame, 0);
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_exists(&mut stream, &state, "absent".to_string()).await
+            })
+        })
+        .await;
+        assert_integer_response(frame, 0);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn hash_read_delete_and_exists_returns() {
+        let ctx = TestContext::new(false).await;
+
+        // Seed field
+        respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hset(
+                    &mut stream,
+                    &state,
+                    "ns".to_string(),
+                    "field1".to_string(),
+                    Bytes::from_static(b"hash val"),
+                )
+                .await
+            })
+        })
+        .await;
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hget(&mut stream, &state, "ns".to_string(), "field1".to_string()).await
+            })
+        })
+        .await;
+        assert_bulk_string(frame, b"hash val");
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hexists(&mut stream, &state, "ns".to_string(), "field1".to_string()).await
+            })
+        })
+        .await;
+        assert_integer_response(frame, 1);
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hdel(&mut stream, &state, "ns".to_string(), "field1".to_string()).await
+            })
+        })
+        .await;
+        assert_integer_response(frame, 1);
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hdel(&mut stream, &state, "ns".to_string(), "field1".to_string()).await
+            })
+        })
+        .await;
+        assert_integer_response(frame, 0);
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hexists(&mut stream, &state, "ns".to_string(), "field1".to_string()).await
+            })
+        })
+        .await;
+        assert_integer_response(frame, 0);
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hget(&mut stream, &state, "ns".to_string(), "field1".to_string()).await
+            })
+        })
+        .await;
+        assert_null(frame);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ttl_and_expire_returns_match_redis() {
+        let ctx = TestContext::new(false).await;
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_ttl(&mut stream, &state, "nope".to_string()).await
+            })
+        })
+        .await;
+        assert_integer_response(frame, -2);
+
+        respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_set(
+                    &mut stream,
+                    &state,
+                    "ttl_key".to_string(),
+                    Bytes::from_static(b"val"),
+                    None,
+                )
+                .await
+            })
+        })
+        .await;
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_ttl(&mut stream, &state, "ttl_key".to_string()).await
+            })
+        })
+        .await;
+        assert_integer_response(frame, -1);
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_expire(&mut stream, &state, "ttl_key".to_string(), 30).await
+            })
+        })
+        .await;
+        assert_integer_response(frame, 1);
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_ttl(&mut stream, &state, "ttl_key".to_string()).await
+            })
+        })
+        .await;
+        if let BytesFrame::Integer(v) = frame {
+            assert!(
+                v >= 1 && v <= 30,
+                "expected ttl between 1 and 30, got {}",
+                v
+            );
+        } else {
+            panic!("Expected TTL integer");
+        }
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_expire(&mut stream, &state, "missing_key".to_string(), 10).await
+            })
+        })
+        .await;
+        assert_integer_response(frame, 0);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ping_info_command_quit_and_cluster_keyslot_returns() {
+        let ctx = TestContext::new(false).await;
+
+        let frame = respond_with(&ctx, |_, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_ping(&mut stream, None).await
+            })
+        });
+        assert_simple_string(frame.await, "PONG");
+
+        let frame = respond_with(&ctx, |_, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_ping(&mut stream, Some("hey".to_string())).await
+            })
+        });
+        assert_bulk_string(frame.await, b"hey");
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_info(&mut stream, &state, None).await
+            })
+        });
+        match frame.await {
+            BytesFrame::BulkString(_) => {}
+            other => panic!("Expected bulk string from INFO, got {:?}", other),
+        }
+
+        let frame = respond_with(&ctx, |_, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_command(&mut stream).await
+            })
+        });
+        assert_array_len(frame.await, 0);
+
+        let frame = respond_with(&ctx, |_, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_cluster_keyslot(&mut stream, "abc".into()).await
+            })
+        });
+        assert_integer_response(frame.await, ClusterManager::calculate_slot("abc") as i64);
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                let _ = handle_redis_command_inner(&mut stream, &state, RedisCommand::Quit).await;
+                Ok(())
+            })
+        });
+        assert_simple_string(frame.await, "OK");
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cluster_commands_error_when_disabled() {
+        let ctx = TestContext::new(false).await;
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_cluster_nodes(&mut stream, &state).await
+            })
+        });
+        assert_error_contains(frame.await, "cluster support disabled");
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_cluster_info(&mut stream, &state).await
+            })
+        });
+        assert_error_contains(frame.await, "cluster support disabled");
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_cluster_addslots(&mut stream, &state, vec![1, 2, 3]).await
+            })
+        });
+        assert_error_contains(frame.await, "cluster support disabled");
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_cluster_delslots(&mut stream, &state, vec![1, 2, 3]).await
+            })
+        });
+        assert_error_contains(frame.await, "cluster support disabled");
+
+        ctx.shutdown().await;
+    }
 }
