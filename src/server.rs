@@ -163,6 +163,36 @@ async fn handle_redis_command_inner(
             }
             handle_get(stream, state, key).await?;
         }
+        RedisCommand::MGet { keys } => {
+            // For MGET in cluster mode, all keys must hash to the same slot
+            // Otherwise return CROSSSLOT error (Redis behavior)
+            if let Some(ref cluster_manager) = state.cluster_manager {
+                if !keys.is_empty() {
+                    let first_slot = ClusterManager::calculate_slot(&keys[0]);
+                    for key in &keys[1..] {
+                        let slot = ClusterManager::calculate_slot(key);
+                        if slot != first_slot {
+                            let response = BytesFrame::Error(
+                                "CROSSSLOT Keys in request don't hash to the same slot".into(),
+                            );
+                            stream.write_all(&serialize_frame(&response)).await?;
+                            return Ok(());
+                        }
+                    }
+                    // All keys are in the same slot, check if we handle it locally
+                    if !cluster_manager.should_handle_locally(&keys[0]).await {
+                        if let Some(redirect) =
+                            cluster_manager.get_redirect_response(&keys[0]).await
+                        {
+                            let response = BytesFrame::Error(redirect.into());
+                            stream.write_all(&serialize_frame(&response)).await?;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            handle_mget(stream, state, keys).await?;
+        }
         RedisCommand::Set {
             key,
             value,
@@ -178,6 +208,36 @@ async fn handle_redis_command_inner(
                 }
             }
             handle_set(stream, state, key, value, ttl_seconds).await?;
+        }
+        RedisCommand::MSet { key_values } => {
+            // For MSET in cluster mode, all keys must hash to the same slot
+            // Otherwise return CROSSSLOT error (Redis behavior)
+            if let Some(ref cluster_manager) = state.cluster_manager {
+                if !key_values.is_empty() {
+                    let first_slot = ClusterManager::calculate_slot(&key_values[0].0);
+                    for (key, _) in &key_values[1..] {
+                        let slot = ClusterManager::calculate_slot(key);
+                        if slot != first_slot {
+                            let response = BytesFrame::Error(
+                                "CROSSSLOT Keys in request don't hash to the same slot".into(),
+                            );
+                            stream.write_all(&serialize_frame(&response)).await?;
+                            return Ok(());
+                        }
+                    }
+                    // All keys are in the same slot, check if we handle it locally
+                    if !cluster_manager.should_handle_locally(&key_values[0].0).await {
+                        if let Some(redirect) =
+                            cluster_manager.get_redirect_response(&key_values[0].0).await
+                        {
+                            let response = BytesFrame::Error(redirect.into());
+                            stream.write_all(&serialize_frame(&response)).await?;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            handle_mset(stream, state, key_values).await?;
         }
         RedisCommand::Del { keys } => {
             handle_del_multiple(stream, state, keys).await?;
@@ -206,12 +266,84 @@ async fn handle_redis_command_inner(
         RedisCommand::HGet { namespace, key } => {
             handle_hget(stream, state, namespace, key).await?;
         }
+        RedisCommand::HMGet { namespace, keys } => {
+            // For HMGET in cluster mode, all fields must hash to the same slot
+            // Otherwise return CROSSSLOT error (Redis behavior)
+            if let Some(ref cluster_manager) = state.cluster_manager {
+                if !keys.is_empty() {
+                    let first_slot = cluster_manager.calculate_slot_for_hash(&namespace, &keys[0]);
+                    for key in &keys[1..] {
+                        let slot = cluster_manager.calculate_slot_for_hash(&namespace, key);
+                        if slot != first_slot {
+                            let response = BytesFrame::Error(
+                                "CROSSSLOT Keys in request don't hash to the same slot".into(),
+                            );
+                            stream.write_all(&serialize_frame(&response)).await?;
+                            return Ok(());
+                        }
+                    }
+                    // All keys are in the same slot, check if we handle it locally
+                    if !cluster_manager
+                        .should_handle_hash_locally(&namespace, &keys[0])
+                        .await
+                    {
+                        if let Some(redirect) = cluster_manager
+                            .get_hash_redirect_response(&namespace, &keys[0])
+                            .await
+                        {
+                            let response = BytesFrame::Error(redirect.into());
+                            stream.write_all(&serialize_frame(&response)).await?;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            handle_hmget(stream, state, namespace, keys).await?;
+        }
         RedisCommand::HSet {
             namespace,
             key,
             value,
         } => {
             handle_hset(stream, state, namespace, key, value).await?;
+        }
+        RedisCommand::HMSet {
+            namespace,
+            field_values,
+        } => {
+            // For HMSET in cluster mode, all fields must hash to the same slot
+            // Otherwise return CROSSSLOT error (Redis behavior)
+            if let Some(ref cluster_manager) = state.cluster_manager {
+                if !field_values.is_empty() {
+                    let first_slot =
+                        cluster_manager.calculate_slot_for_hash(&namespace, &field_values[0].0);
+                    for (field, _) in &field_values[1..] {
+                        let slot = cluster_manager.calculate_slot_for_hash(&namespace, field);
+                        if slot != first_slot {
+                            let response = BytesFrame::Error(
+                                "CROSSSLOT Keys in request don't hash to the same slot".into(),
+                            );
+                            stream.write_all(&serialize_frame(&response)).await?;
+                            return Ok(());
+                        }
+                    }
+                    // All fields are in the same slot, check if we handle it locally
+                    if !cluster_manager
+                        .should_handle_hash_locally(&namespace, &field_values[0].0)
+                        .await
+                    {
+                        if let Some(redirect) = cluster_manager
+                            .get_hash_redirect_response(&namespace, &field_values[0].0)
+                            .await
+                        {
+                            let response = BytesFrame::Error(redirect.into());
+                            stream.write_all(&serialize_frame(&response)).await?;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            handle_hmset(stream, state, namespace, field_values).await?;
         }
         RedisCommand::HSetEx {
             key,
@@ -359,6 +491,59 @@ async fn handle_get(
     Ok(())
 }
 
+async fn handle_mget(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+    keys: Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let now = chrono::Utc::now().timestamp();
+    let mut results: Vec<BytesFrame> = Vec::with_capacity(keys.len());
+
+    for key in keys {
+        // First check inflight cache for pending writes
+        if let Some(data) = state.inflight_cache.get(&key).await {
+            // Decompress if needed
+            let data = decompress_if_enabled(state, data).await?;
+            results.push(BytesFrame::BulkString(data.into()));
+            state.metrics.record_cache_hit();
+            continue;
+        }
+
+        let shard_index = state.get_shard(&key);
+        let pool = &state.db_pools[shard_index];
+
+        match sqlx::query_as::<_, (Vec<u8>,)>(
+            "SELECT data FROM blobs WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
+        )
+        .bind(&key)
+        .bind(now)
+        .fetch_optional(pool)
+        .await
+        {
+            Ok(Some(row)) => {
+                // Decompress if needed
+                let data = decompress_if_enabled(state, row.0.into()).await?;
+                results.push(BytesFrame::BulkString(data.into()));
+                state.metrics.record_cache_hit();
+            }
+            Ok(None) => {
+                results.push(BytesFrame::Null);
+                state.metrics.record_cache_miss();
+            }
+            Err(e) => {
+                tracing::error!("Failed to MGET key {}: {}", key, e);
+                // For MGET, we return null for failed keys rather than erroring the whole operation
+                results.push(BytesFrame::Null);
+                state.metrics.record_error("storage");
+            }
+        }
+    }
+
+    let response = BytesFrame::Array(results);
+    stream.write_all(&serialize_frame(&response)).await?;
+    Ok(())
+}
+
 async fn handle_set(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
@@ -444,6 +629,92 @@ async fn handle_set(
         }
     }
 
+    Ok(())
+}
+
+async fn handle_mset(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+    key_values: Vec<(String, Bytes)>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Note: Cluster routing checks (CROSSSLOT, MOVED) are handled at the command handler level
+    // MSET is atomic in Redis - either all keys are set or none are
+    // We'll process all keys and only return OK if all succeed
+
+    for (key, value) in key_values {
+        let shard_index = state.get_shard(&key);
+        let sender = &state.shard_senders[shard_index];
+
+        let value = compress_if_enabled(state, value).await?;
+
+        if state.cfg.async_write.unwrap_or(false) {
+            // Store in inflight cache to prevent race conditions
+            state
+                .inflight_cache
+                .insert(key.clone(), value.clone())
+                .await;
+
+            let operation = ShardWriteOperation::SetAsync {
+                key,
+                data: value,
+                expires_at: None,
+            };
+
+            if sender.send(operation).await.is_err() {
+                tracing::error!(
+                    "Failed to send ASYNC SET operation to shard {}",
+                    shard_index
+                );
+                let response = BytesFrame::Error("ERR internal error".into());
+                stream.write_all(&serialize_frame(&response)).await?;
+                state.metrics.record_error("storage");
+                return Ok(());
+            }
+            state.metrics.record_storage_operation();
+        } else {
+            // Sync mode: wait for completion
+            let (responder_tx, responder_rx) = oneshot::channel();
+
+            let operation = ShardWriteOperation::Set {
+                key,
+                data: value,
+                expires_at: None,
+                responder: responder_tx,
+            };
+
+            if sender.send(operation).await.is_err() {
+                tracing::error!("Failed to send SET operation to shard {}", shard_index);
+                let response = BytesFrame::Error("ERR internal error".into());
+                stream.write_all(&serialize_frame(&response)).await?;
+                state.metrics.record_error("storage");
+                return Ok(());
+            }
+
+            match responder_rx.await {
+                Ok(Ok(())) => {
+                    state.metrics.record_storage_operation();
+                }
+                Ok(Err(e)) => {
+                    tracing::error!("Shard writer failed for MSET: {}", e);
+                    let response = BytesFrame::Error("ERR database error".into());
+                    stream.write_all(&serialize_frame(&response)).await?;
+                    state.metrics.record_error("storage");
+                    return Ok(());
+                }
+                Err(_) => {
+                    tracing::error!("Shard writer task cancelled or panicked for MSET");
+                    let response = BytesFrame::Error("ERR internal error".into());
+                    stream.write_all(&serialize_frame(&response)).await?;
+                    state.metrics.record_error("storage");
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    // All keys set successfully
+    let response = BytesFrame::SimpleString("OK".into());
+    stream.write_all(&serialize_frame(&response)).await?;
     Ok(())
 }
 
@@ -761,6 +1032,67 @@ async fn handle_hget(
     Ok(())
 }
 
+async fn handle_hmget(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+    namespace: String,
+    keys: Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Note: Cluster routing checks (CROSSSLOT, MOVED) are handled at the command handler level
+    let now = chrono::Utc::now().timestamp();
+    let table_name = format!("blobs_{}", namespace);
+    let mut results: Vec<BytesFrame> = Vec::with_capacity(keys.len());
+
+    for key in keys {
+        // First check inflight cache for pending writes
+        let namespaced_key = state.namespaced_key(&namespace, &key);
+        if let Some(data) = state.inflight_hcache.get(&namespaced_key).await {
+            // Decompress if needed
+            let data = decompress_if_enabled(state, data).await?;
+            results.push(BytesFrame::BulkString(data.into()));
+            continue;
+        }
+
+        let shard_index = state.get_shard(&key);
+        let pool = &state.db_pools[shard_index];
+
+        let query = format!(
+            "SELECT data FROM {} WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
+            table_name
+        );
+
+        match sqlx::query_as::<_, (Vec<u8>,)>(&query)
+            .bind(&key)
+            .bind(now)
+            .fetch_optional(pool)
+            .await
+        {
+            Ok(Some(row)) => {
+                // Decompress if needed
+                let data = decompress_if_enabled(state, row.0.into()).await?;
+                results.push(BytesFrame::BulkString(data.into()));
+            }
+            Ok(None) => {
+                results.push(BytesFrame::Null);
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Failed to HMGET namespace {} key {}: {}",
+                    namespace,
+                    key,
+                    e
+                );
+                // For HMGET, we return null for failed keys rather than erroring the whole operation
+                results.push(BytesFrame::Null);
+            }
+        }
+    }
+
+    let response = BytesFrame::Array(results);
+    stream.write_all(&serialize_frame(&response)).await?;
+    Ok(())
+}
+
 async fn handle_hset(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
@@ -885,6 +1217,94 @@ async fn handle_hset(
         }
     }
 
+    Ok(())
+}
+
+async fn handle_hmset(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+    namespace: String,
+    field_values: Vec<(String, Bytes)>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Note: Cluster routing checks (CROSSSLOT, MOVED) are handled at the command handler level
+    // HMSET always returns OK (unlike HSET which returns count of new fields)
+
+    for (field, value) in field_values {
+        let shard_index = state.get_shard(&field);
+        let sender = &state.shard_senders[shard_index];
+
+        // Compress data if storage compression is enabled
+        let value = compress_if_enabled(state, value).await?;
+
+        if state.cfg.async_write.unwrap_or(false) {
+            // Store in inflight cache to prevent race conditions
+            let namespaced_key = state.namespaced_key(&namespace, &field);
+            state
+                .inflight_hcache
+                .insert(namespaced_key, value.clone())
+                .await;
+
+            let operation = ShardWriteOperation::HSetAsync {
+                namespace: namespace.clone(),
+                key: field,
+                data: value,
+            };
+
+            if sender.send(operation).await.is_err() {
+                tracing::error!(
+                    "Failed to send ASYNC HSET operation to shard {}",
+                    shard_index
+                );
+                let response = BytesFrame::Error("ERR internal error".into());
+                stream.write_all(&serialize_frame(&response)).await?;
+                state.metrics.record_error("storage");
+                return Ok(());
+            }
+            state.metrics.record_storage_operation();
+        } else {
+            // Sync mode: wait for completion
+            let (responder_tx, responder_rx) = oneshot::channel();
+
+            let operation = ShardWriteOperation::HSet {
+                namespace: namespace.clone(),
+                key: field,
+                data: value,
+                responder: responder_tx,
+            };
+
+            if sender.send(operation).await.is_err() {
+                tracing::error!("Failed to send HSET operation to shard {}", shard_index);
+                let response = BytesFrame::Error("ERR internal error".into());
+                stream.write_all(&serialize_frame(&response)).await?;
+                state.metrics.record_error("storage");
+                return Ok(());
+            }
+
+            match responder_rx.await {
+                Ok(Ok(())) => {
+                    state.metrics.record_storage_operation();
+                }
+                Ok(Err(e)) => {
+                    tracing::error!("Shard writer failed for HMSET: {}", e);
+                    let response = BytesFrame::Error("ERR database error".into());
+                    stream.write_all(&serialize_frame(&response)).await?;
+                    state.metrics.record_error("storage");
+                    return Ok(());
+                }
+                Err(_) => {
+                    tracing::error!("Shard writer task cancelled or panicked for HMSET");
+                    let response = BytesFrame::Error("ERR internal error".into());
+                    stream.write_all(&serialize_frame(&response)).await?;
+                    state.metrics.record_error("storage");
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    // All fields set successfully
+    let response = BytesFrame::SimpleString("OK".into());
+    stream.write_all(&serialize_frame(&response)).await?;
     Ok(())
 }
 
@@ -2111,6 +2531,302 @@ mod tests {
             })
         });
         assert_error_contains(frame.await, "cluster support disabled");
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn mget_returns_array_of_values() {
+        let ctx = TestContext::new(false).await;
+
+        // Set up some keys
+        respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_set(
+                    &mut stream,
+                    &state,
+                    "mget_key1".to_string(),
+                    Bytes::from_static(b"value1"),
+                    None,
+                )
+                .await
+            })
+        })
+        .await;
+
+        respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_set(
+                    &mut stream,
+                    &state,
+                    "mget_key2".to_string(),
+                    Bytes::from_static(b"value2"),
+                    None,
+                )
+                .await
+            })
+        })
+        .await;
+
+        // MGET with existing keys and missing key
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_mget(
+                    &mut stream,
+                    &state,
+                    vec![
+                        "mget_key1".to_string(),
+                        "mget_missing".to_string(),
+                        "mget_key2".to_string(),
+                    ],
+                )
+                .await
+            })
+        })
+        .await;
+
+        match frame {
+            BytesFrame::Array(items) => {
+                assert_eq!(items.len(), 3);
+                assert_bulk_string(items[0].clone(), b"value1");
+                assert_null(items[1].clone());
+                assert_bulk_string(items[2].clone(), b"value2");
+            }
+            other => panic!("Expected array, got {:?}", other),
+        }
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn hmget_returns_array_of_values() {
+        let ctx = TestContext::new(false).await;
+
+        // Set up some hash fields
+        respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hset(
+                    &mut stream,
+                    &state,
+                    "hmget_hash".to_string(),
+                    "field1".to_string(),
+                    Bytes::from_static(b"hash_value1"),
+                )
+                .await
+            })
+        })
+        .await;
+
+        respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hset(
+                    &mut stream,
+                    &state,
+                    "hmget_hash".to_string(),
+                    "field2".to_string(),
+                    Bytes::from_static(b"hash_value2"),
+                )
+                .await
+            })
+        })
+        .await;
+
+        // HMGET with existing fields and missing field
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hmget(
+                    &mut stream,
+                    &state,
+                    "hmget_hash".to_string(),
+                    vec![
+                        "field1".to_string(),
+                        "missing_field".to_string(),
+                        "field2".to_string(),
+                    ],
+                )
+                .await
+            })
+        })
+        .await;
+
+        match frame {
+            BytesFrame::Array(items) => {
+                assert_eq!(items.len(), 3);
+                assert_bulk_string(items[0].clone(), b"hash_value1");
+                assert_null(items[1].clone());
+                assert_bulk_string(items[2].clone(), b"hash_value2");
+            }
+            other => panic!("Expected array, got {:?}", other),
+        }
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn mget_empty_keys_returns_empty_array() {
+        let ctx = TestContext::new(false).await;
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_mget(&mut stream, &state, vec![]).await
+            })
+        })
+        .await;
+
+        assert_array_len(frame, 0);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn hmget_empty_keys_returns_empty_array() {
+        let ctx = TestContext::new(false).await;
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hmget(&mut stream, &state, "some_hash".to_string(), vec![]).await
+            })
+        })
+        .await;
+
+        assert_array_len(frame, 0);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn mset_sets_multiple_keys() {
+        let ctx = TestContext::new(false).await;
+
+        // MSET multiple keys
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_mset(
+                    &mut stream,
+                    &state,
+                    vec![
+                        ("mset_key1".to_string(), Bytes::from_static(b"mset_value1")),
+                        ("mset_key2".to_string(), Bytes::from_static(b"mset_value2")),
+                    ],
+                )
+                .await
+            })
+        })
+        .await;
+        assert_simple_string(frame, "OK");
+
+        // Verify keys were set correctly
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_get(&mut stream, &state, "mset_key1".to_string()).await
+            })
+        })
+        .await;
+        assert_bulk_string(frame, b"mset_value1");
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_get(&mut stream, &state, "mset_key2".to_string()).await
+            })
+        })
+        .await;
+        assert_bulk_string(frame, b"mset_value2");
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn mset_empty_returns_ok() {
+        let ctx = TestContext::new(false).await;
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_mset(&mut stream, &state, vec![]).await
+            })
+        })
+        .await;
+        assert_simple_string(frame, "OK");
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn hmset_sets_multiple_fields() {
+        let ctx = TestContext::new(false).await;
+
+        // HMSET multiple fields
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hmset(
+                    &mut stream,
+                    &state,
+                    "hmset_hash".to_string(),
+                    vec![
+                        (
+                            "field1".to_string(),
+                            Bytes::from_static(b"hmset_value1"),
+                        ),
+                        (
+                            "field2".to_string(),
+                            Bytes::from_static(b"hmset_value2"),
+                        ),
+                    ],
+                )
+                .await
+            })
+        })
+        .await;
+        assert_simple_string(frame, "OK");
+
+        // Verify fields were set correctly
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hget(&mut stream, &state, "hmset_hash".to_string(), "field1".to_string())
+                    .await
+            })
+        })
+        .await;
+        assert_bulk_string(frame, b"hmset_value1");
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hget(&mut stream, &state, "hmset_hash".to_string(), "field2".to_string())
+                    .await
+            })
+        })
+        .await;
+        assert_bulk_string(frame, b"hmset_value2");
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn hmset_empty_returns_ok() {
+        let ctx = TestContext::new(false).await;
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hmset(&mut stream, &state, "some_hash".to_string(), vec![]).await
+            })
+        })
+        .await;
+        assert_simple_string(frame, "OK");
 
         ctx.shutdown().await;
     }

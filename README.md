@@ -15,6 +15,7 @@ Blobasaur is a high-performance, sharded blob storage server written in Rust. It
 ## Table of Contents
 
 - [Features](#features)
+- [Why Blobasaur?](#why-blobasaur)
 - [Installation](#installation)
   - [Prerequisites](#prerequisites)
   - [From Source](#from-source)
@@ -29,6 +30,7 @@ Blobasaur is a high-performance, sharded blob storage server written in Rust. It
   - [Basic Commands](#basic-commands)
   - [Namespaced Commands](#namespaced-commands)
   - [Using Redis Clients](#using-redis-clients)
+  - [Full Command Reference](#full-command-reference)
 - [Shard Migration](#shard-migration)
   - [Overview](#overview)
   - [Usage](#usage)
@@ -61,6 +63,63 @@ Blobasaur is a high-performance, sharded blob storage server written in Rust. It
 - **⏰ TTL Support**: Redis-compatible key expiration with `SET EX/PX`, `TTL`, and `EXPIRE` commands plus automatic background cleanup
 - **🌐 Redis Cluster Support**: Full cluster protocol support with automatic node discovery and client redirection
 - **⚙️ Highly Configurable**: Flexible configuration for shards, compression, batching, and performance tuning
+
+## Why Blobasaur?
+
+### Why not Redis?
+
+Redis is an in-memory data store. While it can persist data to disk, it's fundamentally designed to keep your entire dataset in RAM. For blob storage where you might have terabytes of data, this becomes prohibitively expensive. Blobasaur stores data directly on disk via SQLite, using memory only for caching and connection handling. You get Redis protocol compatibility without the memory costs.
+
+### Why not a distributed database like ScyllaDB or Cassandra?
+
+Distributed databases like ScyllaDB, Cassandra, or CockroachDB are excellent for large-scale, multi-datacenter deployments where you need strong consistency guarantees across nodes. However, they come with significant trade-offs:
+
+- **Operational overhead**: Requires cluster management, node coordination, and careful capacity planning
+- **Resource requirements**: Minimum viable clusters typically need 3+ nodes
+- **Complexity**: Tuning compaction strategies, repair processes, and consistency levels
+- **Write amplification**: LSM-tree based stores (Cassandra, ScyllaDB, RocksDB) rewrite data multiple times during compaction, increasing disk I/O and SSD wear
+- **Compaction pressure**: Large blobs exacerbate compaction costs, leading to latency spikes and increased storage requirements during compaction cycles
+- **Inefficient for immutable data**: These databases optimize for update-heavy workloads; if your blobs are mostly write-once-read-many, you're paying compaction costs for no benefit
+
+Blobasaur is designed for simpler deployment scenarios. A single instance with sharded SQLite databases can handle millions of blobs with minimal operational burden. SQLite's B-tree storage has no compaction overhead—data is written once and read directly. When you do need to scale horizontally, Blobasaur's cluster mode provides distribution without the complexity of consensus protocols.
+
+### Why SQLite instead of the filesystem?
+
+Storing blobs as individual files seems intuitive but has significant drawbacks:
+
+- **Inode exhaustion**: Filesystems have limits on the number of files. Millions of small blobs can exhaust inodes before disk space
+- **Directory performance**: Directories with millions of entries become slow to list and traverse
+- **Metadata overhead**: Each file carries filesystem metadata overhead (permissions, timestamps, etc.)
+- **No atomic operations**: Renaming, updating, and deleting files isn't atomic without additional coordination
+- **Fragmentation**: Small files lead to disk fragmentation and wasted space due to block allocation
+- **open()/close() overhead**: Every file read requires system calls to open and close the file handle
+
+SQLite solves these problems elegantly:
+- All data in a single file per shard with B-tree indexing
+- ACID transactions for atomic operations
+- Efficient storage with no per-blob filesystem overhead
+- Built-in compression support at the application level
+- Excellent read performance with proper indexing
+
+According to [SQLite's own benchmarks](https://www.sqlite.org/fasterthanfs.html), SQLite reads and writes small blobs **35% faster** than individual files on disk. The database also uses **20% less disk space** because files are padded to filesystem block boundaries while SQLite packs blobs more efficiently. With memory-mapped I/O, SQLite can be up to 2-10x faster than filesystem reads depending on the platform.
+
+### Why sharding?
+
+SQLite is single-writer by design. While WAL mode allows concurrent reads, write operations are serialized. Sharding across multiple SQLite databases enables:
+
+- **Write parallelism**: Multiple shards can accept writes simultaneously
+- **Better cache utilization**: Each shard has its own page cache
+- **Horizontal scaling**: Add more shards as data grows
+- **Isolation**: Issues in one shard don't affect others
+
+### When should you NOT use Blobasaur?
+
+- **You need sub-millisecond latency**: Use Redis or another in-memory store
+- **You need multi-region replication**: Use a distributed database
+- **You need complex queries**: Use PostgreSQL or another relational database
+- **You have very large blobs (>100MB)**: Consider object storage like S3 or MinIO
+
+Blobasaur is ideal for storing millions of small-to-medium blobs (configs, serialized objects, cached responses, session data) where you want Redis protocol simplicity with disk-based persistence and reasonable performance.
 
 ## Installation
 
@@ -380,6 +439,10 @@ r.execute_command('HSETEX', 'sessions', 'EX', '3600', 'FIELDS', '1', 'user456', 
 # Set multiple fields with expiration
 r.execute_command('HSETEX', 'cache', 'EX', '300', 'FIELDS', '2', 'key1', 'val1', 'key2', 'val2')
 ```
+
+### Full Command Reference
+
+For a complete list of all implemented and planned Redis commands, see [COMMANDS.md](COMMANDS.md).
 
 ## Shard Migration
 

@@ -20,10 +20,16 @@ pub enum RedisCommand {
     Get {
         key: String,
     },
+    MGet {
+        keys: Vec<String>,
+    },
     Set {
         key: String,
         value: Bytes,
         ttl_seconds: Option<u64>,
+    },
+    MSet {
+        key_values: Vec<(String, Bytes)>,
     },
     Del {
         keys: Vec<String>,
@@ -35,10 +41,18 @@ pub enum RedisCommand {
         namespace: String,
         key: String,
     },
+    HMGet {
+        namespace: String,
+        keys: Vec<String>,
+    },
     HSet {
         namespace: String,
         key: String,
         value: Bytes,
+    },
+    HMSet {
+        namespace: String,
+        field_values: Vec<(String, Bytes)>,
     },
     HSetEx {
         key: String,
@@ -91,11 +105,15 @@ impl RedisCommand {
     pub fn name(&self) -> String {
         match self {
             RedisCommand::Get { .. } => "GET".to_string(),
+            RedisCommand::MGet { .. } => "MGET".to_string(),
             RedisCommand::Set { .. } => "SET".to_string(),
+            RedisCommand::MSet { .. } => "MSET".to_string(),
             RedisCommand::Del { .. } => "DEL".to_string(),
             RedisCommand::Exists { .. } => "EXISTS".to_string(),
             RedisCommand::HGet { .. } => "HGET".to_string(),
+            RedisCommand::HMGet { .. } => "HMGET".to_string(),
             RedisCommand::HSet { .. } => "HSET".to_string(),
+            RedisCommand::HMSet { .. } => "HMSET".to_string(),
             RedisCommand::HSetEx { .. } => "HSETEX".to_string(),
             RedisCommand::HDel { .. } => "HDEL".to_string(),
             RedisCommand::HExists { .. } => "HEXISTS".to_string(),
@@ -170,6 +188,18 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
             let key = extract_string(&elements[1])?;
             Ok(RedisCommand::Get { key })
         }
+        "MGET" => {
+            if elements.len() < 2 {
+                return Err(ParseError::Invalid(
+                    "MGET requires at least 1 argument".to_string(),
+                ));
+            }
+            let mut keys = Vec::new();
+            for key_element in &elements[1..] {
+                keys.push(extract_string(key_element)?);
+            }
+            Ok(RedisCommand::MGet { keys })
+        }
         "SET" => {
             if elements.len() < 3 || elements.len() > 5 {
                 return Err(ParseError::Invalid(
@@ -223,6 +253,30 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
                 ttl_seconds,
             })
         }
+        "MSET" => {
+            // MSET key value [key value ...]
+            // Must have at least one key-value pair (3 elements: MSET key value)
+            // Total elements must be odd (command + even number of key-value pairs)
+            if elements.len() < 3 {
+                return Err(ParseError::Invalid(
+                    "MSET requires at least one key-value pair".to_string(),
+                ));
+            }
+            if (elements.len() - 1) % 2 != 0 {
+                return Err(ParseError::Invalid(
+                    "MSET requires an even number of arguments (key-value pairs)".to_string(),
+                ));
+            }
+            let mut key_values = Vec::new();
+            let mut i = 1;
+            while i < elements.len() {
+                let key = extract_string(&elements[i])?;
+                let value = extract_bytes(&elements[i + 1])?;
+                key_values.push((key, value));
+                i += 2;
+            }
+            Ok(RedisCommand::MSet { key_values })
+        }
         "DEL" => {
             if elements.len() < 2 {
                 return Err(ParseError::Invalid(
@@ -271,6 +325,20 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
             let key = extract_string(&elements[2])?;
             Ok(RedisCommand::HGet { namespace, key })
         }
+        "HMGET" => {
+            if elements.len() < 3 {
+                return Err(ParseError::Invalid(
+                    "HMGET requires at least 2 arguments (hash key and at least one field)"
+                        .to_string(),
+                ));
+            }
+            let namespace = extract_string(&elements[1])?;
+            let mut keys = Vec::new();
+            for key_element in &elements[2..] {
+                keys.push(extract_string(key_element)?);
+            }
+            Ok(RedisCommand::HMGet { namespace, keys })
+        }
         "HSET" => {
             if elements.len() != 4 {
                 return Err(ParseError::Invalid(
@@ -284,6 +352,34 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
                 namespace,
                 key,
                 value,
+            })
+        }
+        "HMSET" => {
+            // HMSET key field value [field value ...]
+            // Must have at least hash key + one field-value pair (4 elements: HMSET key field value)
+            // After hash key, must have even number of field-value pairs
+            if elements.len() < 4 {
+                return Err(ParseError::Invalid(
+                    "HMSET requires hash key and at least one field-value pair".to_string(),
+                ));
+            }
+            if (elements.len() - 2) % 2 != 0 {
+                return Err(ParseError::Invalid(
+                    "HMSET requires an even number of field-value arguments".to_string(),
+                ));
+            }
+            let namespace = extract_string(&elements[1])?;
+            let mut field_values = Vec::new();
+            let mut i = 2;
+            while i < elements.len() {
+                let field = extract_string(&elements[i])?;
+                let value = extract_bytes(&elements[i + 1])?;
+                field_values.push((field, value));
+                i += 2;
+            }
+            Ok(RedisCommand::HMSet {
+                namespace,
+                field_values,
             })
         }
         "HSETEX" => {
@@ -959,6 +1055,195 @@ mod tests {
                 key: "mykey".to_string()
             }
         );
+    }
+
+    #[test]
+    fn test_parse_mget_command() {
+        let input = b"*3\r\n$4\r\nMGET\r\n$4\r\nkey1\r\n$4\r\nkey2\r\n";
+        let (resp, _) = parse_resp_with_remaining(input).unwrap();
+        let command = parse_command(resp).unwrap();
+        assert_eq!(
+            command,
+            RedisCommand::MGet {
+                keys: vec!["key1".to_string(), "key2".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_mget_single_key() {
+        let input = b"*2\r\n$4\r\nMGET\r\n$4\r\nkey1\r\n";
+        let (resp, _) = parse_resp_with_remaining(input).unwrap();
+        let command = parse_command(resp).unwrap();
+        assert_eq!(
+            command,
+            RedisCommand::MGet {
+                keys: vec!["key1".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_mget_no_keys() {
+        let input = b"*1\r\n$4\r\nMGET\r\n";
+        let (resp, _) = parse_resp_with_remaining(input).unwrap();
+        let result = parse_command(resp);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("MGET requires at least 1 argument"));
+    }
+
+    #[test]
+    fn test_parse_hmget_command() {
+        let input = b"*4\r\n$5\r\nHMGET\r\n$5\r\nhash1\r\n$6\r\nfield1\r\n$6\r\nfield2\r\n";
+        let (resp, _) = parse_resp_with_remaining(input).unwrap();
+        let command = parse_command(resp).unwrap();
+        assert_eq!(
+            command,
+            RedisCommand::HMGet {
+                namespace: "hash1".to_string(),
+                keys: vec!["field1".to_string(), "field2".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_hmget_single_field() {
+        let input = b"*3\r\n$5\r\nHMGET\r\n$5\r\nhash1\r\n$6\r\nfield1\r\n";
+        let (resp, _) = parse_resp_with_remaining(input).unwrap();
+        let command = parse_command(resp).unwrap();
+        assert_eq!(
+            command,
+            RedisCommand::HMGet {
+                namespace: "hash1".to_string(),
+                keys: vec!["field1".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_hmget_no_fields() {
+        let input = b"*2\r\n$5\r\nHMGET\r\n$5\r\nhash1\r\n";
+        let (resp, _) = parse_resp_with_remaining(input).unwrap();
+        let result = parse_command(resp);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("HMGET requires at least 2 arguments"));
+    }
+
+    #[test]
+    fn test_parse_mset_command() {
+        let input = b"*5\r\n$4\r\nMSET\r\n$4\r\nkey1\r\n$6\r\nvalue1\r\n$4\r\nkey2\r\n$6\r\nvalue2\r\n";
+        let (resp, _) = parse_resp_with_remaining(input).unwrap();
+        let command = parse_command(resp).unwrap();
+        assert_eq!(
+            command,
+            RedisCommand::MSet {
+                key_values: vec![
+                    ("key1".to_string(), Bytes::from_static(b"value1")),
+                    ("key2".to_string(), Bytes::from_static(b"value2")),
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_mset_single_pair() {
+        let input = b"*3\r\n$4\r\nMSET\r\n$4\r\nkey1\r\n$6\r\nvalue1\r\n";
+        let (resp, _) = parse_resp_with_remaining(input).unwrap();
+        let command = parse_command(resp).unwrap();
+        assert_eq!(
+            command,
+            RedisCommand::MSet {
+                key_values: vec![("key1".to_string(), Bytes::from_static(b"value1")),]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_mset_no_args() {
+        let input = b"*1\r\n$4\r\nMSET\r\n";
+        let (resp, _) = parse_resp_with_remaining(input).unwrap();
+        let result = parse_command(resp);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("MSET requires at least one key-value pair"));
+    }
+
+    #[test]
+    fn test_parse_mset_odd_args() {
+        // MSET key1 value1 key2 (missing value2)
+        let input = b"*4\r\n$4\r\nMSET\r\n$4\r\nkey1\r\n$6\r\nvalue1\r\n$4\r\nkey2\r\n";
+        let (resp, _) = parse_resp_with_remaining(input).unwrap();
+        let result = parse_command(resp);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("MSET requires an even number of arguments"));
+    }
+
+    #[test]
+    fn test_parse_hmset_command() {
+        let input =
+            b"*6\r\n$5\r\nHMSET\r\n$5\r\nhash1\r\n$6\r\nfield1\r\n$6\r\nvalue1\r\n$6\r\nfield2\r\n$6\r\nvalue2\r\n";
+        let (resp, _) = parse_resp_with_remaining(input).unwrap();
+        let command = parse_command(resp).unwrap();
+        assert_eq!(
+            command,
+            RedisCommand::HMSet {
+                namespace: "hash1".to_string(),
+                field_values: vec![
+                    ("field1".to_string(), Bytes::from_static(b"value1")),
+                    ("field2".to_string(), Bytes::from_static(b"value2")),
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_hmset_single_field() {
+        let input = b"*4\r\n$5\r\nHMSET\r\n$5\r\nhash1\r\n$6\r\nfield1\r\n$6\r\nvalue1\r\n";
+        let (resp, _) = parse_resp_with_remaining(input).unwrap();
+        let command = parse_command(resp).unwrap();
+        assert_eq!(
+            command,
+            RedisCommand::HMSet {
+                namespace: "hash1".to_string(),
+                field_values: vec![("field1".to_string(), Bytes::from_static(b"value1")),]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_hmset_no_fields() {
+        let input = b"*2\r\n$5\r\nHMSET\r\n$5\r\nhash1\r\n";
+        let (resp, _) = parse_resp_with_remaining(input).unwrap();
+        let result = parse_command(resp);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("HMSET requires hash key and at least one field-value pair"));
+    }
+
+    #[test]
+    fn test_parse_hmset_odd_field_args() {
+        // HMSET hash1 field1 value1 field2 (missing value2)
+        let input = b"*5\r\n$5\r\nHMSET\r\n$5\r\nhash1\r\n$6\r\nfield1\r\n$6\r\nvalue1\r\n$6\r\nfield2\r\n";
+        let (resp, _) = parse_resp_with_remaining(input).unwrap();
+        let result = parse_command(resp);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("HMSET requires an even number of field-value arguments"));
     }
 
     #[test]
