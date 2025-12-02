@@ -83,3 +83,22 @@ synchronous = "NORMAL"
 [metrics]
 enabled = true
 addr = "0.0.0.0:9090" # Address for metrics HTTP server
+
+# Redis Cluster configuration (optional)
+# Enables Redis cluster protocol with automatic node discovery and client redirection
+# [cluster]
+# enabled = true
+# node_id = "node1"                      # Unique identifier for this node
+# seeds = ["127.0.0.1:7002"]             # Other cluster nodes for gossip discovery
+# advertise_addr = "127.0.0.1:6379"      # Redis address advertised to clients
+# port = 7001                            # Gossip port for cluster communication (separate from Redis port)
+#
+# # Hash slot ranges owned by this node (0-16383 total)
+# [[cluster.slot_ranges]]
+# start = 0
+# end = 5460
+#
+# # For a 3-node cluster, you might configure:
+# # Node 1: slots 0-5460
+# # Node 2: slots 5461-10922
+# # Node 3: slots 10923-16383
