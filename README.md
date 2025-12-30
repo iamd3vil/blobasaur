@@ -591,19 +591,7 @@ Full Redis cluster protocol support with:
 - **Client Redirection**: Automatic MOVED responses
 - **Cluster Commands**: `CLUSTER NODES`, `CLUSTER INFO`, etc.
 
-**Basic Cluster Configuration:**
-```toml
-[cluster]
-enabled = true
-node_id = "node1"
-seeds = ["127.0.0.1:6380"]
-advertise_addr = "127.0.0.1:6379"  # Redis address for clients
-port = 6380                        # Gossip port for cluster communication
-
-[[cluster.slot_ranges]]
-start = 0
-end = 8191
-```
+See [config.cluster.example.toml](config.cluster.example.toml) for a complete cluster configuration example with all options documented.
 
 ## Development
 
