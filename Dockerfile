@@ -1,14 +1,14 @@
-FROM rust:1.92 AS builder
+FROM rust:1.92-alpine AS builder
+
+RUN apk add --no-cache musl-dev
 
 WORKDIR /usr/src/app
 COPY . .
 RUN cargo build --release
 
-FROM debian:bookworm-slim
+FROM alpine:3.21
 
-RUN apt-get update && apt-get install -y \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache ca-certificates
 
 WORKDIR /app
 
