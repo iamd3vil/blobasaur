@@ -16,6 +16,7 @@ Blobasaur is a high-performance, sharded blob storage server written in Rust. It
 
 - [Features](#features)
 - [Installation](#installation)
+  - [Docker](#docker)
   - [Prerequisites](#prerequisites)
   - [From Source](#from-source)
   - [Cross-compilation](#cross-compilation)
@@ -85,6 +86,31 @@ You can download pre-compiled binaries for Linux from the [GitHub Releases page]
     ```bash
     ./blobasaur
     ```
+
+### Docker
+
+Docker images are available on GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/iamd3vil/blobasaur:latest
+```
+
+Run with a config file:
+
+```bash
+docker run -d \
+  -p 6379:6379 \
+  -v $(pwd)/config.toml:/app/config.toml \
+  -v $(pwd)/data:/app/data \
+  ghcr.io/iamd3vil/blobasaur:latest \
+  blobasaur --config /app/config.toml
+```
+
+Available tags:
+- `latest` - Latest stable release
+- `x.y.z` - Specific version (e.g., `0.2.1`)
+- `x.y` - Latest patch for minor version (e.g., `0.2`)
+- `main` - Latest build from main branch
 
 ### Prerequisites
 
