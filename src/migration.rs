@@ -6,9 +6,46 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::str::FromStr;
 
+const SQLITE_AUTO_VACUUM_NONE: i64 = 0;
+const SQLITE_AUTO_VACUUM_FULL: i64 = 1;
+const SQLITE_AUTO_VACUUM_INCREMENTAL: i64 = 2;
+
 // Helper function to convert sqlx errors to miette errors
 fn sqlx_to_miette(err: sqlx::Error, context: &str) -> miette::Error {
     miette::miette!("{}: {}", context, err)
+}
+
+fn sqlite_auto_vacuum_mode_name(mode: i64) -> &'static str {
+    match mode {
+        SQLITE_AUTO_VACUUM_NONE => "NONE",
+        SQLITE_AUTO_VACUUM_FULL => "FULL",
+        SQLITE_AUTO_VACUUM_INCREMENTAL => "INCREMENTAL",
+        _ => "UNKNOWN",
+    }
+}
+
+async fn warn_if_auto_vacuum_not_incremental(pool: &SqlitePool, shard_id: usize) {
+    match sqlx::query_scalar::<_, i64>("PRAGMA auto_vacuum")
+        .fetch_one(pool)
+        .await
+    {
+        Ok(SQLITE_AUTO_VACUUM_INCREMENTAL) => {}
+        Ok(mode) => {
+            tracing::warn!(
+                shard_id,
+                auto_vacuum_mode = mode,
+                auto_vacuum_mode_name = sqlite_auto_vacuum_mode_name(mode),
+                "Shard DB auto_vacuum is not INCREMENTAL; existing DBs require VACUUM to switch mode"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                shard_id,
+                error = %error,
+                "Failed to read PRAGMA auto_vacuum for shard DB"
+            );
+        }
+    }
 }
 
 #[derive(Hash)]
@@ -62,6 +99,7 @@ impl MigrationManager {
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .busy_timeout(std::time::Duration::from_millis(5000))
+            .pragma("auto_vacuum", "INCREMENTAL")
             .pragma("synchronous", "NORMAL") // NORMAL is safer than OFF
             .pragma("cache_size", "-1024000") // 1GB cache for better performance during migration
             .pragma("temp_store", "MEMORY")
@@ -93,6 +131,8 @@ impl MigrationManager {
                 "Failed to create connection pool for new shard {}",
                 i
             ))?;
+
+            warn_if_auto_vacuum_not_incremental(&pool, i).await;
 
             // Create the main blobs table
             sqlx::query(

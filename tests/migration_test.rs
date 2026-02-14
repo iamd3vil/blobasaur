@@ -33,6 +33,15 @@ async fn create_test_pool(path: &str) -> Result<SqlitePool, sqlx::Error> {
     SqlitePool::connect_with(connect_options).await
 }
 
+async fn read_auto_vacuum_mode(path: &str) -> Result<i64, Box<dyn std::error::Error>> {
+    let pool = create_test_pool(path).await?;
+    let mode = sqlx::query_scalar::<_, i64>("PRAGMA auto_vacuum")
+        .fetch_one(&pool)
+        .await?;
+    pool.close().await;
+    Ok(mode)
+}
+
 // Helper function to simulate consistent hashing for a given shard count
 fn get_shard_for_key(key: &str, shard_count: usize) -> usize {
     let ring = HashRing::new();
@@ -259,6 +268,39 @@ async fn test_migration_basic() -> Result<(), Box<dyn std::error::Error>> {
 
     // Verify migration verification works
     migration_manager.verify_migration().await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_migration_creates_new_shards_with_incremental_auto_vacuum()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = TempDir::new()?;
+    let old_shard_count = 1;
+    let new_shard_count = 2;
+    let test_keys = vec!["key1", "key2", "key3"];
+
+    create_test_data(&temp_dir, old_shard_count, &test_keys).await?;
+
+    let newly_created_shard = temp_dir.path().join("shard_1.db");
+    assert!(
+        !newly_created_shard.exists(),
+        "shard_1 should not exist pre-migration"
+    );
+
+    let migration_manager = blobasaur::migration::MigrationManager::new(
+        old_shard_count,
+        new_shard_count,
+        temp_dir.path().to_str().unwrap().to_string(),
+    )?;
+
+    migration_manager.run_migration().await?;
+
+    let mode = read_auto_vacuum_mode(newly_created_shard.to_str().unwrap()).await?;
+    assert_eq!(
+        mode, 2,
+        "newly created shard DB should persist auto_vacuum=INCREMENTAL"
+    );
 
     Ok(())
 }

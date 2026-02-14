@@ -2,15 +2,17 @@ use crate::AppState;
 use crate::cluster::ClusterManager;
 use crate::metrics::Timer;
 use crate::redis::{
-    ParseError, RedisCommand, parse_command, parse_resp_with_remaining, serialize_frame,
+    ParseError, RedisCommand, VacuumCommandMode, VacuumShardTarget, parse_command,
+    parse_resp_with_remaining, serialize_frame,
 };
-use crate::shard_manager::ShardWriteOperation;
+use crate::shard_manager::{ShardWriteOperation, VacuumMode, VacuumResult, VacuumStats};
 use bytes::Bytes;
 use redis_protocol::resp2::types::BytesFrame;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
+use tokio::time::{Duration, timeout};
 
 pub async fn run_redis_server(
     state: Arc<AppState>,
@@ -124,6 +126,38 @@ async fn handle_connection(
 }
 
 // Helper function to find the end of a complete message
+
+const SHARD_VACUUM_TIMEOUT: Duration = Duration::from_secs(30);
+const BYTES_PER_MB: u64 = 1024 * 1024;
+
+#[derive(Debug)]
+enum ShardVacuumStatus {
+    Ok,
+    ExecutionError,
+    Timeout,
+    Cancelled,
+    InvalidShard,
+}
+
+impl ShardVacuumStatus {
+    fn as_str(&self) -> &'static str {
+        match self {
+            ShardVacuumStatus::Ok => "ok",
+            ShardVacuumStatus::ExecutionError => "execution_error",
+            ShardVacuumStatus::Timeout => "timeout",
+            ShardVacuumStatus::Cancelled => "cancelled",
+            ShardVacuumStatus::InvalidShard => "invalid_shard",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ShardVacuumDispatchResult {
+    shard_id: usize,
+    status: ShardVacuumStatus,
+    error: Option<String>,
+    vacuum_result: Option<VacuumResult>,
+}
 
 async fn handle_redis_command(
     stream: &mut TcpStream,
@@ -269,6 +303,14 @@ async fn handle_redis_command_inner(
                 }
             }
             handle_expire(stream, state, key, seconds).await?;
+        }
+        RedisCommand::BlobasaurVacuum {
+            target,
+            mode,
+            budget_mb,
+            dry_run,
+        } => {
+            handle_blobasaur_vacuum(stream, state, target, mode, budget_mb, dry_run).await?;
         }
         RedisCommand::Quit => {
             let response = BytesFrame::SimpleString("OK".into());
@@ -1561,6 +1603,271 @@ async fn handle_expire(
     Ok(())
 }
 
+fn vacuum_mode_from_command(mode: VacuumCommandMode) -> VacuumMode {
+    match mode {
+        VacuumCommandMode::Incremental => VacuumMode::Incremental,
+        VacuumCommandMode::Full => VacuumMode::Full,
+    }
+}
+
+fn vacuum_mode_name(mode: VacuumCommandMode) -> &'static str {
+    match mode {
+        VacuumCommandMode::Incremental => "incremental",
+        VacuumCommandMode::Full => "full",
+    }
+}
+
+fn vacuum_mode_name_internal(mode: VacuumMode) -> &'static str {
+    match mode {
+        VacuumMode::Incremental => "incremental",
+        VacuumMode::Full => "full",
+    }
+}
+
+fn maybe_integer(value: Option<u64>) -> BytesFrame {
+    value
+        .map(|v| BytesFrame::Integer(i64::try_from(v).unwrap_or(i64::MAX)))
+        .unwrap_or(BytesFrame::Null)
+}
+
+fn vacuum_stats_to_frame(stats: VacuumStats) -> BytesFrame {
+    BytesFrame::Array(vec![
+        BytesFrame::BulkString("page_size".as_bytes().to_vec().into()),
+        BytesFrame::Integer(i64::try_from(stats.page_size).unwrap_or(i64::MAX)),
+        BytesFrame::BulkString("page_count".as_bytes().to_vec().into()),
+        BytesFrame::Integer(i64::try_from(stats.page_count).unwrap_or(i64::MAX)),
+        BytesFrame::BulkString("freelist_count".as_bytes().to_vec().into()),
+        BytesFrame::Integer(i64::try_from(stats.freelist_count).unwrap_or(i64::MAX)),
+    ])
+}
+
+fn shard_vacuum_result_to_frame(result: ShardVacuumDispatchResult) -> BytesFrame {
+    let (
+        duration_ms,
+        before,
+        after,
+        incremental_pages_requested,
+        estimated_reclaimed_pages,
+        errors,
+    ) = if let Some(vacuum_result) = &result.vacuum_result {
+        (
+            BytesFrame::Integer(
+                i64::try_from(vacuum_result.duration.as_millis()).unwrap_or(i64::MAX),
+            ),
+            vacuum_result
+                .before
+                .map(vacuum_stats_to_frame)
+                .unwrap_or(BytesFrame::Null),
+            vacuum_result
+                .after
+                .map(vacuum_stats_to_frame)
+                .unwrap_or(BytesFrame::Null),
+            maybe_integer(vacuum_result.incremental_pages_requested),
+            maybe_integer(vacuum_result.estimated_reclaimed_pages),
+            BytesFrame::Array(
+                vacuum_result
+                    .errors
+                    .iter()
+                    .map(|err| BytesFrame::BulkString(err.as_bytes().to_vec().into()))
+                    .collect(),
+            ),
+        )
+    } else {
+        (
+            BytesFrame::Null,
+            BytesFrame::Null,
+            BytesFrame::Null,
+            BytesFrame::Null,
+            BytesFrame::Null,
+            BytesFrame::Array(vec![]),
+        )
+    };
+
+    BytesFrame::Array(vec![
+        BytesFrame::BulkString("shard".as_bytes().to_vec().into()),
+        BytesFrame::Integer(i64::try_from(result.shard_id).unwrap_or(i64::MAX)),
+        BytesFrame::BulkString("status".as_bytes().to_vec().into()),
+        BytesFrame::BulkString(result.status.as_str().as_bytes().to_vec().into()),
+        BytesFrame::BulkString("error".as_bytes().to_vec().into()),
+        result
+            .error
+            .map(|err| BytesFrame::BulkString(err.as_bytes().to_vec().into()))
+            .unwrap_or(BytesFrame::Null),
+        BytesFrame::BulkString("duration_ms".as_bytes().to_vec().into()),
+        duration_ms,
+        BytesFrame::BulkString("before".as_bytes().to_vec().into()),
+        before,
+        BytesFrame::BulkString("after".as_bytes().to_vec().into()),
+        after,
+        BytesFrame::BulkString("incremental_pages_requested".as_bytes().to_vec().into()),
+        incremental_pages_requested,
+        BytesFrame::BulkString("estimated_reclaimed_pages".as_bytes().to_vec().into()),
+        estimated_reclaimed_pages,
+        BytesFrame::BulkString("execution_errors".as_bytes().to_vec().into()),
+        errors,
+    ])
+}
+
+async fn run_shard_vacuum(
+    state: &Arc<AppState>,
+    shard_id: usize,
+    mode: VacuumMode,
+    budget_mb: u64,
+    dry_run: bool,
+) -> ShardVacuumDispatchResult {
+    let mode_name = vacuum_mode_name_internal(mode);
+
+    let sender = match state.shard_senders.get(shard_id) {
+        Some(sender) => sender,
+        None => {
+            state
+                .metrics
+                .record_vacuum_run(mode_name, "invalid_shard", None);
+
+            return ShardVacuumDispatchResult {
+                shard_id,
+                status: ShardVacuumStatus::InvalidShard,
+                error: Some(format!("shard {} does not exist on this node", shard_id)),
+                vacuum_result: None,
+            };
+        }
+    };
+
+    let budget_bytes = budget_mb.saturating_mul(BYTES_PER_MB);
+    let (responder_tx, responder_rx) = oneshot::channel();
+
+    if sender
+        .send(ShardWriteOperation::Vacuum {
+            mode,
+            budget_bytes,
+            dry_run,
+            responder: responder_tx,
+        })
+        .await
+        .is_err()
+    {
+        state
+            .metrics
+            .record_vacuum_run(mode_name, "dispatch_error", None);
+        state
+            .metrics
+            .record_vacuum_shard_failure(shard_id, mode_name, "error");
+
+        return ShardVacuumDispatchResult {
+            shard_id,
+            status: ShardVacuumStatus::ExecutionError,
+            error: Some("failed to dispatch vacuum operation to shard writer".to_string()),
+            vacuum_result: None,
+        };
+    }
+
+    match timeout(SHARD_VACUUM_TIMEOUT, responder_rx).await {
+        Ok(Ok(vacuum_result)) => {
+            if vacuum_result.errors.is_empty() {
+                ShardVacuumDispatchResult {
+                    shard_id,
+                    status: ShardVacuumStatus::Ok,
+                    error: None,
+                    vacuum_result: Some(vacuum_result),
+                }
+            } else {
+                let summary = vacuum_result.errors.join("; ");
+                ShardVacuumDispatchResult {
+                    shard_id,
+                    status: ShardVacuumStatus::ExecutionError,
+                    error: Some(summary),
+                    vacuum_result: Some(vacuum_result),
+                }
+            }
+        }
+        Ok(Err(_)) => {
+            state
+                .metrics
+                .record_vacuum_run(mode_name, "cancelled", None);
+            state
+                .metrics
+                .record_vacuum_shard_failure(shard_id, mode_name, "error");
+
+            ShardVacuumDispatchResult {
+                shard_id,
+                status: ShardVacuumStatus::Cancelled,
+                error: Some("shard writer cancelled vacuum response".to_string()),
+                vacuum_result: None,
+            }
+        }
+        Err(_) => {
+            state
+                .metrics
+                .record_vacuum_run(mode_name, "timeout", Some(SHARD_VACUUM_TIMEOUT));
+            state
+                .metrics
+                .record_vacuum_shard_failure(shard_id, mode_name, "error");
+
+            ShardVacuumDispatchResult {
+                shard_id,
+                status: ShardVacuumStatus::Timeout,
+                error: Some(format!(
+                    "vacuum timed out after {} seconds",
+                    SHARD_VACUUM_TIMEOUT.as_secs()
+                )),
+                vacuum_result: None,
+            }
+        }
+    }
+}
+
+async fn handle_blobasaur_vacuum(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+    target: VacuumShardTarget,
+    mode: VacuumCommandMode,
+    budget_mb: u64,
+    dry_run: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mode_internal = vacuum_mode_from_command(mode);
+    let shard_ids: Vec<usize> = match target {
+        VacuumShardTarget::All => (0..state.shard_senders.len()).collect(),
+        VacuumShardTarget::Shard(shard_id) => vec![shard_id],
+    };
+
+    let mut shard_results = Vec::with_capacity(shard_ids.len());
+    for shard_id in shard_ids {
+        let shard_result =
+            run_shard_vacuum(state, shard_id, mode_internal, budget_mb, dry_run).await;
+
+        if matches!(shard_result.status, ShardVacuumStatus::Ok) {
+            tracing::info!(
+                shard_id,
+                status = shard_result.status.as_str(),
+                "Shard vacuum finished"
+            );
+        } else {
+            tracing::warn!(
+                shard_id,
+                status = shard_result.status.as_str(),
+                error = ?shard_result.error,
+                "Shard vacuum finished with error; continuing with remaining shards"
+            );
+        }
+
+        shard_results.push(shard_vacuum_result_to_frame(shard_result));
+    }
+
+    let response = BytesFrame::Array(vec![
+        BytesFrame::BulkString("mode".as_bytes().to_vec().into()),
+        BytesFrame::BulkString(vacuum_mode_name(mode).as_bytes().to_vec().into()),
+        BytesFrame::BulkString("budget_mb".as_bytes().to_vec().into()),
+        BytesFrame::Integer(i64::try_from(budget_mb).unwrap_or(i64::MAX)),
+        BytesFrame::BulkString("dry_run".as_bytes().to_vec().into()),
+        BytesFrame::Integer(if dry_run { 1 } else { 0 }),
+        BytesFrame::BulkString("results".as_bytes().to_vec().into()),
+        BytesFrame::Array(shard_results),
+    ]);
+
+    stream.write_all(&serialize_frame(&response)).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1578,10 +1885,14 @@ mod tests {
 
     impl TestContext {
         async fn new(async_write: bool) -> Self {
+            Self::new_with_shards(async_write, 1).await
+        }
+
+        async fn new_with_shards(async_write: bool, num_shards: usize) -> Self {
             let temp_dir = TempDir::new().expect("temp dir");
             let cfg = Cfg {
                 data_dir: temp_dir.path().to_string_lossy().into_owned(),
-                num_shards: 1,
+                num_shards,
                 storage_compression: None,
                 async_write: Some(async_write),
                 batch_size: Some(1),
@@ -1726,6 +2037,28 @@ mod tests {
         assert!(is_valid_hash_namespace("users_123"));
         assert!(!is_valid_hash_namespace(""));
         assert!(!is_valid_hash_namespace("users-prod"));
+    }
+
+    fn bulk_str(frame: &BytesFrame) -> Option<String> {
+        match frame {
+            BytesFrame::BulkString(bytes) => {
+                Some(String::from_utf8_lossy(bytes.as_ref()).to_string())
+            }
+            _ => None,
+        }
+    }
+
+    fn array_field<'a>(items: &'a [BytesFrame], field_name: &str) -> Option<&'a BytesFrame> {
+        let mut idx = 0;
+        while idx + 1 < items.len() {
+            if let Some(name) = bulk_str(&items[idx]) {
+                if name == field_name {
+                    return Some(&items[idx + 1]);
+                }
+            }
+            idx += 2;
+        }
+        None
     }
 
     #[tokio::test]
@@ -2237,6 +2570,101 @@ mod tests {
             })
         });
         assert_simple_string(frame.await, "OK");
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn blobasaur_vacuum_shard_all_returns_per_shard_results() {
+        let ctx = TestContext::new_with_shards(false, 2).await;
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_redis_command_inner(
+                    &mut stream,
+                    &state,
+                    RedisCommand::BlobasaurVacuum {
+                        target: VacuumShardTarget::All,
+                        mode: VacuumCommandMode::Incremental,
+                        budget_mb: 16,
+                        dry_run: true,
+                    },
+                )
+                .await
+            })
+        })
+        .await;
+
+        let top = match frame {
+            BytesFrame::Array(items) => items,
+            other => panic!("expected array response, got {:?}", other),
+        };
+
+        let results_frame = array_field(&top, "results").expect("results field must exist");
+        let results = match results_frame {
+            BytesFrame::Array(items) => items,
+            other => panic!("expected results array, got {:?}", other),
+        };
+        assert_eq!(results.len(), 2, "expected one result per local shard");
+
+        for item in results {
+            let shard_fields = match item {
+                BytesFrame::Array(fields) => fields,
+                other => panic!("expected shard result array, got {:?}", other),
+            };
+            let status = array_field(shard_fields, "status")
+                .and_then(bulk_str)
+                .expect("status should be present");
+            assert_eq!(status, "ok");
+        }
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn blobasaur_vacuum_invalid_shard_returns_runtime_error_result() {
+        let ctx = TestContext::new(false).await;
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_redis_command_inner(
+                    &mut stream,
+                    &state,
+                    RedisCommand::BlobasaurVacuum {
+                        target: VacuumShardTarget::Shard(99),
+                        mode: VacuumCommandMode::Incremental,
+                        budget_mb: 8,
+                        dry_run: true,
+                    },
+                )
+                .await
+            })
+        })
+        .await;
+
+        let top = match frame {
+            BytesFrame::Array(items) => items,
+            other => panic!("expected array response, got {:?}", other),
+        };
+
+        let results = match array_field(&top, "results") {
+            Some(BytesFrame::Array(items)) => items,
+            Some(other) => panic!("expected results array, got {:?}", other),
+            None => panic!("results field missing"),
+        };
+        assert_eq!(results.len(), 1);
+
+        let shard_fields = match &results[0] {
+            BytesFrame::Array(fields) => fields,
+            other => panic!("expected shard array, got {:?}", other),
+        };
+
+        let status = array_field(shard_fields, "status")
+            .and_then(bulk_str)
+            .expect("status should exist");
+        assert_eq!(status, "invalid_shard");
 
         ctx.shutdown().await;
     }
