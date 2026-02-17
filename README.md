@@ -343,12 +343,15 @@ Blobasaur implements core Redis commands for blob operations:
 
 ### Namespaced Commands
 
-Use namespaces to organize data into logical groups:
+Use namespaces to organize data into logical groups.
+
+> **Namespace format:** `namespace` must be non-empty and contain only ASCII letters, numbers, and underscore (`[A-Za-z0-9_]`).
+> Examples: `users`, `users123`, `users_123`.
 
 - **`HSET namespace key value`**: Store in namespace
   ```bash
-  redis-cli HSET users:123 name "John Doe"
-  redis-cli HSET users:123 email "john@example.com"
+  redis-cli HSET users_123 name "John Doe"
+  redis-cli HSET users_123 email "john@example.com"
   ```
 
 - **`HSETEX key [options] FIELDS numfields field value [field value ...]`**: Store fields with TTL
@@ -371,17 +374,17 @@ Use namespaces to organize data into logical groups:
 
 - **`HGET namespace key`**: Retrieve from namespace
   ```bash
-  redis-cli HGET users:123 name
+  redis-cli HGET users_123 name
   ```
 
 - **`HDEL namespace key`**: Delete from namespace
   ```bash
-  redis-cli HDEL users:123 email
+  redis-cli HDEL users_123 email
   ```
 
 - **`HEXISTS namespace key`**: Check existence in namespace
   ```bash
-  redis-cli HEXISTS users:123 name
+  redis-cli HEXISTS users_123 name
   ```
 
 ### Using Redis Clients
@@ -396,8 +399,8 @@ r.set('mykey', 'myvalue')
 value = r.get('mykey')
 
 # Namespaced operations
-r.hset('users:123', 'name', 'John Doe')
-name = r.hget('users:123', 'name')
+r.hset('users_123', 'name', 'John Doe')
+name = r.hget('users_123', 'name')
 
 # Namespaced operations with TTL (Redis 8.0 compatible)
 # HSETEX syntax: key [options] FIELDS numfields field value [field value ...]
@@ -546,6 +549,7 @@ CREATE TABLE blobs (
 - Created automatically on first access
 - Same schema as default table
 - Isolated from other namespaces
+- `namespace` must match `[A-Za-z0-9_]+`
 
 ### TTL and Key Expiration
 

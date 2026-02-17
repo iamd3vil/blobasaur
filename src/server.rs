@@ -665,6 +665,28 @@ async fn handle_command(stream: &mut TcpStream) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
+fn is_valid_hash_namespace(namespace: &str) -> bool {
+    !namespace.is_empty()
+        && namespace
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+async fn validate_hash_namespace(
+    stream: &mut TcpStream,
+    namespace: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    if is_valid_hash_namespace(namespace) {
+        return Ok(true);
+    }
+
+    let response = BytesFrame::Error(
+        "ERR invalid hash namespace: must be non-empty and contain only [A-Za-z0-9_]".into(),
+    );
+    stream.write_all(&serialize_frame(&response)).await?;
+    Ok(false)
+}
+
 async fn hash_table_exists(pool: &sqlx::SqlitePool, table_name: &str) -> Result<bool, sqlx::Error> {
     sqlx::query("SELECT name FROM sqlite_master WHERE type='table' AND name = ?")
         .bind(table_name)
@@ -697,6 +719,10 @@ async fn handle_hget(
     namespace: String,
     key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if !validate_hash_namespace(stream, &namespace).await? {
+        return Ok(());
+    }
+
     // Check if we should handle this hash operation locally in a cluster
     if let Some(ref cluster_manager) = state.cluster_manager {
         if !cluster_manager
@@ -768,6 +794,10 @@ async fn handle_hset(
     key: String,
     value: Bytes,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if !validate_hash_namespace(stream, &namespace).await? {
+        return Ok(());
+    }
+
     // Check if we should handle this hash operation locally in a cluster
     if let Some(ref cluster_manager) = state.cluster_manager {
         if !cluster_manager
@@ -901,6 +931,10 @@ async fn handle_hsetex(
 
     // In Blobasaur, the hash key is the namespace, and fields are the actual keys
     let namespace = key;
+
+    if !validate_hash_namespace(stream, &namespace).await? {
+        return Ok(());
+    }
 
     // Calculate expires_at timestamp from expire option
     let expires_at = match expire_option {
@@ -1091,6 +1125,10 @@ async fn handle_hdel(
     namespace: String,
     key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if !validate_hash_namespace(stream, &namespace).await? {
+        return Ok(());
+    }
+
     // Check if we should handle this hash operation locally in a cluster
     if let Some(ref cluster_manager) = state.cluster_manager {
         if !cluster_manager
@@ -1194,6 +1232,10 @@ async fn handle_hexists(
     namespace: String,
     key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if !validate_hash_namespace(stream, &namespace).await? {
+        return Ok(());
+    }
+
     // Check if we should handle this hash operation locally in a cluster
     if let Some(ref cluster_manager) = state.cluster_manager {
         if !cluster_manager
@@ -1679,6 +1721,13 @@ mod tests {
         }
     }
 
+    #[test]
+    fn hash_namespace_validation_rules() {
+        assert!(is_valid_hash_namespace("users_123"));
+        assert!(!is_valid_hash_namespace(""));
+        assert!(!is_valid_hash_namespace("users-prod"));
+    }
+
     #[tokio::test]
     async fn hset_returns_added_field_count() {
         let ctx = TestContext::new(false).await;
@@ -1771,6 +1820,122 @@ mod tests {
         .unwrap();
         server_stream.shutdown().await.unwrap();
         assert_integer_response(read_response(client_stream).await, 1);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn hset_rejects_invalid_namespace_sync_mode() {
+        let ctx = TestContext::new(false).await;
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hset(
+                    &mut stream,
+                    &state,
+                    "has-dash".to_string(),
+                    "field".to_string(),
+                    Bytes::from_static(b"value"),
+                )
+                .await
+            })
+        })
+        .await;
+        assert_error_contains(frame, "invalid hash namespace");
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn hset_rejects_invalid_namespace_async_mode() {
+        let ctx = TestContext::new(true).await;
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hset(
+                    &mut stream,
+                    &state,
+                    "has-dash".to_string(),
+                    "field".to_string(),
+                    Bytes::from_static(b"value"),
+                )
+                .await
+            })
+        })
+        .await;
+        assert_error_contains(frame, "invalid hash namespace");
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn other_hash_commands_reject_invalid_namespace() {
+        let ctx = TestContext::new(false).await;
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hget(
+                    &mut stream,
+                    &state,
+                    "has-dash".to_string(),
+                    "field".to_string(),
+                )
+                .await
+            })
+        })
+        .await;
+        assert_error_contains(frame, "invalid hash namespace");
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hdel(
+                    &mut stream,
+                    &state,
+                    "has-dash".to_string(),
+                    "field".to_string(),
+                )
+                .await
+            })
+        })
+        .await;
+        assert_error_contains(frame, "invalid hash namespace");
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hexists(
+                    &mut stream,
+                    &state,
+                    "has-dash".to_string(),
+                    "field".to_string(),
+                )
+                .await
+            })
+        })
+        .await;
+        assert_error_contains(frame, "invalid hash namespace");
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hsetex(
+                    &mut stream,
+                    &state,
+                    "has-dash".to_string(),
+                    false,
+                    false,
+                    None,
+                    vec![("field".to_string(), Bytes::from_static(b"value"))],
+                )
+                .await
+            })
+        })
+        .await;
+        assert_error_contains(frame, "invalid hash namespace");
 
         ctx.shutdown().await;
     }
