@@ -14,6 +14,18 @@ pub enum ExpireOption {
     KeepTtl,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VacuumShardTarget {
+    Shard(usize),
+    All,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VacuumCommandMode {
+    Incremental,
+    Full,
+}
+
 /// Commands supported by Blobasaur
 #[derive(Debug, Clone, PartialEq)]
 pub enum RedisCommand {
@@ -82,6 +94,12 @@ pub enum RedisCommand {
         key: String,
         seconds: u64,
     },
+    BlobasaurVacuum {
+        target: VacuumShardTarget,
+        mode: VacuumCommandMode,
+        budget_mb: u64,
+        dry_run: bool,
+    },
     Quit,
     Unknown(String),
 }
@@ -110,6 +128,7 @@ impl RedisCommand {
             RedisCommand::ClusterKeySlot { .. } => "CLUSTER KEYSLOT".to_string(),
             RedisCommand::Ttl { .. } => "TTL".to_string(),
             RedisCommand::Expire { .. } => "EXPIRE".to_string(),
+            RedisCommand::BlobasaurVacuum { .. } => "BLOBASAUR.VACUUM".to_string(),
             RedisCommand::Quit => "QUIT".to_string(),
             RedisCommand::Unknown(cmd) => cmd.clone(),
         }
@@ -509,9 +528,99 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
             })?;
             Ok(RedisCommand::Expire { key, seconds })
         }
+        "BLOBASAUR.VACUUM" => parse_blobasaur_vacuum_command(&elements),
         "QUIT" => Ok(RedisCommand::Quit),
         _ => Ok(RedisCommand::Unknown(command_name)),
     }
+}
+
+fn parse_blobasaur_vacuum_command(elements: &[BytesFrame]) -> Result<RedisCommand, ParseError> {
+    if elements.len() != 7 && elements.len() != 8 {
+        return Err(ParseError::Invalid(
+            "BLOBASAUR.VACUUM syntax: BLOBASAUR.VACUUM SHARD <id|ALL> MODE <incremental|full> BUDGET_MB <n> [DRYRUN]"
+                .to_string(),
+        ));
+    }
+
+    let shard_keyword = extract_string(&elements[1])?;
+    if !shard_keyword.eq_ignore_ascii_case("SHARD") {
+        return Err(ParseError::Invalid(
+            "BLOBASAUR.VACUUM requires SHARD keyword".to_string(),
+        ));
+    }
+
+    let shard_token = extract_string(&elements[2])?;
+    let target = if shard_token.eq_ignore_ascii_case("ALL") {
+        VacuumShardTarget::All
+    } else {
+        let shard_id = shard_token.parse::<usize>().map_err(|_| {
+            ParseError::Invalid(format!(
+                "Invalid shard id '{}': expected non-negative integer or ALL",
+                shard_token
+            ))
+        })?;
+        VacuumShardTarget::Shard(shard_id)
+    };
+
+    let mode_keyword = extract_string(&elements[3])?;
+    if !mode_keyword.eq_ignore_ascii_case("MODE") {
+        return Err(ParseError::Invalid(
+            "BLOBASAUR.VACUUM requires MODE keyword".to_string(),
+        ));
+    }
+
+    let mode_token = extract_string(&elements[4])?;
+    let mode = if mode_token.eq_ignore_ascii_case("incremental") {
+        VacuumCommandMode::Incremental
+    } else if mode_token.eq_ignore_ascii_case("full") {
+        VacuumCommandMode::Full
+    } else {
+        return Err(ParseError::Invalid(format!(
+            "Invalid MODE '{}': expected incremental or full",
+            mode_token
+        )));
+    };
+
+    let budget_keyword = extract_string(&elements[5])?;
+    if !budget_keyword.eq_ignore_ascii_case("BUDGET_MB") {
+        return Err(ParseError::Invalid(
+            "BLOBASAUR.VACUUM requires BUDGET_MB keyword".to_string(),
+        ));
+    }
+
+    let budget_token = extract_string(&elements[6])?;
+    let budget_mb = budget_token.parse::<u64>().map_err(|_| {
+        ParseError::Invalid(format!(
+            "Invalid BUDGET_MB '{}': expected positive integer",
+            budget_token
+        ))
+    })?;
+
+    if budget_mb == 0 {
+        return Err(ParseError::Invalid(
+            "BUDGET_MB must be greater than 0".to_string(),
+        ));
+    }
+
+    let dry_run = if elements.len() == 8 {
+        let dryrun_token = extract_string(&elements[7])?;
+        if !dryrun_token.eq_ignore_ascii_case("DRYRUN") {
+            return Err(ParseError::Invalid(format!(
+                "Unexpected trailing token '{}': expected DRYRUN",
+                dryrun_token
+            )));
+        }
+        true
+    } else {
+        false
+    };
+
+    Ok(RedisCommand::BlobasaurVacuum {
+        target,
+        mode,
+        budget_mb,
+        dry_run,
+    })
 }
 
 /// Extract string from RESP value
@@ -550,6 +659,15 @@ pub fn serialize_frame(frame: &BytesFrame) -> Bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn command_frame(parts: &[&str]) -> BytesFrame {
+        BytesFrame::Array(
+            parts
+                .iter()
+                .map(|part| BytesFrame::BulkString(part.as_bytes().to_vec().into()))
+                .collect(),
+        )
+    }
 
     #[test]
     fn test_parse_get_command() {
@@ -762,6 +880,148 @@ mod tests {
                 .to_string()
                 .contains("EXPIRE requires exactly 2 arguments")
         );
+    }
+
+    #[test]
+    fn test_parse_blobasaur_vacuum_command_shard_incremental_dryrun() {
+        let command = parse_command(command_frame(&[
+            "BLOBASAUR.VACUUM",
+            "SHARD",
+            "3",
+            "MODE",
+            "incremental",
+            "BUDGET_MB",
+            "128",
+            "DRYRUN",
+        ]))
+        .unwrap();
+
+        assert_eq!(
+            command,
+            RedisCommand::BlobasaurVacuum {
+                target: VacuumShardTarget::Shard(3),
+                mode: VacuumCommandMode::Incremental,
+                budget_mb: 128,
+                dry_run: true,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_blobasaur_vacuum_command_all_full() {
+        let command = parse_command(command_frame(&[
+            "blobasaur.vacuum",
+            "shard",
+            "all",
+            "mode",
+            "FULL",
+            "budget_mb",
+            "64",
+        ]))
+        .unwrap();
+
+        assert_eq!(
+            command,
+            RedisCommand::BlobasaurVacuum {
+                target: VacuumShardTarget::All,
+                mode: VacuumCommandMode::Full,
+                budget_mb: 64,
+                dry_run: false,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_blobasaur_vacuum_command_invalid_forms() {
+        let invalid_cases = vec![
+            (
+                command_frame(&["BLOBASAUR.VACUUM", "SHARD", "0", "MODE", "incremental"]),
+                "BLOBASAUR.VACUUM syntax",
+            ),
+            (
+                command_frame(&[
+                    "BLOBASAUR.VACUUM",
+                    "SHARDS",
+                    "0",
+                    "MODE",
+                    "incremental",
+                    "BUDGET_MB",
+                    "64",
+                ]),
+                "requires SHARD keyword",
+            ),
+            (
+                command_frame(&[
+                    "BLOBASAUR.VACUUM",
+                    "SHARD",
+                    "-1",
+                    "MODE",
+                    "incremental",
+                    "BUDGET_MB",
+                    "64",
+                ]),
+                "Invalid shard id",
+            ),
+            (
+                command_frame(&[
+                    "BLOBASAUR.VACUUM",
+                    "SHARD",
+                    "0",
+                    "MODE",
+                    "fast",
+                    "BUDGET_MB",
+                    "64",
+                ]),
+                "Invalid MODE",
+            ),
+            (
+                command_frame(&[
+                    "BLOBASAUR.VACUUM",
+                    "SHARD",
+                    "0",
+                    "MODE",
+                    "incremental",
+                    "BUDGET_MB",
+                    "0",
+                ]),
+                "BUDGET_MB must be greater than 0",
+            ),
+            (
+                command_frame(&[
+                    "BLOBASAUR.VACUUM",
+                    "SHARD",
+                    "0",
+                    "MODE",
+                    "incremental",
+                    "BUDGET_MB",
+                    "abc",
+                ]),
+                "Invalid BUDGET_MB",
+            ),
+            (
+                command_frame(&[
+                    "BLOBASAUR.VACUUM",
+                    "SHARD",
+                    "0",
+                    "MODE",
+                    "incremental",
+                    "BUDGET_MB",
+                    "64",
+                    "NOW",
+                ]),
+                "expected DRYRUN",
+            ),
+        ];
+
+        for (frame, expected_msg) in invalid_cases {
+            let err = parse_command(frame).unwrap_err();
+            assert!(
+                err.to_string().contains(expected_msg),
+                "expected '{}' in error, got '{}'",
+                expected_msg,
+                err
+            );
+        }
     }
 
     #[test]

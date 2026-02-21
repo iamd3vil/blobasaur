@@ -1,12 +1,14 @@
 use futures::future::join_all;
-use miette::Result;
+use miette::{Result, miette};
 use moka::future::Cache;
 use mpchash::HashRing;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use std::fs;
 use std::str::FromStr;
-use tokio::sync::mpsc;
+use std::sync::Arc;
+use tokio::sync::{Semaphore, mpsc};
+use tokio::task::JoinSet;
 
 use crate::compression::{self, Compressor};
 // Import ShardWriteOperation from shard_manager
@@ -62,6 +64,12 @@ impl AppState {
         // Validate the number of shards in the data directory
         validate_shard_count(&cfg.data_dir, cfg.num_shards)?;
 
+        // Initialize metrics early so startup storage checks can emit counters.
+        let metrics = Metrics::new();
+        let auto_upgrade_legacy_auto_vacuum = cfg.sqlite_auto_upgrade_legacy_auto_vacuum();
+        let auto_upgrade_legacy_auto_vacuum_concurrency =
+            cfg.sqlite_auto_upgrade_legacy_auto_vacuum_concurrency();
+
         let mut db_pools_futures = vec![];
         let pool_max_connections = cfg.sqlite_pool_max_connections();
         for i in 0..cfg.num_shards {
@@ -86,6 +94,7 @@ impl AppState {
 
             // Configure SQLite PRAGMAs for optimal server performance
             connect_options = connect_options
+                .pragma("auto_vacuum", "INCREMENTAL")
                 .pragma("synchronous", synchronous.as_str())
                 .pragma("cache_size", format!("-{}", cache_size_mb * 1024)) // Negative means KiB
                 .pragma("temp_store", "MEMORY")
@@ -112,6 +121,14 @@ impl AppState {
                 res.unwrap_or_else(|e| panic!("Failed to connect to shard {} DB: {}", i, e))
             })
             .collect();
+
+        run_startup_auto_vacuum_enforcement(
+            &db_pools,
+            auto_upgrade_legacy_auto_vacuum,
+            auto_upgrade_legacy_auto_vacuum_concurrency,
+            &metrics,
+        )
+        .await?;
 
         for (i, pool) in db_pools.iter().enumerate() {
             sqlx::query(
@@ -178,9 +195,6 @@ impl AppState {
             _ => None,
         };
 
-        // Initialize metrics
-        let metrics = Metrics::new();
-
         let ring = HashRing::new();
         for i in 0..cfg.num_shards {
             ring.add(ShardNode(i as u64));
@@ -208,6 +222,196 @@ impl AppState {
     pub fn namespaced_key(&self, namespace: &str, key: &str) -> String {
         format!("{}:{}", namespace, key)
     }
+}
+
+const SQLITE_AUTO_VACUUM_NONE: i64 = 0;
+const SQLITE_AUTO_VACUUM_FULL: i64 = 1;
+const SQLITE_AUTO_VACUUM_INCREMENTAL: i64 = 2;
+
+fn sqlite_auto_vacuum_mode_name(mode: i64) -> &'static str {
+    match mode {
+        SQLITE_AUTO_VACUUM_NONE => "NONE",
+        SQLITE_AUTO_VACUUM_FULL => "FULL",
+        SQLITE_AUTO_VACUUM_INCREMENTAL => "INCREMENTAL",
+        _ => "UNKNOWN",
+    }
+}
+
+async fn enforce_auto_vacuum_mode(
+    pool: &SqlitePool,
+    shard_id: usize,
+    auto_upgrade_enabled: bool,
+    metrics: &Metrics,
+) -> Result<()> {
+    let started_at = std::time::Instant::now();
+    let mut conn = pool.acquire().await.map_err(|error| {
+        miette!(
+            "failed to acquire SQLite connection for shard {} DB: {}",
+            shard_id,
+            error
+        )
+    })?;
+
+    let mode = sqlx::query_scalar::<_, i64>("PRAGMA auto_vacuum")
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|error| {
+            miette!(
+                "failed to read PRAGMA auto_vacuum for shard {} DB: {}",
+                shard_id,
+                error
+            )
+        })?;
+
+    if mode == SQLITE_AUTO_VACUUM_INCREMENTAL {
+        return Ok(());
+    }
+
+    tracing::warn!(
+        shard_id,
+        auto_vacuum_mode = mode,
+        auto_vacuum_mode_name = sqlite_auto_vacuum_mode_name(mode),
+        "Shard DB auto_vacuum is not INCREMENTAL"
+    );
+
+    if !auto_upgrade_enabled {
+        metrics.record_sqlite_auto_vacuum_misconfigured();
+        metrics
+            .record_sqlite_auto_vacuum_upgrade_run("skipped_disabled", Some(started_at.elapsed()));
+        return Ok(());
+    }
+
+    tracing::info!(
+        shard_id,
+        from_auto_vacuum_mode = mode,
+        from_auto_vacuum_mode_name = sqlite_auto_vacuum_mode_name(mode),
+        "Auto-upgrading shard DB auto_vacuum mode to INCREMENTAL"
+    );
+
+    let upgrade_result = async {
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&mut *conn)
+            .await
+            .map_err(|error| {
+                miette!(
+                    "shard {}: wal_checkpoint(TRUNCATE) failed during auto_vacuum upgrade: {}",
+                    shard_id,
+                    error
+                )
+            })?;
+
+        sqlx::query("PRAGMA auto_vacuum = INCREMENTAL")
+            .execute(&mut *conn)
+            .await
+            .map_err(|error| {
+                miette!(
+                    "shard {}: setting PRAGMA auto_vacuum=INCREMENTAL failed: {}",
+                    shard_id,
+                    error
+                )
+            })?;
+
+        sqlx::query("VACUUM")
+            .execute(&mut *conn)
+            .await
+            .map_err(|error| {
+                miette!(
+                    "shard {}: VACUUM failed while applying auto_vacuum upgrade: {}",
+                    shard_id,
+                    error
+                )
+            })?;
+
+        let verified_mode = sqlx::query_scalar::<_, i64>("PRAGMA auto_vacuum")
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|error| {
+                miette!(
+                    "failed to re-read PRAGMA auto_vacuum for shard {} DB: {}",
+                    shard_id,
+                    error
+                )
+            })?;
+
+        if verified_mode != SQLITE_AUTO_VACUUM_INCREMENTAL {
+            return Err(miette!(
+                "shard {} auto_vacuum upgrade verification failed: expected INCREMENTAL (2), got {} ({})",
+                shard_id,
+                verified_mode,
+                sqlite_auto_vacuum_mode_name(verified_mode)
+            ));
+        }
+
+        Ok::<(), miette::Error>(())
+    }
+    .await;
+
+    match upgrade_result {
+        Ok(()) => {
+            metrics.record_sqlite_auto_vacuum_upgrade_run("ok", Some(started_at.elapsed()));
+            tracing::info!(
+                shard_id,
+                "Auto-upgraded shard DB auto_vacuum mode to INCREMENTAL"
+            );
+            Ok(())
+        }
+        Err(error) => {
+            metrics.record_sqlite_auto_vacuum_upgrade_run("error", Some(started_at.elapsed()));
+            Err(error)
+        }
+    }
+}
+
+async fn run_startup_auto_vacuum_enforcement(
+    pools: &[SqlitePool],
+    auto_upgrade_enabled: bool,
+    concurrency: usize,
+    metrics: &Metrics,
+) -> Result<()> {
+    if pools.is_empty() {
+        return Ok(());
+    }
+
+    let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
+    let mut join_set = JoinSet::new();
+
+    for (shard_id, pool) in pools.iter().enumerate() {
+        let semaphore = semaphore.clone();
+        let pool = pool.clone();
+        let metrics = metrics.clone();
+
+        join_set.spawn(async move {
+            let _permit = semaphore
+                .acquire_owned()
+                .await
+                .map_err(|_| "startup auto_vacuum semaphore closed".to_string())?;
+
+            enforce_auto_vacuum_mode(&pool, shard_id, auto_upgrade_enabled, &metrics)
+                .await
+                .map_err(|e| e.to_string())
+        });
+    }
+
+    while let Some(next) = join_set.join_next().await {
+        match next {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                join_set.abort_all();
+                while join_set.join_next().await.is_some() {}
+                return Err(miette!("startup auto_vacuum upgrade failed: {}", error));
+            }
+            Err(error) => {
+                join_set.abort_all();
+                while join_set.join_next().await.is_some() {}
+                return Err(miette!(
+                    "startup auto_vacuum upgrade task join error: {}",
+                    error
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Validates that the number of shard files in the data directory matches the expected count
@@ -281,4 +485,197 @@ fn validate_shard_count(data_dir: &str, expected_shards: usize) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{path::Path, str::FromStr};
+    use tempfile::TempDir;
+
+    fn test_cfg(data_dir: String, num_shards: usize) -> Cfg {
+        Cfg {
+            data_dir,
+            num_shards,
+            storage_compression: None,
+            async_write: Some(false),
+            batch_size: Some(1),
+            batch_timeout_ms: Some(0),
+            addr: None,
+            cluster: None,
+            metrics: None,
+            sqlite: None,
+        }
+    }
+
+    fn test_cfg_with_auto_upgrade(
+        data_dir: String,
+        num_shards: usize,
+        auto_upgrade: bool,
+        busy_timeout_ms: Option<u64>,
+    ) -> Cfg {
+        let mut cfg = test_cfg(data_dir, num_shards);
+        cfg.sqlite = Some(crate::config::SqliteConfig {
+            cache_size_mb: None,
+            busy_timeout_ms,
+            synchronous: None,
+            mmap_size: None,
+            max_connections: Some(1),
+            auto_upgrade_legacy_auto_vacuum: Some(auto_upgrade),
+            auto_upgrade_legacy_auto_vacuum_concurrency: Some(1),
+        });
+        cfg
+    }
+
+    async fn create_legacy_shard_db(path: &Path) {
+        let connect_options =
+            SqliteConnectOptions::from_str(&format!("sqlite:{}", path.to_string_lossy()))
+                .expect("failed to parse sqlite path")
+                .create_if_missing(true)
+                .journal_mode(SqliteJournalMode::Wal);
+
+        let pool = SqlitePool::connect_with(connect_options)
+            .await
+            .expect("failed to create legacy shard DB");
+
+        sqlx::query("PRAGMA auto_vacuum = NONE")
+            .execute(&pool)
+            .await
+            .expect("failed to set auto_vacuum=NONE");
+        sqlx::query("VACUUM")
+            .execute(&pool)
+            .await
+            .expect("failed to apply auto_vacuum pragma");
+
+        pool.close().await;
+    }
+
+    async fn read_persisted_auto_vacuum_mode(path: &Path) -> i64 {
+        let connect_options =
+            SqliteConnectOptions::from_str(&format!("sqlite:{}", path.to_string_lossy()))
+                .expect("failed to parse sqlite path")
+                .create_if_missing(true)
+                .journal_mode(SqliteJournalMode::Wal);
+
+        let pool = SqlitePool::connect_with(connect_options)
+            .await
+            .expect("failed to open shard DB");
+
+        let mode = sqlx::query_scalar::<_, i64>("PRAGMA auto_vacuum")
+            .fetch_one(&pool)
+            .await
+            .expect("failed to read auto_vacuum mode");
+        pool.close().await;
+        mode
+    }
+
+    #[tokio::test]
+    async fn app_state_initializes_new_shards_with_incremental_auto_vacuum() {
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let cfg = test_cfg(temp_dir.path().to_string_lossy().into_owned(), 2);
+
+        let mut receivers = Vec::new();
+        let app_state = AppState::new(cfg, &mut receivers)
+            .await
+            .expect("failed to initialize app state");
+
+        for (shard_id, pool) in app_state.db_pools.iter().enumerate() {
+            let mode = sqlx::query_scalar::<_, i64>("PRAGMA auto_vacuum")
+                .fetch_one(pool)
+                .await
+                .expect("failed to read auto_vacuum mode");
+
+            assert_eq!(
+                mode, SQLITE_AUTO_VACUUM_INCREMENTAL,
+                "shard {} should use INCREMENTAL auto_vacuum",
+                shard_id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn app_state_auto_upgrades_legacy_auto_vacuum_mode_by_default() {
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let db_path = temp_dir.path().join("shard_0.db");
+        create_legacy_shard_db(&db_path).await;
+
+        let cfg = test_cfg(temp_dir.path().to_string_lossy().into_owned(), 1);
+        let mut receivers = Vec::new();
+        let app_state = AppState::new(cfg, &mut receivers)
+            .await
+            .expect("app state should auto-upgrade legacy shard");
+        drop(app_state);
+
+        let persisted_mode = read_persisted_auto_vacuum_mode(&db_path).await;
+        assert_eq!(
+            persisted_mode, SQLITE_AUTO_VACUUM_INCREMENTAL,
+            "startup should persist auto_vacuum=INCREMENTAL for legacy shard DBs"
+        );
+    }
+
+    #[tokio::test]
+    async fn app_state_can_skip_legacy_auto_vacuum_upgrade_when_disabled() {
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let db_path = temp_dir.path().join("shard_0.db");
+        create_legacy_shard_db(&db_path).await;
+
+        let cfg = test_cfg_with_auto_upgrade(
+            temp_dir.path().to_string_lossy().into_owned(),
+            1,
+            false,
+            None,
+        );
+        let mut receivers = Vec::new();
+        let app_state = AppState::new(cfg, &mut receivers)
+            .await
+            .expect("app state startup should succeed with auto-upgrade disabled");
+        drop(app_state);
+
+        let persisted_mode = read_persisted_auto_vacuum_mode(&db_path).await;
+        assert_ne!(
+            persisted_mode, SQLITE_AUTO_VACUUM_INCREMENTAL,
+            "legacy shard DB should remain non-INCREMENTAL when auto-upgrade is disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn app_state_startup_fails_if_legacy_auto_vacuum_upgrade_fails() {
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let db_path = temp_dir.path().join("shard_0.db");
+        create_legacy_shard_db(&db_path).await;
+
+        let lock_options =
+            SqliteConnectOptions::from_str(&format!("sqlite:{}", db_path.to_string_lossy()))
+                .expect("failed to parse sqlite path")
+                .create_if_missing(true)
+                .journal_mode(SqliteJournalMode::Wal);
+        let lock_pool = SqlitePool::connect_with(lock_options)
+            .await
+            .expect("failed to open locking connection");
+
+        sqlx::query("BEGIN EXCLUSIVE")
+            .execute(&lock_pool)
+            .await
+            .expect("failed to hold exclusive lock");
+
+        let cfg = test_cfg_with_auto_upgrade(
+            temp_dir.path().to_string_lossy().into_owned(),
+            1,
+            true,
+            Some(1),
+        );
+        let mut receivers = Vec::new();
+        let result = AppState::new(cfg, &mut receivers).await;
+
+        sqlx::query("ROLLBACK")
+            .execute(&lock_pool)
+            .await
+            .expect("failed to release lock");
+        lock_pool.close().await;
+
+        assert!(
+            result.is_err(),
+            "startup must fail fast when legacy auto_vacuum upgrade fails"
+        );
+    }
 }

@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use metrics::{Counter, Gauge, Histogram};
 use metrics_exporter_prometheus::PrometheusBuilder;
@@ -48,6 +48,7 @@ pub struct Metrics {
 
     // Storage metrics
     pub storage_operations_total: Counter,
+    pub sqlite_auto_vacuum_misconfigured_total: Counter,
 
     // Batch metrics
     pub batch_operations_total: Counter,
@@ -100,6 +101,9 @@ impl Metrics {
 
             // Storage metrics
             storage_operations_total: metrics::counter!("blobasaur_storage_operations_total"),
+            sqlite_auto_vacuum_misconfigured_total: metrics::counter!(
+                "blobasaur_sqlite_auto_vacuum_misconfigured_total"
+            ),
 
             // Batch metrics
             batch_operations_total: metrics::counter!("blobasaur_batch_operations_total"),
@@ -208,6 +212,85 @@ impl Metrics {
     /// Record storage operation
     pub fn record_storage_operation(&self) {
         self.storage_operations_total.increment(1);
+    }
+
+    /// Record a shard DB auto-vacuum mode mismatch.
+    pub fn record_sqlite_auto_vacuum_misconfigured(&self) {
+        self.sqlite_auto_vacuum_misconfigured_total.increment(1);
+    }
+
+    /// Record startup auto-upgrade attempts for legacy shard DB auto-vacuum mode.
+    pub fn record_sqlite_auto_vacuum_upgrade_run(&self, result: &str, duration: Option<Duration>) {
+        metrics::counter!(
+            "blobasaur_sqlite_auto_vacuum_upgrade_runs_total",
+            "result" => result.to_string()
+        )
+        .increment(1);
+
+        if let Some(duration) = duration {
+            metrics::histogram!(
+                "blobasaur_sqlite_auto_vacuum_upgrade_duration_seconds",
+                "result" => result.to_string()
+            )
+            .record(duration.as_secs_f64());
+        }
+    }
+
+    /// Record a vacuum run outcome.
+    pub fn record_vacuum_run(&self, mode: &str, result: &str, duration: Option<Duration>) {
+        metrics::counter!(
+            "blobasaur_vacuum_runs_total",
+            "mode" => mode.to_string(),
+            "result" => result.to_string()
+        )
+        .increment(1);
+
+        if let Some(duration) = duration {
+            metrics::histogram!(
+                "blobasaur_vacuum_duration_seconds",
+                "mode" => mode.to_string(),
+                "result" => result.to_string()
+            )
+            .record(duration.as_secs_f64());
+        }
+    }
+
+    /// Record estimated reclaimed pages/bytes for a vacuum run.
+    pub fn record_vacuum_reclaimed_estimate(
+        &self,
+        mode: &str,
+        shard_id: usize,
+        pages: u64,
+        bytes: Option<u64>,
+    ) {
+        let shard = shard_id.to_string();
+
+        metrics::counter!(
+            "blobasaur_vacuum_reclaimed_pages_estimate_total",
+            "mode" => mode.to_string(),
+            "shard" => shard.clone()
+        )
+        .increment(pages);
+
+        if let Some(bytes) = bytes {
+            metrics::counter!(
+                "blobasaur_vacuum_reclaimed_bytes_estimate_total",
+                "mode" => mode.to_string(),
+                "shard" => shard
+            )
+            .increment(bytes);
+        }
+    }
+
+    /// Record shard-level vacuum failures (busy vs generic error).
+    pub fn record_vacuum_shard_failure(&self, shard_id: usize, mode: &str, result: &str) {
+        metrics::counter!(
+            "blobasaur_vacuum_shard_failures_total",
+            "shard" => shard_id.to_string(),
+            "mode" => mode.to_string(),
+            "result" => result.to_string()
+        )
+        .increment(1);
     }
 
     /// Record batch operation

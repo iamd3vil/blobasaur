@@ -46,6 +46,20 @@ pub struct SqliteConfig {
     /// Default: 10 (sqlx default)
     /// Increase for higher concurrency at the cost of RAM
     pub max_connections: Option<u32>,
+
+    /// Automatically upgrade legacy shard DBs where PRAGMA auto_vacuum is not INCREMENTAL.
+    /// Default: true
+    /// If enabled, startup runs:
+    ///   1) PRAGMA wal_checkpoint(TRUNCATE)
+    ///   2) PRAGMA auto_vacuum = INCREMENTAL
+    ///   3) VACUUM
+    /// and fails fast if conversion cannot be completed.
+    pub auto_upgrade_legacy_auto_vacuum: Option<bool>,
+
+    /// Max concurrent shard upgrades during startup legacy auto_vacuum conversion.
+    /// Default: 2 (NVMe-friendly baseline)
+    /// Set to 1 for HDD or conservative rollout.
+    pub auto_upgrade_legacy_auto_vacuum_concurrency: Option<usize>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -170,6 +184,9 @@ impl Cfg {
         let mmap_per_shard_mb = cfg.sqlite_mmap_per_shard_mb();
         let mmap_per_connection_mb = cfg.sqlite_mmap_per_connection_mb();
         let pool_max_connections = cfg.sqlite_pool_max_connections();
+        let auto_upgrade_legacy_auto_vacuum = cfg.sqlite_auto_upgrade_legacy_auto_vacuum();
+        let auto_upgrade_legacy_auto_vacuum_concurrency =
+            cfg.sqlite_auto_upgrade_legacy_auto_vacuum_concurrency();
 
         println!("SQLite configuration:");
         println!(
@@ -187,6 +204,14 @@ impl Cfg {
             println!("  mmap_size: disabled");
         }
         println!("  pool_max_connections: {}", pool_max_connections);
+        println!(
+            "  auto_upgrade_legacy_auto_vacuum: {}",
+            auto_upgrade_legacy_auto_vacuum
+        );
+        println!(
+            "  auto_upgrade_legacy_auto_vacuum_concurrency: {}",
+            auto_upgrade_legacy_auto_vacuum_concurrency
+        );
 
         Ok(cfg)
     }
@@ -315,5 +340,26 @@ impl Cfg {
             0 => 1,
             value => value,
         }
+    }
+
+    /// Whether startup auto-upgrades legacy shard DBs to INCREMENTAL auto_vacuum.
+    /// Default: true.
+    pub fn sqlite_auto_upgrade_legacy_auto_vacuum(&self) -> bool {
+        self.sqlite
+            .as_ref()
+            .and_then(|s| s.auto_upgrade_legacy_auto_vacuum)
+            .unwrap_or(true)
+    }
+
+    /// Startup legacy auto_vacuum upgrade task concurrency.
+    /// Default: 2 (NVMe-friendly baseline).
+    pub fn sqlite_auto_upgrade_legacy_auto_vacuum_concurrency(&self) -> usize {
+        let configured = self
+            .sqlite
+            .as_ref()
+            .and_then(|s| s.auto_upgrade_legacy_auto_vacuum_concurrency)
+            .unwrap_or(2);
+
+        configured.max(1)
     }
 }

@@ -73,6 +73,20 @@ busy_timeout_ms = 5000
 # FULL: Safest but slower, use for critical data
 synchronous = "NORMAL"
 
+# Auto-upgrade legacy shard DBs whose persisted PRAGMA auto_vacuum is not INCREMENTAL.
+# Default: true
+# If enabled, Blobasaur performs a one-time startup conversion with:
+#   PRAGMA wal_checkpoint(TRUNCATE);
+#   PRAGMA auto_vacuum=INCREMENTAL;
+#   VACUUM;
+# Startup fails fast if any shard upgrade fails.
+auto_upgrade_legacy_auto_vacuum = true
+
+# Max concurrent shard upgrades during startup legacy auto_vacuum conversion.
+# Default: 2 (good baseline for NVMe hosts).
+# Set to 1 for HDDs or very conservative rollout.
+auto_upgrade_legacy_auto_vacuum_concurrency = 2
+
 # Total memory-mapped I/O size in MB (default: 0 = disabled)
 # Only useful for databases larger than cache_size
 # Example: 3000 (≈3 GB total budget)
