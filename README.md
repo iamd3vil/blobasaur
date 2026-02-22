@@ -35,6 +35,7 @@ Blobasaur is a high-performance, sharded blob storage server written in Rust. It
   - [Usage](#usage)
   - [Migration Process](#migration-process)
   - [Best Practices](#best-practices)
+- [Vacuum Maintenance](#vacuum-maintenance)
 - [Performance Features](#performance-features)
   - [Write Batching](#write-batching)
   - [Asynchronous Writes](#asynchronous-writes)
@@ -210,6 +211,9 @@ blobasaur --config /path/to/config.toml
 # Shard migration commands
 blobasaur shard migrate <old_shard_count> <new_shard_count>
 
+# Cluster-wide vacuum orchestration
+blobasaur shard vacuum --all-shards --mode incremental --budget-mb 128 --nodes 127.0.0.1:6379,127.0.0.1:6380
+
 # Get help
 blobasaur --help
 ```
@@ -217,6 +221,7 @@ blobasaur --help
 **Available Commands:**
 - `serve` (default): Runs the Blobasaur server
 - `shard migrate`: Migrates data between different shard configurations
+- `shard vacuum`: Orchestrates node-local shard vacuum across one or more nodes
 
 **Global Options:**
 - `--config, -c`: Path to configuration file (default: `config.toml`)
@@ -483,6 +488,32 @@ blobasaur
 - **Disk Space**: Need space for both old and new databases
 - **Testing**: Always test migrations on data copies first
 - **Recovery**: Keep backups for rollback if needed
+
+## Vacuum Maintenance
+
+When keys are deleted or expire, SQLite does not automatically return disk space to the OS — freed pages accumulate on an internal freelist. Over time this can cause significant disk bloat, especially in high-churn workloads.
+
+Blobasaur provides two ways to reclaim this space:
+
+- **Incremental vacuum** (default) — reclaims freelist pages up to a configurable budget per shard. Fast, bounded, and safe for production use.
+- **Full vacuum** — rewrites the entire database, reclaiming all unused space. Best suited for maintenance windows.
+
+**Quick start:**
+
+```bash
+# Dry run — see how much space is reclaimable
+blobasaur shard vacuum --all-shards --dry-run
+
+# Incremental vacuum with 128 MB budget (default)
+blobasaur shard vacuum --all-shards
+
+# Full vacuum during a maintenance window
+blobasaur shard vacuum --all-shards --mode full --timeout-sec 300
+```
+
+Blobasaur also automatically upgrades legacy shard databases to `PRAGMA auto_vacuum = INCREMENTAL` on startup, ensuring new freelist pages are always reclaimable.
+
+📖 **For full documentation** — modes, budget tuning, CLI options, server admin commands, example output, startup upgrade flow, and operational recommendations — see **[VACUUM.md](VACUUM.md)**.
 
 ## Performance Features
 

@@ -69,12 +69,26 @@ When metrics are enabled, Blobasaur starts an HTTP server with the following end
 ### Storage Metrics
 
 - `blobasaur_storage_operations_total` - Total storage operations
+- `blobasaur_sqlite_auto_vacuum_misconfigured_total` - Number of shard DBs observed at startup with `PRAGMA auto_vacuum` not set to `INCREMENTAL` (primarily useful when startup auto-upgrade is disabled)
+- `blobasaur_sqlite_auto_vacuum_upgrade_runs_total{result}` - Startup legacy auto-vacuum conversion attempts by outcome:
+  - `ok` = conversion succeeded
+  - `error` = conversion failed (startup fails fast)
+  - `skipped_disabled` = shard not converted because `[sqlite].auto_upgrade_legacy_auto_vacuum=false`
+- `blobasaur_sqlite_auto_vacuum_upgrade_duration_seconds{result}` - Histogram of startup legacy auto-vacuum conversion duration by outcome
 
 ### Batch Processing Metrics
 
 - `blobasaur_batch_operations_total` - Total batch operations processed
 - `blobasaur_batch_size` - Histogram of batch sizes
 - `blobasaur_batch_duration_seconds` - Histogram of batch processing times
+
+### Vacuum Metrics
+
+- `blobasaur_vacuum_runs_total{mode,result}` - Total shard vacuum attempts by vacuum mode and outcome (`ok`, `error`, `cancelled`, etc.)
+- `blobasaur_vacuum_duration_seconds{mode,result}` - Histogram of shard vacuum duration (seconds) for completed/timed-out runs
+- `blobasaur_vacuum_reclaimed_pages_estimate_total{mode,shard}` - Estimated pages reclaimed by vacuum runs
+- `blobasaur_vacuum_reclaimed_bytes_estimate_total{mode,shard}` - Estimated bytes reclaimed by vacuum runs
+- `blobasaur_vacuum_shard_failures_total{shard,mode,result}` - Per-shard vacuum failure counts, where `result` is `busy` or `error`
 
 ## Usage with Prometheus
 
