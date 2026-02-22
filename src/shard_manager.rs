@@ -1,4 +1,5 @@
 use crate::metrics::Metrics;
+use crate::redis::protocol::HExpireCondition;
 use bytes::Bytes;
 use chrono::Utc;
 use moka::future::Cache;
@@ -64,6 +65,13 @@ pub enum ShardWriteOperation {
         key: String,
         expires_at: i64,
         responder: oneshot::Sender<Result<bool, String>>,
+    },
+    HExpire {
+        namespace: String,
+        key: String,
+        expires_at: i64,
+        condition: Option<HExpireCondition>,
+        responder: oneshot::Sender<Result<i64, String>>,
     },
     #[allow(dead_code)]
     Vacuum {
@@ -270,6 +278,9 @@ async fn process_batch(
                     ShardWriteOperation::Expire { responder, .. } => {
                         let _ = responder.send(Err(error_message.clone()));
                     }
+                    ShardWriteOperation::HExpire { responder, .. } => {
+                        let _ = responder.send(Err(error_message.clone()));
+                    }
                     ShardWriteOperation::Vacuum {
                         mode,
                         budget_bytes,
@@ -301,6 +312,7 @@ async fn process_batch(
 
     let mut results: Vec<(usize, Result<(), String>)> = Vec::new();
     let mut expire_results: Vec<(usize, bool)> = Vec::new();
+    let mut hexpire_results: Vec<(usize, i64)> = Vec::new();
     let mut sync_operations: Vec<usize> = Vec::new();
 
     // Execute all operations in the transaction
@@ -611,6 +623,129 @@ async fn process_batch(
                     }
                 }
             }
+            ShardWriteOperation::HExpire {
+                namespace,
+                key,
+                expires_at,
+                condition,
+                ..
+            } => {
+                sync_operations.push(idx);
+
+                let table_name = format!("blobs_{}", namespace);
+
+                // Ensure table exists
+                if let Err(e) =
+                    ensure_namespaced_table_exists(&mut tx, &table_name, known_tables).await
+                {
+                    tracing::error!("[Shard {}] Failed to ensure table exists: {}", shard_id, e);
+                    hexpire_results.push((idx, -2));
+                    Err(e)
+                } else {
+                    // Check if field exists and get current expires_at
+                    let select_query = format!(
+                        "SELECT expires_at FROM {} WHERE key = ?",
+                        table_name
+                    );
+                    match sqlx::query_as::<_, (Option<i64>,)>(&select_query)
+                        .bind(key)
+                        .fetch_optional(&mut *tx)
+                        .await
+                    {
+                        Ok(None) => {
+                            // Field does not exist
+                            hexpire_results.push((idx, -2));
+                            Ok(())
+                        }
+                        Ok(Some((current_expires_at,))) => {
+                            // Check if seconds is 0 or expires_at is in the past -> delete
+                            let now = Utc::now().timestamp();
+                            if *expires_at <= now {
+                                // Delete the field
+                                let delete_query = format!(
+                                    "DELETE FROM {} WHERE key = ?",
+                                    table_name
+                                );
+                                match sqlx::query(&delete_query)
+                                    .bind(key)
+                                    .execute(&mut *tx)
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        hexpire_results.push((idx, 2));
+                                        Ok(())
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "[Shard {}] HEXPIRE DELETE error for namespace {} key {}: {}",
+                                            shard_id, namespace, key, e
+                                        );
+                                        hexpire_results.push((idx, -2));
+                                        Err(e.to_string())
+                                    }
+                                }
+                            } else {
+                                // Apply condition check
+                                let should_set = match condition {
+                                    None => true,
+                                    Some(HExpireCondition::Nx) => current_expires_at.is_none(),
+                                    Some(HExpireCondition::Xx) => current_expires_at.is_some(),
+                                    Some(HExpireCondition::Gt) => {
+                                        match current_expires_at {
+                                            None => false, // Non-volatile = infinite TTL, new < infinite
+                                            Some(current) => *expires_at > current,
+                                        }
+                                    }
+                                    Some(HExpireCondition::Lt) => {
+                                        match current_expires_at {
+                                            None => true, // Non-volatile = infinite TTL, new < infinite
+                                            Some(current) => *expires_at < current,
+                                        }
+                                    }
+                                };
+
+                                if should_set {
+                                    let update_query = format!(
+                                        "UPDATE {} SET expires_at = ? WHERE key = ?",
+                                        table_name
+                                    );
+                                    match sqlx::query(&update_query)
+                                        .bind(expires_at)
+                                        .bind(key)
+                                        .execute(&mut *tx)
+                                        .await
+                                    {
+                                        Ok(_) => {
+                                            hexpire_results.push((idx, 1));
+                                            Ok(())
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(
+                                                "[Shard {}] HEXPIRE UPDATE error for namespace {} key {}: {}",
+                                                shard_id, namespace, key, e
+                                            );
+                                            hexpire_results.push((idx, 0));
+                                            Err(e.to_string())
+                                        }
+                                    }
+                                } else {
+                                    // Condition not met
+                                    hexpire_results.push((idx, 0));
+                                    Ok(())
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "[Shard {}] HEXPIRE SELECT error for namespace {} key {}: {}",
+                                shard_id, namespace, key, e
+                            );
+                            hexpire_results.push((idx, -2));
+                            Err(e.to_string())
+                        }
+                    }
+                }
+            }
             ShardWriteOperation::Vacuum { .. } => {
                 Err("Vacuum operation reached transactional batch unexpectedly".to_string())
             }
@@ -688,6 +823,22 @@ async fn process_batch(
                 } else {
                     let _ = responder.send(Err(
                         "Internal error: could not find expire result".to_string()
+                    ));
+                }
+            }
+            ShardWriteOperation::HExpire { responder, .. } => {
+                // For hexpire operations, send the per-field result code
+                if let Some((_, result_code)) =
+                    hexpire_results.iter().find(|(idx, _)| *idx == operation_idx)
+                {
+                    let final_result = match &commit_result {
+                        Ok(_) => Ok(*result_code),
+                        Err(e) => Err(e.clone()),
+                    };
+                    let _ = responder.send(final_result);
+                } else {
+                    let _ = responder.send(Err(
+                        "Internal error: could not find hexpire result".to_string()
                     ));
                 }
             }
