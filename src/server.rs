@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
-use tokio::time::{Duration, timeout};
+
 
 pub async fn run_redis_server(
     state: Arc<AppState>,
@@ -127,14 +127,12 @@ async fn handle_connection(
 
 // Helper function to find the end of a complete message
 
-const SHARD_VACUUM_TIMEOUT: Duration = Duration::from_secs(30);
 const BYTES_PER_MB: u64 = 1024 * 1024;
 
 #[derive(Debug)]
 enum ShardVacuumStatus {
     Ok,
     ExecutionError,
-    Timeout,
     Cancelled,
     InvalidShard,
 }
@@ -144,7 +142,6 @@ impl ShardVacuumStatus {
         match self {
             ShardVacuumStatus::Ok => "ok",
             ShardVacuumStatus::ExecutionError => "execution_error",
-            ShardVacuumStatus::Timeout => "timeout",
             ShardVacuumStatus::Cancelled => "cancelled",
             ShardVacuumStatus::InvalidShard => "invalid_shard",
         }
@@ -1761,8 +1758,11 @@ async fn run_shard_vacuum(
         };
     }
 
-    match timeout(SHARD_VACUUM_TIMEOUT, responder_rx).await {
-        Ok(Ok(vacuum_result)) => {
+    // No server-side timeout: the CLI's --timeout-sec controls the overall
+    // deadline via the network-level timeout in send_redis_command_with_timeout.
+    // A hardcoded server timeout causes false failures for large/full vacuums.
+    match responder_rx.await {
+        Ok(vacuum_result) => {
             if vacuum_result.errors.is_empty() {
                 ShardVacuumDispatchResult {
                     shard_id,
@@ -1780,7 +1780,7 @@ async fn run_shard_vacuum(
                 }
             }
         }
-        Ok(Err(_)) => {
+        Err(_) => {
             state
                 .metrics
                 .record_vacuum_run(mode_name, "cancelled", None);
@@ -1792,24 +1792,6 @@ async fn run_shard_vacuum(
                 shard_id,
                 status: ShardVacuumStatus::Cancelled,
                 error: Some("shard writer cancelled vacuum response".to_string()),
-                vacuum_result: None,
-            }
-        }
-        Err(_) => {
-            state
-                .metrics
-                .record_vacuum_run(mode_name, "timeout", Some(SHARD_VACUUM_TIMEOUT));
-            state
-                .metrics
-                .record_vacuum_shard_failure(shard_id, mode_name, "error");
-
-            ShardVacuumDispatchResult {
-                shard_id,
-                status: ShardVacuumStatus::Timeout,
-                error: Some(format!(
-                    "vacuum timed out after {} seconds",
-                    SHARD_VACUUM_TIMEOUT.as_secs()
-                )),
                 vacuum_result: None,
             }
         }

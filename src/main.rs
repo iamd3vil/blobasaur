@@ -325,17 +325,18 @@ fn resolve_target_nodes(
     let mut nodes = Vec::new();
 
     if let Some(cfg) = cfg {
-        if let Some(addr) = cfg.addr.as_deref() {
+        // Prefer cluster advertise_addr (the publicly reachable address) over bind addr
+        // to avoid duplicates when both resolve to the same server (e.g. bind 0.0.0.0:6379
+        // plus advertised 10.0.0.1:6379).
+        let resolved = cfg
+            .cluster
+            .as_ref()
+            .and_then(|c| c.advertise_addr.as_deref())
+            .or(cfg.addr.as_deref());
+
+        if let Some(addr) = resolved {
             if let Some(normalized) = normalize_node_address(addr) {
                 nodes.push(normalized);
-            }
-        }
-
-        if let Some(cluster_cfg) = cfg.cluster.as_ref() {
-            if let Some(advertise_addr) = cluster_cfg.advertise_addr.as_deref() {
-                if let Some(normalized) = normalize_node_address(advertise_addr) {
-                    nodes.push(normalized);
-                }
             }
         }
     }
@@ -938,6 +939,35 @@ mod tests {
 
         let fallback = resolve_target_nodes(None, None).unwrap();
         assert_eq!(fallback, vec!["127.0.0.1:6379".to_string()]);
+    }
+
+    #[test]
+    fn resolve_target_nodes_prefers_advertise_addr_over_bind_addr() {
+        let cfg = config::Cfg {
+            data_dir: "./data".to_string(),
+            num_shards: 4,
+            storage_compression: None,
+            async_write: None,
+            batch_size: None,
+            batch_timeout_ms: None,
+            addr: Some("0.0.0.0:6379".to_string()),
+            cluster: Some(config::ClusterConfig {
+                enabled: true,
+                node_id: "node1".to_string(),
+                seeds: vec![],
+                port: 7946,
+                slots: None,
+                slot_ranges: None,
+                gossip_interval_ms: None,
+                advertise_addr: Some("10.0.0.1:6379".to_string()),
+            }),
+            metrics: None,
+            sqlite: None,
+        };
+
+        // Should return only the advertise_addr, not both addresses
+        let nodes = resolve_target_nodes(None, Some(&cfg)).unwrap();
+        assert_eq!(nodes, vec!["10.0.0.1:6379".to_string()]);
     }
 
     #[test]
