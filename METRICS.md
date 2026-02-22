@@ -84,7 +84,7 @@ When metrics are enabled, Blobasaur starts an HTTP server with the following end
 
 ### Vacuum Metrics
 
-- `blobasaur_vacuum_runs_total{mode,result}` - Total shard vacuum attempts by vacuum mode and outcome (`ok`, `error`, `timeout`, `cancelled`, etc.)
+- `blobasaur_vacuum_runs_total{mode,result}` - Total shard vacuum attempts by vacuum mode and outcome (`ok`, `error`, `cancelled`, etc.)
 - `blobasaur_vacuum_duration_seconds{mode,result}` - Histogram of shard vacuum duration (seconds) for completed/timed-out runs
 - `blobasaur_vacuum_reclaimed_pages_estimate_total{mode,shard}` - Estimated pages reclaimed by vacuum runs
 - `blobasaur_vacuum_reclaimed_bytes_estimate_total{mode,shard}` - Estimated bytes reclaimed by vacuum runs

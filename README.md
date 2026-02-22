@@ -35,6 +35,7 @@ Blobasaur is a high-performance, sharded blob storage server written in Rust. It
   - [Usage](#usage)
   - [Migration Process](#migration-process)
   - [Best Practices](#best-practices)
+- [Vacuum Maintenance](#vacuum-maintenance)
 - [Performance Features](#performance-features)
   - [Write Batching](#write-batching)
   - [Asynchronous Writes](#asynchronous-writes)
@@ -490,42 +491,29 @@ blobasaur
 
 ## Vacuum Maintenance
 
-- Blobasaur exposes a node-local admin command:
-  - `BLOBASAUR.VACUUM SHARD <id|ALL> MODE <incremental|full> BUDGET_MB <n> [DRYRUN]`
-- Blobasaur also provides a CLI orchestrator for multi-node runs:
-  - `blobasaur shard vacuum --all-shards --mode incremental --budget-mb 128 --nodes <addr1,addr2,...> [--dry-run] [--node-concurrency 1] [--shard-concurrency 1] [--timeout-sec 30]`
-- `SHARD ALL` runs serially across local shards and returns per-shard status/results.
-- `DRYRUN` is non-mutating and returns per-shard vacuum stats/estimates.
-- Default maintenance mode is **incremental vacuum** with conservative defaults (128 MB budget, node concurrency 1, shard concurrency 1).
-- The CLI orchestrator continues across node failures and exits non-zero if any node call fails or any shard result is non-`ok`.
-- Newly created shard DBs are initialized with `PRAGMA auto_vacuum = INCREMENTAL`.
-- On startup, Blobasaur automatically upgrades legacy shard DBs whose persisted `auto_vacuum` is not `INCREMENTAL` by running:
-  - `PRAGMA wal_checkpoint(TRUNCATE);`
-  - `PRAGMA auto_vacuum = INCREMENTAL;`
-  - `VACUUM;`
-- Startup fails fast if any shard's auto-upgrade fails, to avoid mixed maintenance state.
-- Automatic upgrade is enabled by default and can be disabled with `[sqlite].auto_upgrade_legacy_auto_vacuum = false`.
-- Startup upgrade runs with bounded parallelism by default (`[sqlite].auto_upgrade_legacy_auto_vacuum_concurrency = 2`, tuned for common NVMe hosts); set to `1` for HDD/conservative environments.
+When keys are deleted or expire, SQLite does not automatically return disk space to the OS — freed pages accumulate on an internal freelist. Over time this can cause significant disk bloat, especially in high-churn workloads.
 
-### Startup Legacy `auto_vacuum` Upgrade Flow
+Blobasaur provides two ways to reclaim this space:
 
-For each configured shard DB (`shard_0.db` through `shard_{num_shards-1}.db`), startup does:
+- **Incremental vacuum** (default) — reclaims freelist pages up to a configurable budget per shard. Fast, bounded, and safe for production use.
+- **Full vacuum** — rewrites the entire database, reclaiming all unused space. Best suited for maintenance windows.
 
-1. Acquire one SQLite connection for the shard upgrade sequence.
-2. Read `PRAGMA auto_vacuum`.
-3. If mode is already `INCREMENTAL (2)`, continue.
-4. If mode is not `INCREMENTAL` and auto-upgrade is disabled, record warning/metrics and continue.
-5. If mode is not `INCREMENTAL` and auto-upgrade is enabled, run:
-   - `PRAGMA wal_checkpoint(TRUNCATE);`
-   - `PRAGMA auto_vacuum = INCREMENTAL;`
-   - `VACUUM;`
-6. Re-read `PRAGMA auto_vacuum` and require value `2`.
-7. On any shard failure, startup exits with error.
+**Quick start:**
 
-Notes:
-- Upgrade work is bounded by `[sqlite].auto_upgrade_legacy_auto_vacuum_concurrency` (default `2`).
-- This is a one-time per-DB conversion in normal operation.
-- Keep sufficient free disk space for `VACUUM` rewrite overhead.
+```bash
+# Dry run — see how much space is reclaimable
+blobasaur shard vacuum --all-shards --dry-run
+
+# Incremental vacuum with 128 MB budget (default)
+blobasaur shard vacuum --all-shards
+
+# Full vacuum during a maintenance window
+blobasaur shard vacuum --all-shards --mode full --timeout-sec 300
+```
+
+Blobasaur also automatically upgrades legacy shard databases to `PRAGMA auto_vacuum = INCREMENTAL` on startup, ensuring new freelist pages are always reclaimable.
+
+📖 **For full documentation** — modes, budget tuning, CLI options, server admin commands, example output, startup upgrade flow, and operational recommendations — see **[VACUUM.md](VACUUM.md)**.
 
 ## Performance Features
 
