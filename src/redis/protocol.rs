@@ -14,6 +14,19 @@ pub enum ExpireOption {
     KeepTtl,
 }
 
+/// Condition options for HEXPIRE command
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HExpireCondition {
+    /// Set expiration only when the field has no expiration
+    Nx,
+    /// Set expiration only when the field has an existing expiration
+    Xx,
+    /// Set expiration only when the new expiration is greater than current one
+    Gt,
+    /// Set expiration only when the new expiration is less than current one
+    Lt,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VacuumShardTarget {
     Shard(usize),
@@ -67,6 +80,18 @@ pub enum RedisCommand {
         namespace: String,
         key: String,
     },
+    HExpire {
+        key: String,
+        seconds: i64,
+        condition: Option<HExpireCondition>,
+        fields: Vec<String>,
+    },
+    HExpireAt {
+        key: String,
+        unix_time_seconds: i64,
+        condition: Option<HExpireCondition>,
+        fields: Vec<String>,
+    },
     Ping {
         message: Option<String>,
     },
@@ -117,6 +142,8 @@ impl RedisCommand {
             RedisCommand::HSetEx { .. } => "HSETEX".to_string(),
             RedisCommand::HDel { .. } => "HDEL".to_string(),
             RedisCommand::HExists { .. } => "HEXISTS".to_string(),
+            RedisCommand::HExpire { .. } => "HEXPIRE".to_string(),
+            RedisCommand::HExpireAt { .. } => "HEXPIREAT".to_string(),
             RedisCommand::Ping { .. } => "PING".to_string(),
             RedisCommand::Info { .. } => "INFO".to_string(),
             RedisCommand::Command => "COMMAND".to_string(),
@@ -451,6 +478,204 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
             let key = extract_string(&elements[2])?;
             Ok(RedisCommand::HExists { namespace, key })
         }
+        "HEXPIRE" => {
+            // HEXPIRE key seconds [NX | XX | GT | LT] FIELDS numfields field [field ...]
+            // Minimum: HEXPIRE key seconds FIELDS 1 field = 6 elements
+            if elements.len() < 6 {
+                return Err(ParseError::Invalid(
+                    "HEXPIRE requires at least key, seconds, FIELDS, numfields, and one field"
+                        .to_string(),
+                ));
+            }
+
+            let key = extract_string(&elements[1])?;
+            let seconds_str = extract_string(&elements[2])?;
+            let seconds = seconds_str.parse::<i64>().map_err(|_| {
+                ParseError::Invalid(format!("Invalid seconds value: {}", seconds_str))
+            })?;
+
+            let mut idx = 3;
+            let mut condition = None;
+
+            // Parse optional condition (NX | XX | GT | LT)
+            if idx < elements.len() {
+                let token = extract_string(&elements[idx])?.to_uppercase();
+                match token.as_str() {
+                    "NX" => {
+                        condition = Some(HExpireCondition::Nx);
+                        idx += 1;
+                    }
+                    "XX" => {
+                        condition = Some(HExpireCondition::Xx);
+                        idx += 1;
+                    }
+                    "GT" => {
+                        condition = Some(HExpireCondition::Gt);
+                        idx += 1;
+                    }
+                    "LT" => {
+                        condition = Some(HExpireCondition::Lt);
+                        idx += 1;
+                    }
+                    "FIELDS" => {} // Not a condition, will be parsed below
+                    _ => {
+                        return Err(ParseError::Invalid(format!(
+                            "Unknown HEXPIRE option: {}",
+                            token
+                        )));
+                    }
+                }
+            }
+
+            // Parse FIELDS keyword
+            if idx >= elements.len() {
+                return Err(ParseError::Invalid(
+                    "HEXPIRE requires FIELDS keyword".to_string(),
+                ));
+            }
+            let fields_keyword = extract_string(&elements[idx])?.to_uppercase();
+            if fields_keyword != "FIELDS" {
+                return Err(ParseError::Invalid(
+                    "HEXPIRE requires FIELDS keyword".to_string(),
+                ));
+            }
+            idx += 1;
+
+            // Parse numfields
+            if idx >= elements.len() {
+                return Err(ParseError::Invalid(
+                    "HEXPIRE requires field count after FIELDS".to_string(),
+                ));
+            }
+            let num_fields = extract_string(&elements[idx])?
+                .parse::<usize>()
+                .map_err(|_| ParseError::Invalid("Invalid field count".to_string()))?;
+            idx += 1;
+
+            if num_fields == 0 {
+                return Err(ParseError::Invalid(
+                    "HEXPIRE requires at least one field".to_string(),
+                ));
+            }
+
+            // Parse field names
+            let mut fields = Vec::with_capacity(num_fields);
+            for _ in 0..num_fields {
+                if idx >= elements.len() {
+                    return Err(ParseError::Invalid(
+                        "Not enough fields provided".to_string(),
+                    ));
+                }
+                fields.push(extract_string(&elements[idx])?);
+                idx += 1;
+            }
+
+            Ok(RedisCommand::HExpire {
+                key,
+                seconds,
+                condition,
+                fields,
+            })
+        }
+        "HEXPIREAT" => {
+            // HEXPIREAT key unix-time-seconds [NX | XX | GT | LT] FIELDS numfields field [field ...]
+            // Minimum: HEXPIREAT key timestamp FIELDS 1 field = 6 elements
+            if elements.len() < 6 {
+                return Err(ParseError::Invalid(
+                    "HEXPIREAT requires at least key, unix-time-seconds, FIELDS, numfields, and one field"
+                        .to_string(),
+                ));
+            }
+
+            let key = extract_string(&elements[1])?;
+            let timestamp_str = extract_string(&elements[2])?;
+            let unix_time_seconds = timestamp_str.parse::<i64>().map_err(|_| {
+                ParseError::Invalid(format!("Invalid timestamp value: {}", timestamp_str))
+            })?;
+
+            let mut idx = 3;
+            let mut condition = None;
+
+            // Parse optional condition (NX | XX | GT | LT)
+            if idx < elements.len() {
+                let token = extract_string(&elements[idx])?.to_uppercase();
+                match token.as_str() {
+                    "NX" => {
+                        condition = Some(HExpireCondition::Nx);
+                        idx += 1;
+                    }
+                    "XX" => {
+                        condition = Some(HExpireCondition::Xx);
+                        idx += 1;
+                    }
+                    "GT" => {
+                        condition = Some(HExpireCondition::Gt);
+                        idx += 1;
+                    }
+                    "LT" => {
+                        condition = Some(HExpireCondition::Lt);
+                        idx += 1;
+                    }
+                    "FIELDS" => {} // Not a condition, will be parsed below
+                    _ => {
+                        return Err(ParseError::Invalid(format!(
+                            "Unknown HEXPIREAT option: {}",
+                            token
+                        )));
+                    }
+                }
+            }
+
+            // Parse FIELDS keyword
+            if idx >= elements.len() {
+                return Err(ParseError::Invalid(
+                    "HEXPIREAT requires FIELDS keyword".to_string(),
+                ));
+            }
+            let fields_keyword = extract_string(&elements[idx])?.to_uppercase();
+            if fields_keyword != "FIELDS" {
+                return Err(ParseError::Invalid(
+                    "HEXPIREAT requires FIELDS keyword".to_string(),
+                ));
+            }
+            idx += 1;
+
+            // Parse numfields
+            if idx >= elements.len() {
+                return Err(ParseError::Invalid(
+                    "HEXPIREAT requires field count after FIELDS".to_string(),
+                ));
+            }
+            let num_fields = extract_string(&elements[idx])?
+                .parse::<usize>()
+                .map_err(|_| ParseError::Invalid("Invalid field count".to_string()))?;
+            idx += 1;
+
+            if num_fields == 0 {
+                return Err(ParseError::Invalid(
+                    "HEXPIREAT requires at least one field".to_string(),
+                ));
+            }
+
+            // Parse field names
+            let mut fields = Vec::with_capacity(num_fields);
+            for _ in 0..num_fields {
+                if idx >= elements.len() {
+                    return Err(ParseError::Invalid(
+                        "Not enough fields provided".to_string(),
+                    ));
+                }
+                fields.push(extract_string(&elements[idx])?);
+                idx += 1;
+            }
+
+            Ok(RedisCommand::HExpireAt {
+                key,
+                unix_time_seconds,
+                condition,
+                fields,
+            })
+        }
         "CLUSTER" => {
             if elements.len() < 2 {
                 return Err(ParseError::Invalid(
@@ -780,24 +1005,20 @@ mod tests {
         let (resp, _) = parse_resp_with_remaining(input).unwrap();
         let result = parse_command(resp);
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("EX requires a value")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("EX requires a value"));
 
         // Test SET with PX but no value
         let input = b"*4\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$5\r\nvalue\r\n$2\r\nPX\r\n";
         let (resp, _) = parse_resp_with_remaining(input).unwrap();
         let result = parse_command(resp);
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("PX requires a value")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("PX requires a value"));
     }
 
     #[test]
@@ -806,12 +1027,10 @@ mod tests {
         let (resp, _) = parse_resp_with_remaining(input).unwrap();
         let result = parse_command(resp);
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Unknown SET option: XX")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Unknown SET option: XX"));
     }
 
     #[test]
@@ -820,12 +1039,10 @@ mod tests {
         let (resp, _) = parse_resp_with_remaining(input).unwrap();
         let result = parse_command(resp);
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Invalid seconds value")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid seconds value"));
     }
 
     #[test]
@@ -835,24 +1052,20 @@ mod tests {
         let (resp, _) = parse_resp_with_remaining(input).unwrap();
         let result = parse_command(resp);
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("TTL requires exactly 1 argument")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("TTL requires exactly 1 argument"));
 
         // Too few arguments
         let input = b"*1\r\n$3\r\nTTL\r\n";
         let (resp, _) = parse_resp_with_remaining(input).unwrap();
         let result = parse_command(resp);
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("TTL requires exactly 1 argument")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("TTL requires exactly 1 argument"));
     }
 
     #[test]
@@ -862,24 +1075,20 @@ mod tests {
         let (resp, _) = parse_resp_with_remaining(input).unwrap();
         let result = parse_command(resp);
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("EXPIRE requires exactly 2 arguments")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("EXPIRE requires exactly 2 arguments"));
 
         // Too few arguments
         let input = b"*2\r\n$6\r\nEXPIRE\r\n$5\r\nmykey\r\n";
         let (resp, _) = parse_resp_with_remaining(input).unwrap();
         let result = parse_command(resp);
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("EXPIRE requires exactly 2 arguments")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("EXPIRE requires exactly 2 arguments"));
     }
 
     #[test]
@@ -1206,6 +1415,193 @@ mod tests {
         let (resp, _) = parse_resp_with_remaining(input).unwrap();
         let command = parse_command(resp).unwrap();
         assert_eq!(command, RedisCommand::Unknown("UNKNOWN".to_string()));
+    }
+
+    #[test]
+    fn test_parse_hexpire_command_basic() {
+        // HEXPIRE myhash 10 FIELDS 2 field1 field2
+        let command = parse_command(command_frame(&[
+            "HEXPIRE", "myhash", "10", "FIELDS", "2", "field1", "field2",
+        ]))
+        .unwrap();
+        assert_eq!(
+            command,
+            RedisCommand::HExpire {
+                key: "myhash".to_string(),
+                seconds: 10,
+                condition: None,
+                fields: vec!["field1".to_string(), "field2".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_hexpire_command_with_nx() {
+        let command = parse_command(command_frame(&[
+            "HEXPIRE", "myhash", "60", "NX", "FIELDS", "1", "field1",
+        ]))
+        .unwrap();
+        assert_eq!(
+            command,
+            RedisCommand::HExpire {
+                key: "myhash".to_string(),
+                seconds: 60,
+                condition: Some(HExpireCondition::Nx),
+                fields: vec!["field1".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_hexpire_command_with_xx() {
+        let command = parse_command(command_frame(&[
+            "HEXPIRE", "myhash", "60", "XX", "FIELDS", "1", "field1",
+        ]))
+        .unwrap();
+        assert_eq!(
+            command,
+            RedisCommand::HExpire {
+                key: "myhash".to_string(),
+                seconds: 60,
+                condition: Some(HExpireCondition::Xx),
+                fields: vec!["field1".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_hexpire_command_with_gt() {
+        let command = parse_command(command_frame(&[
+            "HEXPIRE", "myhash", "60", "GT", "FIELDS", "1", "field1",
+        ]))
+        .unwrap();
+        assert_eq!(
+            command,
+            RedisCommand::HExpire {
+                key: "myhash".to_string(),
+                seconds: 60,
+                condition: Some(HExpireCondition::Gt),
+                fields: vec!["field1".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_hexpire_command_with_lt() {
+        let command = parse_command(command_frame(&[
+            "HEXPIRE", "myhash", "60", "LT", "FIELDS", "1", "field1",
+        ]))
+        .unwrap();
+        assert_eq!(
+            command,
+            RedisCommand::HExpire {
+                key: "myhash".to_string(),
+                seconds: 60,
+                condition: Some(HExpireCondition::Lt),
+                fields: vec!["field1".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_hexpire_command_too_few_args() {
+        // Missing fields
+        let result = parse_command(command_frame(&["HEXPIRE", "myhash", "10"]));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_hexpire_command_invalid_seconds() {
+        let result = parse_command(command_frame(&[
+            "HEXPIRE", "myhash", "abc", "FIELDS", "1", "field1",
+        ]));
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid seconds value"));
+    }
+
+    #[test]
+    fn test_parse_hexpire_command_zero_fields() {
+        // With a condition token to bring element count to 6 (the minimum)
+        let result = parse_command(command_frame(&[
+            "HEXPIRE", "myhash", "10", "NX", "FIELDS", "0",
+        ]));
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("at least one field"));
+    }
+
+    #[test]
+    fn test_parse_hexpireat_command_basic() {
+        let command = parse_command(command_frame(&[
+            "HEXPIREAT",
+            "myhash",
+            "1715704971",
+            "FIELDS",
+            "2",
+            "field1",
+            "field2",
+        ]))
+        .unwrap();
+        assert_eq!(
+            command,
+            RedisCommand::HExpireAt {
+                key: "myhash".to_string(),
+                unix_time_seconds: 1715704971,
+                condition: None,
+                fields: vec!["field1".to_string(), "field2".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_hexpireat_command_with_gt() {
+        let command = parse_command(command_frame(&[
+            "HEXPIREAT",
+            "myhash",
+            "1715704971",
+            "GT",
+            "FIELDS",
+            "1",
+            "field1",
+        ]))
+        .unwrap();
+        assert_eq!(
+            command,
+            RedisCommand::HExpireAt {
+                key: "myhash".to_string(),
+                unix_time_seconds: 1715704971,
+                condition: Some(HExpireCondition::Gt),
+                fields: vec!["field1".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_hexpireat_command_too_few_args() {
+        let result = parse_command(command_frame(&["HEXPIREAT", "myhash", "123"]));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_hexpireat_command_invalid_timestamp() {
+        let result = parse_command(command_frame(&[
+            "HEXPIREAT",
+            "myhash",
+            "notanumber",
+            "FIELDS",
+            "1",
+            "field1",
+        ]));
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid timestamp value"));
     }
 
     #[test]

@@ -2,8 +2,8 @@ use crate::AppState;
 use crate::cluster::ClusterManager;
 use crate::metrics::Timer;
 use crate::redis::{
-    ParseError, RedisCommand, VacuumCommandMode, VacuumShardTarget, parse_command,
-    parse_resp_with_remaining, serialize_frame,
+    HExpireCondition, ParseError, RedisCommand, VacuumCommandMode, VacuumShardTarget,
+    parse_command, parse_resp_with_remaining, serialize_frame,
 };
 use crate::shard_manager::{ShardWriteOperation, VacuumMode, VacuumResult, VacuumStats};
 use bytes::Bytes;
@@ -12,7 +12,6 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
-
 
 pub async fn run_redis_server(
     state: Arc<AppState>,
@@ -258,6 +257,22 @@ async fn handle_redis_command_inner(
         }
         RedisCommand::HExists { namespace, key } => {
             handle_hexists(stream, state, namespace, key).await?;
+        }
+        RedisCommand::HExpire {
+            key,
+            seconds,
+            condition,
+            fields,
+        } => {
+            handle_hexpire(stream, state, key, seconds, condition, fields).await?;
+        }
+        RedisCommand::HExpireAt {
+            key,
+            unix_time_seconds,
+            condition,
+            fields,
+        } => {
+            handle_hexpireat(stream, state, key, unix_time_seconds, condition, fields).await?;
         }
         RedisCommand::ClusterNodes => {
             handle_cluster_nodes(stream, state).await?;
@@ -1326,6 +1341,121 @@ async fn handle_hexists(
             stream.write_all(&serialize_frame(&response)).await?;
         }
     }
+
+    Ok(())
+}
+
+async fn handle_hexpire(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+    key: String,
+    seconds: i64,
+    condition: Option<HExpireCondition>,
+    fields: Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let expires_at = chrono::Utc::now().timestamp() + seconds;
+    handle_hexpire_internal(stream, state, key, expires_at, condition, fields).await
+}
+
+async fn handle_hexpireat(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+    key: String,
+    unix_time_seconds: i64,
+    condition: Option<HExpireCondition>,
+    fields: Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    handle_hexpire_internal(stream, state, key, unix_time_seconds, condition, fields).await
+}
+
+/// Shared implementation for HEXPIRE and HEXPIREAT.
+/// Both commands resolve to an absolute `expires_at` timestamp before calling this.
+async fn handle_hexpire_internal(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+    key: String,
+    expires_at: i64,
+    condition: Option<HExpireCondition>,
+    fields: Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // In Blobasaur, the hash key is the namespace, and fields are the actual keys
+    let namespace = key;
+
+    if !validate_hash_namespace(stream, &namespace).await? {
+        return Ok(());
+    }
+
+    let mut field_results: Vec<i64> = Vec::with_capacity(fields.len());
+
+    for field_key in fields {
+        // Check cluster routing for each field
+        if let Some(ref cluster_manager) = state.cluster_manager {
+            if !cluster_manager
+                .should_handle_hash_locally(&namespace, &field_key)
+                .await
+            {
+                if let Some(redirect) = cluster_manager
+                    .get_hash_redirect_response(&namespace, &field_key)
+                    .await
+                {
+                    let response = BytesFrame::Error(redirect.into());
+                    stream.write_all(&serialize_frame(&response)).await?;
+                    return Ok(());
+                }
+            }
+        }
+
+        let shard_index = state.get_shard(&field_key);
+        let sender = &state.shard_senders[shard_index];
+
+        let (responder_tx, responder_rx) = oneshot::channel();
+
+        let operation = ShardWriteOperation::HExpire {
+            namespace: namespace.clone(),
+            key: field_key.clone(),
+            expires_at,
+            condition,
+            responder: responder_tx,
+        };
+
+        if sender.send(operation).await.is_err() {
+            tracing::error!("Failed to send HEXPIRE operation to shard {}", shard_index);
+            let response = BytesFrame::Error("ERR internal error".into());
+            stream.write_all(&serialize_frame(&response)).await?;
+            state.metrics.record_error("storage");
+            return Ok(());
+        }
+
+        match responder_rx.await {
+            Ok(Ok(result_code)) => {
+                field_results.push(result_code);
+            }
+            Ok(Err(e)) => {
+                tracing::error!(
+                    "HEXPIRE operation failed for namespace {} key {}: {}",
+                    namespace,
+                    field_key,
+                    e
+                );
+                let response = BytesFrame::Error("ERR internal error".into());
+                stream.write_all(&serialize_frame(&response)).await?;
+                state.metrics.record_error("storage");
+                return Ok(());
+            }
+            Err(_) => {
+                tracing::error!("Shard writer task cancelled or panicked for HEXPIRE");
+                let response = BytesFrame::Error("ERR internal error".into());
+                stream.write_all(&serialize_frame(&response)).await?;
+                state.metrics.record_error("storage");
+                return Ok(());
+            }
+        }
+    }
+
+    // Return array of integers, one per field
+    let response = BytesFrame::Array(field_results.into_iter().map(BytesFrame::Integer).collect());
+    stream.write_all(&serialize_frame(&response)).await?;
+    state.metrics.record_storage_operation();
 
     Ok(())
 }
@@ -2647,6 +2777,457 @@ mod tests {
             .and_then(bulk_str)
             .expect("status should exist");
         assert_eq!(status, "invalid_shard");
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn hexpire_sets_expiration_on_existing_fields() {
+        let ctx = TestContext::new(false).await;
+
+        // Seed fields
+        respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hset(
+                    &mut stream,
+                    &state,
+                    "ns".to_string(),
+                    "field1".to_string(),
+                    Bytes::from_static(b"val1"),
+                )
+                .await
+            })
+        })
+        .await;
+
+        respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hset(
+                    &mut stream,
+                    &state,
+                    "ns".to_string(),
+                    "field2".to_string(),
+                    Bytes::from_static(b"val2"),
+                )
+                .await
+            })
+        })
+        .await;
+
+        // Set expiration on both fields + one nonexistent field
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hexpire(
+                    &mut stream,
+                    &state,
+                    "ns".to_string(),
+                    30,
+                    None,
+                    vec![
+                        "field1".to_string(),
+                        "field2".to_string(),
+                        "field3".to_string(),
+                    ],
+                )
+                .await
+            })
+        })
+        .await;
+
+        // Should return array [1, 1, -2]
+        match frame {
+            BytesFrame::Array(items) => {
+                assert_eq!(items.len(), 3);
+                assert_eq!(items[0], BytesFrame::Integer(1));
+                assert_eq!(items[1], BytesFrame::Integer(1));
+                assert_eq!(items[2], BytesFrame::Integer(-2));
+            }
+            other => panic!("Expected array, got {:?}", other),
+        }
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn hexpire_rejects_invalid_namespace() {
+        let ctx = TestContext::new(false).await;
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hexpire(
+                    &mut stream,
+                    &state,
+                    "has-dash".to_string(),
+                    10,
+                    None,
+                    vec!["field".to_string()],
+                )
+                .await
+            })
+        })
+        .await;
+        assert_error_contains(frame, "invalid hash namespace");
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn hexpire_nx_only_sets_when_no_expiration() {
+        let ctx = TestContext::new(false).await;
+
+        // Seed field without expiration
+        respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hset(
+                    &mut stream,
+                    &state,
+                    "ns".to_string(),
+                    "field1".to_string(),
+                    Bytes::from_static(b"val1"),
+                )
+                .await
+            })
+        })
+        .await;
+
+        // NX should succeed (no expiration set yet)
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hexpire(
+                    &mut stream,
+                    &state,
+                    "ns".to_string(),
+                    60,
+                    Some(HExpireCondition::Nx),
+                    vec!["field1".to_string()],
+                )
+                .await
+            })
+        })
+        .await;
+        match frame {
+            BytesFrame::Array(items) => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0], BytesFrame::Integer(1));
+            }
+            other => panic!("Expected array, got {:?}", other),
+        }
+
+        // NX should fail now (expiration already set)
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hexpire(
+                    &mut stream,
+                    &state,
+                    "ns".to_string(),
+                    120,
+                    Some(HExpireCondition::Nx),
+                    vec!["field1".to_string()],
+                )
+                .await
+            })
+        })
+        .await;
+        match frame {
+            BytesFrame::Array(items) => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0], BytesFrame::Integer(0));
+            }
+            other => panic!("Expected array, got {:?}", other),
+        }
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn hexpire_immediate_expiry_still_respects_conditions() {
+        let ctx = TestContext::new(false).await;
+
+        // Seed field without expiration.
+        respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hset(
+                    &mut stream,
+                    &state,
+                    "ns".to_string(),
+                    "field1".to_string(),
+                    Bytes::from_static(b"val1"),
+                )
+                .await
+            })
+        })
+        .await;
+
+        // XX should reject because field has no TTL, even with immediate expiration.
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hexpire(
+                    &mut stream,
+                    &state,
+                    "ns".to_string(),
+                    0,
+                    Some(HExpireCondition::Xx),
+                    vec!["field1".to_string()],
+                )
+                .await
+            })
+        })
+        .await;
+        match frame {
+            BytesFrame::Array(items) => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0], BytesFrame::Integer(0));
+            }
+            other => panic!("Expected array, got {:?}", other),
+        }
+
+        // Field should remain untouched.
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hget(&mut stream, &state, "ns".to_string(), "field1".to_string()).await
+            })
+        })
+        .await;
+        assert_bulk_string(frame, b"val1");
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn hexpire_treats_logically_expired_fields_as_missing() {
+        let ctx = TestContext::new(false).await;
+
+        // Seed field.
+        respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hset(
+                    &mut stream,
+                    &state,
+                    "ns".to_string(),
+                    "field1".to_string(),
+                    Bytes::from_static(b"val1"),
+                )
+                .await
+            })
+        })
+        .await;
+
+        // Mark row as expired in-place (without cleanup deleting it yet).
+        let shard_index = ctx.state.get_shard("field1");
+        let pool = &ctx.state.db_pools[shard_index];
+        let past = chrono::Utc::now().timestamp() - 60;
+        sqlx::query("UPDATE blobs_ns SET expires_at = ? WHERE key = ?")
+            .bind(past)
+            .bind("field1")
+            .execute(pool)
+            .await
+            .expect("failed to force field expiration");
+
+        // Expired field should be treated as missing and not revived.
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hexpire(
+                    &mut stream,
+                    &state,
+                    "ns".to_string(),
+                    60,
+                    None,
+                    vec!["field1".to_string()],
+                )
+                .await
+            })
+        })
+        .await;
+        match frame {
+            BytesFrame::Array(items) => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0], BytesFrame::Integer(-2));
+            }
+            other => panic!("Expected array, got {:?}", other),
+        }
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hget(&mut stream, &state, "ns".to_string(), "field1".to_string()).await
+            })
+        })
+        .await;
+        assert_null(frame);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn hexpire_miss_does_not_create_namespace_table() {
+        let ctx = TestContext::new(false).await;
+
+        let namespace = "ghost_ns";
+        let table_name = format!("blobs_{}", namespace);
+        let shard_index = ctx.state.get_shard("field1");
+        let pool = &ctx.state.db_pools[shard_index];
+
+        let before = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(1) FROM sqlite_master WHERE type = 'table' AND name = ?",
+        )
+        .bind(&table_name)
+        .fetch_one(pool)
+        .await
+        .expect("failed to check table existence before HEXPIRE");
+        assert_eq!(before, 0);
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hexpire(
+                    &mut stream,
+                    &state,
+                    namespace.to_string(),
+                    60,
+                    None,
+                    vec!["field1".to_string()],
+                )
+                .await
+            })
+        })
+        .await;
+        match frame {
+            BytesFrame::Array(items) => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0], BytesFrame::Integer(-2));
+            }
+            other => panic!("Expected array, got {:?}", other),
+        }
+
+        let after = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(1) FROM sqlite_master WHERE type = 'table' AND name = ?",
+        )
+        .bind(&table_name)
+        .fetch_one(pool)
+        .await
+        .expect("failed to check table existence after HEXPIRE");
+        assert_eq!(after, 0);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn hexpireat_sets_absolute_expiration() {
+        let ctx = TestContext::new(false).await;
+
+        // Seed a field
+        respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hset(
+                    &mut stream,
+                    &state,
+                    "ns".to_string(),
+                    "field1".to_string(),
+                    Bytes::from_static(b"val1"),
+                )
+                .await
+            })
+        })
+        .await;
+
+        // Set absolute expiration far in the future
+        let future_ts = chrono::Utc::now().timestamp() + 3600;
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hexpireat(
+                    &mut stream,
+                    &state,
+                    "ns".to_string(),
+                    future_ts,
+                    None,
+                    vec!["field1".to_string(), "nonexistent".to_string()],
+                )
+                .await
+            })
+        })
+        .await;
+
+        match frame {
+            BytesFrame::Array(items) => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0], BytesFrame::Integer(1)); // field1 set
+                assert_eq!(items[1], BytesFrame::Integer(-2)); // nonexistent
+            }
+            other => panic!("Expected array, got {:?}", other),
+        }
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn hexpireat_past_timestamp_deletes_field() {
+        let ctx = TestContext::new(false).await;
+
+        // Seed a field
+        respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hset(
+                    &mut stream,
+                    &state,
+                    "ns".to_string(),
+                    "field1".to_string(),
+                    Bytes::from_static(b"val1"),
+                )
+                .await
+            })
+        })
+        .await;
+
+        // Set expiration to a past timestamp -> should delete
+        let past_ts = chrono::Utc::now().timestamp() - 100;
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hexpireat(
+                    &mut stream,
+                    &state,
+                    "ns".to_string(),
+                    past_ts,
+                    None,
+                    vec!["field1".to_string()],
+                )
+                .await
+            })
+        })
+        .await;
+
+        match frame {
+            BytesFrame::Array(items) => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0], BytesFrame::Integer(2)); // deleted
+            }
+            other => panic!("Expected array, got {:?}", other),
+        }
+
+        // Confirm field is gone
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hget(&mut stream, &state, "ns".to_string(), "field1".to_string()).await
+            })
+        })
+        .await;
+        assert_null(frame);
 
         ctx.shutdown().await;
     }
