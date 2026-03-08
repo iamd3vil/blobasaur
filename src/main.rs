@@ -812,7 +812,7 @@ async fn run_server(config_path: &str) -> Result<()> {
 
     // Spawn shard writer tasks using the receivers populated by AppState::new
     for (i, receiver) in shard_receivers.into_iter().enumerate() {
-        let pool = shared_state.db_pools[i].clone();
+        let pool = shared_state.write_db_pools[i].clone();
         let batch_size = cfg.batch_size.unwrap_or(1);
         let batch_timeout_ms = cfg.batch_timeout_ms.unwrap_or(0);
         let inflight_cache = shared_state.inflight_cache.clone();

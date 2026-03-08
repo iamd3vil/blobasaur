@@ -184,6 +184,7 @@ impl Cfg {
         let mmap_per_shard_mb = cfg.sqlite_mmap_per_shard_mb();
         let mmap_per_connection_mb = cfg.sqlite_mmap_per_connection_mb();
         let pool_max_connections = cfg.sqlite_pool_max_connections();
+        let write_pool_max_connections = cfg.sqlite_write_pool_max_connections();
         let auto_upgrade_legacy_auto_vacuum = cfg.sqlite_auto_upgrade_legacy_auto_vacuum();
         let auto_upgrade_legacy_auto_vacuum_concurrency =
             cfg.sqlite_auto_upgrade_legacy_auto_vacuum_concurrency();
@@ -203,7 +204,10 @@ impl Cfg {
         } else {
             println!("  mmap_size: disabled");
         }
-        println!("  pool_max_connections: {}", pool_max_connections);
+        println!(
+            "  pool_max_connections: {} read + {} dedicated writer",
+            pool_max_connections, write_pool_max_connections
+        );
         println!(
             "  auto_upgrade_legacy_auto_vacuum: {}",
             auto_upgrade_legacy_auto_vacuum
@@ -258,7 +262,7 @@ impl Cfg {
         }
 
         let shards = self.num_shards.max(1) as i64;
-        let connections = self.sqlite_pool_max_connections().max(1) as i64;
+        let connections = self.sqlite_total_pool_connections_per_shard().max(1) as i64;
         let divisor = shards.saturating_mul(connections);
 
         let per_connection = (total as i64) / divisor;
@@ -307,7 +311,7 @@ impl Cfg {
         }
 
         let shards = self.num_shards.max(1) as u64;
-        let connections = self.sqlite_pool_max_connections().max(1) as u64;
+        let connections = self.sqlite_total_pool_connections_per_shard().max(1) as u64;
         let divisor = shards.saturating_mul(connections);
 
         if divisor == 0 {
@@ -340,6 +344,18 @@ impl Cfg {
             0 => 1,
             value => value,
         }
+    }
+
+    /// Dedicated writer pool size per shard.
+    pub fn sqlite_write_pool_max_connections(&self) -> u32 {
+        1
+    }
+
+    /// Total SQLite connections per shard across read and dedicated writer pools.
+    pub fn sqlite_total_pool_connections_per_shard(&self) -> u32 {
+        self.sqlite_pool_max_connections()
+            .saturating_add(self.sqlite_write_pool_max_connections())
+            .max(1)
     }
 
     /// Whether startup auto-upgrades legacy shard DBs to INCREMENTAL auto_vacuum.
