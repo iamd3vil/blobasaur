@@ -24,6 +24,7 @@ pub struct AppState {
     pub cfg: Cfg,
     pub shard_senders: Vec<mpsc::Sender<ShardWriteOperation>>,
     pub db_pools: Vec<SqlitePool>,
+    pub write_db_pools: Vec<SqlitePool>,
     /// Cache for inflight write operations to prevent race conditions in async mode.
     /// When async_write=true, SET operations return OK immediately but the actual
     /// database write happens asynchronously. This cache stores the key-value pairs
@@ -71,45 +72,21 @@ impl AppState {
             cfg.sqlite_auto_upgrade_legacy_auto_vacuum_concurrency();
 
         let mut db_pools_futures = vec![];
+        let mut write_db_pools_futures = vec![];
         let pool_max_connections = cfg.sqlite_pool_max_connections();
+        let write_pool_max_connections = cfg.sqlite_write_pool_max_connections();
         for i in 0..cfg.num_shards {
-            let data_dir = cfg.data_dir.clone();
-            let db_path = format!("{}/shard_{}.db", data_dir, i);
-
-            // Get SQLite configuration with defaults
-            let cache_size_mb = cfg.sqlite_cache_size_per_connection_mb();
-            let busy_timeout_ms = cfg.sqlite_busy_timeout_ms();
-            let synchronous = cfg.sqlite_synchronous();
-            let mmap_size = cfg.sqlite_mmap_per_connection_bytes();
-
-            let mut connect_options =
-                SqliteConnectOptions::from_str(&format!("sqlite:{}", db_path))
-                    .expect(&format!(
-                        "Failed to parse connection string for shard {}",
-                        i
-                    ))
-                    .create_if_missing(true)
-                    .journal_mode(SqliteJournalMode::Wal)
-                    .busy_timeout(std::time::Duration::from_millis(busy_timeout_ms));
-
-            // Configure SQLite PRAGMAs for optimal server performance
-            connect_options = connect_options
-                .pragma("auto_vacuum", "INCREMENTAL")
-                .pragma("synchronous", synchronous.as_str())
-                .pragma("cache_size", format!("-{}", cache_size_mb * 1024)) // Negative means KiB
-                .pragma("temp_store", "MEMORY")
-                .pragma("foreign_keys", "true");
-
-            // Enable memory-mapped I/O if configured
-            if mmap_size > 0 {
-                connect_options = connect_options.pragma("mmap_size", mmap_size.to_string());
-            }
-
             db_pools_futures.push(
                 SqlitePoolOptions::new()
                     .max_connections(pool_max_connections)
-                    .connect_with(connect_options),
-            )
+                    .connect_with(build_sqlite_connect_options(&cfg, i)),
+            );
+
+            write_db_pools_futures.push(
+                SqlitePoolOptions::new()
+                    .max_connections(write_pool_max_connections)
+                    .connect_with(build_sqlite_connect_options(&cfg, i)),
+            );
         }
 
         let db_pool_results: Vec<Result<SqlitePool, sqlx::Error>> =
@@ -119,6 +96,20 @@ impl AppState {
             .enumerate()
             .map(|(i, res)| {
                 res.unwrap_or_else(|e| panic!("Failed to connect to shard {} DB: {}", i, e))
+            })
+            .collect();
+        let write_db_pool_results: Vec<Result<SqlitePool, sqlx::Error>> =
+            join_all(write_db_pools_futures).await;
+        let write_db_pools: Vec<SqlitePool> = write_db_pool_results
+            .into_iter()
+            .enumerate()
+            .map(|(i, res)| {
+                res.unwrap_or_else(|e| {
+                    panic!(
+                        "Failed to connect to shard {} dedicated writer DB: {}",
+                        i, e
+                    )
+                })
             })
             .collect();
 
@@ -204,6 +195,7 @@ impl AppState {
             cfg,
             shard_senders: shard_senders_vec,
             db_pools,
+            write_db_pools,
             inflight_cache,
             inflight_hcache,
             cluster_manager,
@@ -222,6 +214,35 @@ impl AppState {
     pub fn namespaced_key(&self, namespace: &str, key: &str) -> String {
         format!("{}:{}", namespace, key)
     }
+}
+
+fn build_sqlite_connect_options(cfg: &Cfg, shard_id: usize) -> SqliteConnectOptions {
+    let db_path = format!("{}/shard_{}.db", cfg.data_dir, shard_id);
+
+    // Get SQLite configuration with defaults
+    let cache_size_mb = cfg.sqlite_cache_size_per_connection_mb();
+    let busy_timeout_ms = cfg.sqlite_busy_timeout_ms();
+    let synchronous = cfg.sqlite_synchronous();
+    let mmap_size = cfg.sqlite_mmap_per_connection_bytes();
+
+    let mut connect_options = SqliteConnectOptions::from_str(&format!("sqlite:{}", db_path))
+        .unwrap_or_else(|_| panic!("Failed to parse connection string for shard {}", shard_id))
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(std::time::Duration::from_millis(busy_timeout_ms));
+
+    connect_options = connect_options
+        .pragma("auto_vacuum", "INCREMENTAL")
+        .pragma("synchronous", synchronous.as_str())
+        .pragma("cache_size", format!("-{}", cache_size_mb * 1024))
+        .pragma("temp_store", "MEMORY")
+        .pragma("foreign_keys", "true");
+
+    if mmap_size > 0 {
+        connect_options = connect_options.pragma("mmap_size", mmap_size.to_string());
+    }
+
+    connect_options
 }
 
 const SQLITE_AUTO_VACUUM_NONE: i64 = 0;

@@ -521,7 +521,7 @@ async fn handle_del_multiple(
         }
 
         let shard_index = state.get_shard(&key);
-        let pool = &state.db_pools[shard_index];
+        let pool = &state.write_db_pools[shard_index];
 
         // Check if key exists first
         let exists = sqlx::query("SELECT 1 FROM blobs WHERE key = ?")
@@ -870,7 +870,7 @@ async fn handle_hset(
     }
 
     let shard_index = state.get_shard(&key);
-    let pool = &state.db_pools[shard_index];
+    let pool = &state.write_db_pools[shard_index];
     let table_name = format!("blobs_{}", namespace);
 
     let table_exists = match hash_table_exists(pool, &table_name).await {
@@ -1028,7 +1028,7 @@ async fn handle_hsetex(
 
         let shard_index = state.get_shard(&field_key);
         let sender = &state.shard_senders[shard_index];
-        let pool = &state.db_pools[shard_index];
+        let pool = &state.write_db_pools[shard_index];
         let table_name = format!("blobs_{}", namespace);
 
         let table_exists = match hash_table_exists(pool, &table_name).await {
@@ -1201,7 +1201,7 @@ async fn handle_hdel(
     }
 
     let shard_index = state.get_shard(&key);
-    let pool = &state.db_pools[shard_index];
+    let pool = &state.write_db_pools[shard_index];
     let table_name = format!("blobs_{}", namespace);
 
     // First check if key exists
@@ -1984,10 +1984,12 @@ async fn handle_blobasaur_vacuum(
 mod tests {
     use super::*;
     use crate::cluster::ClusterManager;
-    use crate::{config::Cfg, shard_manager};
+    use crate::config::{Cfg, SqliteConfig};
+    use crate::shard_manager::{self, ShardWriteOperation};
     use futures::future::BoxFuture;
     use tempfile::TempDir;
     use tokio::net::{TcpListener, TcpStream};
+    use tokio::time::{Duration, timeout};
 
     struct TestContext {
         state: Arc<AppState>,
@@ -2015,14 +2017,19 @@ mod tests {
                 sqlite: None,
             };
 
-            let mut receivers = Vec::new();
-            let state = Arc::new(AppState::new(cfg.clone(), &mut receivers).await.unwrap());
+            Self::from_cfg(temp_dir, cfg).await
+        }
 
+        async fn from_cfg(temp_dir: TempDir, cfg: Cfg) -> Self {
             let batch_size = cfg.batch_size.unwrap_or(1);
             let batch_timeout = cfg.batch_timeout_ms.unwrap_or(0);
+
+            let mut receivers = Vec::new();
+            let state = Arc::new(AppState::new(cfg, &mut receivers).await.unwrap());
+
             let mut writer_handles = Vec::new();
             for (i, receiver) in receivers.into_iter().enumerate() {
-                let pool = state.db_pools[i].clone();
+                let pool = state.write_db_pools[i].clone();
                 let inflight_cache = state.inflight_cache.clone();
                 let inflight_hcache = state.inflight_hcache.clone();
                 let metrics = state.metrics.clone();
@@ -2055,6 +2062,29 @@ mod tests {
             for handle in writer_handles {
                 let _ = handle.await;
             }
+        }
+    }
+
+    fn single_read_connection_cfg(temp_dir: &TempDir, async_write: bool) -> Cfg {
+        Cfg {
+            data_dir: temp_dir.path().to_string_lossy().into_owned(),
+            num_shards: 1,
+            storage_compression: None,
+            async_write: Some(async_write),
+            batch_size: Some(1),
+            batch_timeout_ms: Some(0),
+            addr: None,
+            cluster: None,
+            metrics: None,
+            sqlite: Some(SqliteConfig {
+                cache_size_mb: None,
+                busy_timeout_ms: Some(250),
+                synchronous: None,
+                mmap_size: None,
+                max_connections: Some(1),
+                auto_upgrade_legacy_auto_vacuum: None,
+                auto_upgrade_legacy_auto_vacuum_concurrency: None,
+            }),
         }
     }
 
@@ -2422,6 +2452,229 @@ mod tests {
         })
         .await;
         assert_null(frame);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sync_write_completes_while_read_pool_connection_is_occupied() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let cfg = single_read_connection_cfg(&temp_dir, false);
+        let ctx = TestContext::from_cfg(temp_dir, cfg).await;
+
+        let read_conn = ctx.state.db_pools[0]
+            .acquire()
+            .await
+            .expect("occupy read pool connection");
+
+        let (responder, response_rx) = tokio::sync::oneshot::channel();
+        ctx.state.shard_senders[0]
+            .send(ShardWriteOperation::Set {
+                key: "dedicated-writer".to_string(),
+                data: Bytes::from_static(b"value"),
+                expires_at: None,
+                responder,
+            })
+            .await
+            .expect("queue write");
+
+        let write_result = timeout(Duration::from_secs(1), response_rx)
+            .await
+            .expect("write should not be blocked by a busy read pool")
+            .expect("writer task dropped response channel");
+        assert!(write_result.is_ok(), "writer task should persist the value");
+
+        drop(read_conn);
+
+        let persisted = sqlx::query_scalar::<_, Vec<u8>>("SELECT data FROM blobs WHERE key = ?")
+            .bind("dedicated-writer")
+            .fetch_one(&ctx.state.db_pools[0])
+            .await
+            .expect("read back persisted value");
+        assert_eq!(persisted, b"value");
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn del_completes_while_read_pool_connection_is_occupied() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let cfg = single_read_connection_cfg(&temp_dir, false);
+        let ctx = TestContext::from_cfg(temp_dir, cfg).await;
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_set(
+                    &mut stream,
+                    &state,
+                    "delete-me".to_string(),
+                    Bytes::from_static(b"value"),
+                    None,
+                )
+                .await
+            })
+        })
+        .await;
+        assert_simple_string(frame, "OK");
+
+        let read_conn = ctx.state.db_pools[0]
+            .acquire()
+            .await
+            .expect("occupy read pool connection");
+
+        let frame = timeout(
+            Duration::from_secs(1),
+            respond_with(&ctx, |state, stream| {
+                Box::pin(async move {
+                    let mut stream = stream;
+                    handle_del_multiple(&mut stream, &state, vec!["delete-me".to_string()]).await
+                })
+            }),
+        )
+        .await
+        .expect("DEL should not block on the read pool");
+        assert_integer_response(frame, 1);
+
+        drop(read_conn);
+
+        let remaining = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM blobs WHERE key = ?")
+            .bind("delete-me")
+            .fetch_one(&ctx.state.db_pools[0])
+            .await
+            .expect("check deleted row");
+        assert_eq!(remaining, 0);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn hdel_completes_while_read_pool_connection_is_occupied() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let cfg = single_read_connection_cfg(&temp_dir, false);
+        let ctx = TestContext::from_cfg(temp_dir, cfg).await;
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hset(
+                    &mut stream,
+                    &state,
+                    "users".to_string(),
+                    "alice".to_string(),
+                    Bytes::from_static(b"value"),
+                )
+                .await
+            })
+        })
+        .await;
+        assert_integer_response(frame, 1);
+
+        let read_conn = ctx.state.db_pools[0]
+            .acquire()
+            .await
+            .expect("occupy read pool connection");
+
+        let frame = timeout(
+            Duration::from_secs(1),
+            respond_with(&ctx, |state, stream| {
+                Box::pin(async move {
+                    let mut stream = stream;
+                    handle_hdel(
+                        &mut stream,
+                        &state,
+                        "users".to_string(),
+                        "alice".to_string(),
+                    )
+                    .await
+                })
+            }),
+        )
+        .await
+        .expect("HDEL should not block on the read pool");
+        assert_integer_response(frame, 1);
+
+        drop(read_conn);
+
+        let remaining =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM blobs_users WHERE key = ?")
+                .bind("alice")
+                .fetch_one(&ctx.state.db_pools[0])
+                .await
+                .expect("check deleted hash field");
+        assert_eq!(remaining, 0);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn hset_and_hsetex_complete_while_read_pool_connection_is_occupied() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let cfg = single_read_connection_cfg(&temp_dir, false);
+        let ctx = TestContext::from_cfg(temp_dir, cfg).await;
+
+        let read_conn = ctx.state.db_pools[0]
+            .acquire()
+            .await
+            .expect("occupy read pool connection");
+
+        let frame = timeout(
+            Duration::from_secs(1),
+            respond_with(&ctx, |state, stream| {
+                Box::pin(async move {
+                    let mut stream = stream;
+                    handle_hset(
+                        &mut stream,
+                        &state,
+                        "users".to_string(),
+                        "alice".to_string(),
+                        Bytes::from_static(b"first"),
+                    )
+                    .await
+                })
+            }),
+        )
+        .await
+        .expect("HSET should not block on the read pool");
+        assert_integer_response(frame, 1);
+
+        let frame = timeout(
+            Duration::from_secs(1),
+            respond_with(&ctx, |state, stream| {
+                Box::pin(async move {
+                    let mut stream = stream;
+                    handle_hsetex(
+                        &mut stream,
+                        &state,
+                        "users".to_string(),
+                        true,
+                        false,
+                        None,
+                        vec![("bob".to_string(), Bytes::from_static(b"second"))],
+                    )
+                    .await
+                })
+            }),
+        )
+        .await
+        .expect("HSETEX should not block on the read pool");
+        assert_integer_response(frame, 1);
+
+        drop(read_conn);
+
+        let alice = sqlx::query_scalar::<_, Vec<u8>>("SELECT data FROM blobs_users WHERE key = ?")
+            .bind("alice")
+            .fetch_one(&ctx.state.db_pools[0])
+            .await
+            .expect("read back alice");
+        assert_eq!(alice, b"first");
+
+        let bob = sqlx::query_scalar::<_, Vec<u8>>("SELECT data FROM blobs_users WHERE key = ?")
+            .bind("bob")
+            .fetch_one(&ctx.state.db_pools[0])
+            .await
+            .expect("read back bob");
+        assert_eq!(bob, b"second");
 
         ctx.shutdown().await;
     }
