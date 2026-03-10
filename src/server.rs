@@ -324,6 +324,12 @@ async fn handle_redis_command_inner(
         } => {
             handle_blobasaur_vacuum(stream, state, target, mode, budget_mb, dry_run).await?;
         }
+        RedisCommand::Hello { protover } => {
+            handle_hello(stream, protover).await?;
+        }
+        RedisCommand::Client { subcommand } => {
+            handle_client(stream, &subcommand).await?;
+        }
         RedisCommand::Quit => {
             let response = BytesFrame::SimpleString("OK".into());
             stream.write_all(&serialize_frame(&response)).await?;
@@ -715,6 +721,54 @@ async fn handle_command(stream: &mut TcpStream) -> Result<(), Box<dyn std::error
     // Return a minimal COMMAND response - just an empty array for now
     // A full implementation would return detailed command information
     let response = BytesFrame::Array(vec![]);
+    stream.write_all(&serialize_frame(&response)).await?;
+    Ok(())
+}
+
+async fn handle_hello(
+    stream: &mut TcpStream,
+    protover: Option<u64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Only RESP2 is supported. If the client requests a different protocol
+    // version, return NOPROTO so it can fall back to RESP2.
+    if let Some(ver) = protover {
+        if ver != 2 {
+            let response = BytesFrame::Error(
+                format!(
+                    "NOPROTO unsupported protocol version {}, only RESP2 is supported",
+                    ver
+                )
+                .into(),
+            );
+            stream.write_all(&serialize_frame(&response)).await?;
+            return Ok(());
+        }
+    }
+
+    // Return server info as a RESP2 flat array of key-value pairs
+    let response = BytesFrame::Array(vec![
+        BytesFrame::BulkString("server".into()),
+        BytesFrame::BulkString("blobasaur".into()),
+        BytesFrame::BulkString("version".into()),
+        BytesFrame::BulkString(env!("CARGO_PKG_VERSION").into()),
+        BytesFrame::BulkString("proto".into()),
+        BytesFrame::Integer(2),
+        BytesFrame::BulkString("mode".into()),
+        BytesFrame::BulkString("standalone".into()),
+        BytesFrame::BulkString("role".into()),
+        BytesFrame::BulkString("master".into()),
+    ]);
+    stream.write_all(&serialize_frame(&response)).await?;
+    Ok(())
+}
+
+async fn handle_client(
+    stream: &mut TcpStream,
+    _subcommand: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Handle CLIENT subcommands (SETNAME, GETNAME, etc.)
+    // Redis clients send CLIENT commands on connect for connection management
+    let response = BytesFrame::SimpleString("OK".into());
     stream.write_all(&serialize_frame(&response)).await?;
     Ok(())
 }
