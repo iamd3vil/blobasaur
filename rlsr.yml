@@ -1,0 +1,18 @@
+releases:
+  - name: "Release to github"
+    dist_folder: "./dist"
+    targets:
+      github:
+        owner: "iamd3vil"
+        repo: "blobasaur"
+    checksum:
+      algorithm: "sha256"
+    additional_files:
+      - "README.md"
+      - "LICENSE"
+    builds:
+      - command: "cargo build --locked --release --target x86_64-unknown-linux-musl"
+        artifact: "target/x86_64-unknown-linux-musl/release/blobasaur"
+        bin_name: "blobasaur"
+        archive_name: "blobasaur-Linux-musl-x86_64"
+        name: "Linux build"

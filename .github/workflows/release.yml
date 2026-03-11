@@ -1,31 +1,34 @@
+name: Release
+
 on:
   push:
-    tags: ["v*"]
+    tags:
+      - "v*"
+
 jobs:
   release:
-    name: Release - ${{ matrix.platform.os-name }}
-    strategy:
-      matrix:
-        platform:
-          - os-name: Linux-x86_64
-            runs-on: ubuntu-24.04
-            target: x86_64-unknown-linux-musl
-    runs-on: ${{ matrix.platform.runs-on }}
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Build binary
-        uses: houseabsolute/actions-rust-cross@v1
         with:
-          command: build
-          target: ${{ matrix.platform.target }}
-          args: "--locked --release"
-          strip: true
-      - name: Publish artifacts and release
-        uses: houseabsolute/actions-rust-release@v0
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          executable-name: blobasaur
-          changes-file: ""
-          target: ${{ matrix.platform.target }}
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Release
+        uses: iamd3vil/rlsr/.github/actions/rlsr@v0.8.0
+        with:
+          config: rlsr.yml
+          publish: true
+          rm_dist: true
+          github_token: ${{ secrets.GITHUB_TOKEN }}
