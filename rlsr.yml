@@ -15,4 +15,10 @@ releases:
         artifact: "target/x86_64-unknown-linux-musl/release/blobasaur"
         bin_name: "blobasaur"
         archive_name: "blobasaur-Linux-musl-x86_64"
+        archive_format: "tar_gz"
         name: "Linux build"
+changelog:
+  format: "github"
+  exclude:
+    - "^ci(\\(|:)"
+    - "^chore(\\(|:)"
