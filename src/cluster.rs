@@ -236,16 +236,6 @@ impl ClusterManager {
                 let dead_nodes: Vec<_> =
                     chitchat_guard.dead_nodes().map(|id| &id.node_id).collect();
 
-                info!(
-                    "Gossip check for {}: {} total nodes, {} live nodes: {:?}, {} dead nodes: {:?}",
-                    self.node_id,
-                    total_nodes,
-                    live_nodes.len(),
-                    live_nodes,
-                    dead_nodes.len(),
-                    dead_nodes
-                );
-
                 debug!(
                     "Gossip update: {} total nodes, {} live nodes: {:?}, {} dead nodes: {:?}",
                     total_nodes,
@@ -274,12 +264,6 @@ impl ClusterManager {
                                         slots: gossip_data.slots.into_iter().collect(),
                                         _state: gossip_data.state,
                                     };
-                                    info!(
-                                        "Discovered cluster node: {} at {} with {} slots",
-                                        cluster_node.id,
-                                        cluster_node.addr,
-                                        cluster_node.slots.len()
-                                    );
                                     nodes_map.insert(chitchat_id.node_id.clone(), cluster_node);
                                 } else {
                                     warn!(
@@ -302,22 +286,64 @@ impl ClusterManager {
 
                 drop(chitchat_guard);
 
-                // Update the nodes map and log changes
+                // Update the nodes map and log topology changes
                 let mut nodes = self.nodes.write().await;
-                let prev_count = nodes.len();
-                *nodes = nodes_map;
-                let new_count = nodes.len();
 
-                if prev_count != new_count {
+                // Diff the new node set against the current one to detect
+                // added, removed, and updated (addr/slots changed) nodes
+                let mut added = Vec::new();
+                let mut updated = Vec::new();
+                let mut removed = Vec::new();
+
+                for (id, node) in &nodes_map {
+                    match nodes.get(id) {
+                        None => added.push((node.id.clone(), node.addr, node.slots.len())),
+                        Some(old) if old.addr != node.addr || old.slots != node.slots => {
+                            updated.push((
+                                node.id.clone(),
+                                old.addr,
+                                node.addr,
+                                old.slots.len(),
+                                node.slots.len(),
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                for id in nodes.keys() {
+                    if !nodes_map.contains_key(id) {
+                        removed.push(id.clone());
+                    }
+                }
+
+                let topology_stable = added.is_empty()
+                    && updated.is_empty()
+                    && removed.is_empty()
+                    && !nodes_map.is_empty();
+                let node_count = nodes_map.len();
+                *nodes = nodes_map;
+                drop(nodes);
+
+                for (id, addr, slot_count) in added {
                     info!(
-                        "Cluster membership changed for {}: {} -> {} nodes",
-                        self.node_id, prev_count, new_count
+                        "Discovered cluster node: {} at {} with {} slots",
+                        id, addr, slot_count
                     );
-                    debug!("Cluster nodes: {} total", new_count);
-                } else if new_count > 0 {
+                }
+                for (id, old_addr, new_addr, old_slot_count, new_slot_count) in updated {
+                    info!(
+                        "Cluster node updated: {} (addr {} -> {}, slots {} -> {})",
+                        id, old_addr, new_addr, old_slot_count, new_slot_count
+                    );
+                }
+                for id in removed {
+                    info!("Cluster node left the cluster: {}", id);
+                }
+
+                if topology_stable {
                     debug!(
-                        "Cluster membership stable for {}: {} nodes",
-                        self.node_id, new_count
+                        "Cluster topology stable for {}: {} nodes",
+                        self.node_id, node_count
                     );
                 }
             } else {
