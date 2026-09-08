@@ -38,8 +38,7 @@ For a 3-node cluster, distribute the 16384 slots using ranges:
 # Basic server configuration
 data_dir = "data"
 num_shards = 4
-storage_compression = true
-output_compression = false
+storage_compression = { enabled = true, algorithm = "zstd", level = 3 }
 async_write = true
 batch_size = 100
 batch_timeout_ms = 10
@@ -65,8 +64,7 @@ end = 5460
 # Basic server configuration
 data_dir = "data"
 num_shards = 4
-storage_compression = true
-output_compression = false
+storage_compression = { enabled = true, algorithm = "zstd", level = 3 }
 async_write = true
 batch_size = 100
 batch_timeout_ms = 10
@@ -92,8 +90,7 @@ end = 10922
 # Basic server configuration
 data_dir = "data"
 num_shards = 4
-storage_compression = true
-output_compression = false
+storage_compression = { enabled = true, algorithm = "zstd", level = 3 }
 async_write = true
 batch_size = 100
 batch_timeout_ms = 10
