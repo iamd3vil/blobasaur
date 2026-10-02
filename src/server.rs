@@ -529,13 +529,21 @@ async fn handle_del_multiple(
         let shard_index = state.get_shard(&key);
         let pool = &state.write_db_pools[shard_index];
 
-        // Check if key exists first
-        let exists = sqlx::query("SELECT 1 FROM blobs WHERE key = ?")
+        // Check if key exists first. A failed check (e.g. the writer connection is
+        // held by a long VACUUM) must not be reported as "key not found".
+        let exists = match sqlx::query("SELECT 1 FROM blobs WHERE key = ?")
             .bind(&key)
             .fetch_optional(pool)
             .await
-            .map(|row| row.is_some())
-            .unwrap_or(false);
+        {
+            Ok(row) => row.is_some(),
+            Err(e) => {
+                tracing::error!("Failed to check DEL existence for key {}: {}", key, e);
+                let response = BytesFrame::Error("ERR database error".into());
+                stream.write_all(&serialize_frame(&response)).await?;
+                return Ok(());
+            }
+        };
 
         if !exists {
             continue; // Key doesn't exist, skip
@@ -1258,14 +1266,35 @@ async fn handle_hdel(
     let pool = &state.write_db_pools[shard_index];
     let table_name = format!("blobs_{}", namespace);
 
-    // First check if key exists
-    let query = format!("SELECT 1 FROM {} WHERE key = ?", table_name);
-    let exists = sqlx::query(&query)
-        .bind(&key)
-        .fetch_optional(pool)
-        .await
-        .map(|row| row.is_some())
-        .unwrap_or(false);
+    // First check if key exists. A missing namespace table is a genuine miss;
+    // any other failure must surface instead of being reported as "not found".
+    let table_exists = match hash_table_exists(pool, &table_name).await {
+        Ok(exists) => exists,
+        Err(e) => {
+            tracing::error!(
+                "Failed to check table existence for namespace {}: {}",
+                table_name,
+                e
+            );
+            let response = BytesFrame::Error("ERR database error".into());
+            stream.write_all(&serialize_frame(&response)).await?;
+            return Ok(());
+        }
+    };
+    let exists = match hash_field_exists(pool, &table_name, &key, table_exists).await {
+        Ok(exists) => exists,
+        Err(e) => {
+            tracing::error!(
+                "Failed to check HDEL existence for namespace {} key {}: {}",
+                namespace,
+                key,
+                e
+            );
+            let response = BytesFrame::Error("ERR database error".into());
+            stream.write_all(&serialize_frame(&response)).await?;
+            return Ok(());
+        }
+    };
 
     if !exists {
         // Redis HDEL returns the number of keys deleted
@@ -2729,6 +2758,33 @@ mod tests {
             .await
             .expect("read back bob");
         assert_eq!(bob, b"second");
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn del_and_hdel_return_error_when_existence_check_fails() {
+        let ctx = TestContext::new(false).await;
+        // Simulates the writer connection being unavailable (e.g. held by a long VACUUM).
+        ctx.state.write_db_pools[0].close().await;
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_del_multiple(&mut stream, &state, vec!["some-key".to_string()]).await
+            })
+        })
+        .await;
+        assert_error_contains(frame, "database error");
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hdel(&mut stream, &state, "ns".to_string(), "field".to_string()).await
+            })
+        })
+        .await;
+        assert_error_contains(frame, "database error");
 
         ctx.shutdown().await;
     }
