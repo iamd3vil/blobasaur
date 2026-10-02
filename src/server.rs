@@ -7,6 +7,7 @@ use crate::redis::{
 };
 use crate::shard_manager::{ShardWriteOperation, VacuumMode, VacuumResult, VacuumStats};
 use bytes::Bytes;
+use futures::FutureExt;
 use redis_protocol::resp2::types::BytesFrame;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2011,6 +2012,15 @@ async fn run_shard_vacuum(
     }
 }
 
+/// Non-blocking check for a closed peer. Pipelined bytes count as still connected.
+fn client_disconnected(stream: &TcpStream) -> bool {
+    let mut buf = [0_u8; 1];
+    match stream.peek(&mut buf).now_or_never() {
+        Some(Ok(0)) | Some(Err(_)) => true,
+        Some(Ok(_)) | None => false,
+    }
+}
+
 async fn handle_blobasaur_vacuum(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
@@ -2027,6 +2037,17 @@ async fn handle_blobasaur_vacuum(
 
     let mut shard_results = Vec::with_capacity(shard_ids.len());
     for shard_id in shard_ids {
+        // Nobody is waiting for the result (e.g. the CLI hit --timeout-sec), so don't
+        // start more shards; otherwise a retried run queues a second pass behind this one.
+        if client_disconnected(stream) {
+            tracing::warn!(
+                shard_id,
+                completed_shards = shard_results.len(),
+                "Client disconnected during vacuum; skipping remaining shards"
+            );
+            return Ok(());
+        }
+
         let shard_result =
             run_shard_vacuum(state, shard_id, mode_internal, budget_mb, dry_run).await;
 
@@ -2787,6 +2808,21 @@ mod tests {
         assert_error_contains(frame, "database error");
 
         ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn client_disconnected_detects_closed_peer() {
+        let (server, client) = tcp_pair().await;
+        assert!(!client_disconnected(&server));
+
+        drop(client);
+        let detected = timeout(Duration::from_secs(1), async {
+            while !client_disconnected(&server) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(detected.is_ok(), "closed peer should be detected");
     }
 
     #[tokio::test]
