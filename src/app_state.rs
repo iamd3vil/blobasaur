@@ -13,7 +13,10 @@ use tokio::task::JoinSet;
 use crate::compression::{self, Compressor};
 // Import ShardWriteOperation from shard_manager
 use crate::{
-    cluster::ClusterManager, config::Cfg, metrics::Metrics, shard_manager::ShardWriteOperation,
+    cluster::ClusterManager,
+    config::Cfg,
+    metrics::Metrics,
+    shard_manager::{ShardWriteOperation, wal_checkpoint_truncate},
 };
 use bytes::Bytes;
 
@@ -309,17 +312,6 @@ async fn enforce_auto_vacuum_mode(
     );
 
     let upgrade_result = async {
-        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .execute(&mut *conn)
-            .await
-            .map_err(|error| {
-                miette!(
-                    "shard {}: wal_checkpoint(TRUNCATE) failed during auto_vacuum upgrade: {}",
-                    shard_id,
-                    error
-                )
-            })?;
-
         sqlx::query("PRAGMA auto_vacuum = INCREMENTAL")
             .execute(&mut *conn)
             .await
@@ -341,6 +333,16 @@ async fn enforce_auto_vacuum_mode(
                     error
                 )
             })?;
+
+        // The conversion has already succeeded at this point; a busy checkpoint only
+        // delays returning the WAL space, so it shouldn't block startup.
+        if let Err(error) = wal_checkpoint_truncate(&mut *conn).await {
+            tracing::warn!(
+                shard_id,
+                error,
+                "WAL truncate after auto_vacuum upgrade did not complete"
+            );
+        }
 
         let verified_mode = sqlx::query_scalar::<_, i64>("PRAGMA auto_vacuum")
             .fetch_one(&mut *conn)
