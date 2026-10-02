@@ -508,7 +508,7 @@ blobasaur shard vacuum --all-shards --dry-run
 blobasaur shard vacuum --all-shards
 
 # Full vacuum during a maintenance window
-blobasaur shard vacuum --all-shards --mode full --timeout-sec 300
+blobasaur shard vacuum --all-shards --mode full
 ```
 
 Blobasaur also automatically upgrades legacy shard databases to `PRAGMA auto_vacuum = INCREMENTAL` on startup, ensuring new freelist pages are always reclaimable.

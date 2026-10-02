@@ -15,7 +15,7 @@ Reclaims freelist pages **up to a budget**, without rewriting the entire databas
 - Runs `PRAGMA incremental_vacuum(N)` where `N` is derived from `--budget-mb` and the shard's page size.
 - Only reclaims pages already on the freelist — fast and bounded.
 - Does **not** defragment or compact the database.
-- Safe to run during production traffic (though a brief WAL checkpoint is performed first).
+- Safe to run during production traffic (a WAL checkpoint runs afterwards to return the space to disk).
 
 ### Full (`--mode full`)
 
@@ -24,6 +24,7 @@ Rewrites the **entire** database file, reclaiming all freelist pages and defragm
 - Runs `VACUUM`, which rebuilds the database from scratch into a new file.
 - Reclaims **all** unused space, not just up to a budget.
 - Significantly more expensive: requires temporary disk space equal to the database size and holds an exclusive lock.
+- While it runs, the shard's writes are queued and commands that use the shard's writer connection (`DEL`, `HDEL`, `HSET`, ...) may return `ERR database error` once the pool's 30s acquire timeout is exceeded.
 - Best used during maintenance windows or after bulk deletions.
 
 ### Which mode to use?
@@ -72,7 +73,7 @@ blobasaur shard vacuum --all-shards [OPTIONS]
 | `--dry-run` | `false` | Only calculate and report vacuum effects |
 | `--node-concurrency` | `1` | Max parallel node calls |
 | `--shard-concurrency` | `1` | Reserved for future use (currently serial) |
-| `--timeout-sec` | `30` | Per-node network timeout in seconds |
+| `--timeout-sec` | `300` (incremental), `3600` (full) | Per-node timeout in seconds; covers all shards on the node, which run serially |
 
 ### Node Resolution
 
@@ -107,7 +108,7 @@ blobasaur shard vacuum --all-shards --budget-mb 512
 **Full vacuum during a maintenance window:**
 
 ```bash
-blobasaur shard vacuum --all-shards --mode full --timeout-sec 300
+blobasaur shard vacuum --all-shards --mode full
 ```
 
 **Multi-node orchestration:**
@@ -129,7 +130,7 @@ Vacuum orchestration started
   dry_run: true
   node_concurrency: 1
   shard_concurrency: 1
-  timeout_sec: 30
+  timeout_sec: 300
   nodes: 127.0.0.1:6379
 
 Vacuum orchestration report:
@@ -148,7 +149,7 @@ Key fields in the per-shard output:
 | `status` | `ok`, `execution_error`, `cancelled`, or `invalid_shard` |
 | `duration_ms` | Wall-clock time for that shard's vacuum |
 | `incremental_pages_requested` | Pages targeted for reclamation (incremental mode) |
-| `estimated_reclaimed_pages` | Actual (or estimated, in dry-run) pages reclaimed |
+| `estimated_reclaimed_pages` | Drop in `page_count` (in dry-run: estimated from the freelist) |
 | `error` | Error message if status is not `ok` |
 | `execution_errors` | Individual SQLite errors encountered during the operation |
 
@@ -186,14 +187,14 @@ The response is a RESP array containing per-shard results in the same format as 
 For each shard, the vacuum operation performs the following steps:
 
 1. **Collect pre-vacuum stats** — reads `PRAGMA page_size`, `PRAGMA page_count`, and `PRAGMA freelist_count`.
-2. **WAL checkpoint** — runs `PRAGMA wal_checkpoint(TRUNCATE)` to flush the WAL into the main database file.
-3. **Vacuum** (skipped in dry-run):
+2. **Vacuum** (skipped in dry-run):
    - *Incremental:* runs `PRAGMA incremental_vacuum(N)` where `N` = `min(freelist_count, budget_bytes / page_size)`.
-   - *Full:* runs `VACUUM` to rebuild the entire database.
+   - *Full:* runs `VACUUM` to rebuild the entire database. Shard connections use SQLite's default file-backed temp store, so the rebuilt copy goes to a temp file rather than RAM.
+3. **WAL checkpoint** (skipped in dry-run) — runs `PRAGMA wal_checkpoint(TRUNCATE)`. In WAL mode the main DB file only shrinks once the vacuum is checkpointed, and a full `VACUUM` writes a WAL roughly the size of the rebuilt DB. A checkpoint blocked by active readers is reported as a `busy` error.
 4. **Collect post-vacuum stats** — re-reads page/freelist counts.
-5. **Report** — calculates estimated reclaimed pages and bytes.
+5. **Report** — calculates reclaimed pages (from the `page_count` delta) and bytes.
 
-Shards on a given node are processed **serially** (one at a time) to avoid overwhelming disk I/O. Multiple nodes can be vacuumed in parallel using `--node-concurrency`.
+Shards on a given node are processed **serially** (one at a time) to avoid overwhelming disk I/O. Multiple nodes can be vacuumed in parallel using `--node-concurrency`. If the client disconnects (for example, the CLI hits `--timeout-sec`), the node finishes the shard in progress and skips the rest.
 
 ## Startup Auto-Vacuum Upgrade
 
@@ -209,9 +210,9 @@ For each shard database (`shard_0.db` through `shard_{N-1}.db`):
 2. If already `INCREMENTAL` (value `2`), skip — no work needed.
 3. If not `INCREMENTAL` and auto-upgrade is **disabled**, log a warning and continue.
 4. If not `INCREMENTAL` and auto-upgrade is **enabled** (default), run:
-   - `PRAGMA wal_checkpoint(TRUNCATE);`
    - `PRAGMA auto_vacuum = INCREMENTAL;`
    - `VACUUM;`
+   - `PRAGMA wal_checkpoint(TRUNCATE);` (a busy checkpoint is logged as a warning and doesn't fail startup)
 5. Verify the mode is now `INCREMENTAL`.
 6. **Fail fast** if any shard's upgrade fails, to avoid mixed maintenance state.
 
@@ -250,10 +251,10 @@ Run incremental vacuum on a regular schedule (daily or weekly, depending on chur
    ```bash
    blobasaur shard vacuum --all-shards --dry-run
    ```
-2. **Check disk space** — full vacuum needs temporary space equal to the largest shard DB.
-3. **Increase timeout for full vacuum** — large databases can take minutes:
+2. **Check disk space** — full vacuum needs temporary space equal to the largest shard DB. SQLite writes the temp file to `SQLITE_TMPDIR`, then `TMPDIR`, then `/var/tmp`, `/usr/tmp`, `/tmp`. If that resolves to a tmpfs, the copy lands in RAM again, so point `SQLITE_TMPDIR` at a disk-backed directory.
+3. **Size the timeout for full vacuum** — the default is 3600s per node across all of its shards. Raise it for large nodes:
    ```bash
-   blobasaur shard vacuum --all-shards --mode full --timeout-sec 600
+   blobasaur shard vacuum --all-shards --mode full --timeout-sec 7200
    ```
 
 ### Monitoring
