@@ -3,7 +3,7 @@ use crate::redis::protocol::HExpireCondition;
 use bytes::Bytes;
 use chrono::Utc;
 use moka::future::Cache;
-use sqlx::SqlitePool;
+use sqlx::{Sqlite, SqlitePool};
 use std::collections::{HashSet, VecDeque};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, interval, timeout};
@@ -962,6 +962,29 @@ async fn collect_vacuum_stats(pool: &SqlitePool) -> Result<VacuumStats, String> 
     })
 }
 
+/// Runs `PRAGMA wal_checkpoint(TRUNCATE)` and treats an incomplete checkpoint as
+/// an error. SQLite reports a blocked checkpoint as `busy=1` in the result row
+/// rather than as a statement error.
+pub(crate) async fn wal_checkpoint_truncate<'e, E>(executor: E) -> Result<(), String>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    let (busy, log_frames, checkpointed_frames) =
+        sqlx::query_as::<_, (i64, i64, i64)>("PRAGMA wal_checkpoint(TRUNCATE)")
+            .fetch_one(executor)
+            .await
+            .map_err(|e| format!("wal_checkpoint(TRUNCATE) failed: {}", e))?;
+
+    if busy != 0 {
+        return Err(format!(
+            "wal_checkpoint(TRUNCATE) incomplete: database is busy (log={}, checkpointed={})",
+            log_frames, checkpointed_frames
+        ));
+    }
+
+    Ok(())
+}
+
 async fn execute_vacuum(
     shard_id: usize,
     pool: &SqlitePool,
@@ -1001,13 +1024,6 @@ async fn execute_vacuum(
     }
 
     if !dry_run {
-        if let Err(e) = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .execute(pool)
-            .await
-        {
-            errors.push(format!("wal_checkpoint(TRUNCATE) failed: {}", e));
-        }
-
         match mode {
             VacuumMode::Incremental => {
                 if let Some(pages_to_vacuum) = incremental_pages_requested {
@@ -1032,6 +1048,13 @@ async fn execute_vacuum(
                 }
             }
         }
+
+        // In WAL mode the main DB file only shrinks once the vacuum's frames are
+        // checkpointed, and a full VACUUM leaves a WAL roughly the size of the
+        // rebuilt DB. Truncate it so the reclaimed space is returned to disk.
+        if let Err(e) = wal_checkpoint_truncate(pool).await {
+            errors.push(e);
+        }
     }
 
     let after = match collect_vacuum_stats(pool).await {
@@ -1049,11 +1072,14 @@ async fn execute_vacuum(
             (VacuumMode::Full, None) => None,
         }
     } else {
+        // Use the page_count delta: a full VACUUM also reclaims fragmented space
+        // that never appeared on the freelist, and concurrent expiry deletes can
+        // grow the freelist mid-run without changing the file size.
         match (before, after) {
             (Some(before_stats), Some(after_stats)) => Some(
                 before_stats
-                    .freelist_count
-                    .saturating_sub(after_stats.freelist_count),
+                    .page_count
+                    .saturating_sub(after_stats.page_count),
             ),
             _ => None,
         }
@@ -1516,5 +1542,122 @@ mod tests {
             .await
             .expect("writer task did not stop")
             .expect("writer task failed");
+    }
+
+    /// Pool matching production writer settings: WAL, a single connection.
+    async fn create_writer_like_pool(
+        db_path: &std::path::Path,
+        busy_timeout_ms: u64,
+    ) -> SqlitePool {
+        let connect_options =
+            SqliteConnectOptions::from_str(&format!("sqlite:{}", db_path.display()))
+                .expect("failed to parse sqlite connection string")
+                .create_if_missing(true)
+                .journal_mode(SqliteJournalMode::Wal)
+                .busy_timeout(std::time::Duration::from_millis(busy_timeout_ms))
+                .pragma("auto_vacuum", "INCREMENTAL");
+
+        SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(connect_options)
+            .await
+            .expect("failed to create sqlite pool")
+    }
+
+    #[tokio::test]
+    async fn full_vacuum_truncates_wal_and_reports_page_delta() {
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let db_path = temp_dir.path().join("shard_0.db");
+        let pool = create_writer_like_pool(&db_path, 5000).await;
+
+        sqlx::query("CREATE TABLE t (k INTEGER PRIMARY KEY, d BLOB)")
+            .execute(&pool)
+            .await
+            .expect("failed to create table");
+        for k in 0..64_i64 {
+            sqlx::query("INSERT INTO t (k, d) VALUES (?, ?)")
+                .bind(k)
+                .bind(vec![1_u8; 64 * 1024])
+                .execute(&pool)
+                .await
+                .expect("failed to insert row");
+        }
+        sqlx::query("DELETE FROM t WHERE k % 2 = 0")
+            .execute(&pool)
+            .await
+            .expect("failed to delete rows");
+
+        let result = execute_vacuum(0, &pool, VacuumMode::Full, 1, false, &Metrics::new()).await;
+        assert!(
+            result.errors.is_empty(),
+            "unexpected errors: {:?}",
+            result.errors
+        );
+
+        let before = result.before.expect("pre-stats");
+        let after = result.after.expect("post-stats");
+        assert!(
+            after.page_count < before.page_count,
+            "full vacuum should shrink the DB"
+        );
+        assert_eq!(
+            result.estimated_reclaimed_pages,
+            Some(before.page_count - after.page_count)
+        );
+
+        let wal_path = temp_dir.path().join("shard_0.db-wal");
+        let wal_len = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(wal_len, 0, "WAL should be truncated after vacuum");
+    }
+
+    #[tokio::test]
+    async fn wal_checkpoint_truncate_reports_busy_when_reader_holds_snapshot() {
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let db_path = temp_dir.path().join("shard_0.db");
+        let writer = create_writer_like_pool(&db_path, 50).await;
+        let readers = create_writer_like_pool(&db_path, 50).await;
+
+        sqlx::query("CREATE TABLE t (k INTEGER PRIMARY KEY)")
+            .execute(&writer)
+            .await
+            .expect("failed to create table");
+        sqlx::query("INSERT INTO t (k) VALUES (1)")
+            .execute(&writer)
+            .await
+            .expect("failed to insert row");
+
+        let mut reader = readers.acquire().await.expect("failed to acquire reader");
+        sqlx::query("BEGIN")
+            .execute(&mut *reader)
+            .await
+            .expect("failed to begin read transaction");
+        sqlx::query("SELECT COUNT(*) FROM t")
+            .execute(&mut *reader)
+            .await
+            .expect("failed to read");
+
+        sqlx::query("INSERT INTO t (k) VALUES (2)")
+            .execute(&writer)
+            .await
+            .expect("failed to insert row");
+
+        let err = wal_checkpoint_truncate(&writer)
+            .await
+            .expect_err("checkpoint should be incomplete while a reader holds a snapshot");
+        assert!(
+            is_sqlite_busy_error(&err),
+            "expected busy error, got: {}",
+            err
+        );
+
+        sqlx::query("COMMIT")
+            .execute(&mut *reader)
+            .await
+            .expect("failed to end read transaction");
+        drop(reader);
+
+        wal_checkpoint_truncate(&writer)
+            .await
+            .expect("checkpoint should complete once the reader is gone");
     }
 }

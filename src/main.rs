@@ -26,7 +26,9 @@ use gumdrop::Options;
 
 const DEFAULT_NODE_CONCURRENCY: usize = 1;
 const DEFAULT_SHARD_CONCURRENCY: usize = 1;
-const DEFAULT_NODE_TIMEOUT_SEC: u64 = 30;
+// Shards are vacuumed serially, so the per-node timeout must cover every shard on the node.
+const DEFAULT_INCREMENTAL_NODE_TIMEOUT_SEC: u64 = 300;
+const DEFAULT_FULL_NODE_TIMEOUT_SEC: u64 = 3600;
 const MAX_ADMIN_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Options, Debug)]
@@ -126,7 +128,10 @@ struct VacuumOptions {
     )]
     shard_concurrency: usize,
 
-    #[options(help = "Per-node timeout in seconds", long = "timeout-sec")]
+    #[options(
+        help = "Per-node timeout in seconds (default: 300 incremental, 3600 full)",
+        long = "timeout-sec"
+    )]
     timeout_sec: Option<u64>,
 }
 
@@ -141,6 +146,13 @@ impl CliVacuumMode {
         match self {
             CliVacuumMode::Incremental => "incremental",
             CliVacuumMode::Full => "full",
+        }
+    }
+
+    fn default_node_timeout_sec(&self) -> u64 {
+        match self {
+            CliVacuumMode::Incremental => DEFAULT_INCREMENTAL_NODE_TIMEOUT_SEC,
+            CliVacuumMode::Full => DEFAULT_FULL_NODE_TIMEOUT_SEC,
         }
     }
 }
@@ -243,7 +255,7 @@ async fn handle_shard_vacuum_command(vacuum_opts: VacuumOptions, config_path: &s
     let shard_concurrency = vacuum_opts.shard_concurrency.max(DEFAULT_SHARD_CONCURRENCY);
     let timeout_sec = vacuum_opts
         .timeout_sec
-        .unwrap_or(DEFAULT_NODE_TIMEOUT_SEC)
+        .unwrap_or(mode.default_node_timeout_sec())
         .max(1);
 
     if shard_concurrency != 1 {

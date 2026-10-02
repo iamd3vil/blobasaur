@@ -13,7 +13,10 @@ use tokio::task::JoinSet;
 use crate::compression::{self, Compressor};
 // Import ShardWriteOperation from shard_manager
 use crate::{
-    cluster::ClusterManager, config::Cfg, metrics::Metrics, shard_manager::ShardWriteOperation,
+    cluster::ClusterManager,
+    config::Cfg,
+    metrics::Metrics,
+    shard_manager::{ShardWriteOperation, wal_checkpoint_truncate},
 };
 use bytes::Bytes;
 
@@ -235,7 +238,6 @@ fn build_sqlite_connect_options(cfg: &Cfg, shard_id: usize) -> SqliteConnectOpti
         .pragma("auto_vacuum", "INCREMENTAL")
         .pragma("synchronous", synchronous.as_str())
         .pragma("cache_size", format!("-{}", cache_size_mb * 1024))
-        .pragma("temp_store", "MEMORY")
         .pragma("foreign_keys", "true");
 
     if mmap_size > 0 {
@@ -310,17 +312,6 @@ async fn enforce_auto_vacuum_mode(
     );
 
     let upgrade_result = async {
-        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .execute(&mut *conn)
-            .await
-            .map_err(|error| {
-                miette!(
-                    "shard {}: wal_checkpoint(TRUNCATE) failed during auto_vacuum upgrade: {}",
-                    shard_id,
-                    error
-                )
-            })?;
-
         sqlx::query("PRAGMA auto_vacuum = INCREMENTAL")
             .execute(&mut *conn)
             .await
@@ -342,6 +333,16 @@ async fn enforce_auto_vacuum_mode(
                     error
                 )
             })?;
+
+        // The conversion has already succeeded at this point; a busy checkpoint only
+        // delays returning the WAL space, so it shouldn't block startup.
+        if let Err(error) = wal_checkpoint_truncate(&mut *conn).await {
+            tracing::warn!(
+                shard_id,
+                error,
+                "WAL truncate after auto_vacuum upgrade did not complete"
+            );
+        }
 
         let verified_mode = sqlx::query_scalar::<_, i64>("PRAGMA auto_vacuum")
             .fetch_one(&mut *conn)
@@ -610,6 +611,18 @@ mod tests {
                 mode, SQLITE_AUTO_VACUUM_INCREMENTAL,
                 "shard {} should use INCREMENTAL auto_vacuum",
                 shard_id
+            );
+        }
+
+        // temp_store=MEMORY would make a full VACUUM build the whole rebuilt DB in RAM.
+        for pool in &app_state.write_db_pools {
+            let temp_store = sqlx::query_scalar::<_, i64>("PRAGMA temp_store")
+                .fetch_one(pool)
+                .await
+                .expect("failed to read temp_store");
+            assert_eq!(
+                temp_store, 0,
+                "writer connections should use the default temp_store"
             );
         }
     }

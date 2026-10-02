@@ -7,6 +7,7 @@ use crate::redis::{
 };
 use crate::shard_manager::{ShardWriteOperation, VacuumMode, VacuumResult, VacuumStats};
 use bytes::Bytes;
+use futures::FutureExt;
 use redis_protocol::resp2::types::BytesFrame;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -529,13 +530,21 @@ async fn handle_del_multiple(
         let shard_index = state.get_shard(&key);
         let pool = &state.write_db_pools[shard_index];
 
-        // Check if key exists first
-        let exists = sqlx::query("SELECT 1 FROM blobs WHERE key = ?")
+        // Check if key exists first. A failed check (e.g. the writer connection is
+        // held by a long VACUUM) must not be reported as "key not found".
+        let exists = match sqlx::query("SELECT 1 FROM blobs WHERE key = ?")
             .bind(&key)
             .fetch_optional(pool)
             .await
-            .map(|row| row.is_some())
-            .unwrap_or(false);
+        {
+            Ok(row) => row.is_some(),
+            Err(e) => {
+                tracing::error!("Failed to check DEL existence for key {}: {}", key, e);
+                let response = BytesFrame::Error("ERR database error".into());
+                stream.write_all(&serialize_frame(&response)).await?;
+                return Ok(());
+            }
+        };
 
         if !exists {
             continue; // Key doesn't exist, skip
@@ -1258,14 +1267,35 @@ async fn handle_hdel(
     let pool = &state.write_db_pools[shard_index];
     let table_name = format!("blobs_{}", namespace);
 
-    // First check if key exists
-    let query = format!("SELECT 1 FROM {} WHERE key = ?", table_name);
-    let exists = sqlx::query(&query)
-        .bind(&key)
-        .fetch_optional(pool)
-        .await
-        .map(|row| row.is_some())
-        .unwrap_or(false);
+    // First check if key exists. A missing namespace table is a genuine miss;
+    // any other failure must surface instead of being reported as "not found".
+    let table_exists = match hash_table_exists(pool, &table_name).await {
+        Ok(exists) => exists,
+        Err(e) => {
+            tracing::error!(
+                "Failed to check table existence for namespace {}: {}",
+                table_name,
+                e
+            );
+            let response = BytesFrame::Error("ERR database error".into());
+            stream.write_all(&serialize_frame(&response)).await?;
+            return Ok(());
+        }
+    };
+    let exists = match hash_field_exists(pool, &table_name, &key, table_exists).await {
+        Ok(exists) => exists,
+        Err(e) => {
+            tracing::error!(
+                "Failed to check HDEL existence for namespace {} key {}: {}",
+                namespace,
+                key,
+                e
+            );
+            let response = BytesFrame::Error("ERR database error".into());
+            stream.write_all(&serialize_frame(&response)).await?;
+            return Ok(());
+        }
+    };
 
     if !exists {
         // Redis HDEL returns the number of keys deleted
@@ -1982,6 +2012,15 @@ async fn run_shard_vacuum(
     }
 }
 
+/// Non-blocking check for a closed peer. Pipelined bytes count as still connected.
+fn client_disconnected(stream: &TcpStream) -> bool {
+    let mut buf = [0_u8; 1];
+    match stream.peek(&mut buf).now_or_never() {
+        Some(Ok(0)) | Some(Err(_)) => true,
+        Some(Ok(_)) | None => false,
+    }
+}
+
 async fn handle_blobasaur_vacuum(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
@@ -1998,6 +2037,17 @@ async fn handle_blobasaur_vacuum(
 
     let mut shard_results = Vec::with_capacity(shard_ids.len());
     for shard_id in shard_ids {
+        // Nobody is waiting for the result (e.g. the CLI hit --timeout-sec), so don't
+        // start more shards; otherwise a retried run queues a second pass behind this one.
+        if client_disconnected(stream) {
+            tracing::warn!(
+                shard_id,
+                completed_shards = shard_results.len(),
+                "Client disconnected during vacuum; skipping remaining shards"
+            );
+            return Ok(());
+        }
+
         let shard_result =
             run_shard_vacuum(state, shard_id, mode_internal, budget_mb, dry_run).await;
 
@@ -2731,6 +2781,48 @@ mod tests {
         assert_eq!(bob, b"second");
 
         ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn del_and_hdel_return_error_when_existence_check_fails() {
+        let ctx = TestContext::new(false).await;
+        // Simulates the writer connection being unavailable (e.g. held by a long VACUUM).
+        ctx.state.write_db_pools[0].close().await;
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_del_multiple(&mut stream, &state, vec!["some-key".to_string()]).await
+            })
+        })
+        .await;
+        assert_error_contains(frame, "database error");
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_hdel(&mut stream, &state, "ns".to_string(), "field".to_string()).await
+            })
+        })
+        .await;
+        assert_error_contains(frame, "database error");
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn client_disconnected_detects_closed_peer() {
+        let (server, client) = tcp_pair().await;
+        assert!(!client_disconnected(&server));
+
+        drop(client);
+        let detected = timeout(Duration::from_secs(1), async {
+            while !client_disconnected(&server) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(detected.is_ok(), "closed peer should be detected");
     }
 
     #[tokio::test]
