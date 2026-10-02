@@ -1049,11 +1049,14 @@ async fn execute_vacuum(
             (VacuumMode::Full, None) => None,
         }
     } else {
+        // Use the page_count delta: a full VACUUM also reclaims fragmented space
+        // that never appeared on the freelist, and concurrent expiry deletes can
+        // grow the freelist mid-run without changing the file size.
         match (before, after) {
             (Some(before_stats), Some(after_stats)) => Some(
                 before_stats
-                    .freelist_count
-                    .saturating_sub(after_stats.freelist_count),
+                    .page_count
+                    .saturating_sub(after_stats.page_count),
             ),
             _ => None,
         }
