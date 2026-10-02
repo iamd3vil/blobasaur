@@ -235,7 +235,6 @@ fn build_sqlite_connect_options(cfg: &Cfg, shard_id: usize) -> SqliteConnectOpti
         .pragma("auto_vacuum", "INCREMENTAL")
         .pragma("synchronous", synchronous.as_str())
         .pragma("cache_size", format!("-{}", cache_size_mb * 1024))
-        .pragma("temp_store", "MEMORY")
         .pragma("foreign_keys", "true");
 
     if mmap_size > 0 {
@@ -610,6 +609,18 @@ mod tests {
                 mode, SQLITE_AUTO_VACUUM_INCREMENTAL,
                 "shard {} should use INCREMENTAL auto_vacuum",
                 shard_id
+            );
+        }
+
+        // temp_store=MEMORY would make a full VACUUM build the whole rebuilt DB in RAM.
+        for pool in &app_state.write_db_pools {
+            let temp_store = sqlx::query_scalar::<_, i64>("PRAGMA temp_store")
+                .fetch_one(pool)
+                .await
+                .expect("failed to read temp_store");
+            assert_eq!(
+                temp_store, 0,
+                "writer connections should use the default temp_store"
             );
         }
     }
