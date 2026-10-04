@@ -1036,6 +1036,17 @@ fn extract_bytes(value: &BytesFrame) -> Result<Bytes, ParseError> {
 
 /// Serialize RESP value to bytes using redis-protocol crate
 pub fn serialize_frame(frame: &BytesFrame) -> Bytes {
+    // Error replies end at the first CRLF, and some echo client input (e.g. an
+    // unknown command name). Replace CR/LF with spaces, as Redis does, so a
+    // client can't split one reply into several.
+    let sanitized;
+    let frame = match frame {
+        BytesFrame::Error(msg) if msg.contains(['\r', '\n']) => {
+            sanitized = BytesFrame::Error(msg.replace(['\r', '\n'], " ").into());
+            &sanitized
+        }
+        _ => frame,
+    };
     let mut buf = bytes::BytesMut::new();
     extend_encode(&mut buf, frame, false).expect("Failed to encode frame");
     buf.freeze()
@@ -1145,6 +1156,15 @@ mod tests {
             b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$999999999\r\n",
             MAX,
             "max_request_size_mb",
+        );
+    }
+
+    #[test]
+    fn serialize_frame_strips_crlf_from_errors() {
+        let frame = BytesFrame::Error("ERR unknown command 'FOO\r\n+OK'".into());
+        assert_eq!(
+            &serialize_frame(&frame)[..],
+            b"-ERR unknown command 'FOO  +OK'\r\n"
         );
     }
 
