@@ -1212,8 +1212,9 @@ async fn handle_hsetex(
     // Calculate expires_at timestamp from expire option
     let expires_at = match expire_option {
         Some(ExpireOption::Ex(seconds)) => Some(chrono::Utc::now().timestamp() + seconds as i64),
+        // Round up like SET PX (the parser has range-checked it).
         Some(ExpireOption::Px(millis)) => {
-            Some(chrono::Utc::now().timestamp() + (millis as i64 / 1000))
+            Some(chrono::Utc::now().timestamp() + millis.div_ceil(1000) as i64)
         }
         Some(ExpireOption::ExAt(timestamp)) => Some(timestamp),
         Some(ExpireOption::PxAt(timestamp)) => Some(timestamp / 1000),

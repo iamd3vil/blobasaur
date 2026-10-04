@@ -1,6 +1,10 @@
 use bytes::{Bytes, BytesMut};
 use redis_protocol::resp2::{decode::decode_bytes_mut, encode::extend_encode, types::BytesFrame};
 
+/// Longest relative TTL accepted, as in Redis (the TTL in ms must fit in i64).
+/// Also keeps `now + ttl` from overflowing.
+const MAX_TTL_SECS: u64 = (i64::MAX / 1000) as u64;
+
 /// Max arguments in one request, same as Redis' multibulk limit.
 const MAX_REQUEST_ARGS: usize = 1024 * 1024;
 /// Longest possible `*N` / `$len` header line, including its CRLF.
@@ -347,7 +351,7 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
                         let seconds = seconds_str.parse::<u64>().map_err(|_| {
                             ParseError::Invalid(format!("Invalid EX value: {}", seconds_str))
                         })?;
-                        ttl_seconds = Some(seconds);
+                        ttl_seconds = Some(ttl_secs(seconds, false, "set")?);
                         i += 2;
                     }
                     "PX" => {
@@ -358,7 +362,7 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
                         let millis = millis_str.parse::<u64>().map_err(|_| {
                             ParseError::Invalid(format!("Invalid PX value: {}", millis_str))
                         })?;
-                        ttl_seconds = Some(millis / 1000); // Convert to seconds
+                        ttl_seconds = Some(ttl_secs(millis, true, "set")?);
                         i += 2;
                     }
                     _ => {
@@ -472,6 +476,7 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
                         let seconds = extract_string(&elements[idx + 1])?
                             .parse::<u64>()
                             .map_err(|_| ParseError::Invalid("Invalid EX value".to_string()))?;
+                        ttl_secs(seconds, false, "hsetex")?;
                         expire_option = Some(ExpireOption::Ex(seconds));
                         idx += 2;
                     }
@@ -482,6 +487,7 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
                         let millis = extract_string(&elements[idx + 1])?
                             .parse::<u64>()
                             .map_err(|_| ParseError::Invalid("Invalid PX value".to_string()))?;
+                        ttl_secs(millis, true, "hsetex")?;
                         expire_option = Some(ExpireOption::Px(millis));
                         idx += 2;
                     }
@@ -600,6 +606,9 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
             let seconds = seconds_str.parse::<i64>().map_err(|_| {
                 ParseError::Invalid(format!("Invalid seconds value: {}", seconds_str))
             })?;
+            if seconds.unsigned_abs() > MAX_TTL_SECS {
+                return Err(invalid_expire_time("hexpire"));
+            }
 
             let mut idx = 3;
             let mut condition = None;
@@ -858,6 +867,10 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
             let seconds = seconds_str.parse::<u64>().map_err(|_| {
                 ParseError::Invalid(format!("Invalid seconds value: {}", seconds_str))
             })?;
+            // 0 is allowed: like Redis, it expires the key immediately.
+            if seconds > MAX_TTL_SECS {
+                return Err(invalid_expire_time("expire"));
+            }
             Ok(RedisCommand::Expire { key, seconds })
         }
         "BLOBASAUR.VACUUM" => parse_blobasaur_vacuum_command(&elements),
@@ -976,15 +989,35 @@ fn parse_blobasaur_vacuum_command(elements: &[BytesFrame]) -> Result<RedisComman
 }
 
 /// Extract string from RESP value
+/// Keys are stored as TEXT, so non-UTF-8 input is rejected rather than lossily
+/// converted: lossy conversion maps different binary keys to the same key.
 fn extract_string(value: &BytesFrame) -> Result<String, ParseError> {
     match value {
-        BytesFrame::BulkString(data) => Ok(String::from_utf8_lossy(data).to_string()),
-        BytesFrame::SimpleString(data) => Ok(String::from_utf8_lossy(data).to_string()),
+        BytesFrame::BulkString(data) | BytesFrame::SimpleString(data) => {
+            std::str::from_utf8(data).map(str::to_owned).map_err(|_| {
+                ParseError::Invalid("keys and string arguments must be valid UTF-8".to_string())
+            })
+        }
         BytesFrame::Null => Err(ParseError::Invalid(
             "Cannot use null as string argument".to_string(),
         )),
         _ => Err(ParseError::Invalid("Expected string argument".to_string())),
     }
+}
+
+/// Checks a relative TTL for SET/HSETEX: must be positive and in range.
+/// Expiry is stored in whole seconds, so millisecond TTLs round up and a key
+/// never expires before the time asked for.
+fn ttl_secs(ttl: u64, millis: bool, command: &str) -> Result<u64, ParseError> {
+    let secs = if millis { ttl.div_ceil(1000) } else { ttl };
+    if secs == 0 || secs > MAX_TTL_SECS {
+        return Err(invalid_expire_time(command));
+    }
+    Ok(secs)
+}
+
+fn invalid_expire_time(command: &str) -> ParseError {
+    ParseError::Invalid(format!("invalid expire time in '{}' command", command))
 }
 
 /// Extract bytes from RESP value
@@ -1113,6 +1146,78 @@ mod tests {
             MAX,
             "max_request_size_mb",
         );
+    }
+
+    fn parse(parts: &[&str]) -> Result<RedisCommand, ParseError> {
+        parse_command(command_frame(parts))
+    }
+
+    fn assert_parse_error(parts: &[&str], expected: &str) {
+        match parse(parts) {
+            Err(ParseError::Invalid(msg)) => {
+                assert!(
+                    msg.contains(expected),
+                    "{msg:?} should contain {expected:?}"
+                )
+            }
+            other => panic!("{parts:?}: expected error {expected:?}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_utf8_keys_are_rejected_instead_of_colliding() {
+        let frame = BytesFrame::Array(vec![
+            BytesFrame::BulkString(Bytes::from_static(b"GET")),
+            BytesFrame::BulkString(Bytes::from_static(b"\xff")),
+        ]);
+        match parse_command(frame) {
+            Err(ParseError::Invalid(msg)) => assert!(msg.contains("UTF-8"), "{msg}"),
+            other => panic!("expected UTF-8 error, got {other:?}"),
+        }
+        // Values stay binary.
+        let frame = BytesFrame::Array(vec![
+            BytesFrame::BulkString(Bytes::from_static(b"SET")),
+            BytesFrame::BulkString(Bytes::from_static(b"k")),
+            BytesFrame::BulkString(Bytes::from_static(b"\xff\x00")),
+        ]);
+        assert!(parse_command(frame).is_ok());
+    }
+
+    #[test]
+    fn set_ttls_round_up_and_reject_zero_or_out_of_range() {
+        let ttl = |parts: &[&str]| match parse(parts).unwrap() {
+            RedisCommand::Set { ttl_seconds, .. } => ttl_seconds,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(ttl(&["SET", "k", "v", "EX", "10"]), Some(10));
+        assert_eq!(ttl(&["SET", "k", "v", "PX", "500"]), Some(1));
+        assert_eq!(ttl(&["SET", "k", "v", "PX", "1500"]), Some(2));
+        assert_eq!(ttl(&["SET", "k", "v", "PX", "2000"]), Some(2));
+
+        let too_big = (MAX_TTL_SECS + 1).to_string();
+        for (option, value) in [("EX", "0"), ("PX", "0"), ("EX", too_big.as_str())] {
+            assert_parse_error(&["SET", "k", "v", option, value], "invalid expire time");
+        }
+        assert_parse_error(
+            &["HSETEX", "ns", "EX", "0", "FIELDS", "1", "f", "v"],
+            "invalid expire time",
+        );
+    }
+
+    #[test]
+    fn expire_and_hexpire_reject_out_of_range_ttls() {
+        assert!(matches!(
+            parse(&["EXPIRE", "k", "0"]),
+            Ok(RedisCommand::Expire { seconds: 0, .. })
+        ));
+        let too_big = (MAX_TTL_SECS + 1).to_string();
+        assert_parse_error(&["EXPIRE", "k", &too_big], "invalid expire time");
+        for seconds in [too_big.as_str(), "-9223372036854775808"] {
+            assert_parse_error(
+                &["HEXPIRE", "ns", seconds, "FIELDS", "1", "f"],
+                "invalid expire time",
+            );
+        }
     }
 
     fn command_frame(parts: &[&str]) -> BytesFrame {

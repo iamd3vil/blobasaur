@@ -372,7 +372,7 @@ Use namespaces to organize data into logical groups.
   # Set multiple fields with expiration
   redis-cli HSETEX cache EX 300 FIELDS 2 key1 "value1" key2 "value2"
 
-  # Set with millisecond precision
+  # TTL in milliseconds (rounded up to whole seconds)
   redis-cli HSETEX temp PX 5000 FIELDS 1 data "temporary"
 
   # Only set if field doesn't exist (FNX option)
@@ -608,6 +608,8 @@ CREATE TABLE blobs (
 - **Automatic Expiry**: All read operations (`GET`, `EXISTS`, `TTL`) automatically filter expired keys
 - **Background Cleanup**: Per-shard cleanup tasks run every 60 seconds to remove expired keys
 - **Efficient Storage**: Uses indexed `expires_at` timestamps for fast expiry queries
+- **Second Resolution**: Expiry is stored in whole seconds, so `PX` TTLs are rounded up (`PX 500` lives for 1 second). `EX 0`, `PX 0` and out-of-range TTLs are rejected, as in Redis
+- **UTF-8 Keys**: Keys, namespaces and other string arguments must be valid UTF-8 (values can be any bytes)
 
 **Implementation Details:**
 - Expiration timestamps stored as Unix epoch seconds in `expires_at` column
