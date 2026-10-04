@@ -359,7 +359,8 @@ async fn process_batch(
         }
     };
 
-    let mut results: Vec<(usize, Result<(), String>)> = Vec::new();
+    // One entry per op, in batch order.
+    let mut results: Vec<Result<(), String>> = Vec::with_capacity(batch.len());
     let mut expire_results: Vec<(usize, bool)> = Vec::new();
     let mut hexpire_results: Vec<(usize, i64)> = Vec::new();
     let mut sync_operations: Vec<usize> = Vec::new();
@@ -693,7 +694,7 @@ async fn process_batch(
             }
         };
 
-        results.push((idx, result));
+        results.push(result);
     }
 
     // Commit transaction
@@ -736,6 +737,11 @@ async fn process_batch(
         }
     }
 
+    // An op succeeded only if its own statement and the commit both did. A
+    // failed statement doesn't abort the transaction, so the commit alone
+    // can't tell a client its write was persisted.
+    let op_result = |idx: usize| commit_result.clone().and(results[idx].clone());
+
     // Send responses to synchronous operations
     for (operation_idx, operation) in batch.drain(..).enumerate() {
         match operation {
@@ -744,11 +750,7 @@ async fn process_batch(
             | ShardWriteOperation::HSet { responder, .. }
             | ShardWriteOperation::HSetEx { responder, .. }
             | ShardWriteOperation::HDelete { responder, .. } => {
-                let final_result = match &commit_result {
-                    Ok(_) => Ok(()),
-                    Err(e) => Err(e.clone()),
-                };
-                let _ = responder.send(final_result);
+                let _ = responder.send(op_result(operation_idx));
             }
             ShardWriteOperation::Expire { responder, .. } => {
                 // For expire operations, we need to send the actual result (bool)
@@ -756,11 +758,7 @@ async fn process_batch(
                 if let Some((_, success)) =
                     expire_results.iter().find(|(idx, _)| *idx == operation_idx)
                 {
-                    let final_result = match &commit_result {
-                        Ok(_) => Ok(*success),
-                        Err(e) => Err(e.clone()),
-                    };
-                    let _ = responder.send(final_result);
+                    let _ = responder.send(op_result(operation_idx).map(|()| *success));
                 } else {
                     let _ = responder.send(Err(
                         "Internal error: could not find expire result".to_string()
@@ -773,11 +771,7 @@ async fn process_batch(
                     .iter()
                     .find(|(idx, _)| *idx == operation_idx)
                 {
-                    let final_result = match &commit_result {
-                        Ok(_) => Ok(*result_code),
-                        Err(e) => Err(e.clone()),
-                    };
-                    let _ = responder.send(final_result);
+                    let _ = responder.send(op_result(operation_idx).map(|()| *result_code));
                 } else {
                     let _ = responder.send(Err(
                         "Internal error: could not find hexpire result".to_string()
@@ -1464,6 +1458,64 @@ mod tests {
             "failed to read PRAGMA freelist_count".to_string(),
         ];
         assert_eq!(classify_vacuum_error_kinds(&mixed), (true, true));
+    }
+
+    #[tokio::test]
+    async fn sync_write_reports_its_own_statement_failure() {
+        let (_temp_dir, pool) = create_test_pool().await;
+        // Another connection holds the write lock: the writer's INSERT fails
+        // with SQLITE_BUSY, but its (now read-only) transaction still commits.
+        let mut lock = pool.acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *lock)
+            .await
+            .unwrap();
+
+        let (sender, receiver) = mpsc::channel(8);
+        let writer = tokio::spawn(shard_writer_task(ShardWriter {
+            shard_id: 0,
+            pool: pool.clone(),
+            receiver,
+            batch_size: 8,
+            batch_timeout_ms: 0,
+            inflight_cache: Cache::new(16),
+            inflight_hcache: Cache::new(16),
+            metrics: Metrics::new(),
+            shutdown: CancellationToken::new(),
+        }));
+
+        let set = |key: &str| {
+            let (responder, rx) = oneshot::channel();
+            let op = ShardWriteOperation::Set {
+                key: key.to_string(),
+                data: Bytes::from_static(b"v"),
+                expires_at: None,
+                responder,
+            };
+            (op, rx)
+        };
+
+        let (op, rx) = set("blocked");
+        sender.send(op).await.unwrap();
+        let result = rx.await.unwrap();
+        assert!(
+            result.as_ref().is_err_and(|e| e.contains("locked")),
+            "a write that wasn't persisted must not be acknowledged: {result:?}"
+        );
+
+        sqlx::query("ROLLBACK").execute(&mut *lock).await.unwrap();
+        drop(lock);
+        let (op, rx) = set("after");
+        sender.send(op).await.unwrap();
+        assert_eq!(rx.await.unwrap(), Ok(()));
+
+        drop(sender);
+        writer.await.unwrap();
+        let keys: Vec<(String,)> = sqlx::query_as("SELECT key FROM blobs")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(keys, vec![("after".to_string(),)]);
     }
 
     #[tokio::test]
