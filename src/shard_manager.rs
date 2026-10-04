@@ -118,19 +118,35 @@ impl VacuumResult {
     }
 }
 
+/// Everything a shard writer task needs; see [`shard_writer_task`].
+pub struct ShardWriter {
+    pub shard_id: usize,
+    pub pool: SqlitePool,
+    pub receiver: mpsc::Receiver<ShardWriteOperation>,
+    pub batch_size: usize,
+    /// Max time to wait for more ops while a batch is non-empty.
+    pub batch_timeout_ms: u64,
+    pub inflight_cache: Cache<String, Bytes>,
+    pub inflight_hcache: Cache<String, Bytes>,
+    pub metrics: Metrics,
+    /// Cancel to make the writer commit everything queued and return.
+    pub shutdown: CancellationToken,
+}
+
 // Enhanced consumer with batching support
-#[allow(clippy::too_many_arguments)] // task entry point; each arg is a distinct dependency
-pub async fn shard_writer_task(
-    shard_id: usize,
-    pool: SqlitePool,
-    mut receiver: mpsc::Receiver<ShardWriteOperation>,
-    batch_size: usize,
-    batch_timeout_ms: u64,
-    inflight_cache: Cache<String, Bytes>,
-    inflight_hcache: Cache<String, Bytes>,
-    metrics: Metrics,
-    shutdown: CancellationToken,
-) {
+pub async fn shard_writer_task(writer: ShardWriter) {
+    let ShardWriter {
+        shard_id,
+        pool,
+        mut receiver,
+        batch_size,
+        batch_timeout_ms,
+        inflight_cache,
+        inflight_hcache,
+        metrics,
+        shutdown,
+    } = writer;
+
     // Load existing namespaced tables into memory
     let mut known_tables = load_existing_tables(&pool, shard_id).await;
     let batch_timeout = Duration::from_millis(batch_timeout_ms);
@@ -1471,17 +1487,17 @@ mod tests {
         shutdown.cancel();
         timeout(
             Duration::from_secs(5),
-            shard_writer_task(
-                0,
-                pool.clone(),
+            shard_writer_task(ShardWriter {
+                shard_id: 0,
+                pool: pool.clone(),
                 receiver,
-                16,
-                60_000,
-                Cache::new(128),
-                Cache::new(128),
-                Metrics::new(),
+                batch_size: 16,
+                batch_timeout_ms: 60_000,
+                inflight_cache: Cache::new(128),
+                inflight_hcache: Cache::new(128),
+                metrics: Metrics::new(),
                 shutdown,
-            ),
+            }),
         )
         .await
         .expect("writer did not stop");
@@ -1516,17 +1532,17 @@ mod tests {
         .expect("failed to insert seed row");
 
         let (sender, receiver) = mpsc::channel(64);
-        let writer_handle = tokio::spawn(shard_writer_task(
-            0,
-            pool.clone(),
+        let writer_handle = tokio::spawn(shard_writer_task(ShardWriter {
+            shard_id: 0,
+            pool: pool.clone(),
             receiver,
-            64,
-            10,
-            Cache::new(128),
-            Cache::new(128),
-            Metrics::new(),
-            CancellationToken::new(),
-        ));
+            batch_size: 64,
+            batch_timeout_ms: 10,
+            inflight_cache: Cache::new(128),
+            inflight_hcache: Cache::new(128),
+            metrics: Metrics::new(),
+            shutdown: CancellationToken::new(),
+        }));
 
         let (delete_tx, delete_rx) = oneshot::channel();
         sender

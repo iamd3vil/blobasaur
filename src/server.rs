@@ -6,7 +6,9 @@ use crate::redis::{
     HExpireCondition, ParseError, RedisCommand, VacuumCommandMode, VacuumShardTarget,
     parse_command, parse_resp_with_remaining, serialize_frame,
 };
-use crate::shard_manager::{self, ShardWriteOperation, VacuumMode, VacuumResult, VacuumStats};
+use crate::shard_manager::{
+    self, ShardWriteOperation, ShardWriter, VacuumMode, VacuumResult, VacuumStats,
+};
 use bytes::Bytes;
 use futures::FutureExt;
 use redis_protocol::resp2::types::BytesFrame;
@@ -60,15 +62,17 @@ pub async fn run(
     let mut writers = Vec::with_capacity(cfg.num_shards);
     for (i, receiver) in shard_receivers.into_iter().enumerate() {
         writers.push(tokio::spawn(shard_manager::shard_writer_task(
-            i,
-            state.write_db_pools[i].clone(),
-            receiver,
-            cfg.batch_size.unwrap_or(1),
-            cfg.batch_timeout_ms.unwrap_or(0),
-            state.inflight_cache.clone(),
-            state.inflight_hcache.clone(),
-            state.metrics.clone(),
-            writers_shutdown.clone(),
+            ShardWriter {
+                shard_id: i,
+                pool: state.write_db_pools[i].clone(),
+                receiver,
+                batch_size: cfg.batch_size.unwrap_or(1),
+                batch_timeout_ms: cfg.batch_timeout_ms.unwrap_or(0),
+                inflight_cache: state.inflight_cache.clone(),
+                inflight_hcache: state.inflight_hcache.clone(),
+                metrics: state.metrics.clone(),
+                shutdown: writers_shutdown.clone(),
+            },
         )));
     }
 
@@ -2288,27 +2292,25 @@ mod tests {
 
         async fn from_cfg(temp_dir: TempDir, cfg: Cfg) -> Self {
             let batch_size = cfg.batch_size.unwrap_or(1);
-            let batch_timeout = cfg.batch_timeout_ms.unwrap_or(0);
+            let batch_timeout_ms = cfg.batch_timeout_ms.unwrap_or(0);
 
             let mut receivers = Vec::new();
             let state = Arc::new(AppState::new(cfg, &mut receivers).await.unwrap());
 
             let mut writer_handles = Vec::new();
             for (i, receiver) in receivers.into_iter().enumerate() {
-                let pool = state.write_db_pools[i].clone();
-                let inflight_cache = state.inflight_cache.clone();
-                let inflight_hcache = state.inflight_hcache.clone();
-                let metrics = state.metrics.clone();
                 writer_handles.push(tokio::spawn(shard_manager::shard_writer_task(
-                    i,
-                    pool,
-                    receiver,
-                    batch_size,
-                    batch_timeout,
-                    inflight_cache,
-                    inflight_hcache,
-                    metrics,
-                    CancellationToken::new(),
+                    ShardWriter {
+                        shard_id: i,
+                        pool: state.write_db_pools[i].clone(),
+                        receiver,
+                        batch_size,
+                        batch_timeout_ms,
+                        inflight_cache: state.inflight_cache.clone(),
+                        inflight_hcache: state.inflight_hcache.clone(),
+                        metrics: state.metrics.clone(),
+                        shutdown: CancellationToken::new(),
+                    },
                 )));
             }
 
