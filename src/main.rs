@@ -348,10 +348,10 @@ fn resolve_target_nodes(
             .and_then(|c| c.advertise_addr.as_deref())
             .or(cfg.addr.as_deref());
 
-        if let Some(addr) = resolved {
-            if let Some(normalized) = normalize_node_address(addr) {
-                nodes.push(normalized);
-            }
+        if let Some(addr) = resolved
+            && let Some(normalized) = normalize_node_address(addr)
+        {
+            nodes.push(normalized);
         }
     }
 
@@ -664,10 +664,10 @@ fn array_field<'a>(items: &'a [BytesFrame], field_name: &str) -> Option<&'a Byte
     let mut idx = 0;
 
     while idx + 1 < items.len() {
-        if let Some(name) = frame_to_string(&items[idx]) {
-            if name == field_name {
-                return Some(&items[idx + 1]);
-            }
+        if let Some(name) = frame_to_string(&items[idx])
+            && name == field_name
+        {
+            return Some(&items[idx + 1]);
         }
 
         idx += 2;

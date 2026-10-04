@@ -1,3 +1,4 @@
+#[cfg(test)]
 mod integration_tests;
 pub mod protocol;
 

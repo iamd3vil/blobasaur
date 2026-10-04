@@ -119,6 +119,7 @@ impl VacuumResult {
 }
 
 // Enhanced consumer with batching support
+#[allow(clippy::too_many_arguments)] // task entry point; each arg is a distinct dependency
 pub async fn shard_writer_task(
     shard_id: usize,
     pool: SqlitePool,
@@ -361,9 +362,8 @@ async fn process_batch(
                 data,
                 expires_at,
             } => {
-                match operation {
-                    ShardWriteOperation::Set { .. } => sync_operations.push(idx),
-                    _ => {}
+                if let ShardWriteOperation::Set { .. } = operation {
+                    sync_operations.push(idx)
                 }
 
                 let now = Utc::now().timestamp();
@@ -408,9 +408,8 @@ async fn process_batch(
                 }
             }
             ShardWriteOperation::Delete { key, .. } | ShardWriteOperation::DeleteAsync { key } => {
-                match operation {
-                    ShardWriteOperation::Delete { .. } => sync_operations.push(idx),
-                    _ => {}
+                if let ShardWriteOperation::Delete { .. } = operation {
+                    sync_operations.push(idx)
                 }
 
                 sqlx::query("DELETE FROM blobs WHERE key = ?")
@@ -434,9 +433,8 @@ async fn process_batch(
                 key,
                 data,
             } => {
-                match operation {
-                    ShardWriteOperation::HSet { .. } => sync_operations.push(idx),
-                    _ => {}
+                if let ShardWriteOperation::HSet { .. } = operation {
+                    sync_operations.push(idx)
                 }
 
                 let table_name = format!("blobs_{}", namespace);
@@ -522,9 +520,8 @@ async fn process_batch(
                 data,
                 expires_at,
             } => {
-                match operation {
-                    ShardWriteOperation::HSetEx { .. } => sync_operations.push(idx),
-                    _ => {}
+                if let ShardWriteOperation::HSetEx { .. } = operation {
+                    sync_operations.push(idx)
                 }
 
                 let table_name = format!("blobs_{}", namespace);
@@ -601,9 +598,8 @@ async fn process_batch(
             }
             ShardWriteOperation::HDelete { namespace, key, .. }
             | ShardWriteOperation::HDeleteAsync { namespace, key } => {
-                match operation {
-                    ShardWriteOperation::HDelete { .. } => sync_operations.push(idx),
-                    _ => {}
+                if let ShardWriteOperation::HDelete { .. } = operation {
+                    sync_operations.push(idx)
                 }
 
                 let table_name = format!("blobs_{}", namespace);
@@ -725,8 +721,7 @@ async fn process_batch(
     }
 
     // Send responses to synchronous operations
-    let mut operation_idx = 0;
-    for operation in batch.drain(..) {
+    for (operation_idx, operation) in batch.drain(..).enumerate() {
         match operation {
             ShardWriteOperation::Set { responder, .. }
             | ShardWriteOperation::Delete { responder, .. }
@@ -813,7 +808,6 @@ async fn process_batch(
                 });
             }
         }
-        operation_idx += 1;
     }
 }
 

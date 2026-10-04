@@ -56,6 +56,12 @@ pub struct Metrics {
     pub batch_duration_seconds: Histogram,
 }
 
+impl Default for Metrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Metrics {
     /// Initialize metrics with the global recorder
     pub fn new() -> Self {

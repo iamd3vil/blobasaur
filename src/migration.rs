@@ -277,7 +277,7 @@ impl MigrationManager {
                 // Key needs to be migrated to a different shard
                 keys_to_migrate
                     .entry(new_shard_id)
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(key.clone());
                 keys_to_delete.push(key);
             }

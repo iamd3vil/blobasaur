@@ -6,12 +6,18 @@ use std::io;
 
 pub struct NoneCompressor;
 
+impl Default for NoneCompressor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NoneCompressor {
     pub fn new() -> Self {
         Self
     }
     pub fn validate(_: &CompressionConfig) -> Result<(), miette::Error> {
-        return Ok(());
+        Ok(())
     }
 }
 

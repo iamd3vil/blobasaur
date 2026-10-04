@@ -56,6 +56,7 @@ pub struct SqliteConfig {
     ///   1) PRAGMA wal_checkpoint(TRUNCATE)
     ///   2) PRAGMA auto_vacuum = INCREMENTAL
     ///   3) VACUUM
+    ///
     /// and fails fast if conversion cannot be completed.
     pub auto_upgrade_legacy_auto_vacuum: Option<bool>,
 
@@ -98,17 +99,17 @@ pub enum CompressionType {
 #[derive(Debug, Clone, Copy, serde::Deserialize, PartialEq)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum SqliteSynchronous {
-    OFF,
-    NORMAL,
-    FULL,
+    Off,
+    Normal,
+    Full,
 }
 
 impl SqliteSynchronous {
     pub fn as_str(&self) -> &'static str {
         match self {
-            SqliteSynchronous::OFF => "OFF",
-            SqliteSynchronous::NORMAL => "NORMAL",
-            SqliteSynchronous::FULL => "FULL",
+            SqliteSynchronous::Off => "OFF",
+            SqliteSynchronous::Normal => "NORMAL",
+            SqliteSynchronous::Full => "FULL",
         }
     }
 }
@@ -168,13 +169,13 @@ impl Cfg {
         println!("Data directory: {}", cfg.data_dir);
         println!("Number of shards: {}", cfg.num_shards);
 
-        if let Some(ref metrics) = cfg.metrics {
-            if metrics.enabled {
-                println!(
-                    "Metrics enabled on: {}",
-                    metrics.addr.as_deref().unwrap_or("0.0.0.0:9090")
-                );
-            }
+        if let Some(ref metrics) = cfg.metrics
+            && metrics.enabled
+        {
+            println!(
+                "Metrics enabled on: {}",
+                metrics.addr.as_deref().unwrap_or("0.0.0.0:9090")
+            );
         }
 
         // Print SQLite configuration
@@ -228,10 +229,7 @@ impl Cfg {
     }
 
     pub fn is_compression(&self) -> bool {
-        match &self.storage_compression {
-            Some(comp) if comp.enabled => true,
-            _ => false,
-        }
+        self.storage_compression.as_ref().is_some_and(|c| c.enabled)
     }
 
     /// Get configured SQLite cache size in MB for the whole process.
@@ -291,7 +289,7 @@ impl Cfg {
         self.sqlite
             .as_ref()
             .and_then(|s| s.synchronous)
-            .unwrap_or(SqliteSynchronous::NORMAL)
+            .unwrap_or(SqliteSynchronous::Normal)
     }
 
     /// Get SQLite mmap size in MB (default: 0 = disabled)

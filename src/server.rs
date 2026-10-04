@@ -368,14 +368,13 @@ async fn handle_redis_command_inner(
 ) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         RedisCommand::Get { key } => {
-            if let Some(ref cluster_manager) = state.cluster_manager {
-                if !cluster_manager.should_handle_locally(&key).await {
-                    if let Some(redirect) = cluster_manager.get_redirect_response(&key).await {
-                        let response = BytesFrame::Error(redirect.into());
-                        stream.write_all(&serialize_frame(&response)).await?;
-                        return Ok(());
-                    }
-                }
+            if let Some(ref cluster_manager) = state.cluster_manager
+                && !cluster_manager.should_handle_locally(&key).await
+                && let Some(redirect) = cluster_manager.get_redirect_response(&key).await
+            {
+                let response = BytesFrame::Error(redirect.into());
+                stream.write_all(&serialize_frame(&response)).await?;
+                return Ok(());
             }
             handle_get(stream, state, key).await?;
         }
@@ -384,14 +383,13 @@ async fn handle_redis_command_inner(
             value,
             ttl_seconds,
         } => {
-            if let Some(ref cluster_manager) = state.cluster_manager {
-                if !cluster_manager.should_handle_locally(&key).await {
-                    if let Some(redirect) = cluster_manager.get_redirect_response(&key).await {
-                        let response = BytesFrame::Error(redirect.into());
-                        stream.write_all(&serialize_frame(&response)).await?;
-                        return Ok(());
-                    }
-                }
+            if let Some(ref cluster_manager) = state.cluster_manager
+                && !cluster_manager.should_handle_locally(&key).await
+                && let Some(redirect) = cluster_manager.get_redirect_response(&key).await
+            {
+                let response = BytesFrame::Error(redirect.into());
+                stream.write_all(&serialize_frame(&response)).await?;
+                return Ok(());
             }
             handle_set(stream, state, key, value, ttl_seconds).await?;
         }
@@ -399,14 +397,13 @@ async fn handle_redis_command_inner(
             handle_del_multiple(stream, state, keys).await?;
         }
         RedisCommand::Exists { key } => {
-            if let Some(ref cluster_manager) = state.cluster_manager {
-                if !cluster_manager.should_handle_locally(&key).await {
-                    if let Some(redirect) = cluster_manager.get_redirect_response(&key).await {
-                        let response = BytesFrame::Error(redirect.into());
-                        stream.write_all(&serialize_frame(&response)).await?;
-                        return Ok(());
-                    }
-                }
+            if let Some(ref cluster_manager) = state.cluster_manager
+                && !cluster_manager.should_handle_locally(&key).await
+                && let Some(redirect) = cluster_manager.get_redirect_response(&key).await
+            {
+                let response = BytesFrame::Error(redirect.into());
+                stream.write_all(&serialize_frame(&response)).await?;
+                return Ok(());
             }
             handle_exists(stream, state, key).await?;
         }
@@ -479,26 +476,24 @@ async fn handle_redis_command_inner(
             handle_cluster_keyslot(stream, key).await?;
         }
         RedisCommand::Ttl { key } => {
-            if let Some(ref cluster_manager) = state.cluster_manager {
-                if !cluster_manager.should_handle_locally(&key).await {
-                    if let Some(redirect) = cluster_manager.get_redirect_response(&key).await {
-                        let response = BytesFrame::Error(redirect.into());
-                        stream.write_all(&serialize_frame(&response)).await?;
-                        return Ok(());
-                    }
-                }
+            if let Some(ref cluster_manager) = state.cluster_manager
+                && !cluster_manager.should_handle_locally(&key).await
+                && let Some(redirect) = cluster_manager.get_redirect_response(&key).await
+            {
+                let response = BytesFrame::Error(redirect.into());
+                stream.write_all(&serialize_frame(&response)).await?;
+                return Ok(());
             }
             handle_ttl(stream, state, key).await?;
         }
         RedisCommand::Expire { key, seconds } => {
-            if let Some(ref cluster_manager) = state.cluster_manager {
-                if !cluster_manager.should_handle_locally(&key).await {
-                    if let Some(redirect) = cluster_manager.get_redirect_response(&key).await {
-                        let response = BytesFrame::Error(redirect.into());
-                        stream.write_all(&serialize_frame(&response)).await?;
-                        return Ok(());
-                    }
-                }
+            if let Some(ref cluster_manager) = state.cluster_manager
+                && !cluster_manager.should_handle_locally(&key).await
+                && let Some(redirect) = cluster_manager.get_redirect_response(&key).await
+            {
+                let response = BytesFrame::Error(redirect.into());
+                stream.write_all(&serialize_frame(&response)).await?;
+                return Ok(());
             }
             handle_expire(stream, state, key, seconds).await?;
         }
@@ -534,10 +529,10 @@ async fn compress_if_enabled(
     state: &Arc<AppState>,
     data: Bytes,
 ) -> Result<Bytes, Box<dyn std::error::Error>> {
-    if state.cfg.is_compression() {
-        if let Some(compressor) = &state.compressor {
-            return Ok(compressor.compress(&data).await?.into());
-        }
+    if state.cfg.is_compression()
+        && let Some(compressor) = &state.compressor
+    {
+        return Ok(compressor.compress(&data).await?.into());
     }
     Ok(data)
 }
@@ -546,10 +541,10 @@ async fn decompress_if_enabled(
     state: &Arc<AppState>,
     data: Bytes,
 ) -> Result<Bytes, Box<dyn std::error::Error>> {
-    if state.cfg.is_compression() {
-        if let Some(compressor) = &state.compressor {
-            return Ok(compressor.decompress(&data).await?.into());
-        }
+    if state.cfg.is_compression()
+        && let Some(compressor) = &state.compressor
+    {
+        return Ok(compressor.decompress(&data).await?.into());
     }
     Ok(data)
 }
@@ -564,7 +559,7 @@ async fn handle_get(
         // Decompress if needed
         let data = decompress_if_enabled(state, data).await?;
 
-        let response = BytesFrame::BulkString(data.into());
+        let response = BytesFrame::BulkString(data);
         stream.write_all(&serialize_frame(&response)).await?;
         state.metrics.record_cache_hit();
         return Ok(());
@@ -585,7 +580,7 @@ async fn handle_get(
             // Decompress if needed
             let data = decompress_if_enabled(state, row.0.into()).await?;
 
-            let response = BytesFrame::BulkString(data.into());
+            let response = BytesFrame::BulkString(data);
             stream.write_all(&serialize_frame(&response)).await?;
             state.metrics.record_cache_hit();
         }
@@ -702,14 +697,13 @@ async fn handle_del_multiple(
 
     for key in keys {
         // Check cluster routing for each key
-        if let Some(ref cluster_manager) = state.cluster_manager {
-            if !cluster_manager.should_handle_locally(&key).await {
-                if let Some(redirect) = cluster_manager.get_redirect_response(&key).await {
-                    let response = BytesFrame::Error(redirect.into());
-                    stream.write_all(&serialize_frame(&response)).await?;
-                    return Ok(());
-                }
-            }
+        if let Some(ref cluster_manager) = state.cluster_manager
+            && !cluster_manager.should_handle_locally(&key).await
+            && let Some(redirect) = cluster_manager.get_redirect_response(&key).await
+        {
+            let response = BytesFrame::Error(redirect.into());
+            stream.write_all(&serialize_frame(&response)).await?;
+            return Ok(());
         }
 
         let shard_index = state.get_shard(&key);
@@ -925,18 +919,18 @@ async fn handle_hello(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Only RESP2 is supported. If the client requests a different protocol
     // version, return NOPROTO so it can fall back to RESP2.
-    if let Some(ver) = protover {
-        if ver != 2 {
-            let response = BytesFrame::Error(
-                format!(
-                    "NOPROTO unsupported protocol version {}, only RESP2 is supported",
-                    ver
-                )
-                .into(),
-            );
-            stream.write_all(&serialize_frame(&response)).await?;
-            return Ok(());
-        }
+    if let Some(ver) = protover
+        && ver != 2
+    {
+        let response = BytesFrame::Error(
+            format!(
+                "NOPROTO unsupported protocol version {}, only RESP2 is supported",
+                ver
+            )
+            .into(),
+        );
+        stream.write_all(&serialize_frame(&response)).await?;
+        return Ok(());
     }
 
     // Return server info as a RESP2 flat array of key-value pairs
@@ -1026,20 +1020,17 @@ async fn handle_hget(
     }
 
     // Check if we should handle this hash operation locally in a cluster
-    if let Some(ref cluster_manager) = state.cluster_manager {
-        if !cluster_manager
+    if let Some(ref cluster_manager) = state.cluster_manager
+        && !cluster_manager
             .should_handle_hash_locally(&namespace, &key)
             .await
-        {
-            if let Some(redirect) = cluster_manager
-                .get_hash_redirect_response(&namespace, &key)
-                .await
-            {
-                let response = BytesFrame::Error(redirect.into());
-                stream.write_all(&serialize_frame(&response)).await?;
-                return Ok(());
-            }
-        }
+        && let Some(redirect) = cluster_manager
+            .get_hash_redirect_response(&namespace, &key)
+            .await
+    {
+        let response = BytesFrame::Error(redirect.into());
+        stream.write_all(&serialize_frame(&response)).await?;
+        return Ok(());
     }
 
     // First check inflight cache for pending writes
@@ -1048,7 +1039,7 @@ async fn handle_hget(
         // Decompress if needed
         let data = decompress_if_enabled(state, data).await?;
 
-        let response = BytesFrame::BulkString(data.into());
+        let response = BytesFrame::BulkString(data);
         stream.write_all(&serialize_frame(&response)).await?;
         return Ok(());
     }
@@ -1072,7 +1063,7 @@ async fn handle_hget(
             // Decompress if needed
             let data = decompress_if_enabled(state, row.0.into()).await?;
 
-            let response = BytesFrame::BulkString(data.into());
+            let response = BytesFrame::BulkString(data);
             stream.write_all(&serialize_frame(&response)).await?;
         }
         Ok(None) => {
@@ -1101,20 +1092,17 @@ async fn handle_hset(
     }
 
     // Check if we should handle this hash operation locally in a cluster
-    if let Some(ref cluster_manager) = state.cluster_manager {
-        if !cluster_manager
+    if let Some(ref cluster_manager) = state.cluster_manager
+        && !cluster_manager
             .should_handle_hash_locally(&namespace, &key)
             .await
-        {
-            if let Some(redirect) = cluster_manager
-                .get_hash_redirect_response(&namespace, &key)
-                .await
-            {
-                let response = BytesFrame::Error(redirect.into());
-                stream.write_all(&serialize_frame(&response)).await?;
-                return Ok(());
-            }
-        }
+        && let Some(redirect) = cluster_manager
+            .get_hash_redirect_response(&namespace, &key)
+            .await
+    {
+        let response = BytesFrame::Error(redirect.into());
+        stream.write_all(&serialize_frame(&response)).await?;
+        return Ok(());
     }
 
     let shard_index = state.get_shard(&key);
@@ -1258,20 +1246,17 @@ async fn handle_hsetex(
 
     for (field_key, field_value) in fields {
         // Check if we should handle this hash operation locally in a cluster
-        if let Some(ref cluster_manager) = state.cluster_manager {
-            if !cluster_manager
+        if let Some(ref cluster_manager) = state.cluster_manager
+            && !cluster_manager
                 .should_handle_hash_locally(&namespace, &field_key)
                 .await
-            {
-                if let Some(redirect) = cluster_manager
-                    .get_hash_redirect_response(&namespace, &field_key)
-                    .await
-                {
-                    let response = BytesFrame::Error(redirect.into());
-                    stream.write_all(&serialize_frame(&response)).await?;
-                    return Ok(());
-                }
-            }
+            && let Some(redirect) = cluster_manager
+                .get_hash_redirect_response(&namespace, &field_key)
+                .await
+        {
+            let response = BytesFrame::Error(redirect.into());
+            stream.write_all(&serialize_frame(&response)).await?;
+            return Ok(());
         }
 
         let shard_index = state.get_shard(&field_key);
@@ -1432,20 +1417,17 @@ async fn handle_hdel(
     }
 
     // Check if we should handle this hash operation locally in a cluster
-    if let Some(ref cluster_manager) = state.cluster_manager {
-        if !cluster_manager
+    if let Some(ref cluster_manager) = state.cluster_manager
+        && !cluster_manager
             .should_handle_hash_locally(&namespace, &key)
             .await
-        {
-            if let Some(redirect) = cluster_manager
-                .get_hash_redirect_response(&namespace, &key)
-                .await
-            {
-                let response = BytesFrame::Error(redirect.into());
-                stream.write_all(&serialize_frame(&response)).await?;
-                return Ok(());
-            }
-        }
+        && let Some(redirect) = cluster_manager
+            .get_hash_redirect_response(&namespace, &key)
+            .await
+    {
+        let response = BytesFrame::Error(redirect.into());
+        stream.write_all(&serialize_frame(&response)).await?;
+        return Ok(());
     }
 
     let shard_index = state.get_shard(&key);
@@ -1560,20 +1542,17 @@ async fn handle_hexists(
     }
 
     // Check if we should handle this hash operation locally in a cluster
-    if let Some(ref cluster_manager) = state.cluster_manager {
-        if !cluster_manager
+    if let Some(ref cluster_manager) = state.cluster_manager
+        && !cluster_manager
             .should_handle_hash_locally(&namespace, &key)
             .await
-        {
-            if let Some(redirect) = cluster_manager
-                .get_hash_redirect_response(&namespace, &key)
-                .await
-            {
-                let response = BytesFrame::Error(redirect.into());
-                stream.write_all(&serialize_frame(&response)).await?;
-                return Ok(());
-            }
-        }
+        && let Some(redirect) = cluster_manager
+            .get_hash_redirect_response(&namespace, &key)
+            .await
+    {
+        let response = BytesFrame::Error(redirect.into());
+        stream.write_all(&serialize_frame(&response)).await?;
+        return Ok(());
     }
 
     let shard_index = state.get_shard(&key);
@@ -1658,20 +1637,17 @@ async fn handle_hexpire_internal(
 
     for field_key in fields {
         // Check cluster routing for each field
-        if let Some(ref cluster_manager) = state.cluster_manager {
-            if !cluster_manager
+        if let Some(ref cluster_manager) = state.cluster_manager
+            && !cluster_manager
                 .should_handle_hash_locally(&namespace, &field_key)
                 .await
-            {
-                if let Some(redirect) = cluster_manager
-                    .get_hash_redirect_response(&namespace, &field_key)
-                    .await
-                {
-                    let response = BytesFrame::Error(redirect.into());
-                    stream.write_all(&serialize_frame(&response)).await?;
-                    return Ok(());
-                }
-            }
+            && let Some(redirect) = cluster_manager
+                .get_hash_redirect_response(&namespace, &field_key)
+                .await
+        {
+            let response = BytesFrame::Error(redirect.into());
+            stream.write_all(&serialize_frame(&response)).await?;
+            return Ok(());
         }
 
         let shard_index = state.get_shard(&field_key);
@@ -1791,7 +1767,7 @@ async fn handle_cluster_slots(
                         .and_then(|c| c.advertise_addr.clone())
                         .unwrap_or("127.0.0.1:6379".to_string());
                     let parts: Vec<&str> = advertise_addr.split(':').collect();
-                    let ip = parts.get(0).cloned().unwrap_or("127.0.0.1").to_string();
+                    let ip = parts.first().cloned().unwrap_or("127.0.0.1").to_string();
                     let port = parts
                         .get(1)
                         .and_then(|p| p.parse::<i64>().ok())
@@ -1818,7 +1794,7 @@ async fn handle_cluster_slots(
                 .and_then(|c| c.advertise_addr.clone())
                 .unwrap_or("127.0.0.1:6379".to_string());
             let parts: Vec<&str> = advertise_addr.split(':').collect();
-            let ip = parts.get(0).cloned().unwrap_or("127.0.0.1").to_string();
+            let ip = parts.first().cloned().unwrap_or("127.0.0.1").to_string();
             let port = parts
                 .get(1)
                 .and_then(|p| p.parse::<i64>().ok())
@@ -2485,10 +2461,10 @@ mod tests {
     fn array_field<'a>(items: &'a [BytesFrame], field_name: &str) -> Option<&'a BytesFrame> {
         let mut idx = 0;
         while idx + 1 < items.len() {
-            if let Some(name) = bulk_str(&items[idx]) {
-                if name == field_name {
-                    return Some(&items[idx + 1]);
-                }
+            if let Some(name) = bulk_str(&items[idx])
+                && name == field_name
+            {
+                return Some(&items[idx + 1]);
             }
             idx += 2;
         }
@@ -3194,7 +3170,7 @@ mod tests {
         .await;
         if let BytesFrame::Integer(v) = frame {
             assert!(
-                v >= 1 && v <= 30,
+                (1..=30).contains(&v),
                 "expected ttl between 1 and 30, got {}",
                 v
             );

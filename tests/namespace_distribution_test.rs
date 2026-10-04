@@ -50,12 +50,12 @@ fn calculate_slot_namespace_based(namespace: &str) -> u16 {
 /// Calculate slot with hash tag awareness
 fn calculate_slot_hash_tag_aware(key: &str) -> u16 {
     // Extract hash tag if present
-    if let Some(start) = key.find('{') {
-        if let Some(end) = key[start + 1..].find('}') {
-            let tag = &key[start + 1..start + 1 + end];
-            if !tag.is_empty() {
-                return calculate_slot_key_based(tag);
-            }
+    if let Some(start) = key.find('{')
+        && let Some(end) = key[start + 1..].find('}')
+    {
+        let tag = &key[start + 1..start + 1 + end];
+        if !tag.is_empty() {
+            return calculate_slot_key_based(tag);
         }
     }
     calculate_slot_key_based(key)
@@ -155,7 +155,7 @@ mod tests {
             "{user:alice}:cache",
         ];
 
-        let bob_keys = vec!["{user:bob}:profile", "{user:bob}:settings"];
+        let bob_keys = ["{user:bob}:profile", "{user:bob}:settings"];
 
         // Alice's data should all go to the same slot
         let alice_slots: HashSet<u16> = alice_keys

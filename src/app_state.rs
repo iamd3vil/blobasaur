@@ -448,10 +448,10 @@ fn validate_shard_count(data_dir: &str, expected_shards: usize) -> Result<()> {
     }
 
     // If the directory is empty, that's also fine - no validation needed
-    if let Ok(entries) = fs::read_dir(data_path) {
-        if entries.count() == 0 {
-            return Ok(());
-        }
+    if let Ok(entries) = fs::read_dir(data_path)
+        && entries.count() == 0
+    {
+        return Ok(());
     }
 
     // Count existing shard files
@@ -470,17 +470,15 @@ fn validate_shard_count(data_dir: &str, expected_shards: usize) -> Result<()> {
         for entry in entries.flatten() {
             let file_name = entry.file_name();
             let file_name_str = file_name.to_string_lossy();
-            if file_name_str.starts_with("shard_") && file_name_str.ends_with(".db") {
-                if let Some(num_str) = file_name_str
+            if file_name_str.starts_with("shard_")
+                && file_name_str.ends_with(".db")
+                && let Some(num_str) = file_name_str
                     .strip_prefix("shard_")
                     .and_then(|s| s.strip_suffix(".db"))
-                {
-                    if let Ok(shard_num) = num_str.parse::<usize>() {
-                        if shard_num >= expected_shards {
-                            extra_shards.push(shard_num);
-                        }
-                    }
-                }
+                && let Ok(shard_num) = num_str.parse::<usize>()
+                && shard_num >= expected_shards
+            {
+                extra_shards.push(shard_num);
             }
         }
     }

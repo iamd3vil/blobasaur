@@ -10,21 +10,16 @@ use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
 /// Strategy for distributing namespace operations across cluster nodes
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NamespaceDistributionStrategy {
     /// Use namespace for slot calculation (legacy behavior - confines namespace to one node)
     #[allow(dead_code)]
     NamespaceBased,
     /// Use key for slot calculation (distributes namespace across nodes)
+    #[default]
     KeyBased,
     /// Use hash tags when present, fallback to key-based
     HashTagAware,
-}
-
-impl Default for NamespaceDistributionStrategy {
-    fn default() -> Self {
-        Self::KeyBased
-    }
 }
 
 use crate::config::ClusterConfig;
@@ -416,18 +411,11 @@ impl ClusterManager {
                 // Use namespace as the hash key (legacy behavior)
                 Self::calculate_slot_with_strategy(namespace, self.namespace_strategy)
             }
-            NamespaceDistributionStrategy::KeyBased => {
-                // Use individual key for distribution
+            NamespaceDistributionStrategy::KeyBased
+            | NamespaceDistributionStrategy::HashTagAware => {
+                // Use individual key for distribution; calculate_slot_with_strategy
+                // extracts the hash tag for HashTagAware.
                 Self::calculate_slot_with_strategy(key, self.namespace_strategy)
-            }
-            NamespaceDistributionStrategy::HashTagAware => {
-                // Check if key has hash tag, otherwise use key
-                let combined_key = if key.contains('{') && key.contains('}') {
-                    key
-                } else {
-                    key
-                };
-                Self::calculate_slot_with_strategy(combined_key, self.namespace_strategy)
             }
         }
     }
@@ -808,8 +796,7 @@ mod tests {
         let cluster_manager = ClusterManager::new(&config, gossip_bind_addr, redis_addr).await;
 
         // Note: This test might fail in CI due to UDP binding issues
-        if cluster_manager.is_ok() {
-            let manager = cluster_manager.unwrap();
+        if let Ok(manager) = cluster_manager {
             assert_eq!(manager.node_id, "test-node");
 
             // Check local slots were set

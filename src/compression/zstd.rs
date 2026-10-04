@@ -18,7 +18,7 @@ impl ZstdCompressor {
     }
     pub fn validate(config: &CompressionConfig) -> Result<(), miette::Error> {
         let level = config.level.unwrap_or(0);
-        if level < 1 || level > 22 {
+        if !(1..=22).contains(&level) {
             return Err(miette::miette!(
                 "Compression level must be between 1 and 22"
             ));

@@ -501,7 +501,7 @@ async fn test_migration_verification_failure() -> Result<(), Box<dyn std::error:
 #[tokio::test]
 async fn test_migration_consistent_hashing() -> Result<(), Box<dyn std::error::Error>> {
     // Test that keys distribute differently between different shard counts
-    let keys = vec!["key1", "key2", "key3", "key4", "key5"];
+    let keys = ["key1", "key2", "key3", "key4", "key5"];
 
     let old_distribution: Vec<usize> = keys.iter().map(|k| get_shard_for_key(k, 2)).collect();
     let new_distribution: Vec<usize> = keys.iter().map(|k| get_shard_for_key(k, 3)).collect();

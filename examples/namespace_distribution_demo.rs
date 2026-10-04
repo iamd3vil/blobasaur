@@ -64,18 +64,10 @@ fn calculate_slot_for_hash(
             // Use namespace as the hash key (legacy behavior)
             calculate_slot_with_strategy(namespace, strategy)
         }
-        NamespaceDistributionStrategy::KeyBased => {
-            // Use individual key for distribution
+        NamespaceDistributionStrategy::KeyBased | NamespaceDistributionStrategy::HashTagAware => {
+            // Use individual key for distribution; calculate_slot_with_strategy
+            // extracts the hash tag for HashTagAware.
             calculate_slot_with_strategy(key, strategy)
-        }
-        NamespaceDistributionStrategy::HashTagAware => {
-            // Check if key has hash tag, otherwise use key
-            let combined_key = if key.contains('{') && key.contains('}') {
-                key
-            } else {
-                key
-            };
-            calculate_slot_with_strategy(combined_key, strategy)
         }
     }
 }
