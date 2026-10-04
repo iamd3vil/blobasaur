@@ -1138,20 +1138,24 @@ async fn handle_hset(
         }
     };
 
-    let existed_before = match hash_field_exists(pool, &table_name, &key, table_exists).await {
-        Ok(exists) => exists,
-        Err(e) => {
-            tracing::error!(
-                "Failed to check HSET existence for namespace {} key {}: {}",
-                namespace,
-                key,
-                e
-            );
-            let response = BytesFrame::Error("ERR database error ".into());
-            stream.write_all(&serialize_frame(&response)).await?;
-            return Ok(());
-        }
-    };
+    // A queued async HSET of this field counts as existing, as in HDEL.
+    let existed_before = state
+        .inflight_hcache
+        .contains_key(&state.namespaced_key(&namespace, &key))
+        || match hash_field_exists(pool, &table_name, &key, table_exists).await {
+            Ok(exists) => exists,
+            Err(e) => {
+                tracing::error!(
+                    "Failed to check HSET existence for namespace {} key {}: {}",
+                    namespace,
+                    key,
+                    e
+                );
+                let response = BytesFrame::Error("ERR database error ".into());
+                stream.write_all(&serialize_frame(&response)).await?;
+                return Ok(());
+            }
+        };
 
     let sender = &state.shard_senders[shard_index];
 
@@ -1292,20 +1296,24 @@ async fn handle_hsetex(
             }
         };
 
-        let exists = match hash_field_exists(pool, &table_name, &field_key, table_exists).await {
-            Ok(exists) => exists,
-            Err(e) => {
-                tracing::error!(
-                    "Failed to check field existence for namespace {} key {}: {}",
-                    namespace,
-                    field_key,
-                    e
-                );
-                let response = BytesFrame::Error("ERR database error".into());
-                stream.write_all(&serialize_frame(&response)).await?;
-                return Ok(());
-            }
-        };
+        // A queued async write of this field counts as existing, as in HDEL.
+        let exists = state
+            .inflight_hcache
+            .contains_key(&state.namespaced_key(&namespace, &field_key))
+            || match hash_field_exists(pool, &table_name, &field_key, table_exists).await {
+                Ok(exists) => exists,
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to check field existence for namespace {} key {}: {}",
+                        namespace,
+                        field_key,
+                        e
+                    );
+                    let response = BytesFrame::Error("ERR database error".into());
+                    stream.write_all(&serialize_frame(&response)).await?;
+                    return Ok(());
+                }
+            };
 
         // Check FNX/FXX conditions if specified
         if fnx || fxx {
@@ -3092,6 +3100,22 @@ mod tests {
         })
         .await;
         assert_integer_response(frame, 1);
+
+        // Overwriting a queued field is an update, not a new field.
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_hset(
+                    &mut stream,
+                    &state,
+                    "ns".to_string(),
+                    "field".to_string(),
+                    Bytes::from_static(b"v2"),
+                )
+                .await
+            })
+        })
+        .await;
+        assert_integer_response(frame, 0);
 
         // Skipping these deletes would let the queued writes commit afterwards
         // and bring the keys back.
