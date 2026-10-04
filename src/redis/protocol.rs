@@ -1,3 +1,4 @@
+use crate::cluster::REDIS_CLUSTER_SLOTS;
 use bytes::{Bytes, BytesMut};
 use redis_protocol::resp2::{decode::decode_bytes_mut, encode::extend_encode, types::BytesFrame};
 
@@ -812,9 +813,13 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
                     let mut slots = Vec::new();
                     for slot_arg in &elements[2..] {
                         let slot_str = extract_string(slot_arg)?;
-                        let slot = slot_str.parse::<u16>().map_err(|_| {
-                            ParseError::Invalid(format!("Invalid slot number: {}", slot_str))
-                        })?;
+                        let slot = slot_str
+                            .parse::<u16>()
+                            .ok()
+                            .filter(|slot| *slot < REDIS_CLUSTER_SLOTS)
+                            .ok_or_else(|| {
+                                ParseError::Invalid(format!("Invalid slot number: {}", slot_str))
+                            })?;
                         slots.push(slot);
                     }
                     Ok(RedisCommand::ClusterAddSlots { slots })
@@ -828,9 +833,13 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
                     let mut slots = Vec::new();
                     for slot_arg in &elements[2..] {
                         let slot_str = extract_string(slot_arg)?;
-                        let slot = slot_str.parse::<u16>().map_err(|_| {
-                            ParseError::Invalid(format!("Invalid slot number: {}", slot_str))
-                        })?;
+                        let slot = slot_str
+                            .parse::<u16>()
+                            .ok()
+                            .filter(|slot| *slot < REDIS_CLUSTER_SLOTS)
+                            .ok_or_else(|| {
+                                ParseError::Invalid(format!("Invalid slot number: {}", slot_str))
+                            })?;
                         slots.push(slot);
                     }
                     Ok(RedisCommand::ClusterDelSlots { slots })
@@ -1170,6 +1179,14 @@ mod tests {
 
     fn parse(parts: &[&str]) -> Result<RedisCommand, ParseError> {
         parse_command(command_frame(parts))
+    }
+
+    #[test]
+    fn cluster_slot_commands_reject_slots_outside_the_keyspace() {
+        for sub in ["ADDSLOTS", "DELSLOTS"] {
+            assert!(parse(&["CLUSTER", sub, "0", "16383"]).is_ok());
+            assert_parse_error(&["CLUSTER", sub, "16384"], "Invalid slot number");
+        }
     }
 
     fn assert_parse_error(parts: &[&str], expected: &str) {
