@@ -81,9 +81,13 @@ pub async fn run(
     // Spawn cleanup tasks for each shard
     let cleanup_interval_secs = 60; // Clean up expired keys every 60 seconds
     for i in 0..cfg.num_shards {
+        // Expiry cleanup deletes rows, so it shares the shard's single writer
+        // connection: taking turns with the writer instead of holding the SQLite
+        // write lock from another connection, which made writer batches fail
+        // with SQLITE_BUSY.
         background.push(tokio::spawn(shard_manager::shard_cleanup_task(
             i,
-            state.db_pools[i].clone(),
+            state.write_db_pools[i].clone(),
             cleanup_interval_secs,
         )));
     }
