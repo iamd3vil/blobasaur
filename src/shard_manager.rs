@@ -3,6 +3,7 @@ use crate::redis::protocol::HExpireCondition;
 use bytes::Bytes;
 use chrono::Utc;
 use moka::future::Cache;
+use moka::ops::compute::Op;
 use sqlx::{Sqlite, SqlitePool};
 use std::collections::{HashSet, VecDeque};
 use tokio::sync::{mpsc, oneshot};
@@ -131,6 +132,35 @@ pub struct ShardWriter {
     pub metrics: Metrics,
     /// Cancel to make the writer commit everything queued and return.
     pub shutdown: CancellationToken,
+}
+
+/// Records an acknowledged async write so reads see it before it commits.
+/// Uses `and_compute_with` so it's ordered against [`clear_pending_write`]
+/// on the same key.
+pub async fn record_pending_write(cache: &Cache<String, Bytes>, key: String, value: Bytes) {
+    cache
+        .entry(key)
+        .and_compute_with(|_| async move { Op::Put(value) })
+        .await;
+}
+
+/// Removes `key`'s pending-write entry if it still holds `written` (the same
+/// allocation, so this is cheap even for large values).
+async fn clear_pending_write(cache: &Cache<String, Bytes>, key: &str, written: &Bytes) {
+    cache
+        .entry_by_ref(key)
+        .and_compute_with(|entry| async move {
+            match entry {
+                Some(entry)
+                    if entry.value().as_ptr() == written.as_ptr()
+                        && entry.value().len() == written.len() =>
+                {
+                    Op::Remove
+                }
+                _ => Op::Nop,
+            }
+        })
+        .await;
 }
 
 // Enhanced consumer with batching support
@@ -703,37 +733,32 @@ async fn process_batch(
         e.to_string()
     });
 
-    // Clean up inflight cache entries after successful database commit.
-    // This prevents memory leaks and ensures the cache doesn't grow indefinitely.
-    // The inflight cache is used to prevent race conditions in async write mode:
-    // when a SET returns OK immediately, subsequent GET requests check the cache
-    // first before hitting the database. Once the write is committed, we can
-    // safely remove the entry from the cache since it's now in the database.
-    if commit_result.is_ok() {
-        for operation in batch.iter() {
-            match operation {
-                ShardWriteOperation::SetAsync { key, .. } => {
-                    inflight_cache.invalidate(key).await;
-                }
-                ShardWriteOperation::DeleteAsync { key } => {
-                    // Also clean up any SET operations that might have been overridden
-                    inflight_cache.invalidate(key).await;
-                }
-                ShardWriteOperation::HSetAsync { namespace, key, .. } => {
-                    let namespaced_key = format!("{}:{}", namespace, key);
-                    inflight_hcache.invalidate(&namespaced_key).await;
-                }
-                ShardWriteOperation::HSetExAsync { namespace, key, .. } => {
-                    let namespaced_key = format!("{}:{}", namespace, key);
-                    inflight_hcache.invalidate(&namespaced_key).await;
-                }
-                ShardWriteOperation::HDeleteAsync { namespace, key } => {
-                    // Also clean up any HSET operations that might have been overridden
-                    let namespaced_key = format!("{}:{}", namespace, key);
-                    inflight_hcache.invalidate(&namespaced_key).await;
-                }
-                _ => {} // Only async operations use the inflight cache
+    // The writes are processed: drop their inflight cache entries so reads go
+    // to the DB, whether or not they committed (a failed write isn't in the
+    // DB, and reads shouldn't keep serving it). Only drop an entry if it still
+    // holds this op's value: a newer write to the same key, still queued, must
+    // stay visible. Deletes need nothing here; DEL/HDEL clear the entry when
+    // issued, and clearing again now could drop a SET issued after the DEL.
+    for operation in batch.iter() {
+        match operation {
+            ShardWriteOperation::SetAsync { key, data, .. } => {
+                clear_pending_write(inflight_cache, key, data).await;
             }
+            ShardWriteOperation::HSetAsync {
+                namespace,
+                key,
+                data,
+            }
+            | ShardWriteOperation::HSetExAsync {
+                namespace,
+                key,
+                data,
+                ..
+            } => {
+                let namespaced_key = format!("{}:{}", namespace, key);
+                clear_pending_write(inflight_hcache, &namespaced_key, data).await;
+            }
+            _ => {}
         }
     }
 
@@ -1458,6 +1483,74 @@ mod tests {
             "failed to read PRAGMA freelist_count".to_string(),
         ];
         assert_eq!(classify_vacuum_error_kinds(&mixed), (true, true));
+    }
+
+    #[tokio::test]
+    async fn processed_async_write_only_clears_its_own_cache_entry() {
+        let (_temp_dir, pool) = create_test_pool().await;
+        let cache: Cache<String, Bytes> = Cache::new(16);
+        let (sender, receiver) = mpsc::channel(8);
+        let writer = tokio::spawn(shard_writer_task(ShardWriter {
+            shard_id: 0,
+            pool,
+            receiver,
+            batch_size: 8,
+            batch_timeout_ms: 0,
+            inflight_cache: cache.clone(),
+            inflight_hcache: Cache::new(16),
+            metrics: Metrics::new(),
+            shutdown: CancellationToken::new(),
+        }));
+        // Waits until the writer has processed everything sent before it.
+        let barrier = || async {
+            let (responder, rx) = oneshot::channel();
+            sender
+                .send(ShardWriteOperation::Set {
+                    key: "barrier".to_string(),
+                    data: Bytes::from_static(b"b"),
+                    expires_at: None,
+                    responder,
+                })
+                .await
+                .unwrap();
+            rx.await.unwrap().unwrap();
+        };
+        let set_async = |key: &str, data: Bytes| ShardWriteOperation::SetAsync {
+            key: key.to_string(),
+            data,
+            expires_at: None,
+        };
+
+        // SET k v1 then SET k v2: the cache holds v2 while v1's op is processed.
+        let v2 = Bytes::from(vec![2u8; 16]);
+        record_pending_write(&cache, "k".to_string(), v2.clone()).await;
+        sender
+            .send(set_async("k", Bytes::from(vec![1u8; 16])))
+            .await
+            .unwrap();
+        // DEL d then SET d: the delete's op must not clear the newer SET.
+        record_pending_write(&cache, "d".to_string(), Bytes::from_static(b"new")).await;
+        sender
+            .send(ShardWriteOperation::DeleteAsync {
+                key: "d".to_string(),
+            })
+            .await
+            .unwrap();
+        barrier().await;
+        assert_eq!(
+            cache.get("k").await,
+            Some(v2.clone()),
+            "newer SET must stay visible"
+        );
+        assert!(cache.contains_key("d"), "SET after DEL must stay visible");
+
+        // v2's own op clears it.
+        sender.send(set_async("k", v2)).await.unwrap();
+        barrier().await;
+        assert!(!cache.contains_key("k"));
+
+        drop(sender);
+        writer.await.unwrap();
     }
 
     #[tokio::test]

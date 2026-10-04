@@ -606,9 +606,7 @@ async fn handle_set(
     // Check if async_write is enabled
     if state.cfg.async_write.unwrap_or(false) {
         // Store in inflight cache to prevent race conditions
-        state
-            .inflight_cache
-            .insert(key.clone(), value.clone())
+        shard_manager::record_pending_write(&state.inflight_cache, key.clone(), value.clone())
             .await;
 
         // Calculate expires_at timestamp if TTL is provided
@@ -1164,9 +1162,7 @@ async fn handle_hset(
     if state.cfg.async_write.unwrap_or(false) {
         // Store in inflight cache to prevent race conditions
         let namespaced_key = state.namespaced_key(&namespace, &key);
-        state
-            .inflight_hcache
-            .insert(namespaced_key, value.clone())
+        shard_manager::record_pending_write(&state.inflight_hcache, namespaced_key, value.clone())
             .await;
 
         // Async mode: respond immediately after queueing
@@ -1336,10 +1332,12 @@ async fn handle_hsetex(
         if state.cfg.async_write.unwrap_or(false) {
             // Store in inflight cache to prevent race conditions
             let namespaced_key = state.namespaced_key(&namespace, &field_key);
-            state
-                .inflight_hcache
-                .insert(namespaced_key, compressed_value.clone())
-                .await;
+            shard_manager::record_pending_write(
+                &state.inflight_hcache,
+                namespaced_key,
+                compressed_value.clone(),
+            )
+            .await;
 
             let operation = if let Some(exp) = expires_at {
                 ShardWriteOperation::HSetExAsync {
