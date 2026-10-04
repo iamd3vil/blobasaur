@@ -1033,20 +1033,24 @@ mod tests {
         let (resp, _) = parse_resp_with_remaining(input).unwrap();
         let result = parse_command(resp);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("EX requires a value"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("EX requires a value")
+        );
 
         // Test SET with PX but no value
         let input = b"*4\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$5\r\nvalue\r\n$2\r\nPX\r\n";
         let (resp, _) = parse_resp_with_remaining(input).unwrap();
         let result = parse_command(resp);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("PX requires a value"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("PX requires a value")
+        );
     }
 
     #[test]
@@ -1055,10 +1059,12 @@ mod tests {
         let (resp, _) = parse_resp_with_remaining(input).unwrap();
         let result = parse_command(resp);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Unknown SET option: XX"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Unknown SET option: XX")
+        );
     }
 
     #[test]
@@ -1067,10 +1073,12 @@ mod tests {
         let (resp, _) = parse_resp_with_remaining(input).unwrap();
         let result = parse_command(resp);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid seconds value"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid seconds value")
+        );
     }
 
     #[test]
@@ -1080,20 +1088,24 @@ mod tests {
         let (resp, _) = parse_resp_with_remaining(input).unwrap();
         let result = parse_command(resp);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("TTL requires exactly 1 argument"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("TTL requires exactly 1 argument")
+        );
 
         // Too few arguments
         let input = b"*1\r\n$3\r\nTTL\r\n";
         let (resp, _) = parse_resp_with_remaining(input).unwrap();
         let result = parse_command(resp);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("TTL requires exactly 1 argument"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("TTL requires exactly 1 argument")
+        );
     }
 
     #[test]
@@ -1103,20 +1115,24 @@ mod tests {
         let (resp, _) = parse_resp_with_remaining(input).unwrap();
         let result = parse_command(resp);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("EXPIRE requires exactly 2 arguments"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("EXPIRE requires exactly 2 arguments")
+        );
 
         // Too few arguments
         let input = b"*2\r\n$6\r\nEXPIRE\r\n$5\r\nmykey\r\n";
         let (resp, _) = parse_resp_with_remaining(input).unwrap();
         let result = parse_command(resp);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("EXPIRE requires exactly 2 arguments"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("EXPIRE requires exactly 2 arguments")
+        );
     }
 
     #[test]
@@ -1544,10 +1560,12 @@ mod tests {
             "HEXPIRE", "myhash", "abc", "FIELDS", "1", "field1",
         ]));
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid seconds value"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid seconds value")
+        );
     }
 
     #[test]
@@ -1557,10 +1575,12 @@ mod tests {
             "HEXPIRE", "myhash", "10", "NX", "FIELDS", "0",
         ]));
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("at least one field"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("at least one field")
+        );
     }
 
     #[test]
@@ -1626,10 +1646,12 @@ mod tests {
             "field1",
         ]));
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid timestamp value"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid timestamp value")
+        );
     }
 
     #[test]
