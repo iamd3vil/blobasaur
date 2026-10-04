@@ -700,19 +700,26 @@ async fn handle_del_multiple(
         let shard_index = state.get_shard(&key);
         let pool = &state.write_db_pools[shard_index];
 
-        // Check if key exists first. A failed check (e.g. the writer connection is
+        // A queued async SET is in the inflight cache but not the DB yet. It
+        // counts as existing: skipping the delete would let that SET commit
+        // afterwards and bring the key back.
+        // Otherwise check the DB. A failed check (e.g. the writer connection is
         // held by a long VACUUM) must not be reported as "key not found".
-        let exists = match sqlx::query("SELECT 1 FROM blobs WHERE key = ?")
-            .bind(&key)
-            .fetch_optional(pool)
-            .await
-        {
-            Ok(row) => row.is_some(),
-            Err(e) => {
-                tracing::error!("Failed to check DEL existence for key {}: {}", key, e);
-                let response = BytesFrame::Error("ERR database error".into());
-                stream.write_all(&serialize_frame(&response)).await?;
-                return Ok(());
+        let exists = if state.inflight_cache.contains_key(&key) {
+            true
+        } else {
+            match sqlx::query("SELECT 1 FROM blobs WHERE key = ?")
+                .bind(&key)
+                .fetch_optional(pool)
+                .await
+            {
+                Ok(row) => row.is_some(),
+                Err(e) => {
+                    tracing::error!("Failed to check DEL existence for key {}: {}", key, e);
+                    let response = BytesFrame::Error("ERR database error".into());
+                    stream.write_all(&serialize_frame(&response)).await?;
+                    return Ok(());
+                }
             }
         };
 
@@ -789,6 +796,14 @@ async fn handle_exists(
     state: &Arc<AppState>,
     key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // A queued async SET counts, as it does for GET.
+    if state.inflight_cache.contains_key(&key) {
+        stream
+            .write_all(&serialize_frame(&BytesFrame::Integer(1)))
+            .await?;
+        return Ok(());
+    }
+
     let shard_index = state.get_shard(&key);
     let pool = &state.db_pools[shard_index];
 
@@ -1426,33 +1441,41 @@ async fn handle_hdel(
     let pool = &state.write_db_pools[shard_index];
     let table_name = format!("blobs_{}", namespace);
 
-    // First check if key exists. A missing namespace table is a genuine miss;
-    // any other failure must surface instead of being reported as "not found".
-    let table_exists = match hash_table_exists(pool, &table_name).await {
-        Ok(exists) => exists,
-        Err(e) => {
-            tracing::error!(
-                "Failed to check table existence for namespace {}: {}",
-                table_name,
-                e
-            );
-            let response = BytesFrame::Error("ERR database error".into());
-            stream.write_all(&serialize_frame(&response)).await?;
-            return Ok(());
-        }
-    };
-    let exists = match hash_field_exists(pool, &table_name, &key, table_exists).await {
-        Ok(exists) => exists,
-        Err(e) => {
-            tracing::error!(
-                "Failed to check HDEL existence for namespace {} key {}: {}",
-                namespace,
-                key,
-                e
-            );
-            let response = BytesFrame::Error("ERR database error".into());
-            stream.write_all(&serialize_frame(&response)).await?;
-            return Ok(());
+    // A queued async HSET is in the inflight cache but not the DB yet. It counts
+    // as existing: skipping the delete would let that HSET commit afterwards
+    // and bring the field back.
+    // Otherwise check the DB. A missing namespace table is a genuine miss; any
+    // other failure must surface instead of being reported as "not found".
+    let namespaced_key = state.namespaced_key(&namespace, &key);
+    let exists = if state.inflight_hcache.contains_key(&namespaced_key) {
+        true
+    } else {
+        let table_exists = match hash_table_exists(pool, &table_name).await {
+            Ok(exists) => exists,
+            Err(e) => {
+                tracing::error!(
+                    "Failed to check table existence for namespace {}: {}",
+                    table_name,
+                    e
+                );
+                let response = BytesFrame::Error("ERR database error".into());
+                stream.write_all(&serialize_frame(&response)).await?;
+                return Ok(());
+            }
+        };
+        match hash_field_exists(pool, &table_name, &key, table_exists).await {
+            Ok(exists) => exists,
+            Err(e) => {
+                tracing::error!(
+                    "Failed to check HDEL existence for namespace {} key {}: {}",
+                    namespace,
+                    key,
+                    e
+                );
+                let response = BytesFrame::Error("ERR database error".into());
+                stream.write_all(&serialize_frame(&response)).await?;
+                return Ok(());
+            }
         }
     };
 
@@ -1468,7 +1491,6 @@ async fn handle_hdel(
     // Check if async_write is enabled
     if state.cfg.async_write.unwrap_or(false) {
         // Remove from inflight cache immediately for delete operations
-        let namespaced_key = state.namespaced_key(&namespace, &key);
         state.inflight_hcache.invalidate(&namespaced_key).await;
 
         // Async mode: respond immediately after queueing
@@ -1544,6 +1566,17 @@ async fn handle_hexists(
     {
         let response = BytesFrame::Error(redirect.into());
         stream.write_all(&serialize_frame(&response)).await?;
+        return Ok(());
+    }
+
+    // A queued async HSET counts, as it does for HGET.
+    if state
+        .inflight_hcache
+        .contains_key(&state.namespaced_key(&namespace, &key))
+    {
+        stream
+            .write_all(&serialize_frame(&BytesFrame::Integer(1)))
+            .await?;
         return Ok(());
     }
 
@@ -2980,6 +3013,62 @@ mod tests {
         })
         .await;
         assert!(detected.is_ok(), "closed peer should be detected");
+    }
+
+    #[tokio::test]
+    async fn async_del_and_exists_count_writes_still_queued() {
+        let ctx = TestContext::new(true).await;
+        // An acked async SET/HSET whose op hasn't committed yet: in the inflight
+        // cache, not in the DB.
+        let value = Bytes::from_static(b"v");
+        ctx.state
+            .inflight_cache
+            .insert("queued".to_string(), value.clone())
+            .await;
+        ctx.state
+            .inflight_hcache
+            .insert(ctx.state.namespaced_key("ns", "field"), value)
+            .await;
+
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move { handle_exists(&mut stream, &state, "queued".to_string()).await })
+        })
+        .await;
+        assert_integer_response(frame, 1);
+
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_hexists(&mut stream, &state, "ns".to_string(), "field".to_string()).await
+            })
+        })
+        .await;
+        assert_integer_response(frame, 1);
+
+        // Skipping these deletes would let the queued writes commit afterwards
+        // and bring the keys back.
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_del_multiple(&mut stream, &state, vec!["queued".to_string()]).await
+            })
+        })
+        .await;
+        assert_integer_response(frame, 1);
+
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_hdel(&mut stream, &state, "ns".to_string(), "field".to_string()).await
+            })
+        })
+        .await;
+        assert_integer_response(frame, 1);
+
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move { handle_exists(&mut stream, &state, "queued".to_string()).await })
+        })
+        .await;
+        assert_integer_response(frame, 0);
+
+        ctx.shutdown().await;
     }
 
     #[tokio::test]
