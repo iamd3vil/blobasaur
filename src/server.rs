@@ -4,12 +4,12 @@ use crate::config::Cfg;
 use crate::metrics::Timer;
 use crate::redis::{
     HExpireCondition, ParseError, RedisCommand, VacuumCommandMode, VacuumShardTarget,
-    parse_command, parse_resp_with_remaining, serialize_frame,
+    decode_request, parse_command, serialize_frame,
 };
 use crate::shard_manager::{
     self, ShardWriteOperation, ShardWriter, VacuumMode, VacuumResult, VacuumStats,
 };
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::FutureExt;
 use redis_protocol::resp2::types::BytesFrame;
 use std::sync::Arc;
@@ -221,95 +221,74 @@ pub async fn run_redis_server(
     }
 }
 
+/// Read size hint per socket read; the buffer still grows to fit large requests.
+const READ_CHUNK: usize = 64 * 1024;
+
 async fn handle_connection(
     mut stream: TcpStream,
     state: Arc<AppState>,
     shutdown: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut buffer = Vec::new();
-    let mut temp_buffer = vec![0; 4096];
+    let max_request_size = state.cfg.max_request_size();
+    let mut buffer = BytesMut::with_capacity(READ_CHUNK);
 
     loop {
-        let read = tokio::select! {
-            read = stream.read(&mut temp_buffer) => read,
-            _ = shutdown.cancelled() => return Ok(()),
-        };
-        let n = match read {
-            Ok(0) => return Ok(()), // Connection closed
-            Ok(n) => n,
-            Err(e) => {
-                tracing::error!("Failed to read from socket: {}", e);
-                return Err(Box::new(e));
-            }
-        };
-
-        buffer.extend_from_slice(&temp_buffer[..n]);
-        tracing::debug!(
-            "Read {} bytes from socket, buffer size is now {}",
-            n,
-            buffer.len()
-        );
-
-        // Try to parse complete messages from the buffer
-        let mut remaining_data = &buffer[..];
-
-        while !remaining_data.is_empty() {
+        // Run every complete request already buffered before reading more.
+        loop {
             // Shutting down: close instead of starting the next pipelined command.
             if shutdown.is_cancelled() {
                 return Ok(());
             }
-            match parse_resp_with_remaining(remaining_data) {
-                Ok((resp_value, remaining)) => {
-                    remaining_data = remaining;
-
-                    // Parse and handle the command
-                    match parse_command(resp_value) {
-                        Ok(command) => {
-                            if let Err(e) = handle_redis_command(&mut stream, &state, command).await
-                            {
-                                tracing::error!("Error handling command: {}", e);
-                                return Err(e);
-                            }
-                        }
-                        Err(ParseError::Invalid(msg)) => {
-                            tracing::warn!("Invalid command: {}", msg);
-                            let error_resp = BytesFrame::Error(format!("ERR {}", msg).into());
-                            stream.write_all(&serialize_frame(&error_resp)).await?;
-                        }
-                        Err(e) => {
-                            tracing::error!("Command parse error: {}", e);
-                            let error_resp = BytesFrame::Error("ERR protocol error".into());
-                            stream.write_all(&serialize_frame(&error_resp)).await?;
-                        }
-                    }
+            let request = match decode_request(&mut buffer, max_request_size) {
+                Ok(Some(request)) => request,
+                Ok(None) => break,
+                Err(e) => {
+                    // Like Redis, reply once and close. Resyncing mid-stream could
+                    // run bytes from inside a value as commands.
+                    tracing::warn!("Protocol error, closing connection: {}", e);
+                    state.metrics.record_error("protocol");
+                    let error_resp = BytesFrame::Error(format!("ERR Protocol error: {}", e).into());
+                    stream.write_all(&serialize_frame(&error_resp)).await?;
+                    return Ok(());
                 }
-                Err(ParseError::Incomplete) => {
-                    // Need more data, keep remaining data in buffer
-                    break;
+            };
+
+            match parse_command(request) {
+                Ok(command) => {
+                    if let Err(e) = handle_redis_command(&mut stream, &state, command).await {
+                        tracing::error!("Error handling command: {}", e);
+                        return Err(e);
+                    }
                 }
                 Err(ParseError::Invalid(msg)) => {
-                    tracing::warn!("Protocol error: {}", msg);
+                    tracing::warn!("Invalid command: {}", msg);
                     let error_resp = BytesFrame::Error(format!("ERR {}", msg).into());
                     stream.write_all(&serialize_frame(&error_resp)).await?;
-                    // Skip one byte to try to recover
-                    if !remaining_data.is_empty() {
-                        remaining_data = &remaining_data[1..];
-                    }
+                }
+                Err(e) => {
+                    tracing::error!("Command parse error: {}", e);
+                    let error_resp = BytesFrame::Error("ERR protocol error".into());
+                    stream.write_all(&serialize_frame(&error_resp)).await?;
                 }
             }
         }
 
-        // Update buffer to keep only unprocessed data
-        let remaining_len = remaining_data.len();
-        let processed_len = buffer.len() - remaining_len;
-        if processed_len > 0 {
-            buffer.drain(..processed_len);
-        }
-
-        // Prevent buffer from growing too large
-        if buffer.len() > 1024 * 1024 {
-            tracing::warn!("Buffer too large, closing connection");
-            return Err("Buffer overflow".into());
+        buffer.reserve(READ_CHUNK);
+        let read = tokio::select! {
+            read = stream.read_buf(&mut buffer) => read,
+            _ = shutdown.cancelled() => return Ok(()),
+        };
+        match read {
+            Ok(0) => return Ok(()), // Connection closed
+            Ok(n) => tracing::debug!(
+                "Read {} bytes from socket, buffer size is now {}",
+                n,
+                buffer.len()
+            ),
+            Err(e) => {
+                tracing::error!("Failed to read from socket: {}", e);
+                return Err(Box::new(e));
+            }
         }
     }
 }
@@ -2254,6 +2233,7 @@ mod tests {
     use super::*;
     use crate::cluster::ClusterManager;
     use crate::config::{Cfg, SqliteConfig};
+    use crate::redis::parse_resp_with_remaining;
     use crate::shard_manager::{self, ShardWriteOperation};
     use futures::future::BoxFuture;
     use tempfile::TempDir;
@@ -2284,6 +2264,7 @@ mod tests {
                 cluster: None,
                 metrics: None,
                 shutdown_timeout_secs: None,
+                max_request_size_mb: None,
                 sqlite: None,
             };
 
@@ -2346,6 +2327,7 @@ mod tests {
             cluster: None,
             metrics: None,
             shutdown_timeout_secs: None,
+            max_request_size_mb: None,
             sqlite: Some(SqliteConfig {
                 cache_size_mb: None,
                 busy_timeout_ms: Some(250),

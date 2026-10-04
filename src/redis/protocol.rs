@@ -1,5 +1,10 @@
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use redis_protocol::resp2::{decode::decode_bytes_mut, encode::extend_encode, types::BytesFrame};
+
+/// Max arguments in one request, same as Redis' multibulk limit.
+const MAX_REQUEST_ARGS: usize = 1024 * 1024;
+/// Longest possible `*N` / `$len` header line, including its CRLF.
+const MAX_HEADER_LEN: usize = 32;
 
 /// Redis protocol data types (re-export from redis-protocol crate)
 pub type RespValue = BytesFrame;
@@ -179,7 +184,101 @@ pub enum ParseError {
     Invalid(String),
 }
 
-/// Parse a single RESP message and return both the parsed value and remaining bytes
+/// Decodes one client request from the front of `buf`.
+///
+/// Clients only send flat arrays of bulk strings (`*N\r\n` then N x
+/// `$len\r\n<data>\r\n`), so anything else is a protocol error: nesting,
+/// other frame types, a missing CRLF, or a request larger than `max_size`.
+/// Nothing recurses and payloads are never copied or rescanned: on success the
+/// request is split off `buf` and each argument is a slice of it.
+///
+/// Returns `Ok(None)` until the whole request has arrived.
+pub fn decode_request(
+    buf: &mut BytesMut,
+    max_size: usize,
+) -> Result<Option<BytesFrame>, ParseError> {
+    let mut pos = 0;
+    let Some(argc) = read_header(buf, &mut pos, b'*')? else {
+        return Ok(None);
+    };
+    if argc > MAX_REQUEST_ARGS {
+        return Err(ParseError::Invalid("invalid multibulk length".to_string()));
+    }
+
+    let mut args = Vec::with_capacity(argc.min(64));
+    for _ in 0..argc {
+        let Some(len) = read_header(buf, &mut pos, b'$')? else {
+            return Ok(None);
+        };
+        let end = pos.saturating_add(len).saturating_add(2);
+        if end > max_size {
+            return Err(ParseError::Invalid(format!(
+                "request exceeds max_request_size_mb ({} bytes)",
+                max_size
+            )));
+        }
+        if buf.len() < end {
+            return Ok(None);
+        }
+        if &buf[end - 2..end] != b"\r\n" {
+            return Err(ParseError::Invalid(
+                "expected CRLF after bulk string".to_string(),
+            ));
+        }
+        args.push(pos..end - 2);
+        pos = end;
+    }
+
+    let request = buf.split_to(pos).freeze();
+    Ok(Some(BytesFrame::Array(
+        args.into_iter()
+            .map(|range| BytesFrame::BulkString(request.slice(range)))
+            .collect(),
+    )))
+}
+
+/// Reads a `<prefix><decimal>\r\n` header at `pos` and advances past it.
+fn read_header(buf: &[u8], pos: &mut usize, prefix: u8) -> Result<Option<usize>, ParseError> {
+    let rest = &buf[*pos..];
+    let Some(&first) = rest.first() else {
+        return Ok(None);
+    };
+    if first != prefix {
+        return Err(ParseError::Invalid(format!(
+            "expected '{}', got '{}'",
+            prefix as char,
+            first.escape_ascii()
+        )));
+    }
+    let Some(cr) = rest.iter().take(MAX_HEADER_LEN).position(|&b| b == b'\r') else {
+        return if rest.len() >= MAX_HEADER_LEN {
+            Err(ParseError::Invalid("header line too long".to_string()))
+        } else {
+            Ok(None)
+        };
+    };
+    if rest.len() < cr + 2 {
+        return Ok(None);
+    }
+    let digits = &rest[1..cr];
+    if rest[cr + 1] != b'\n' || digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return Err(ParseError::Invalid(format!(
+            "invalid {} length",
+            if prefix == b'*' { "multibulk" } else { "bulk" }
+        )));
+    }
+    // At most MAX_HEADER_LEN digits, so this only fails on overflow.
+    let value = std::str::from_utf8(digits)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| ParseError::Invalid("length out of range".to_string()))?;
+    *pos += cr + 2;
+    Ok(Some(value))
+}
+
+/// Parse a single RESP message and return both the parsed value and remaining bytes.
+/// Generic decoder for replies from our own nodes (vacuum CLI); client requests
+/// go through [`decode_request`].
 pub fn parse_resp_with_remaining(input: &[u8]) -> Result<(RespValue, &[u8]), ParseError> {
     let mut bytes_mut = bytes::BytesMut::from(input);
 
@@ -891,8 +990,8 @@ fn extract_string(value: &BytesFrame) -> Result<String, ParseError> {
 /// Extract bytes from RESP value
 fn extract_bytes(value: &BytesFrame) -> Result<Bytes, ParseError> {
     match value {
-        BytesFrame::BulkString(data) => Ok(Bytes::copy_from_slice(data)),
-        BytesFrame::SimpleString(data) => Ok(Bytes::copy_from_slice(data)),
+        BytesFrame::BulkString(data) => Ok(data.clone()),
+        BytesFrame::SimpleString(data) => Ok(data.clone()),
         BytesFrame::Null => Err(ParseError::Invalid(
             "Cannot use null as byte argument".to_string(),
         )),
@@ -912,6 +1011,109 @@ pub fn serialize_frame(frame: &BytesFrame) -> Bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const MAX: usize = 1024 * 1024;
+
+    fn request(parts: &[&[u8]]) -> Vec<u8> {
+        let mut out = format!("*{}\r\n", parts.len()).into_bytes();
+        for part in parts {
+            out.extend_from_slice(format!("${}\r\n", part.len()).as_bytes());
+            out.extend_from_slice(part);
+            out.extend_from_slice(b"\r\n");
+        }
+        out
+    }
+
+    fn decode(input: &[u8], max: usize) -> (Result<Option<BytesFrame>, ParseError>, BytesMut) {
+        let mut buf = BytesMut::from(input);
+        let result = decode_request(&mut buf, max);
+        (result, buf)
+    }
+
+    fn assert_protocol_error(input: &[u8], max: usize, expected: &str) {
+        match decode(input, max).0 {
+            Err(ParseError::Invalid(msg)) => {
+                assert!(
+                    msg.contains(expected),
+                    "{msg:?} should contain {expected:?}"
+                )
+            }
+            other => panic!("expected protocol error {expected:?}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_request_splits_one_request_off_the_buffer() {
+        let mut input = request(&[b"SET", b"key", b"bin\r\n\x00value"]);
+        input.extend_from_slice(&request(&[b"GET", b"key"]));
+
+        let (result, rest) = decode(&input, MAX);
+        let expected = command_frame(&["SET", "key", "bin\r\n\x00value"]);
+        assert_eq!(result.unwrap(), Some(expected));
+        assert_eq!(&rest[..], &request(&[b"GET", b"key"])[..]);
+    }
+
+    #[test]
+    fn decode_request_waits_for_every_partial_prefix() {
+        let input = request(&[b"SET", b"key", b"value"]);
+        for cut in 0..input.len() {
+            let (result, rest) = decode(&input[..cut], MAX);
+            assert!(
+                matches!(result, Ok(None)),
+                "prefix of {cut} bytes: {result:?}"
+            );
+            assert_eq!(rest.len(), cut, "incomplete input must stay buffered");
+        }
+        assert!(decode(&input, MAX).0.unwrap().is_some());
+    }
+
+    #[test]
+    fn decode_request_handles_empty_args_and_empty_array() {
+        let (result, _) = decode(&request(&[b"PING", b""]), MAX);
+        assert_eq!(result.unwrap(), Some(command_frame(&["PING", ""])));
+        let (result, rest) = decode(b"*0\r\n", MAX);
+        assert_eq!(result.unwrap(), Some(BytesFrame::Array(vec![])));
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn decode_request_rejects_deeply_nested_arrays_without_recursing() {
+        // Used to overflow the stack and abort the whole process.
+        let mut input = b"*1\r\n".repeat(100_000);
+        input.extend_from_slice(b"$4\r\nPING\r\n");
+        assert_protocol_error(&input, MAX, "expected '$'");
+    }
+
+    #[test]
+    fn decode_request_rejects_bad_framing() {
+        // Declared length is short, so the bytes after the value aren't CRLF.
+        // The old decoder accepted this and ran the trailing bytes as a command.
+        let mut short = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$2\r\nXYab".to_vec();
+        short.extend_from_slice(&request(&[b"DEL", b"victim"]));
+        assert_protocol_error(&short, MAX, "expected CRLF");
+
+        assert_protocol_error(b"PING\r\n", MAX, "expected '*'");
+        assert_protocol_error(b"*1\r\n+PING\r\n", MAX, "expected '$'");
+        assert_protocol_error(b"*1\r\n$-1\r\n", MAX, "invalid bulk length");
+        assert_protocol_error(b"*x\r\n", MAX, "invalid multibulk length");
+        assert_protocol_error(b"*1\n$4\r\nPING\r\n", MAX, "invalid multibulk length");
+        assert_protocol_error(&[b"*".as_slice(), &[b'1'; 40]].concat(), MAX, "too long");
+        assert_protocol_error(b"*99999999999999999999\r\n", MAX, "out of range");
+        assert_protocol_error(b"*2000000\r\n", MAX, "invalid multibulk length");
+    }
+
+    #[test]
+    fn decode_request_enforces_max_size_before_buffering_the_value() {
+        let input = request(&[b"SET", b"k", &[b'x'; 100]]);
+        assert!(decode(&input, input.len()).0.unwrap().is_some());
+        assert_protocol_error(&input, input.len() - 1, "max_request_size_mb");
+        // Rejected from the header alone, without waiting for the payload.
+        assert_protocol_error(
+            b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$999999999\r\n",
+            MAX,
+            "max_request_size_mb",
+        );
+    }
 
     fn command_frame(parts: &[&str]) -> BytesFrame {
         BytesFrame::Array(

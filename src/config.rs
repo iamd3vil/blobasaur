@@ -18,6 +18,9 @@ pub struct Cfg {
     /// Max seconds to drain in-flight commands and queued writes on SIGINT/SIGTERM.
     /// Default: 30
     pub shutdown_timeout_secs: Option<u64>,
+    /// Max size of a single client request (command plus all arguments) in MB.
+    /// Larger requests get an error and the connection is closed. Default: 100
+    pub max_request_size_mb: Option<u64>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -166,6 +169,12 @@ impl Cfg {
             return Err(miette::miette!("batch_size must be greater than 0"));
         }
 
+        if cfg.max_request_size_mb == Some(0) {
+            return Err(miette::miette!(
+                "max_request_size_mb must be greater than 0"
+            ));
+        }
+
         println!("Data directory: {}", cfg.data_dir);
         println!("Number of shards: {}", cfg.num_shards);
 
@@ -226,6 +235,12 @@ impl Cfg {
 
     pub fn shutdown_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.shutdown_timeout_secs.unwrap_or(30))
+    }
+
+    /// Max request size in bytes; see `max_request_size_mb`.
+    pub fn max_request_size(&self) -> usize {
+        let mb = self.max_request_size_mb.unwrap_or(100);
+        usize::try_from(mb.saturating_mul(1024 * 1024)).unwrap_or(usize::MAX)
     }
 
     pub fn is_compression(&self) -> bool {
