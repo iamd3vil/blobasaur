@@ -7,6 +7,7 @@ use sqlx::{Sqlite, SqlitePool};
 use std::collections::{HashSet, VecDeque};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, interval, timeout};
+use tokio_util::sync::CancellationToken;
 
 // Message type for writer consumers
 pub enum ShardWriteOperation {
@@ -127,6 +128,7 @@ pub async fn shard_writer_task(
     inflight_cache: Cache<String, Bytes>,
     inflight_hcache: Cache<String, Bytes>,
     metrics: Metrics,
+    shutdown: CancellationToken,
 ) {
     // Load existing namespaced tables into memory
     let mut known_tables = load_existing_tables(&pool, shard_id).await;
@@ -147,7 +149,11 @@ pub async fn shard_writer_task(
         if batch.is_empty() {
             let next_operation = match pending_maintenance_operation.take() {
                 Some(operation) => Some(operation),
-                None => receiver.recv().await,
+                None => tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => break,
+                    operation = receiver.recv() => operation,
+                },
             };
 
             match next_operation {
@@ -170,7 +176,12 @@ pub async fn shard_writer_task(
             }
         } else {
             // If batch has items, wait with timeout for more operations
-            match timeout(batch_timeout, receiver.recv()).await {
+            let next_operation = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => break,
+                result = timeout(batch_timeout, receiver.recv()) => result,
+            };
+            match next_operation {
                 Ok(Some(operation)) => {
                     if matches!(operation, ShardWriteOperation::Vacuum { .. }) {
                         pending_maintenance_operation = Some(operation);
@@ -219,9 +230,26 @@ pub async fn shard_writer_task(
         }
     }
 
-    // Process any remaining operations
-    if !batch.is_empty() {
+    // Drain: reject new sends, then commit everything already queued without
+    // waiting for batch_timeout. Senders whose op made it into the channel were
+    // (or will be) acknowledged, so all of it must hit the DB before we return.
+    receiver.close();
+    let mut drained = 0;
+    loop {
+        while batch.len() < batch_size {
+            match receiver.recv().await {
+                // Dropping the responder reports the vacuum as cancelled.
+                Some(ShardWriteOperation::Vacuum { .. }) => {}
+                Some(operation) => batch.push_back(operation),
+                None => break,
+            }
+        }
+        if batch.is_empty() {
+            break;
+        }
+
         let processed_batch_size = batch.len();
+        drained += processed_batch_size;
         let batch_start = std::time::Instant::now();
         process_batch(
             shard_id,
@@ -236,7 +264,11 @@ pub async fn shard_writer_task(
         metrics.record_batch_operation(processed_batch_size, batch_duration);
     }
 
-    tracing::info!("Shard {} writer task stopped", shard_id);
+    tracing::info!(
+        "Shard {} writer task stopped, drained {} pending ops",
+        shard_id,
+        drained
+    );
 }
 
 async fn process_batch(
@@ -1425,6 +1457,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn writer_drains_queued_ops_on_shutdown() {
+        let (_temp_dir, pool) = create_test_pool().await;
+        let (sender, receiver) = mpsc::channel(64);
+        for i in 0..50 {
+            sender
+                .send(ShardWriteOperation::SetAsync {
+                    key: format!("key-{i}"),
+                    data: Bytes::from_static(b"v"),
+                    expires_at: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        // Shutdown already requested and the sender is still alive: the
+        // writer must commit the queue rather than wait for more ops.
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        timeout(
+            Duration::from_secs(5),
+            shard_writer_task(
+                0,
+                pool.clone(),
+                receiver,
+                16,
+                60_000,
+                Cache::new(128),
+                Cache::new(128),
+                Metrics::new(),
+                shutdown,
+            ),
+        )
+        .await
+        .expect("writer did not stop");
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM blobs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 50);
+        assert!(
+            sender.is_closed(),
+            "writer should reject sends after shutdown"
+        );
+    }
+
+    #[tokio::test]
     async fn vacuum_operation_is_an_ordering_barrier_in_writer_queue() {
         let (_temp_dir, pool) = create_test_pool().await;
 
@@ -1452,6 +1531,7 @@ mod tests {
             Cache::new(128),
             Cache::new(128),
             Metrics::new(),
+            CancellationToken::new(),
         ));
 
         let (delete_tx, delete_rx) = oneshot::channel();

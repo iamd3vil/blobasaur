@@ -15,6 +15,9 @@ pub struct Cfg {
     pub cluster: Option<ClusterConfig>,
     pub metrics: Option<MetricsConfig>,
     pub sqlite: Option<SqliteConfig>,
+    /// Max seconds to drain in-flight commands and queued writes on SIGINT/SIGTERM.
+    /// Default: 30
+    pub shutdown_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -218,6 +221,10 @@ impl Cfg {
         );
 
         Ok(cfg)
+    }
+
+    pub fn shutdown_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.shutdown_timeout_secs.unwrap_or(30))
     }
 
     pub fn is_compression(&self) -> bool {

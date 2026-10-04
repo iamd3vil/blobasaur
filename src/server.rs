@@ -1,11 +1,12 @@
 use crate::AppState;
 use crate::cluster::ClusterManager;
+use crate::config::Cfg;
 use crate::metrics::Timer;
 use crate::redis::{
     HExpireCondition, ParseError, RedisCommand, VacuumCommandMode, VacuumShardTarget,
     parse_command, parse_resp_with_remaining, serialize_frame,
 };
-use crate::shard_manager::{ShardWriteOperation, VacuumMode, VacuumResult, VacuumStats};
+use crate::shard_manager::{self, ShardWriteOperation, VacuumMode, VacuumResult, VacuumStats};
 use bytes::Bytes;
 use futures::FutureExt;
 use redis_protocol::resp2::types::BytesFrame;
@@ -13,25 +14,200 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
+/// Runs blobasaur on `listener` until `shutdown` is cancelled, then shuts down
+/// without losing acknowledged writes:
+/// 1. stop accepting connections,
+/// 2. stop reading new commands and let in-flight ones reply,
+/// 3. drain every shard writer (commit all queued ops) and await it,
+/// 4. stop background tasks and the cluster manager,
+/// 5. checkpoint the WAL and close the pools.
+///
+/// Returns an error if shard writers could not drain within
+/// `shutdown_timeout_secs`; acknowledged writes may have been lost then.
+pub async fn run(
+    cfg: Cfg,
+    listener: TcpListener,
+    shutdown: CancellationToken,
+) -> miette::Result<()> {
+    use miette::{Context, miette};
+
+    // Initialize metrics if enabled
+    let prometheus_handle = if cfg.metrics.as_ref().is_some_and(|m| m.enabled) {
+        Some(crate::metrics::init_metrics_exporter().wrap_err("initializing metrics exporter")?)
+    } else {
+        None
+    };
+
+    // This vector will be populated by AppState::new
+    let mut shard_receivers = Vec::with_capacity(cfg.num_shards);
+
+    // Initialize AppState, AppState::new will populate shard_receivers
+    let state = Arc::new(
+        AppState::new(cfg.clone(), &mut shard_receivers)
+            .await
+            .wrap_err("initializing AppState")?,
+    );
+
+    // Initialize metrics
+    state.metrics.record_server_startup();
+
+    // Writers get their own token: they must keep running while in-flight
+    // commands finish, and only drain once connections are done.
+    let writers_shutdown = CancellationToken::new();
+    let mut writers = Vec::with_capacity(cfg.num_shards);
+    for (i, receiver) in shard_receivers.into_iter().enumerate() {
+        writers.push(tokio::spawn(shard_manager::shard_writer_task(
+            i,
+            state.write_db_pools[i].clone(),
+            receiver,
+            cfg.batch_size.unwrap_or(1),
+            cfg.batch_timeout_ms.unwrap_or(0),
+            state.inflight_cache.clone(),
+            state.inflight_hcache.clone(),
+            state.metrics.clone(),
+            writers_shutdown.clone(),
+        )));
+    }
+
+    let mut background = Vec::new();
+
+    // Spawn cleanup tasks for each shard
+    let cleanup_interval_secs = 60; // Clean up expired keys every 60 seconds
+    for i in 0..cfg.num_shards {
+        background.push(tokio::spawn(shard_manager::shard_cleanup_task(
+            i,
+            state.db_pools[i].clone(),
+            cleanup_interval_secs,
+        )));
+    }
+
+    // Start HTTP metrics server if enabled
+    if let Some(handle) = prometheus_handle {
+        let metrics_addr = cfg
+            .metrics
+            .as_ref()
+            .and_then(|m| m.addr.clone())
+            .unwrap_or_else(|| "0.0.0.0:9090".to_string());
+
+        background.push(tokio::spawn(async move {
+            if let Err(e) = crate::http_server::run_metrics_server(handle, &metrics_addr).await {
+                tracing::error!("Failed to run metrics server: {}", e);
+            }
+        }));
+    }
+
+    let connections = TaskTracker::new();
+    let server_result = run_redis_server(state.clone(), listener, &connections, &shutdown).await;
+    if let Err(e) = &server_result {
+        tracing::error!("Redis listener failed, shutting down: {}", e);
+        shutdown.cancel();
+    }
+
+    let drain_timeout = cfg.shutdown_timeout();
+    let deadline = tokio::time::Instant::now() + drain_timeout;
+    tracing::info!(
+        "Shutdown started: no longer accepting connections, draining {} active connections and {} shard writers (timeout {:?})",
+        connections.len(),
+        writers.len(),
+        drain_timeout
+    );
+
+    connections.close();
+    if tokio::time::timeout_at(deadline, connections.wait())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            "{} connections still running a command at the drain deadline; their writes will be rejected",
+            connections.len()
+        );
+    }
+
+    writers_shutdown.cancel();
+    let mut drain_failed = false;
+    for (shard_id, writer) in writers.iter_mut().enumerate() {
+        match tokio::time::timeout_at(deadline, writer).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::error!(
+                    "Shard {} writer task failed during shutdown: {}",
+                    shard_id,
+                    e
+                );
+                drain_failed = true;
+            }
+            Err(_) => {
+                let sender = &state.shard_senders[shard_id];
+                tracing::error!(
+                    "SHUTDOWN TIMEOUT: shard {} writer did not drain within {:?}; {} queued ops (plus the batch being committed) were acknowledged but NOT persisted",
+                    shard_id,
+                    drain_timeout,
+                    sender.max_capacity() - sender.capacity()
+                );
+                drain_failed = true;
+            }
+        }
+    }
+
+    for task in &background {
+        task.abort();
+    }
+    if let Some(cluster_manager) = &state.cluster_manager {
+        cluster_manager.shutdown().await;
+    }
+
+    if drain_failed {
+        return Err(miette!(
+            "shutdown drain incomplete: acknowledged writes may have been lost"
+        ));
+    }
+
+    for (shard_id, pool) in state.write_db_pools.iter().enumerate() {
+        if let Err(e) = shard_manager::wal_checkpoint_truncate(pool).await {
+            tracing::warn!(
+                "Shard {} WAL checkpoint on shutdown failed: {}",
+                shard_id,
+                e
+            );
+        }
+    }
+    for pool in state.db_pools.iter().chain(&state.write_db_pools) {
+        pool.close().await;
+    }
+
+    server_result.map_err(|e| miette!("Failed to run Redis server: {}", e))?;
+    tracing::info!("Shutdown complete: all acknowledged writes persisted");
+    Ok(())
+}
+
+/// Accepts connections until `shutdown` is cancelled. Connection tasks are
+/// spawned on `connections` so the caller can wait for them to finish.
 pub async fn run_redis_server(
     state: Arc<AppState>,
-    addr: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind(addr).await?;
-    tracing::info!("Blobasaur server listening on {}", addr);
+    listener: TcpListener,
+    connections: &TaskTracker,
+    shutdown: &CancellationToken,
+) -> std::io::Result<()> {
+    tracing::info!("Blobasaur server listening on {}", listener.local_addr()?);
 
     loop {
-        let (stream, addr) = listener.accept().await?;
+        let (stream, addr) = tokio::select! {
+            accepted = listener.accept() => accepted?,
+            _ = shutdown.cancelled() => return Ok(()),
+        };
         tracing::info!("Accepted new connection from {}", addr);
         tracing::debug!("New Blobasaur connection from {}", addr);
 
         let state_clone = state.clone();
+        let shutdown = shutdown.clone();
         // Record new connection
         state.metrics.record_connection();
 
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, state_clone.clone()).await {
+        connections.spawn(async move {
+            if let Err(e) = handle_connection(stream, state_clone.clone(), shutdown).await {
                 tracing::error!("Error handling connection from {}: {}", addr, e);
                 state_clone.metrics.record_error("connection");
             }
@@ -44,12 +220,17 @@ pub async fn run_redis_server(
 async fn handle_connection(
     mut stream: TcpStream,
     state: Arc<AppState>,
+    shutdown: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut buffer = Vec::new();
     let mut temp_buffer = vec![0; 4096];
 
     loop {
-        let n = match stream.read(&mut temp_buffer).await {
+        let read = tokio::select! {
+            read = stream.read(&mut temp_buffer) => read,
+            _ = shutdown.cancelled() => return Ok(()),
+        };
+        let n = match read {
             Ok(0) => return Ok(()), // Connection closed
             Ok(n) => n,
             Err(e) => {
@@ -69,6 +250,10 @@ async fn handle_connection(
         let mut remaining_data = &buffer[..];
 
         while !remaining_data.is_empty() {
+            // Shutting down: close instead of starting the next pipelined command.
+            if shutdown.is_cancelled() {
+                return Ok(());
+            }
             match parse_resp_with_remaining(remaining_data) {
                 Ok((resp_value, remaining)) => {
                     remaining_data = remaining;
@@ -2118,6 +2303,7 @@ mod tests {
                 addr: None,
                 cluster: None,
                 metrics: None,
+                shutdown_timeout_secs: None,
                 sqlite: None,
             };
 
@@ -2146,6 +2332,7 @@ mod tests {
                     inflight_cache,
                     inflight_hcache,
                     metrics,
+                    CancellationToken::new(),
                 )));
             }
 
@@ -2180,6 +2367,7 @@ mod tests {
             addr: None,
             cluster: None,
             metrics: None,
+            shutdown_timeout_secs: None,
             sqlite: Some(SqliteConfig {
                 cache_size_mb: None,
                 busy_timeout_ms: Some(250),

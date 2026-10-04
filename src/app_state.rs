@@ -526,6 +526,7 @@ mod tests {
             addr: None,
             cluster: None,
             metrics: None,
+            shutdown_timeout_secs: None,
             sqlite: None,
         }
     }

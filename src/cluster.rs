@@ -660,7 +660,6 @@ impl ClusterManager {
     }
 
     /// Shutdown the cluster manager
-    #[allow(dead_code)]
     pub async fn shutdown(&self) {
         if let Some(handle) = self.chitchat_handle.as_ref() {
             let chitchat_arc = handle.chitchat();
