@@ -989,6 +989,12 @@ async fn validate_hash_namespace(
     Ok(false)
 }
 
+/// Namespace tables are created per shard on the first HSET routed there, so a
+/// read can hit a shard without the table. That's a miss, not an error.
+fn is_missing_table(error: &sqlx::Error) -> bool {
+    matches!(error, sqlx::Error::Database(db) if db.message().starts_with("no such table"))
+}
+
 async fn hash_table_exists(pool: &sqlx::SqlitePool, table_name: &str) -> Result<bool, sqlx::Error> {
     sqlx::query("SELECT name FROM sqlite_master WHERE type='table' AND name = ?")
         .bind(table_name)
@@ -1075,6 +1081,11 @@ async fn handle_hget(
         Ok(None) => {
             let response = BytesFrame::Null;
             stream.write_all(&serialize_frame(&response)).await?;
+        }
+        Err(e) if is_missing_table(&e) => {
+            stream
+                .write_all(&serialize_frame(&BytesFrame::Null))
+                .await?;
         }
         Err(e) => {
             tracing::error!("Failed to HGET namespace {} key {}: {}", namespace, key, e);
@@ -1602,6 +1613,11 @@ async fn handle_hexists(
         Ok(None) => {
             let response = BytesFrame::Integer(0);
             stream.write_all(&serialize_frame(&response)).await?;
+        }
+        Err(e) if is_missing_table(&e) => {
+            stream
+                .write_all(&serialize_frame(&BytesFrame::Integer(0)))
+                .await?;
         }
         Err(e) => {
             tracing::error!(
@@ -3013,6 +3029,41 @@ mod tests {
         })
         .await;
         assert!(detected.is_ok(), "closed peer should be detected");
+    }
+
+    #[tokio::test]
+    async fn hget_and_hexists_miss_when_namespace_table_is_absent() {
+        let ctx = TestContext::new(false).await;
+
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_hget(
+                    &mut stream,
+                    &state,
+                    "never_written".to_string(),
+                    "f".to_string(),
+                )
+                .await
+            })
+        })
+        .await;
+        assert_null(frame);
+
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_hexists(
+                    &mut stream,
+                    &state,
+                    "never_written".to_string(),
+                    "f".to_string(),
+                )
+                .await
+            })
+        })
+        .await;
+        assert_integer_response(frame, 0);
+
+        ctx.shutdown().await;
     }
 
     #[tokio::test]
