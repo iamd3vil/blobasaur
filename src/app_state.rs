@@ -2,8 +2,8 @@ use futures::future::join_all;
 use miette::{Result, miette};
 use moka::future::Cache;
 use mpchash::HashRing;
-use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use sqlx::{Connection, SqliteConnection, SqlitePool};
 use std::fs;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -19,6 +19,15 @@ use crate::{
     shard_manager::{ShardWriteOperation, wal_checkpoint_truncate},
 };
 use bytes::Bytes;
+
+const CREATE_BLOBS_TABLE: &str = "CREATE TABLE IF NOT EXISTS blobs (
+    key TEXT PRIMARY KEY,
+    data BLOB,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    expires_at INTEGER,
+    version INTEGER NOT NULL DEFAULT 0
+)";
 
 #[derive(Hash)]
 struct ShardNode(u64);
@@ -74,6 +83,28 @@ impl AppState {
         let auto_upgrade_legacy_auto_vacuum_concurrency =
             cfg.sqlite_auto_upgrade_legacy_auto_vacuum_concurrency();
 
+        // auto_vacuum only takes effect on a brand-new DB file, before anything
+        // else (e.g. the switch to WAL) initializes it. It isn't a pool connect
+        // option because on an existing DB, setting it takes the write lock, and
+        // every new pool connection doing that made writer batches fail with
+        // SQLITE_BUSY. So create the table once on a short-lived connection that
+        // sets it, before the pools open the file. Older shards keep their mode;
+        // the enforcement below handles them.
+        for i in 0..cfg.num_shards {
+            let options =
+                build_sqlite_connect_options(&cfg, i).pragma("auto_vacuum", "INCREMENTAL");
+            let mut conn = SqliteConnection::connect_with(&options)
+                .await
+                .map_err(|e| miette!("failed to open shard {} DB: {}", i, e))?;
+            sqlx::query(CREATE_BLOBS_TABLE)
+                .execute(&mut conn)
+                .await
+                .map_err(|e| miette!("failed to create table in shard {} DB: {}", i, e))?;
+            conn.close()
+                .await
+                .map_err(|e| miette!("failed to close shard {} DB: {}", i, e))?;
+        }
+
         let mut db_pools_futures = vec![];
         let mut write_db_pools_futures = vec![];
         let pool_max_connections = cfg.sqlite_pool_max_connections();
@@ -125,19 +156,10 @@ impl AppState {
         .await?;
 
         for (i, pool) in db_pools.iter().enumerate() {
-            sqlx::query(
-                "CREATE TABLE IF NOT EXISTS blobs (
-                    key TEXT PRIMARY KEY,
-                    data BLOB,
-                    created_at INTEGER NOT NULL,
-                    updated_at INTEGER NOT NULL,
-                    expires_at INTEGER,
-                    version INTEGER NOT NULL DEFAULT 0
-                )",
-            )
-            .execute(pool)
-            .await
-            .unwrap_or_else(|e| panic!("Failed to create table in shard {} DB: {}", i, e));
+            sqlx::query(CREATE_BLOBS_TABLE)
+                .execute(pool)
+                .await
+                .unwrap_or_else(|e| panic!("Failed to create table in shard {} DB: {}", i, e));
 
             // Create index on expires_at for efficient expiry queries
             sqlx::query(
@@ -234,8 +256,8 @@ fn build_sqlite_connect_options(cfg: &Cfg, shard_id: usize) -> SqliteConnectOpti
         .journal_mode(SqliteJournalMode::Wal)
         .busy_timeout(std::time::Duration::from_millis(busy_timeout_ms));
 
+    // No auto_vacuum here: see AppState::new.
     connect_options = connect_options
-        .pragma("auto_vacuum", "INCREMENTAL")
         .pragma("synchronous", synchronous.as_str())
         .pragma("cache_size", format!("-{}", cache_size_mb * 1024))
         .pragma("foreign_keys", "true");
@@ -568,6 +590,11 @@ mod tests {
             .execute(&pool)
             .await
             .expect("failed to apply auto_vacuum pragma");
+        // Real legacy shards already hold data.
+        sqlx::query("CREATE TABLE blobs (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)")
+            .execute(&pool)
+            .await
+            .expect("failed to create legacy blobs table");
 
         pool.close().await;
     }
@@ -589,6 +616,46 @@ mod tests {
             .expect("failed to read auto_vacuum mode");
         pool.close().await;
         mode
+    }
+
+    #[tokio::test]
+    async fn new_pool_connections_do_not_take_the_write_lock() {
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let cfg = test_cfg_with_auto_upgrade(
+            temp_dir.path().to_string_lossy().into_owned(),
+            1,
+            true,
+            Some(100),
+        );
+        let mut receivers = Vec::new();
+        let _app_state = AppState::new(cfg.clone(), &mut receivers)
+            .await
+            .expect("failed to initialize app state");
+
+        // Stand-in for the shard writer mid-batch.
+        let mut writer = SqliteConnection::connect_with(&build_sqlite_connect_options(&cfg, 0))
+            .await
+            .expect("failed to open writer connection");
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut writer)
+            .await
+            .expect("failed to take write lock");
+
+        // Pools open connections like this under load and when recycling them.
+        // Setting auto_vacuum on connect needed the write lock and failed here.
+        let mut fresh = SqliteConnection::connect_with(&build_sqlite_connect_options(&cfg, 0))
+            .await
+            .expect("opening a connection must not need the write lock");
+        let mode = sqlx::query_scalar::<_, i64>("PRAGMA auto_vacuum")
+            .fetch_one(&mut fresh)
+            .await
+            .expect("failed to read auto_vacuum");
+        assert_eq!(mode, SQLITE_AUTO_VACUUM_INCREMENTAL);
+
+        sqlx::query("ROLLBACK")
+            .execute(&mut writer)
+            .await
+            .expect("failed to release write lock");
     }
 
     #[tokio::test]
