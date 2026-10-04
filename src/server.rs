@@ -255,9 +255,13 @@ async fn handle_connection(
 
             match parse_command(request) {
                 Ok(command) => {
+                    let quit = matches!(command, RedisCommand::Quit);
                     if let Err(e) = handle_redis_command(&mut stream, &state, command).await {
                         tracing::error!("Error handling command: {}", e);
                         return Err(e);
+                    }
+                    if quit {
+                        return Ok(());
                     }
                 }
                 Err(ParseError::Invalid(msg)) => {
@@ -495,9 +499,9 @@ async fn handle_redis_command_inner(
             handle_client(stream, &subcommand).await?;
         }
         RedisCommand::Quit => {
+            // handle_connection closes the connection after this reply.
             let response = BytesFrame::SimpleString("OK".into());
             stream.write_all(&serialize_frame(&response)).await?;
-            return Err("Client quit".into());
         }
         RedisCommand::Unknown(cmd) => {
             tracing::warn!("Unknown command: {}", cmd);

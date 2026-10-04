@@ -169,3 +169,19 @@ async fn request_over_the_limit_is_rejected_and_server_survives() {
         Some("+OK")
     );
 }
+
+#[tokio::test]
+async fn quit_replies_ok_and_closes_without_running_the_rest() {
+    let server = start(None).await;
+    let mut client = server.connect().await;
+    let mut pipeline = request(&[b"QUIT"]);
+    pipeline.extend_from_slice(&request(&[b"SET", b"after-quit", b"v"]));
+    client.send(&pipeline).await;
+    assert_eq!(client.line().await.as_deref(), Some("+OK"));
+    assert_eq!(client.line().await, None, "connection should be closed");
+
+    assert_eq!(
+        server.call(&[b"EXISTS", b"after-quit"]).await.as_deref(),
+        Some(":0")
+    );
+}
