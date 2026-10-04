@@ -560,8 +560,12 @@ async_write = true
 
 **Features:**
 - Immediate response to clients
-- Inflight cache prevents race conditions
-- Maintains consistency guarantees
+- Inflight cache prevents race conditions: `GET`, `HGET`, `EXISTS`, `HEXISTS`, `DEL`, `HDEL` and `HSET` see writes that are acknowledged but not yet committed
+- Acknowledged writes are committed before a graceful shutdown completes (see [Shutdown](#shutdown))
+
+**Known gaps** (reads settle within milliseconds, once the queued op commits):
+- Right after an async `DEL`/`HDEL`, reads can still return the old value until the delete commits.
+- `TTL` reads only committed data, so right after an async `SET ... EX` it can return `-2`.
 
 ### Storage Compression
 
@@ -676,6 +680,7 @@ Comprehensive test suite covering:
 - **Unit Tests**: RESP protocol parsing and serialization
 - **Integration Tests**: Command handling and binary data
 - **Protocol Compliance**: Redis compatibility verification
+- **Client Compatibility**: a [go-redis](https://github.com/redis/go-redis) suite (`tests/goredis`) run against a live server in sync and async mode, over RESP2 and RESP3
 
 ```bash
 # Run all tests
@@ -684,6 +689,8 @@ cargo test
 # Run with output
 cargo test -- --nocapture
 ```
+
+The go-redis suite needs Go (version in `tests/goredis/go.mod`); the first run downloads the pinned go-redis module. Without Go, `cargo test` fails with a message explaining this. Set `BLOBASAUR_SKIP_GO_TESTS=1` to skip that suite.
 
 ### Key Dependencies
 
