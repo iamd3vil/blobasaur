@@ -386,6 +386,13 @@ fn take_value(operation: &mut ShardWriteOperation) -> Vec<u8> {
     }
 }
 
+/// Async values a batch must add up to before clearing it also frees them
+/// right away. moka keeps removed entries until its next housekeeping, which
+/// only runs on later cache activity, so an idle server would hold on to the
+/// last large values. Small batches skip it: forcing it after every batch cost
+/// ~7% throughput at batch_size = 1.
+const FREE_NOW_BYTES: usize = 1024 * 1024;
+
 /// The batch is processed: drop its async ops' inflight cache entries so reads
 /// go to the DB, whether or not they committed (a failed op isn't in the DB,
 /// and reads shouldn't keep serving it). Only drop an entry the op recorded:
@@ -395,9 +402,11 @@ async fn clear_pending_entries(
     inflight_cache: &Cache<String, Pending>,
     inflight_hcache: &Cache<String, Pending>,
 ) {
+    let mut value_bytes = 0;
     for operation in batch.iter() {
         match operation {
             ShardWriteOperation::SetAsync { key, data, .. } => {
+                value_bytes += data.len();
                 clear_pending_write(inflight_cache, key, &Pending::Value(data.clone())).await;
             }
             ShardWriteOperation::DeleteAsync { key, token } => {
@@ -414,6 +423,7 @@ async fn clear_pending_entries(
                 data,
                 ..
             } => {
+                value_bytes += data.len();
                 let namespaced_key = format!("{}:{}", namespace, key);
                 clear_pending_write(
                     inflight_hcache,
@@ -433,6 +443,10 @@ async fn clear_pending_entries(
             }
             _ => {}
         }
+    }
+    if value_bytes >= FREE_NOW_BYTES {
+        inflight_cache.run_pending_tasks().await;
+        inflight_hcache.run_pending_tasks().await;
     }
 }
 
@@ -1664,6 +1678,22 @@ mod tests {
             .await
             .unwrap();
         token
+    }
+
+    #[tokio::test]
+    async fn clearing_a_large_async_value_frees_it() {
+        let cache: Cache<String, Pending> = Cache::new(16);
+        let hcache: Cache<String, Pending> = Cache::new(16);
+        let (sender, mut receiver) = mpsc::channel(16);
+
+        let value = Bytes::from(vec![1u8; FREE_NOW_BYTES]);
+        queue_set(&cache, &sender, "k", value.clone()).await;
+        let batch = VecDeque::from([receiver.try_recv().unwrap()]);
+        clear_pending_entries(&batch, &cache, &hcache).await;
+        drop(batch);
+
+        // Only the test's own handle is left: the cache let go of its copy.
+        assert!(value.is_unique(), "cache still holds the value");
     }
 
     #[tokio::test]
