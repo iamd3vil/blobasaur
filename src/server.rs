@@ -9,7 +9,7 @@ use crate::redis::{
 use crate::shard_manager::{
     self, Pending, ShardWriteOperation, ShardWriter, VacuumMode, VacuumResult, VacuumStats,
 };
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use futures::FutureExt;
 use redis_protocol::resp2::types::BytesFrame;
 use std::sync::Arc;
@@ -228,6 +228,24 @@ pub async fn run_redis_server(
 /// Read size hint per socket read; the buffer still grows to fit large requests.
 const READ_CHUNK: usize = 64 * 1024;
 
+/// A read buffer that grew past this is replaced once everything in it has
+/// been consumed; see [`release_large_buffer`].
+const LARGE_READ_BUFFER: usize = 1024 * 1024;
+
+/// A request split off the buffer still shares the buffer's allocation. Once
+/// the buffer has grown large (`grown_to`, its biggest capacity since the last
+/// reset) and nothing is left in it, start a fresh one. The last request's
+/// value then owns that allocation alone, so the writer can take it without a
+/// copy, and the allocation is freed with the request instead of being kept
+/// for the connection's lifetime. `grown_to` is tracked separately because
+/// `capacity()` shrinks as requests are split off the front.
+fn release_large_buffer(buffer: &mut BytesMut, grown_to: &mut usize) {
+    if buffer.is_empty() && *grown_to > LARGE_READ_BUFFER {
+        *buffer = BytesMut::with_capacity(READ_CHUNK);
+        *grown_to = READ_CHUNK;
+    }
+}
+
 async fn handle_connection(
     mut stream: TcpStream,
     state: Arc<AppState>,
@@ -235,6 +253,7 @@ async fn handle_connection(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let max_request_size = state.cfg.max_request_size();
     let mut buffer = BytesMut::with_capacity(READ_CHUNK);
+    let mut grown_to = READ_CHUNK;
 
     loop {
         // Run every complete request already buffered before reading more.
@@ -256,6 +275,7 @@ async fn handle_connection(
                     return Ok(());
                 }
             };
+            release_large_buffer(&mut buffer, &mut grown_to);
 
             match parse_command(request) {
                 Ok(command) => {
@@ -282,6 +302,8 @@ async fn handle_connection(
         }
 
         buffer.reserve(READ_CHUNK);
+        // After growing, the data starts at the front, so this is the allocation.
+        grown_to = grown_to.max(buffer.capacity());
         let read = tokio::select! {
             read = stream.read_buf(&mut buffer) => read,
             _ = shutdown.cancelled() => return Ok(()),
@@ -540,6 +562,14 @@ async fn decompress_if_enabled(
     Ok(data)
 }
 
+/// Writes `data` as a bulk string reply. Unlike `serialize_frame`, this doesn't
+/// copy the value into a frame buffer first.
+async fn write_bulk(stream: &mut TcpStream, data: &[u8]) -> std::io::Result<()> {
+    let header = format!("${}\r\n", data.len());
+    let mut reply = Buf::chain(header.as_bytes(), data).chain(&b"\r\n"[..]);
+    stream.write_all_buf(&mut reply).await
+}
+
 async fn handle_get(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
@@ -551,8 +581,7 @@ async fn handle_get(
             // Decompress if needed
             let data = decompress_if_enabled(state, data).await?;
 
-            let response = BytesFrame::BulkString(data);
-            stream.write_all(&serialize_frame(&response)).await?;
+            write_bulk(stream, &data).await?;
             state.metrics.record_cache_hit();
             return Ok(());
         }
@@ -581,8 +610,7 @@ async fn handle_get(
             // Decompress if needed
             let data = decompress_if_enabled(state, row.0.into()).await?;
 
-            let response = BytesFrame::BulkString(data);
-            stream.write_all(&serialize_frame(&response)).await?;
+            write_bulk(stream, &data).await?;
             state.metrics.record_cache_hit();
         }
         Ok(None) => {
@@ -1066,8 +1094,7 @@ async fn handle_hget(
             // Decompress if needed
             let data = decompress_if_enabled(state, data).await?;
 
-            let response = BytesFrame::BulkString(data);
-            stream.write_all(&serialize_frame(&response)).await?;
+            write_bulk(stream, &data).await?;
             return Ok(());
         }
         Some(Pending::Deleted(_)) => {
@@ -1098,8 +1125,7 @@ async fn handle_hget(
             // Decompress if needed
             let data = decompress_if_enabled(state, row.0.into()).await?;
 
-            let response = BytesFrame::BulkString(data);
-            stream.write_all(&serialize_frame(&response)).await?;
+            write_bulk(stream, &data).await?;
         }
         Ok(None) => {
             let response = BytesFrame::Null;
@@ -2373,6 +2399,49 @@ mod tests {
     use tempfile::TempDir;
     use tokio::net::{TcpListener, TcpStream};
     use tokio::time::{Duration, timeout};
+
+    #[test]
+    fn large_request_owns_its_buffer_after_release() {
+        let value = vec![7u8; 2 * LARGE_READ_BUFFER];
+        let request = format!("*3\r\n$3\r\nSET\r\n$1\r\nk\r\n${}\r\n", value.len());
+        let mut request = request.into_bytes();
+        request.extend_from_slice(&value);
+        request.extend_from_slice(b"\r\n");
+
+        // The request fills its buffer exactly, so no capacity is left after it
+        // is split off. grown_to is what handle_connection records on reserve.
+        let mut buffer = BytesMut::with_capacity(request.len());
+        buffer.extend_from_slice(&request);
+        let mut grown_to = buffer.capacity();
+
+        let frame = decode_request(&mut buffer, usize::MAX).unwrap().unwrap();
+        release_large_buffer(&mut buffer, &mut grown_to);
+        let BytesFrame::Array(mut args) = frame else {
+            panic!("expected an array");
+        };
+        let Some(BytesFrame::BulkString(data)) = args.pop() else {
+            panic!("expected a bulk string");
+        };
+        drop(args);
+        assert_eq!(data, value);
+        assert!(
+            data.is_unique(),
+            "buffer still shares the request's allocation"
+        );
+        assert_eq!(grown_to, READ_CHUNK);
+    }
+
+    #[test]
+    fn small_requests_keep_their_buffer() {
+        let mut buffer = BytesMut::with_capacity(READ_CHUNK);
+        buffer.reserve(2 * READ_CHUNK);
+        let mut grown_to = buffer.capacity();
+        buffer.extend_from_slice(b"*1\r\n$4\r\nPING\r\n");
+        decode_request(&mut buffer, usize::MAX).unwrap().unwrap();
+        let before = buffer.as_ptr();
+        release_large_buffer(&mut buffer, &mut grown_to);
+        assert_eq!(buffer.as_ptr(), before, "small buffer was replaced");
+    }
 
     struct TestContext {
         state: Arc<AppState>,
