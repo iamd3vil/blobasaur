@@ -29,6 +29,12 @@ batch_size = 50
 # Only relevant when batch_size > 1 (defaults to 0)
 batch_timeout_ms = 10
 
+# max_request_size_mb: Max size of one client request, i.e. a command plus all
+# its arguments (defaults to 100). Larger requests get an error and the
+# connection is closed. Values are held in memory while processed, so keep this
+# in line with available RAM and expected concurrent large writes.
+# max_request_size_mb = 100
+
 # shutdown_timeout_secs: On SIGINT/SIGTERM, max time to commit queued writes
 # before exiting (defaults to 30). Exceeding it exits non-zero and logs how
 # many acknowledged writes were not persisted. Keep your orchestrator's kill

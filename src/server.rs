@@ -4,12 +4,12 @@ use crate::config::Cfg;
 use crate::metrics::Timer;
 use crate::redis::{
     HExpireCondition, ParseError, RedisCommand, VacuumCommandMode, VacuumShardTarget,
-    parse_command, parse_resp_with_remaining, serialize_frame,
+    decode_request, parse_command, serialize_frame,
 };
 use crate::shard_manager::{
     self, ShardWriteOperation, ShardWriter, VacuumMode, VacuumResult, VacuumStats,
 };
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::FutureExt;
 use redis_protocol::resp2::types::BytesFrame;
 use std::sync::Arc;
@@ -81,9 +81,13 @@ pub async fn run(
     // Spawn cleanup tasks for each shard
     let cleanup_interval_secs = 60; // Clean up expired keys every 60 seconds
     for i in 0..cfg.num_shards {
+        // Expiry cleanup deletes rows, so it shares the shard's single writer
+        // connection: taking turns with the writer instead of holding the SQLite
+        // write lock from another connection, which made writer batches fail
+        // with SQLITE_BUSY.
         background.push(tokio::spawn(shard_manager::shard_cleanup_task(
             i,
-            state.db_pools[i].clone(),
+            state.write_db_pools[i].clone(),
             cleanup_interval_secs,
         )));
     }
@@ -221,95 +225,78 @@ pub async fn run_redis_server(
     }
 }
 
+/// Read size hint per socket read; the buffer still grows to fit large requests.
+const READ_CHUNK: usize = 64 * 1024;
+
 async fn handle_connection(
     mut stream: TcpStream,
     state: Arc<AppState>,
     shutdown: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut buffer = Vec::new();
-    let mut temp_buffer = vec![0; 4096];
+    let max_request_size = state.cfg.max_request_size();
+    let mut buffer = BytesMut::with_capacity(READ_CHUNK);
 
     loop {
-        let read = tokio::select! {
-            read = stream.read(&mut temp_buffer) => read,
-            _ = shutdown.cancelled() => return Ok(()),
-        };
-        let n = match read {
-            Ok(0) => return Ok(()), // Connection closed
-            Ok(n) => n,
-            Err(e) => {
-                tracing::error!("Failed to read from socket: {}", e);
-                return Err(Box::new(e));
-            }
-        };
-
-        buffer.extend_from_slice(&temp_buffer[..n]);
-        tracing::debug!(
-            "Read {} bytes from socket, buffer size is now {}",
-            n,
-            buffer.len()
-        );
-
-        // Try to parse complete messages from the buffer
-        let mut remaining_data = &buffer[..];
-
-        while !remaining_data.is_empty() {
+        // Run every complete request already buffered before reading more.
+        loop {
             // Shutting down: close instead of starting the next pipelined command.
             if shutdown.is_cancelled() {
                 return Ok(());
             }
-            match parse_resp_with_remaining(remaining_data) {
-                Ok((resp_value, remaining)) => {
-                    remaining_data = remaining;
-
-                    // Parse and handle the command
-                    match parse_command(resp_value) {
-                        Ok(command) => {
-                            if let Err(e) = handle_redis_command(&mut stream, &state, command).await
-                            {
-                                tracing::error!("Error handling command: {}", e);
-                                return Err(e);
-                            }
-                        }
-                        Err(ParseError::Invalid(msg)) => {
-                            tracing::warn!("Invalid command: {}", msg);
-                            let error_resp = BytesFrame::Error(format!("ERR {}", msg).into());
-                            stream.write_all(&serialize_frame(&error_resp)).await?;
-                        }
-                        Err(e) => {
-                            tracing::error!("Command parse error: {}", e);
-                            let error_resp = BytesFrame::Error("ERR protocol error".into());
-                            stream.write_all(&serialize_frame(&error_resp)).await?;
-                        }
-                    }
+            let request = match decode_request(&mut buffer, max_request_size) {
+                Ok(Some(request)) => request,
+                Ok(None) => break,
+                Err(e) => {
+                    // Like Redis, reply once and close. Resyncing mid-stream could
+                    // run bytes from inside a value as commands.
+                    tracing::warn!("Protocol error, closing connection: {}", e);
+                    state.metrics.record_error("protocol");
+                    let error_resp = BytesFrame::Error(format!("ERR Protocol error: {}", e).into());
+                    stream.write_all(&serialize_frame(&error_resp)).await?;
+                    return Ok(());
                 }
-                Err(ParseError::Incomplete) => {
-                    // Need more data, keep remaining data in buffer
-                    break;
+            };
+
+            match parse_command(request) {
+                Ok(command) => {
+                    let quit = matches!(command, RedisCommand::Quit);
+                    if let Err(e) = handle_redis_command(&mut stream, &state, command).await {
+                        tracing::error!("Error handling command: {}", e);
+                        return Err(e);
+                    }
+                    if quit {
+                        return Ok(());
+                    }
                 }
                 Err(ParseError::Invalid(msg)) => {
-                    tracing::warn!("Protocol error: {}", msg);
+                    tracing::warn!("Invalid command: {}", msg);
                     let error_resp = BytesFrame::Error(format!("ERR {}", msg).into());
                     stream.write_all(&serialize_frame(&error_resp)).await?;
-                    // Skip one byte to try to recover
-                    if !remaining_data.is_empty() {
-                        remaining_data = &remaining_data[1..];
-                    }
+                }
+                Err(e) => {
+                    tracing::error!("Command parse error: {}", e);
+                    let error_resp = BytesFrame::Error("ERR protocol error".into());
+                    stream.write_all(&serialize_frame(&error_resp)).await?;
                 }
             }
         }
 
-        // Update buffer to keep only unprocessed data
-        let remaining_len = remaining_data.len();
-        let processed_len = buffer.len() - remaining_len;
-        if processed_len > 0 {
-            buffer.drain(..processed_len);
-        }
-
-        // Prevent buffer from growing too large
-        if buffer.len() > 1024 * 1024 {
-            tracing::warn!("Buffer too large, closing connection");
-            return Err("Buffer overflow".into());
+        buffer.reserve(READ_CHUNK);
+        let read = tokio::select! {
+            read = stream.read_buf(&mut buffer) => read,
+            _ = shutdown.cancelled() => return Ok(()),
+        };
+        match read {
+            Ok(0) => return Ok(()), // Connection closed
+            Ok(n) => tracing::debug!(
+                "Read {} bytes from socket, buffer size is now {}",
+                n,
+                buffer.len()
+            ),
+            Err(e) => {
+                tracing::error!("Failed to read from socket: {}", e);
+                return Err(Box::new(e));
+            }
         }
     }
 }
@@ -516,9 +503,9 @@ async fn handle_redis_command_inner(
             handle_client(stream, &subcommand).await?;
         }
         RedisCommand::Quit => {
+            // handle_connection closes the connection after this reply.
             let response = BytesFrame::SimpleString("OK".into());
             stream.write_all(&serialize_frame(&response)).await?;
-            return Err("Client quit".into());
         }
         RedisCommand::Unknown(cmd) => {
             tracing::warn!("Unknown command: {}", cmd);
@@ -619,9 +606,7 @@ async fn handle_set(
     // Check if async_write is enabled
     if state.cfg.async_write.unwrap_or(false) {
         // Store in inflight cache to prevent race conditions
-        state
-            .inflight_cache
-            .insert(key.clone(), value.clone())
+        shard_manager::record_pending_write(&state.inflight_cache, key.clone(), value.clone())
             .await;
 
         // Calculate expires_at timestamp if TTL is provided
@@ -713,19 +698,26 @@ async fn handle_del_multiple(
         let shard_index = state.get_shard(&key);
         let pool = &state.write_db_pools[shard_index];
 
-        // Check if key exists first. A failed check (e.g. the writer connection is
+        // A queued async SET is in the inflight cache but not the DB yet. It
+        // counts as existing: skipping the delete would let that SET commit
+        // afterwards and bring the key back.
+        // Otherwise check the DB. A failed check (e.g. the writer connection is
         // held by a long VACUUM) must not be reported as "key not found".
-        let exists = match sqlx::query("SELECT 1 FROM blobs WHERE key = ?")
-            .bind(&key)
-            .fetch_optional(pool)
-            .await
-        {
-            Ok(row) => row.is_some(),
-            Err(e) => {
-                tracing::error!("Failed to check DEL existence for key {}: {}", key, e);
-                let response = BytesFrame::Error("ERR database error".into());
-                stream.write_all(&serialize_frame(&response)).await?;
-                return Ok(());
+        let exists = if state.inflight_cache.contains_key(&key) {
+            true
+        } else {
+            match sqlx::query("SELECT 1 FROM blobs WHERE key = ?")
+                .bind(&key)
+                .fetch_optional(pool)
+                .await
+            {
+                Ok(row) => row.is_some(),
+                Err(e) => {
+                    tracing::error!("Failed to check DEL existence for key {}: {}", key, e);
+                    let response = BytesFrame::Error("ERR database error".into());
+                    stream.write_all(&serialize_frame(&response)).await?;
+                    return Ok(());
+                }
             }
         };
 
@@ -802,6 +794,14 @@ async fn handle_exists(
     state: &Arc<AppState>,
     key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // A queued async SET counts, as it does for GET.
+    if state.inflight_cache.contains_key(&key) {
+        stream
+            .write_all(&serialize_frame(&BytesFrame::Integer(1)))
+            .await?;
+        return Ok(());
+    }
+
     let shard_index = state.get_shard(&key);
     let pool = &state.db_pools[shard_index];
 
@@ -987,6 +987,12 @@ async fn validate_hash_namespace(
     Ok(false)
 }
 
+/// Namespace tables are created per shard on the first HSET routed there, so a
+/// read can hit a shard without the table. That's a miss, not an error.
+fn is_missing_table(error: &sqlx::Error) -> bool {
+    matches!(error, sqlx::Error::Database(db) if db.message().starts_with("no such table"))
+}
+
 async fn hash_table_exists(pool: &sqlx::SqlitePool, table_name: &str) -> Result<bool, sqlx::Error> {
     sqlx::query("SELECT name FROM sqlite_master WHERE type='table' AND name = ?")
         .bind(table_name)
@@ -1074,6 +1080,11 @@ async fn handle_hget(
             let response = BytesFrame::Null;
             stream.write_all(&serialize_frame(&response)).await?;
         }
+        Err(e) if is_missing_table(&e) => {
+            stream
+                .write_all(&serialize_frame(&BytesFrame::Null))
+                .await?;
+        }
         Err(e) => {
             tracing::error!("Failed to HGET namespace {} key {}: {}", namespace, key, e);
             let response = BytesFrame::Error("ERR database error ".into());
@@ -1127,20 +1138,24 @@ async fn handle_hset(
         }
     };
 
-    let existed_before = match hash_field_exists(pool, &table_name, &key, table_exists).await {
-        Ok(exists) => exists,
-        Err(e) => {
-            tracing::error!(
-                "Failed to check HSET existence for namespace {} key {}: {}",
-                namespace,
-                key,
-                e
-            );
-            let response = BytesFrame::Error("ERR database error ".into());
-            stream.write_all(&serialize_frame(&response)).await?;
-            return Ok(());
-        }
-    };
+    // A queued async HSET of this field counts as existing, as in HDEL.
+    let existed_before = state
+        .inflight_hcache
+        .contains_key(&state.namespaced_key(&namespace, &key))
+        || match hash_field_exists(pool, &table_name, &key, table_exists).await {
+            Ok(exists) => exists,
+            Err(e) => {
+                tracing::error!(
+                    "Failed to check HSET existence for namespace {} key {}: {}",
+                    namespace,
+                    key,
+                    e
+                );
+                let response = BytesFrame::Error("ERR database error ".into());
+                stream.write_all(&serialize_frame(&response)).await?;
+                return Ok(());
+            }
+        };
 
     let sender = &state.shard_senders[shard_index];
 
@@ -1151,9 +1166,7 @@ async fn handle_hset(
     if state.cfg.async_write.unwrap_or(false) {
         // Store in inflight cache to prevent race conditions
         let namespaced_key = state.namespaced_key(&namespace, &key);
-        state
-            .inflight_hcache
-            .insert(namespaced_key, value.clone())
+        shard_manager::record_pending_write(&state.inflight_hcache, namespaced_key, value.clone())
             .await;
 
         // Async mode: respond immediately after queueing
@@ -1233,8 +1246,9 @@ async fn handle_hsetex(
     // Calculate expires_at timestamp from expire option
     let expires_at = match expire_option {
         Some(ExpireOption::Ex(seconds)) => Some(chrono::Utc::now().timestamp() + seconds as i64),
+        // Round up like SET PX (the parser has range-checked it).
         Some(ExpireOption::Px(millis)) => {
-            Some(chrono::Utc::now().timestamp() + (millis as i64 / 1000))
+            Some(chrono::Utc::now().timestamp() + millis.div_ceil(1000) as i64)
         }
         Some(ExpireOption::ExAt(timestamp)) => Some(timestamp),
         Some(ExpireOption::PxAt(timestamp)) => Some(timestamp / 1000),
@@ -1282,20 +1296,24 @@ async fn handle_hsetex(
             }
         };
 
-        let exists = match hash_field_exists(pool, &table_name, &field_key, table_exists).await {
-            Ok(exists) => exists,
-            Err(e) => {
-                tracing::error!(
-                    "Failed to check field existence for namespace {} key {}: {}",
-                    namespace,
-                    field_key,
-                    e
-                );
-                let response = BytesFrame::Error("ERR database error".into());
-                stream.write_all(&serialize_frame(&response)).await?;
-                return Ok(());
-            }
-        };
+        // A queued async write of this field counts as existing, as in HDEL.
+        let exists = state
+            .inflight_hcache
+            .contains_key(&state.namespaced_key(&namespace, &field_key))
+            || match hash_field_exists(pool, &table_name, &field_key, table_exists).await {
+                Ok(exists) => exists,
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to check field existence for namespace {} key {}: {}",
+                        namespace,
+                        field_key,
+                        e
+                    );
+                    let response = BytesFrame::Error("ERR database error".into());
+                    stream.write_all(&serialize_frame(&response)).await?;
+                    return Ok(());
+                }
+            };
 
         // Check FNX/FXX conditions if specified
         if fnx || fxx {
@@ -1322,10 +1340,12 @@ async fn handle_hsetex(
         if state.cfg.async_write.unwrap_or(false) {
             // Store in inflight cache to prevent race conditions
             let namespaced_key = state.namespaced_key(&namespace, &field_key);
-            state
-                .inflight_hcache
-                .insert(namespaced_key, compressed_value.clone())
-                .await;
+            shard_manager::record_pending_write(
+                &state.inflight_hcache,
+                namespaced_key,
+                compressed_value.clone(),
+            )
+            .await;
 
             let operation = if let Some(exp) = expires_at {
                 ShardWriteOperation::HSetExAsync {
@@ -1438,33 +1458,41 @@ async fn handle_hdel(
     let pool = &state.write_db_pools[shard_index];
     let table_name = format!("blobs_{}", namespace);
 
-    // First check if key exists. A missing namespace table is a genuine miss;
-    // any other failure must surface instead of being reported as "not found".
-    let table_exists = match hash_table_exists(pool, &table_name).await {
-        Ok(exists) => exists,
-        Err(e) => {
-            tracing::error!(
-                "Failed to check table existence for namespace {}: {}",
-                table_name,
-                e
-            );
-            let response = BytesFrame::Error("ERR database error".into());
-            stream.write_all(&serialize_frame(&response)).await?;
-            return Ok(());
-        }
-    };
-    let exists = match hash_field_exists(pool, &table_name, &key, table_exists).await {
-        Ok(exists) => exists,
-        Err(e) => {
-            tracing::error!(
-                "Failed to check HDEL existence for namespace {} key {}: {}",
-                namespace,
-                key,
-                e
-            );
-            let response = BytesFrame::Error("ERR database error".into());
-            stream.write_all(&serialize_frame(&response)).await?;
-            return Ok(());
+    // A queued async HSET is in the inflight cache but not the DB yet. It counts
+    // as existing: skipping the delete would let that HSET commit afterwards
+    // and bring the field back.
+    // Otherwise check the DB. A missing namespace table is a genuine miss; any
+    // other failure must surface instead of being reported as "not found".
+    let namespaced_key = state.namespaced_key(&namespace, &key);
+    let exists = if state.inflight_hcache.contains_key(&namespaced_key) {
+        true
+    } else {
+        let table_exists = match hash_table_exists(pool, &table_name).await {
+            Ok(exists) => exists,
+            Err(e) => {
+                tracing::error!(
+                    "Failed to check table existence for namespace {}: {}",
+                    table_name,
+                    e
+                );
+                let response = BytesFrame::Error("ERR database error".into());
+                stream.write_all(&serialize_frame(&response)).await?;
+                return Ok(());
+            }
+        };
+        match hash_field_exists(pool, &table_name, &key, table_exists).await {
+            Ok(exists) => exists,
+            Err(e) => {
+                tracing::error!(
+                    "Failed to check HDEL existence for namespace {} key {}: {}",
+                    namespace,
+                    key,
+                    e
+                );
+                let response = BytesFrame::Error("ERR database error".into());
+                stream.write_all(&serialize_frame(&response)).await?;
+                return Ok(());
+            }
         }
     };
 
@@ -1480,7 +1508,6 @@ async fn handle_hdel(
     // Check if async_write is enabled
     if state.cfg.async_write.unwrap_or(false) {
         // Remove from inflight cache immediately for delete operations
-        let namespaced_key = state.namespaced_key(&namespace, &key);
         state.inflight_hcache.invalidate(&namespaced_key).await;
 
         // Async mode: respond immediately after queueing
@@ -1559,6 +1586,17 @@ async fn handle_hexists(
         return Ok(());
     }
 
+    // A queued async HSET counts, as it does for HGET.
+    if state
+        .inflight_hcache
+        .contains_key(&state.namespaced_key(&namespace, &key))
+    {
+        stream
+            .write_all(&serialize_frame(&BytesFrame::Integer(1)))
+            .await?;
+        return Ok(());
+    }
+
     let shard_index = state.get_shard(&key);
     let pool = &state.db_pools[shard_index];
     let table_name = format!("blobs_{}", namespace);
@@ -1581,6 +1619,11 @@ async fn handle_hexists(
         Ok(None) => {
             let response = BytesFrame::Integer(0);
             stream.write_all(&serialize_frame(&response)).await?;
+        }
+        Err(e) if is_missing_table(&e) => {
+            stream
+                .write_all(&serialize_frame(&BytesFrame::Integer(0)))
+                .await?;
         }
         Err(e) => {
             tracing::error!(
@@ -2254,6 +2297,7 @@ mod tests {
     use super::*;
     use crate::cluster::ClusterManager;
     use crate::config::{Cfg, SqliteConfig};
+    use crate::redis::parse_resp_with_remaining;
     use crate::shard_manager::{self, ShardWriteOperation};
     use futures::future::BoxFuture;
     use tempfile::TempDir;
@@ -2284,6 +2328,7 @@ mod tests {
                 cluster: None,
                 metrics: None,
                 shutdown_timeout_secs: None,
+                max_request_size_mb: None,
                 sqlite: None,
             };
 
@@ -2346,6 +2391,7 @@ mod tests {
             cluster: None,
             metrics: None,
             shutdown_timeout_secs: None,
+            max_request_size_mb: None,
             sqlite: Some(SqliteConfig {
                 cache_size_mb: None,
                 busy_timeout_ms: Some(250),
@@ -2989,6 +3035,113 @@ mod tests {
         })
         .await;
         assert!(detected.is_ok(), "closed peer should be detected");
+    }
+
+    #[tokio::test]
+    async fn hget_and_hexists_miss_when_namespace_table_is_absent() {
+        let ctx = TestContext::new(false).await;
+
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_hget(
+                    &mut stream,
+                    &state,
+                    "never_written".to_string(),
+                    "f".to_string(),
+                )
+                .await
+            })
+        })
+        .await;
+        assert_null(frame);
+
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_hexists(
+                    &mut stream,
+                    &state,
+                    "never_written".to_string(),
+                    "f".to_string(),
+                )
+                .await
+            })
+        })
+        .await;
+        assert_integer_response(frame, 0);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn async_del_and_exists_count_writes_still_queued() {
+        let ctx = TestContext::new(true).await;
+        // An acked async SET/HSET whose op hasn't committed yet: in the inflight
+        // cache, not in the DB.
+        let value = Bytes::from_static(b"v");
+        ctx.state
+            .inflight_cache
+            .insert("queued".to_string(), value.clone())
+            .await;
+        ctx.state
+            .inflight_hcache
+            .insert(ctx.state.namespaced_key("ns", "field"), value)
+            .await;
+
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move { handle_exists(&mut stream, &state, "queued".to_string()).await })
+        })
+        .await;
+        assert_integer_response(frame, 1);
+
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_hexists(&mut stream, &state, "ns".to_string(), "field".to_string()).await
+            })
+        })
+        .await;
+        assert_integer_response(frame, 1);
+
+        // Overwriting a queued field is an update, not a new field.
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_hset(
+                    &mut stream,
+                    &state,
+                    "ns".to_string(),
+                    "field".to_string(),
+                    Bytes::from_static(b"v2"),
+                )
+                .await
+            })
+        })
+        .await;
+        assert_integer_response(frame, 0);
+
+        // Skipping these deletes would let the queued writes commit afterwards
+        // and bring the keys back.
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_del_multiple(&mut stream, &state, vec!["queued".to_string()]).await
+            })
+        })
+        .await;
+        assert_integer_response(frame, 1);
+
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_hdel(&mut stream, &state, "ns".to_string(), "field".to_string()).await
+            })
+        })
+        .await;
+        assert_integer_response(frame, 1);
+
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move { handle_exists(&mut stream, &state, "queued".to_string()).await })
+        })
+        .await;
+        assert_integer_response(frame, 0);
+
+        ctx.shutdown().await;
     }
 
     #[tokio::test]

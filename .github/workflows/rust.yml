@@ -16,6 +16,10 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - uses: actions/setup-go@v5
+      with:
+        go-version-file: tests/goredis/go.mod
+        cache-dependency-path: tests/goredis/go.sum
     - name: Build
       run: cargo build --verbose
     - name: Run tests

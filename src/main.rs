@@ -867,6 +867,7 @@ mod tests {
             cluster: None,
             metrics: None,
             shutdown_timeout_secs: None,
+            max_request_size_mb: None,
             sqlite: None,
         };
 
@@ -891,6 +892,7 @@ mod tests {
             cluster: None,
             metrics: None,
             shutdown_timeout_secs: None,
+            max_request_size_mb: None,
             sqlite: None,
         };
 
@@ -923,6 +925,7 @@ mod tests {
             }),
             metrics: None,
             shutdown_timeout_secs: None,
+            max_request_size_mb: None,
             sqlite: None,
         };
 
