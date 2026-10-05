@@ -32,6 +32,7 @@ async fn run_go_suite(async_write: bool) {
         sqlite: None,
         shutdown_timeout_secs: None,
         max_request_size_mb: None,
+        cleanup_chunk_size: None,
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

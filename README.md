@@ -260,6 +260,7 @@ batch_size = 1                      # Write batch size
 batch_timeout_ms = 0               # Batch timeout in milliseconds
 shutdown_timeout_secs = 30          # Max time to drain writes on shutdown
 max_request_size_mb = 100           # Max size of one request (command + all arguments)
+cleanup_chunk_size = 1000           # Max expired rows deleted per cleanup statement
 ```
 
 A request larger than `max_request_size_mb` gets an `ERR Protocol error` reply and the connection is closed. The same happens for any malformed request, as in Redis. Each request is held in memory while it's processed, so peak memory grows with concurrent large writes times this limit.
@@ -616,7 +617,7 @@ CREATE TABLE blobs (
 **Implementation Details:**
 - Expiration timestamps stored as Unix epoch seconds in `expires_at` column
 - Database indexes on `expires_at` for efficient cleanup queries
-- Background cleanup processes both main `blobs` table and namespaced tables
+- Background cleanup processes both main `blobs` table and namespaced tables, deleting expired rows in chunks (`cleanup_chunk_size`, default 1000) so writes to the shard are not blocked for long
 - Race-free expiry checking: keys are considered expired at query time
 
 **Usage Examples:**

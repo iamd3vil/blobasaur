@@ -1364,8 +1364,43 @@ async fn ensure_namespaced_table_exists(
     }
 }
 
+/// Deletes expired rows from `table` in chunks of `chunk_size`. The
+/// cleanup shares the shard's single writer connection, so each chunk is its own
+/// statement: the pool hands out connections in FIFO order, letting a waiting
+/// writer batch run between chunks instead of stalling behind one long DELETE.
+async fn delete_expired(
+    pool: &SqlitePool,
+    table: &str,
+    now: i64,
+    chunk_size: u32,
+) -> Result<u64, sqlx::Error> {
+    let query = format!(
+        "DELETE FROM {table} WHERE rowid IN (
+            SELECT rowid FROM {table} WHERE expires_at IS NOT NULL AND expires_at <= ? LIMIT ?
+        )"
+    );
+    let mut total = 0;
+    loop {
+        let deleted = sqlx::query(&query)
+            .bind(now)
+            .bind(chunk_size)
+            .execute(pool)
+            .await?
+            .rows_affected();
+        total += deleted;
+        if deleted < u64::from(chunk_size) {
+            return Ok(total);
+        }
+    }
+}
+
 /// Background task to clean up expired keys from a shard
-pub async fn shard_cleanup_task(shard_id: usize, pool: SqlitePool, cleanup_interval_secs: u64) {
+pub async fn shard_cleanup_task(
+    shard_id: usize,
+    pool: SqlitePool,
+    cleanup_interval_secs: u64,
+    chunk_size: u32,
+) {
     let mut interval = interval(Duration::from_secs(cleanup_interval_secs));
 
     tracing::info!(
@@ -1379,75 +1414,44 @@ pub async fn shard_cleanup_task(shard_id: usize, pool: SqlitePool, cleanup_inter
 
         let now = chrono::Utc::now().timestamp();
 
-        // Clean up expired keys from the main blobs table
-        match sqlx::query("DELETE FROM blobs WHERE expires_at IS NOT NULL AND expires_at <= ?")
-            .bind(now)
-            .execute(&pool)
-            .await
-        {
-            Ok(result) => {
-                let deleted_count = result.rows_affected();
-                if deleted_count > 0 {
-                    tracing::info!(
-                        "[Shard {}] Cleaned up {} expired keys from blobs table",
-                        shard_id,
-                        deleted_count
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::error!(
-                    "[Shard {}] Error during cleanup of blobs table: {}",
-                    shard_id,
-                    e
-                );
-            }
-        }
-
-        // Clean up expired keys from namespaced tables
-        // First, get all table names that start with "blobs_"
-        let tables_result = sqlx::query_as::<_, (String,)>(
+        // The main blobs table plus every namespaced "blobs_*" table
+        let mut tables = vec!["blobs".to_string()];
+        match sqlx::query_as::<_, (String,)>(
             "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'blobs_%'",
         )
         .fetch_all(&pool)
-        .await;
-
-        match tables_result {
-            Ok(tables) => {
-                for (table_name,) in tables {
-                    let query = format!(
-                        "DELETE FROM {} WHERE expires_at IS NOT NULL AND expires_at <= ?",
-                        table_name
-                    );
-                    match sqlx::query(&query).bind(now).execute(&pool).await {
-                        Ok(result) => {
-                            let deleted_count = result.rows_affected();
-                            if deleted_count > 0 {
-                                tracing::info!(
-                                    "[Shard {}] Cleaned up {} expired keys from table {}",
-                                    shard_id,
-                                    deleted_count,
-                                    table_name
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                "[Shard {}] Error during cleanup of table {}: {}",
-                                shard_id,
-                                table_name,
-                                e
-                            );
-                        }
-                    }
-                }
-            }
+        .await
+        {
+            Ok(names) => tables.extend(names.into_iter().map(|(name,)| name)),
             Err(e) => {
                 tracing::error!(
                     "[Shard {}] Error querying table names for cleanup: {}",
                     shard_id,
                     e
                 );
+            }
+        }
+
+        for table_name in tables {
+            match delete_expired(&pool, &table_name, now, chunk_size).await {
+                Ok(deleted_count) => {
+                    if deleted_count > 0 {
+                        tracing::info!(
+                            "[Shard {}] Cleaned up {} expired keys from table {}",
+                            shard_id,
+                            deleted_count,
+                            table_name
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "[Shard {}] Error during cleanup of table {}: {}",
+                        shard_id,
+                        table_name,
+                        e
+                    );
+                }
             }
         }
     }
@@ -1509,6 +1513,45 @@ mod tests {
         .expect("failed to create expires index");
 
         (temp_dir, pool)
+    }
+
+    #[tokio::test]
+    async fn delete_expired_removes_only_expired_rows_across_chunks() {
+        let (_dir, pool) = create_test_pool().await;
+        let now = 1_000;
+        let chunk_size = 10;
+        let expired = chunk_size * 2 + 5;
+
+        // `expired` rows already expired, plus one live row and one with no expiry
+        sqlx::query(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?)
+             INSERT INTO blobs (key, data, created_at, updated_at, expires_at)
+             SELECT 'k' || i, x'00', 0, 0, ? FROM n",
+        )
+        .bind(expired)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO blobs (key, data, created_at, updated_at, expires_at)
+             VALUES ('live', x'00', 0, 0, ?), ('forever', x'00', 0, 0, NULL)",
+        )
+        .bind(now + 1)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let deleted = delete_expired(&pool, "blobs", now, chunk_size)
+            .await
+            .unwrap();
+        assert_eq!(deleted, u64::from(expired));
+
+        let keys: Vec<(String,)> = sqlx::query_as("SELECT key FROM blobs ORDER BY key")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(keys, vec![("forever".into(),), ("live".into(),)]);
     }
 
     #[test]

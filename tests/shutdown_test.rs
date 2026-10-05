@@ -53,6 +53,7 @@ async fn start(async_write: bool, batch_size: usize, batch_timeout_ms: u64) -> S
         }),
         shutdown_timeout_secs: Some(20),
         max_request_size_mb: None,
+        cleanup_chunk_size: None,
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

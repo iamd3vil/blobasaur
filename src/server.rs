@@ -89,6 +89,7 @@ pub async fn run(
             i,
             state.write_db_pools[i].clone(),
             cleanup_interval_secs,
+            cfg.cleanup_chunk_size(),
         )));
     }
 
@@ -2401,6 +2402,7 @@ mod tests {
                 metrics: None,
                 shutdown_timeout_secs: None,
                 max_request_size_mb: None,
+                cleanup_chunk_size: None,
                 sqlite: None,
             };
 
@@ -2480,6 +2482,7 @@ mod tests {
             metrics: None,
             shutdown_timeout_secs: None,
             max_request_size_mb: None,
+            cleanup_chunk_size: None,
             sqlite: Some(SqliteConfig {
                 cache_size_mb: None,
                 busy_timeout_ms: Some(250),
