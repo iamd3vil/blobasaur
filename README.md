@@ -560,12 +560,10 @@ async_write = true
 
 **Features:**
 - Immediate response to clients
-- Inflight cache prevents race conditions: `GET`, `HGET`, `EXISTS`, `HEXISTS`, `DEL`, `HDEL` and `HSET` see writes that are acknowledged but not yet committed
+- Inflight cache prevents race conditions: `GET`, `HGET`, `EXISTS`, `HEXISTS`, `DEL`, `HDEL` and `HSET` see writes and deletes that are acknowledged but not yet committed
 - Acknowledged writes are committed before a graceful shutdown completes (see [Shutdown](#shutdown))
 
-**Known gaps** (reads settle within milliseconds, once the queued op commits):
-- Right after an async `DEL`/`HDEL`, reads can still return the old value until the delete commits.
-- `TTL` reads only committed data, so right after an async `SET ... EX` it can return `-2`.
+**Known gap** (settles within milliseconds, once the queued op commits): `TTL` reads only committed data, so right after an async `SET ... EX` it can return `-2`.
 
 ### Storage Compression
 

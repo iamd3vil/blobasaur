@@ -93,7 +93,8 @@ func TestStrings(t *testing.T) {
 
 		expect(t, "EXISTS", rdb.Exists(ctx, p+"k"), int64(1))
 		expect(t, "DEL", rdb.Del(ctx, p+"k", p+"empty", p+"missing"), int64(2))
-		afterDelete(t, "EXISTS after DEL", func() bool { return rdb.Exists(ctx, p+"k").Val() == 0 })
+		expect(t, "EXISTS after DEL", rdb.Exists(ctx, p+"k"), int64(0))
+		checkNil(t, "GET after DEL", rdb.Get(ctx, p+"k").Err())
 	})
 }
 
@@ -135,9 +136,8 @@ func TestHashes(t *testing.T) {
 		}
 
 		expect(t, "HDEL", rdb.HDel(ctx, ns, p+"f1"), int64(1))
-		afterDelete(t, "HGET after HDEL", func() bool {
-			return errors.Is(rdb.HGet(ctx, ns, p+"f1").Err(), redis.Nil)
-		})
+		checkNil(t, "HGET after HDEL", rdb.HGet(ctx, ns, p+"f1").Err())
+		expect(t, "HEXISTS after HDEL", rdb.HExists(ctx, ns, p+"f1"), false)
 		expect(t, "HDEL again", rdb.HDel(ctx, ns, p+"f1"), int64(0))
 	})
 }
@@ -256,19 +256,6 @@ func TestLargeValues(t *testing.T) {
 		}
 		expect(t, "PING after large values", rdb.Ping(ctx), "PONG")
 	})
-}
-
-// afterDelete checks a read made right after DEL/HDEL. Sync mode must see the
-// delete at once. Async mode only once the queued delete commits: DEL clears
-// the inflight cache, so reads fall through to the DB, which still has the row
-// for a few ms. Known gap; fixing it needs pending-delete markers in the cache.
-func afterDelete(t *testing.T, what string, cond func() bool) {
-	t.Helper()
-	if os.Getenv("BLOBASAUR_ASYNC_WRITE") == "1" {
-		waitFor(t, what, cond)
-	} else if !cond() {
-		t.Fatalf("%s: not visible right after the delete", what)
-	}
 }
 
 func waitFor(t *testing.T, what string, cond func() bool) {

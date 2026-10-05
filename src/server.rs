@@ -7,7 +7,7 @@ use crate::redis::{
     decode_request, parse_command, serialize_frame,
 };
 use crate::shard_manager::{
-    self, ShardWriteOperation, ShardWriter, VacuumMode, VacuumResult, VacuumStats,
+    self, Pending, ShardWriteOperation, ShardWriter, VacuumMode, VacuumResult, VacuumStats,
 };
 use bytes::{Bytes, BytesMut};
 use futures::FutureExt;
@@ -546,14 +546,24 @@ async fn handle_get(
     key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // First check inflight cache for pending writes
-    if let Some(data) = state.inflight_cache.get(&key).await {
-        // Decompress if needed
-        let data = decompress_if_enabled(state, data).await?;
+    match state.inflight_cache.get(&key).await {
+        Some(Pending::Value(data)) => {
+            // Decompress if needed
+            let data = decompress_if_enabled(state, data).await?;
 
-        let response = BytesFrame::BulkString(data);
-        stream.write_all(&serialize_frame(&response)).await?;
-        state.metrics.record_cache_hit();
-        return Ok(());
+            let response = BytesFrame::BulkString(data);
+            stream.write_all(&serialize_frame(&response)).await?;
+            state.metrics.record_cache_hit();
+            return Ok(());
+        }
+        Some(Pending::Deleted(_)) => {
+            stream
+                .write_all(&serialize_frame(&BytesFrame::Null))
+                .await?;
+            state.metrics.record_cache_miss();
+            return Ok(());
+        }
+        None => {}
     }
 
     let shard_index = state.get_shard(&key);
@@ -605,21 +615,22 @@ async fn handle_set(
 
     // Check if async_write is enabled
     if state.cfg.async_write.unwrap_or(false) {
-        // Store in inflight cache to prevent race conditions
-        shard_manager::record_pending_write(&state.inflight_cache, key.clone(), value.clone())
-            .await;
-
         // Calculate expires_at timestamp if TTL is provided
         let expires_at = ttl_seconds.map(|ttl| chrono::Utc::now().timestamp() + ttl as i64);
 
-        // Async mode: respond immediately after queueing
+        // Async mode: respond immediately after queueing. The inflight cache
+        // serves the value until it commits.
         let operation = ShardWriteOperation::SetAsync {
-            key,
-            data: value,
+            key: key.clone(),
+            data: value.clone(),
             expires_at,
         };
+        let pending = Pending::Value(value);
 
-        if sender.send(operation).await.is_err() {
+        if shard_manager::queue_pending(&state.inflight_cache, sender, key, pending, operation)
+            .await
+            .is_err()
+        {
             tracing::error!(
                 "Failed to send ASYNC SET operation to shard {}",
                 shard_index
@@ -700,13 +711,12 @@ async fn handle_del_multiple(
 
         // A queued async SET is in the inflight cache but not the DB yet. It
         // counts as existing: skipping the delete would let that SET commit
-        // afterwards and bring the key back.
+        // afterwards and bring the key back. A queued DEL means it's gone.
         // Otherwise check the DB. A failed check (e.g. the writer connection is
         // held by a long VACUUM) must not be reported as "key not found".
-        let exists = if state.inflight_cache.contains_key(&key) {
-            true
-        } else {
-            match sqlx::query("SELECT 1 FROM blobs WHERE key = ?")
+        let exists = match shard_manager::pending_exists(&state.inflight_cache, &key).await {
+            Some(exists) => exists,
+            None => match sqlx::query("SELECT 1 FROM blobs WHERE key = ?")
                 .bind(&key)
                 .fetch_optional(pool)
                 .await
@@ -718,7 +728,7 @@ async fn handle_del_multiple(
                     stream.write_all(&serialize_frame(&response)).await?;
                     return Ok(());
                 }
-            }
+            },
         };
 
         if !exists {
@@ -729,13 +739,19 @@ async fn handle_del_multiple(
 
         // Check if async_write is enabled
         if state.cfg.async_write.unwrap_or(false) {
-            // Remove from inflight cache immediately for delete operations
-            state.inflight_cache.invalidate(&key).await;
+            // Async mode: respond immediately after queueing. Reads see the
+            // key as gone until the delete commits.
+            let token = shard_manager::next_delete_token();
+            let operation = ShardWriteOperation::DeleteAsync {
+                key: key.clone(),
+                token,
+            };
+            let pending = Pending::Deleted(token);
 
-            // Async mode: respond immediately after queueing
-            let operation = ShardWriteOperation::DeleteAsync { key };
-
-            if sender.send(operation).await.is_err() {
+            if shard_manager::queue_pending(&state.inflight_cache, sender, key, pending, operation)
+                .await
+                .is_err()
+            {
                 tracing::error!(
                     "Failed to send ASYNC DELETE operation to shard {}",
                     shard_index
@@ -794,10 +810,10 @@ async fn handle_exists(
     state: &Arc<AppState>,
     key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // A queued async SET counts, as it does for GET.
-    if state.inflight_cache.contains_key(&key) {
+    // A queued async SET or DEL decides it, as it does for GET.
+    if let Some(exists) = shard_manager::pending_exists(&state.inflight_cache, &key).await {
         stream
-            .write_all(&serialize_frame(&BytesFrame::Integer(1)))
+            .write_all(&serialize_frame(&BytesFrame::Integer(exists as i64)))
             .await?;
         return Ok(());
     }
@@ -1045,13 +1061,22 @@ async fn handle_hget(
 
     // First check inflight cache for pending writes
     let namespaced_key = state.namespaced_key(&namespace, &key);
-    if let Some(data) = state.inflight_hcache.get(&namespaced_key).await {
-        // Decompress if needed
-        let data = decompress_if_enabled(state, data).await?;
+    match state.inflight_hcache.get(&namespaced_key).await {
+        Some(Pending::Value(data)) => {
+            // Decompress if needed
+            let data = decompress_if_enabled(state, data).await?;
 
-        let response = BytesFrame::BulkString(data);
-        stream.write_all(&serialize_frame(&response)).await?;
-        return Ok(());
+            let response = BytesFrame::BulkString(data);
+            stream.write_all(&serialize_frame(&response)).await?;
+            return Ok(());
+        }
+        Some(Pending::Deleted(_)) => {
+            stream
+                .write_all(&serialize_frame(&BytesFrame::Null))
+                .await?;
+            return Ok(());
+        }
+        None => {}
     }
 
     let shard_index = state.get_shard(&key);
@@ -1138,11 +1163,15 @@ async fn handle_hset(
         }
     };
 
-    // A queued async HSET of this field counts as existing, as in HDEL.
-    let existed_before = state
-        .inflight_hcache
-        .contains_key(&state.namespaced_key(&namespace, &key))
-        || match hash_field_exists(pool, &table_name, &key, table_exists).await {
+    // A queued async HSET or HDEL of this field decides it, as in HDEL.
+    let pending = shard_manager::pending_exists(
+        &state.inflight_hcache,
+        &state.namespaced_key(&namespace, &key),
+    )
+    .await;
+    let existed_before = match pending {
+        Some(exists) => exists,
+        None => match hash_field_exists(pool, &table_name, &key, table_exists).await {
             Ok(exists) => exists,
             Err(e) => {
                 tracing::error!(
@@ -1155,7 +1184,8 @@ async fn handle_hset(
                 stream.write_all(&serialize_frame(&response)).await?;
                 return Ok(());
             }
-        };
+        },
+    };
 
     let sender = &state.shard_senders[shard_index];
 
@@ -1164,19 +1194,26 @@ async fn handle_hset(
 
     // Check if async_write is enabled
     if state.cfg.async_write.unwrap_or(false) {
-        // Store in inflight cache to prevent race conditions
+        // Async mode: respond immediately after queueing. The inflight cache
+        // serves the value until it commits.
         let namespaced_key = state.namespaced_key(&namespace, &key);
-        shard_manager::record_pending_write(&state.inflight_hcache, namespaced_key, value.clone())
-            .await;
-
-        // Async mode: respond immediately after queueing
         let operation = ShardWriteOperation::HSetAsync {
             namespace,
             key,
-            data: value,
+            data: value.clone(),
         };
+        let pending = Pending::Value(value);
 
-        if sender.send(operation).await.is_err() {
+        if shard_manager::queue_pending(
+            &state.inflight_hcache,
+            sender,
+            namespaced_key,
+            pending,
+            operation,
+        )
+        .await
+        .is_err()
+        {
             tracing::error!(
                 "Failed to send ASYNC HSET operation to shard {}",
                 shard_index
@@ -1296,11 +1333,15 @@ async fn handle_hsetex(
             }
         };
 
-        // A queued async write of this field counts as existing, as in HDEL.
-        let exists = state
-            .inflight_hcache
-            .contains_key(&state.namespaced_key(&namespace, &field_key))
-            || match hash_field_exists(pool, &table_name, &field_key, table_exists).await {
+        // A queued async write or HDEL of this field decides it, as in HDEL.
+        let pending = shard_manager::pending_exists(
+            &state.inflight_hcache,
+            &state.namespaced_key(&namespace, &field_key),
+        )
+        .await;
+        let exists = match pending {
+            Some(exists) => exists,
+            None => match hash_field_exists(pool, &table_name, &field_key, table_exists).await {
                 Ok(exists) => exists,
                 Err(e) => {
                     tracing::error!(
@@ -1313,7 +1354,8 @@ async fn handle_hsetex(
                     stream.write_all(&serialize_frame(&response)).await?;
                     return Ok(());
                 }
-            };
+            },
+        };
 
         // Check FNX/FXX conditions if specified
         if fnx || fxx {
@@ -1338,15 +1380,9 @@ async fn handle_hsetex(
 
         // Send the operation
         if state.cfg.async_write.unwrap_or(false) {
-            // Store in inflight cache to prevent race conditions
+            // The inflight cache serves the value until it commits.
             let namespaced_key = state.namespaced_key(&namespace, &field_key);
-            shard_manager::record_pending_write(
-                &state.inflight_hcache,
-                namespaced_key,
-                compressed_value.clone(),
-            )
-            .await;
-
+            let pending = Pending::Value(compressed_value.clone());
             let operation = if let Some(exp) = expires_at {
                 ShardWriteOperation::HSetExAsync {
                     namespace: namespace.clone(),
@@ -1362,7 +1398,16 @@ async fn handle_hsetex(
                 }
             };
 
-            if sender.send(operation).await.is_err() {
+            if shard_manager::queue_pending(
+                &state.inflight_hcache,
+                sender,
+                namespaced_key,
+                pending,
+                operation,
+            )
+            .await
+            .is_err()
+            {
                 tracing::error!(
                     "Failed to send ASYNC HSETEX operation to shard {}",
                     shard_index
@@ -1460,12 +1505,13 @@ async fn handle_hdel(
 
     // A queued async HSET is in the inflight cache but not the DB yet. It counts
     // as existing: skipping the delete would let that HSET commit afterwards
-    // and bring the field back.
+    // and bring the field back. A queued HDEL means it's gone.
     // Otherwise check the DB. A missing namespace table is a genuine miss; any
     // other failure must surface instead of being reported as "not found".
     let namespaced_key = state.namespaced_key(&namespace, &key);
-    let exists = if state.inflight_hcache.contains_key(&namespaced_key) {
-        true
+    let pending = shard_manager::pending_exists(&state.inflight_hcache, &namespaced_key).await;
+    let exists = if let Some(exists) = pending {
+        exists
     } else {
         let table_exists = match hash_table_exists(pool, &table_name).await {
             Ok(exists) => exists,
@@ -1507,13 +1553,26 @@ async fn handle_hdel(
 
     // Check if async_write is enabled
     if state.cfg.async_write.unwrap_or(false) {
-        // Remove from inflight cache immediately for delete operations
-        state.inflight_hcache.invalidate(&namespaced_key).await;
+        // Async mode: respond immediately after queueing. Reads see the field
+        // as gone until the delete commits.
+        let token = shard_manager::next_delete_token();
+        let operation = ShardWriteOperation::HDeleteAsync {
+            namespace,
+            key,
+            token,
+        };
+        let pending = Pending::Deleted(token);
 
-        // Async mode: respond immediately after queueing
-        let operation = ShardWriteOperation::HDeleteAsync { namespace, key };
-
-        if sender.send(operation).await.is_err() {
+        if shard_manager::queue_pending(
+            &state.inflight_hcache,
+            sender,
+            namespaced_key,
+            pending,
+            operation,
+        )
+        .await
+        .is_err()
+        {
             tracing::error!(
                 "Failed to send ASYNC HDEL operation to shard {}",
                 shard_index
@@ -1586,13 +1645,15 @@ async fn handle_hexists(
         return Ok(());
     }
 
-    // A queued async HSET counts, as it does for HGET.
-    if state
-        .inflight_hcache
-        .contains_key(&state.namespaced_key(&namespace, &key))
+    // A queued async HSET or HDEL decides it, as it does for HGET.
+    if let Some(exists) = shard_manager::pending_exists(
+        &state.inflight_hcache,
+        &state.namespaced_key(&namespace, &key),
+    )
+    .await
     {
         stream
-            .write_all(&serialize_frame(&BytesFrame::Integer(1)))
+            .write_all(&serialize_frame(&BytesFrame::Integer(exists as i64)))
             .await?;
         return Ok(());
     }
@@ -1931,6 +1992,15 @@ async fn handle_ttl(
     state: &Arc<AppState>,
     key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // A queued DEL means the key is gone. (A queued SET's expiry isn't in the
+    // cache, so TTL still reads the DB for those.)
+    if shard_manager::pending_exists(&state.inflight_cache, &key).await == Some(false) {
+        stream
+            .write_all(&serialize_frame(&BytesFrame::Integer(-2)))
+            .await?;
+        return Ok(());
+    }
+
     let shard_index = state.get_shard(&key);
     let pool = &state.db_pools[shard_index];
     let now = chrono::Utc::now().timestamp();
@@ -2307,6 +2377,8 @@ mod tests {
     struct TestContext {
         state: Arc<AppState>,
         writer_handles: Vec<tokio::task::JoinHandle<()>>,
+        /// Receivers of shard writers not started yet; see [`Self::resume`].
+        paused_receivers: Vec<tokio::sync::mpsc::Receiver<ShardWriteOperation>>,
         _temp_dir: TempDir,
     }
 
@@ -2336,33 +2408,49 @@ mod tests {
         }
 
         async fn from_cfg(temp_dir: TempDir, cfg: Cfg) -> Self {
-            let batch_size = cfg.batch_size.unwrap_or(1);
-            let batch_timeout_ms = cfg.batch_timeout_ms.unwrap_or(0);
+            let mut ctx = Self::paused_from_cfg(temp_dir, cfg).await;
+            ctx.resume();
+            ctx
+        }
 
-            let mut receivers = Vec::new();
-            let state = Arc::new(AppState::new(cfg, &mut receivers).await.unwrap());
+        /// One shard whose writer doesn't run until [`Self::resume`], so async
+        /// ops stay queued.
+        async fn new_paused(async_write: bool) -> Self {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let mut cfg = single_read_connection_cfg(&temp_dir, async_write);
+            cfg.sqlite = None;
+            cfg.batch_size = Some(16);
+            Self::paused_from_cfg(temp_dir, cfg).await
+        }
 
-            let mut writer_handles = Vec::new();
-            for (i, receiver) in receivers.into_iter().enumerate() {
-                writer_handles.push(tokio::spawn(shard_manager::shard_writer_task(
-                    ShardWriter {
-                        shard_id: i,
-                        pool: state.write_db_pools[i].clone(),
-                        receiver,
-                        batch_size,
-                        batch_timeout_ms,
-                        inflight_cache: state.inflight_cache.clone(),
-                        inflight_hcache: state.inflight_hcache.clone(),
-                        metrics: state.metrics.clone(),
-                        shutdown: CancellationToken::new(),
-                    },
-                )));
-            }
-
+        async fn paused_from_cfg(temp_dir: TempDir, cfg: Cfg) -> Self {
+            let mut paused_receivers = Vec::new();
+            let state = Arc::new(AppState::new(cfg, &mut paused_receivers).await.unwrap());
             TestContext {
                 state,
-                writer_handles,
+                writer_handles: Vec::new(),
+                paused_receivers,
                 _temp_dir: temp_dir,
+            }
+        }
+
+        fn resume(&mut self) {
+            let state = &self.state;
+            for (i, receiver) in self.paused_receivers.drain(..).enumerate() {
+                self.writer_handles
+                    .push(tokio::spawn(shard_manager::shard_writer_task(
+                        ShardWriter {
+                            shard_id: i,
+                            pool: state.write_db_pools[i].clone(),
+                            receiver,
+                            batch_size: state.cfg.batch_size.unwrap_or(1),
+                            batch_timeout_ms: state.cfg.batch_timeout_ms.unwrap_or(0),
+                            inflight_cache: state.inflight_cache.clone(),
+                            inflight_hcache: state.inflight_hcache.clone(),
+                            metrics: state.metrics.clone(),
+                            shutdown: CancellationToken::new(),
+                        },
+                    )));
             }
         }
 
@@ -3080,11 +3168,14 @@ mod tests {
         let value = Bytes::from_static(b"v");
         ctx.state
             .inflight_cache
-            .insert("queued".to_string(), value.clone())
+            .insert("queued".to_string(), Pending::Value(value.clone()))
             .await;
         ctx.state
             .inflight_hcache
-            .insert(ctx.state.namespaced_key("ns", "field"), value)
+            .insert(
+                ctx.state.namespaced_key("ns", "field"),
+                Pending::Value(value),
+            )
             .await;
 
         let frame = respond_with(&ctx, |state, mut stream| {
@@ -3140,6 +3231,150 @@ mod tests {
         })
         .await;
         assert_integer_response(frame, 0);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn reads_see_async_deletes_still_queued() {
+        let mut ctx = TestContext::new_paused(true).await;
+        // A committed key and field.
+        let pool = &ctx.state.write_db_pools[0];
+        sqlx::query(
+            "INSERT INTO blobs (key, data, created_at, updated_at) VALUES ('k', 'v', 0, 0)",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE blobs_ns (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO blobs_ns (key, data, created_at, updated_at) VALUES ('f', 'v', 0, 0)",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        // The writer is paused, so these deletes stay queued and the rows stay
+        // in the DB. Reads must still see them as gone.
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_del_multiple(&mut stream, &state, vec!["k".to_string()]).await
+            })
+        })
+        .await;
+        assert_integer_response(frame, 1);
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move { handle_get(&mut stream, &state, "k".to_string()).await })
+        })
+        .await;
+        assert_null(frame);
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move { handle_exists(&mut stream, &state, "k".to_string()).await })
+        })
+        .await;
+        assert_integer_response(frame, 0);
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move { handle_ttl(&mut stream, &state, "k".to_string()).await })
+        })
+        .await;
+        assert_integer_response(frame, -2);
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_del_multiple(&mut stream, &state, vec!["k".to_string()]).await
+            })
+        })
+        .await;
+        assert_integer_response(frame, 0);
+
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_hdel(&mut stream, &state, "ns".to_string(), "f".to_string()).await
+            })
+        })
+        .await;
+        assert_integer_response(frame, 1);
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_hget(&mut stream, &state, "ns".to_string(), "f".to_string()).await
+            })
+        })
+        .await;
+        assert_null(frame);
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_hexists(&mut stream, &state, "ns".to_string(), "f".to_string()).await
+            })
+        })
+        .await;
+        assert_integer_response(frame, 0);
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_hdel(&mut stream, &state, "ns".to_string(), "f".to_string()).await
+            })
+        })
+        .await;
+        assert_integer_response(frame, 0);
+        // FXX needs the field to exist.
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                let fields = vec![("f".to_string(), Bytes::from_static(b"fxx"))];
+                handle_hsetex(
+                    &mut stream,
+                    &state,
+                    "ns".to_string(),
+                    false,
+                    true,
+                    None,
+                    fields,
+                )
+                .await
+            })
+        })
+        .await;
+        assert_integer_response(frame, 0);
+        // Re-adding a deleted field creates it.
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_hset(
+                    &mut stream,
+                    &state,
+                    "ns".to_string(),
+                    "f".to_string(),
+                    Bytes::from_static(b"v2"),
+                )
+                .await
+            })
+        })
+        .await;
+        assert_integer_response(frame, 1);
+
+        // Once the queue commits (EXPIRE is synchronous, so it waits for the
+        // ops ahead of it), the DB agrees and the cache is empty.
+        ctx.resume();
+        respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move { handle_expire(&mut stream, &state, "k".to_string(), 10).await })
+        })
+        .await;
+        assert!(!ctx.state.inflight_cache.contains_key("k"));
+        assert!(!ctx.state.inflight_hcache.contains_key("ns:f"));
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move { handle_get(&mut stream, &state, "k".to_string()).await })
+        })
+        .await;
+        assert_null(frame);
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_hget(&mut stream, &state, "ns".to_string(), "f".to_string()).await
+            })
+        })
+        .await;
+        assert_bulk_string(frame, b"v2");
 
         ctx.shutdown().await;
     }
