@@ -370,6 +370,22 @@ pub async fn shard_writer_task(writer: ShardWriter) {
     );
 }
 
+/// The op's value as an owned `Vec` to bind (empty if it has none): sqlx
+/// copies a borrowed blob but takes an owned one as is. Sync ops give theirs
+/// up, which costs no copy when the value is the last user of its request
+/// buffer. Async ops still need theirs to clear the inflight cache, so copy.
+fn take_value(operation: &mut ShardWriteOperation) -> Vec<u8> {
+    match operation {
+        ShardWriteOperation::Set { data, .. }
+        | ShardWriteOperation::HSet { data, .. }
+        | ShardWriteOperation::HSetEx { data, .. } => Vec::from(std::mem::take(data)),
+        ShardWriteOperation::SetAsync { data, .. }
+        | ShardWriteOperation::HSetAsync { data, .. }
+        | ShardWriteOperation::HSetExAsync { data, .. } => data.to_vec(),
+        _ => Vec::new(),
+    }
+}
+
 /// The batch is processed: drop its async ops' inflight cache entries so reads
 /// go to the DB, whether or not they committed (a failed op isn't in the DB,
 /// and reads shouldn't keep serving it). Only drop an entry the op recorded:
@@ -499,18 +515,15 @@ async fn process_batch(
     let mut sync_operations: Vec<usize> = Vec::new();
 
     // Execute all operations in the transaction
-    for (idx, operation) in batch.iter().enumerate() {
+    for (idx, operation) in batch.iter_mut().enumerate() {
+        let value = take_value(operation);
+        let operation = &*operation;
         let result = match operation {
             ShardWriteOperation::Set {
-                key,
-                data,
-                expires_at,
-                ..
+                key, expires_at, ..
             }
             | ShardWriteOperation::SetAsync {
-                key,
-                data,
-                expires_at,
+                key, expires_at, ..
             } => {
                 if let ShardWriteOperation::Set { .. } = operation {
                     sync_operations.push(idx)
@@ -529,7 +542,7 @@ async fn process_batch(
                 if exists {
                     // Update existing record - update data, updated_at, expires_at, and version
                     sqlx::query("UPDATE blobs SET data = ?, updated_at = ?, expires_at = ?, version = version + 1 WHERE key = ?")
-                        .bind(&data[..])
+                        .bind(value)
                         .bind(now)
                         .bind(expires_at)
                         .bind(key)
@@ -544,7 +557,7 @@ async fn process_batch(
                     // Insert new record with metadata
                     sqlx::query("INSERT INTO blobs (key, data, created_at, updated_at, expires_at, version) VALUES (?, ?, ?, ?, ?, 0)")
                         .bind(key)
-                        .bind(&data[..])
+                        .bind(value)
                         .bind(now)
                         .bind(now)
                         .bind(expires_at)
@@ -573,17 +586,8 @@ async fn process_batch(
                         e.to_string()
                     })
             }
-            ShardWriteOperation::HSet {
-                namespace,
-                key,
-                data,
-                ..
-            }
-            | ShardWriteOperation::HSetAsync {
-                namespace,
-                key,
-                data,
-            } => {
+            ShardWriteOperation::HSet { namespace, key, .. }
+            | ShardWriteOperation::HSetAsync { namespace, key, .. } => {
                 if let ShardWriteOperation::HSet { .. } = operation {
                     sync_operations.push(idx)
                 }
@@ -615,7 +619,7 @@ async fn process_batch(
                             table_name
                         );
                         sqlx::query(&update_query)
-                            .bind(&data[..])
+                            .bind(value)
                             .bind(now)
                             .bind(key)
                             .execute(&mut *tx)
@@ -639,7 +643,7 @@ async fn process_batch(
                         );
                         sqlx::query(&insert_query)
                             .bind(key)
-                            .bind(&data[..])
+                            .bind(value)
                             .bind(now)
                             .bind(now)
                             .execute(&mut *tx)
@@ -661,15 +665,14 @@ async fn process_batch(
             ShardWriteOperation::HSetEx {
                 namespace,
                 key,
-                data,
                 expires_at,
                 ..
             }
             | ShardWriteOperation::HSetExAsync {
                 namespace,
                 key,
-                data,
                 expires_at,
+                ..
             } => {
                 if let ShardWriteOperation::HSetEx { .. } = operation {
                     sync_operations.push(idx)
@@ -702,7 +705,7 @@ async fn process_batch(
                             table_name
                         );
                         sqlx::query(&update_query)
-                            .bind(&data[..])
+                            .bind(value)
                             .bind(now)
                             .bind(*expires_at)
                             .bind(key)
@@ -727,7 +730,7 @@ async fn process_batch(
                         );
                         sqlx::query(&insert_query)
                             .bind(key)
-                            .bind(&data[..])
+                            .bind(value)
                             .bind(now)
                             .bind(now)
                             .bind(*expires_at)
@@ -1463,6 +1466,32 @@ mod tests {
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
     use std::str::FromStr;
     use tempfile::TempDir;
+
+    #[test]
+    fn take_value_reuses_a_sync_values_request_buffer() {
+        // A request split off the connection buffer, which is then replaced, as
+        // decode_request and handle_connection do after a large request.
+        let mut buf = bytes::BytesMut::with_capacity(4096);
+        buf.extend_from_slice(b"*3\r\n$3\r\nSET\r\n");
+        let header = buf.len();
+        buf.extend_from_slice(&[7u8; 1024]);
+        let request = buf.split().freeze();
+        drop(buf);
+        let data = request.slice(header..);
+        drop(request);
+
+        let (responder, _rx) = oneshot::channel();
+        let mut op = ShardWriteOperation::Set {
+            key: "k".to_string(),
+            data,
+            expires_at: None,
+            responder,
+        };
+        let value = take_value(&mut op);
+        assert_eq!(value, vec![7u8; 1024]);
+        // A copy would be a new allocation sized to the value.
+        assert_eq!(value.capacity(), 4096, "value was copied");
+    }
 
     async fn create_test_pool() -> (TempDir, SqlitePool) {
         let temp_dir = TempDir::new().expect("failed to create temp dir");

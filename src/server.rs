@@ -9,7 +9,7 @@ use crate::redis::{
 use crate::shard_manager::{
     self, Pending, ShardWriteOperation, ShardWriter, VacuumMode, VacuumResult, VacuumStats,
 };
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use futures::FutureExt;
 use redis_protocol::resp2::types::BytesFrame;
 use std::sync::Arc;
@@ -256,6 +256,13 @@ async fn handle_connection(
                     return Ok(());
                 }
             };
+            // The request was split off a buffer that still shares its allocation.
+            // After a large request, start a fresh buffer: the request's value then
+            // owns that allocation alone, so the writer can take it without a
+            // copy, and it's freed with the request instead of kept per connection.
+            if buffer.is_empty() && buffer.capacity() > READ_CHUNK {
+                buffer = BytesMut::with_capacity(READ_CHUNK);
+            }
 
             match parse_command(request) {
                 Ok(command) => {
@@ -540,6 +547,14 @@ async fn decompress_if_enabled(
     Ok(data)
 }
 
+/// Writes `data` as a bulk string reply. Unlike `serialize_frame`, this doesn't
+/// copy the value into a frame buffer first.
+async fn write_bulk(stream: &mut TcpStream, data: &[u8]) -> std::io::Result<()> {
+    let header = format!("${}\r\n", data.len());
+    let mut reply = Buf::chain(header.as_bytes(), data).chain(&b"\r\n"[..]);
+    stream.write_all_buf(&mut reply).await
+}
+
 async fn handle_get(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
@@ -551,8 +566,7 @@ async fn handle_get(
             // Decompress if needed
             let data = decompress_if_enabled(state, data).await?;
 
-            let response = BytesFrame::BulkString(data);
-            stream.write_all(&serialize_frame(&response)).await?;
+            write_bulk(stream, &data).await?;
             state.metrics.record_cache_hit();
             return Ok(());
         }
@@ -581,8 +595,7 @@ async fn handle_get(
             // Decompress if needed
             let data = decompress_if_enabled(state, row.0.into()).await?;
 
-            let response = BytesFrame::BulkString(data);
-            stream.write_all(&serialize_frame(&response)).await?;
+            write_bulk(stream, &data).await?;
             state.metrics.record_cache_hit();
         }
         Ok(None) => {
@@ -1066,8 +1079,7 @@ async fn handle_hget(
             // Decompress if needed
             let data = decompress_if_enabled(state, data).await?;
 
-            let response = BytesFrame::BulkString(data);
-            stream.write_all(&serialize_frame(&response)).await?;
+            write_bulk(stream, &data).await?;
             return Ok(());
         }
         Some(Pending::Deleted(_)) => {
@@ -1098,8 +1110,7 @@ async fn handle_hget(
             // Decompress if needed
             let data = decompress_if_enabled(state, row.0.into()).await?;
 
-            let response = BytesFrame::BulkString(data);
-            stream.write_all(&serialize_frame(&response)).await?;
+            write_bulk(stream, &data).await?;
         }
         Ok(None) => {
             let response = BytesFrame::Null;
