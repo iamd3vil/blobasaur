@@ -42,7 +42,6 @@ async fn run_go_suite(async_write: bool) {
         .args(["test", "-count=1", "./..."])
         .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/goredis"))
         .env("BLOBASAUR_ADDR", addr.to_string())
-        .env("BLOBASAUR_ASYNC_WRITE", if async_write { "1" } else { "0" })
         .output()
         .await
         .unwrap_or_else(|e| {

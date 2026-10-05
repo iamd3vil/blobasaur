@@ -16,9 +16,8 @@ use crate::{
     cluster::ClusterManager,
     config::Cfg,
     metrics::Metrics,
-    shard_manager::{ShardWriteOperation, wal_checkpoint_truncate},
+    shard_manager::{Pending, ShardWriteOperation, wal_checkpoint_truncate},
 };
-use bytes::Bytes;
 
 const CREATE_BLOBS_TABLE: &str = "CREATE TABLE IF NOT EXISTS blobs (
     key TEXT PRIMARY KEY,
@@ -38,15 +37,15 @@ pub struct AppState {
     pub db_pools: Vec<SqlitePool>,
     pub write_db_pools: Vec<SqlitePool>,
     /// Cache for inflight write operations to prevent race conditions in async mode.
-    /// When async_write=true, SET operations return OK immediately but the actual
-    /// database write happens asynchronously. This cache stores the key-value pairs
-    /// for pending writes so that GET requests can return the correct data even
-    /// before the write completes, preventing race conditions.
-    pub inflight_cache: Cache<String, Bytes>,
+    /// When async_write=true, SET and DEL return immediately but the actual
+    /// database write happens asynchronously. This cache stores the pending
+    /// value, or a delete marker, so that reads see the write even before it
+    /// commits.
+    pub inflight_cache: Cache<String, Pending>,
     /// Cache for inflight namespaced write operations (namespace:key -> data).
     /// Same as inflight_cache but for HSET/HGET operations. The key format is
     /// "namespace:key" to avoid collisions between namespaces.
-    pub inflight_hcache: Cache<String, Bytes>,
+    pub inflight_hcache: Cache<String, Pending>,
     /// Cluster manager for Redis cluster protocol
     pub cluster_manager: Option<ClusterManager>,
     pub compressor: Option<Box<dyn Compressor>>,
@@ -65,8 +64,9 @@ impl AppState {
         // Clear the output vector first to ensure it's empty
         shard_receivers_out.clear();
 
+        let queue_capacity = cfg.batch_size.unwrap_or(100);
         for _ in 0..cfg.num_shards {
-            let (sender, receiver) = mpsc::channel(cfg.batch_size.unwrap_or(100));
+            let (sender, receiver) = mpsc::channel(queue_capacity);
             shard_senders_vec.push(sender);
             shard_receivers_out.push(receiver); // Populate the output vector with receivers
         }
@@ -170,10 +170,14 @@ impl AppState {
             .unwrap_or_else(|e| panic!("Failed to create expires_at index in shard {} DB: {}", i, e));
         }
 
-        // Create caches for inflight operations
-        // Use a reasonable capacity - adjust based on expected load
-        let inflight_cache = Cache::new(10_000);
-        let inflight_hcache = Cache::new(10_000);
+        // Caches for inflight async ops. An entry must never be evicted before
+        // its op commits, or reads would miss an acknowledged write or delete.
+        // Each entry belongs to an op that is queued (at most `queue_capacity`
+        // per shard) or in the batch being written (at most `batch_size`, which
+        // is no larger), so this capacity is never reached.
+        let inflight_capacity = (cfg.num_shards * 2 * queue_capacity) as u64;
+        let inflight_cache = Cache::new(inflight_capacity);
+        let inflight_hcache = Cache::new(inflight_capacity);
 
         // Initialize cluster manager if clustering is enabled
         let cluster_manager = if let Some(ref cluster_config) = cfg.cluster {

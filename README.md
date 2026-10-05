@@ -560,12 +560,10 @@ async_write = true
 
 **Features:**
 - Immediate response to clients
-- Inflight cache prevents race conditions: `GET`, `HGET`, `EXISTS`, `HEXISTS`, `DEL`, `HDEL` and `HSET` see writes that are acknowledged but not yet committed
+- Inflight cache prevents race conditions: `GET`, `HGET`, `EXISTS`, `HEXISTS`, `DEL`, `HDEL` and `HSET` see writes and deletes that are acknowledged but not yet committed
 - Acknowledged writes are committed before a graceful shutdown completes (see [Shutdown](#shutdown))
 
-**Known gaps** (reads settle within milliseconds, once the queued op commits):
-- Right after an async `DEL`/`HDEL`, reads can still return the old value until the delete commits.
-- `TTL` reads only committed data, so right after an async `SET ... EX` it can return `-2`.
+**Known gap** (settles within milliseconds, once the queued op commits): `TTL` reads only committed data, so right after an async `SET ... EX` it can return `-2`.
 
 ### Storage Compression
 
@@ -635,11 +633,11 @@ redis-cli EXPIRE permanent_key 3600
 
 ### Race Condition Handling
 
-**The Problem:** Async writes could cause GET requests to miss recently SET data.
+**The Problem:** Async writes could cause GET requests to miss recently SET data, or still return data that was just deleted.
 
 **The Solution:** Inflight cache system:
-- Tracks pending write operations
-- Serves data from cache during async writes
+- Tracks pending write and delete operations
+- Serves data from cache during async writes, and treats keys with a pending delete as absent
 - Automatic cleanup after database commits
 
 ### Redis Cluster Compatibility

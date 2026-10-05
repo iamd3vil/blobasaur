@@ -6,6 +6,7 @@ use moka::future::Cache;
 use moka::ops::compute::Op;
 use sqlx::{Sqlite, SqlitePool};
 use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, interval, timeout};
 use tokio_util::sync::CancellationToken;
@@ -29,6 +30,8 @@ pub enum ShardWriteOperation {
     },
     DeleteAsync {
         key: String,
+        /// Matches the [`Pending::Deleted`] marker DEL left in the cache.
+        token: u64,
     },
     HSet {
         namespace: String,
@@ -62,6 +65,8 @@ pub enum ShardWriteOperation {
     HDeleteAsync {
         namespace: String,
         key: String,
+        /// Matches the [`Pending::Deleted`] marker HDEL left in the cache.
+        token: u64,
     },
     Expire {
         key: String,
@@ -127,36 +132,83 @@ pub struct ShardWriter {
     pub batch_size: usize,
     /// Max time to wait for more ops while a batch is non-empty.
     pub batch_timeout_ms: u64,
-    pub inflight_cache: Cache<String, Bytes>,
-    pub inflight_hcache: Cache<String, Bytes>,
+    pub inflight_cache: Cache<String, Pending>,
+    pub inflight_hcache: Cache<String, Pending>,
     pub metrics: Metrics,
     /// Cancel to make the writer commit everything queued and return.
     pub shutdown: CancellationToken,
 }
 
-/// Records an acknowledged async write so reads see it before it commits.
-/// Uses `and_compute_with` so it's ordered against [`clear_pending_write`]
-/// on the same key.
-pub async fn record_pending_write(cache: &Cache<String, Bytes>, key: String, value: Bytes) {
-    cache
-        .entry(key)
-        .and_compute_with(|_| async move { Op::Put(value) })
-        .await;
+/// An async write that is acknowledged but not committed yet. Reads check
+/// the inflight cache first, so they see it before the DB does.
+#[derive(Clone, Debug)]
+pub enum Pending {
+    Value(Bytes),
+    /// A queued DEL/HDEL: the key reads as absent. The token is unique per
+    /// delete, so its op clears only its own marker.
+    Deleted(u64),
 }
 
-/// Removes `key`'s pending-write entry if it still holds `written` (the same
-/// allocation, so this is cheap even for large values).
-async fn clear_pending_write(cache: &Cache<String, Bytes>, key: &str, written: &Bytes) {
+impl Pending {
+    /// Whether this is the very entry `other` recorded, not just equal data.
+    /// Values compare by allocation, so this is cheap even for large values.
+    fn is(&self, other: &Pending) -> bool {
+        match (self, other) {
+            (Pending::Value(a), Pending::Value(b)) => {
+                a.as_ptr() == b.as_ptr() && a.len() == b.len()
+            }
+            (Pending::Deleted(a), Pending::Deleted(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+/// Queues an async `op` and records its `pending` entry for `key` as one
+/// step per key, so the cache always holds the entry of the last op queued
+/// for that key. Waits for queue space first: if the writer is gone, nothing
+/// is recorded. Uses `and_compute_with`, so it's also ordered against
+/// [`clear_pending_write`] on the same key.
+pub async fn queue_pending(
+    cache: &Cache<String, Pending>,
+    sender: &mpsc::Sender<ShardWriteOperation>,
+    key: String,
+    pending: Pending,
+    op: ShardWriteOperation,
+) -> Result<(), mpsc::error::SendError<()>> {
+    let permit = sender.reserve().await?;
+    cache
+        .entry(key)
+        .and_compute_with(|_| async move {
+            permit.send(op);
+            Op::Put(pending)
+        })
+        .await;
+    Ok(())
+}
+
+/// A fresh token for a [`Pending::Deleted`] marker and its delete op.
+pub fn next_delete_token() -> u64 {
+    static NEXT_TOKEN: AtomicU64 = AtomicU64::new(0);
+    NEXT_TOKEN.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Whether a queued async op decides `key`'s existence: `Some(true)` for a
+/// write, `Some(false)` for a delete, `None` if nothing is queued (ask the DB).
+pub async fn pending_exists(cache: &Cache<String, Pending>, key: &str) -> Option<bool> {
+    cache
+        .get(key)
+        .await
+        .map(|pending| matches!(pending, Pending::Value(_)))
+}
+
+/// Removes `key`'s entry if it is still the one `written` recorded: a newer
+/// op on the same key, still queued, must stay visible.
+async fn clear_pending_write(cache: &Cache<String, Pending>, key: &str, written: &Pending) {
     cache
         .entry_by_ref(key)
         .and_compute_with(|entry| async move {
             match entry {
-                Some(entry)
-                    if entry.value().as_ptr() == written.as_ptr()
-                        && entry.value().len() == written.len() =>
-                {
-                    Op::Remove
-                }
+                Some(entry) if entry.value().is(written) => Op::Remove,
                 _ => Op::Nop,
             }
         })
@@ -318,13 +370,63 @@ pub async fn shard_writer_task(writer: ShardWriter) {
     );
 }
 
+/// The batch is processed: drop its async ops' inflight cache entries so reads
+/// go to the DB, whether or not they committed (a failed op isn't in the DB,
+/// and reads shouldn't keep serving it). Only drop an entry the op recorded:
+/// a newer op on the same key, still queued, must stay visible.
+async fn clear_pending_entries(
+    batch: &VecDeque<ShardWriteOperation>,
+    inflight_cache: &Cache<String, Pending>,
+    inflight_hcache: &Cache<String, Pending>,
+) {
+    for operation in batch.iter() {
+        match operation {
+            ShardWriteOperation::SetAsync { key, data, .. } => {
+                clear_pending_write(inflight_cache, key, &Pending::Value(data.clone())).await;
+            }
+            ShardWriteOperation::DeleteAsync { key, token } => {
+                clear_pending_write(inflight_cache, key, &Pending::Deleted(*token)).await;
+            }
+            ShardWriteOperation::HSetAsync {
+                namespace,
+                key,
+                data,
+            }
+            | ShardWriteOperation::HSetExAsync {
+                namespace,
+                key,
+                data,
+                ..
+            } => {
+                let namespaced_key = format!("{}:{}", namespace, key);
+                clear_pending_write(
+                    inflight_hcache,
+                    &namespaced_key,
+                    &Pending::Value(data.clone()),
+                )
+                .await;
+            }
+            ShardWriteOperation::HDeleteAsync {
+                namespace,
+                key,
+                token,
+            } => {
+                let namespaced_key = format!("{}:{}", namespace, key);
+                clear_pending_write(inflight_hcache, &namespaced_key, &Pending::Deleted(*token))
+                    .await;
+            }
+            _ => {}
+        }
+    }
+}
+
 async fn process_batch(
     shard_id: usize,
     pool: &SqlitePool,
     batch: &mut VecDeque<ShardWriteOperation>,
     known_tables: &mut HashSet<String>,
-    inflight_cache: &Cache<String, Bytes>,
-    inflight_hcache: &Cache<String, Bytes>,
+    inflight_cache: &Cache<String, Pending>,
+    inflight_hcache: &Cache<String, Pending>,
 ) {
     if batch.is_empty() {
         return;
@@ -343,6 +445,7 @@ async fn process_batch(
         Err(e) => {
             tracing::error!("[Shard {}] Failed to start transaction: {}", shard_id, e);
             let error_message = format!("Transaction start failed: {}", e);
+            clear_pending_entries(batch, inflight_cache, inflight_hcache).await;
 
             // Send errors to all synchronous operations and clear batch
             for operation in batch.drain(..) {
@@ -454,7 +557,8 @@ async fn process_batch(
                         })
                 }
             }
-            ShardWriteOperation::Delete { key, .. } | ShardWriteOperation::DeleteAsync { key } => {
+            ShardWriteOperation::Delete { key, .. }
+            | ShardWriteOperation::DeleteAsync { key, .. } => {
                 if let ShardWriteOperation::Delete { .. } = operation {
                     sync_operations.push(idx)
                 }
@@ -644,7 +748,7 @@ async fn process_batch(
                 }
             }
             ShardWriteOperation::HDelete { namespace, key, .. }
-            | ShardWriteOperation::HDeleteAsync { namespace, key } => {
+            | ShardWriteOperation::HDeleteAsync { namespace, key, .. } => {
                 if let ShardWriteOperation::HDelete { .. } = operation {
                     sync_operations.push(idx)
                 }
@@ -733,34 +837,7 @@ async fn process_batch(
         e.to_string()
     });
 
-    // The writes are processed: drop their inflight cache entries so reads go
-    // to the DB, whether or not they committed (a failed write isn't in the
-    // DB, and reads shouldn't keep serving it). Only drop an entry if it still
-    // holds this op's value: a newer write to the same key, still queued, must
-    // stay visible. Deletes need nothing here; DEL/HDEL clear the entry when
-    // issued, and clearing again now could drop a SET issued after the DEL.
-    for operation in batch.iter() {
-        match operation {
-            ShardWriteOperation::SetAsync { key, data, .. } => {
-                clear_pending_write(inflight_cache, key, data).await;
-            }
-            ShardWriteOperation::HSetAsync {
-                namespace,
-                key,
-                data,
-            }
-            | ShardWriteOperation::HSetExAsync {
-                namespace,
-                key,
-                data,
-                ..
-            } => {
-                let namespaced_key = format!("{}:{}", namespace, key);
-                clear_pending_write(inflight_hcache, &namespaced_key, data).await;
-            }
-            _ => {}
-        }
-    }
+    clear_pending_entries(batch, inflight_cache, inflight_hcache).await;
 
     // An op succeeded only if its own statement and the commit both did. A
     // failed statement doesn't abort the transaction, so the commit alone
@@ -1485,72 +1562,140 @@ mod tests {
         assert_eq!(classify_vacuum_error_kinds(&mixed), (true, true));
     }
 
-    #[tokio::test]
-    async fn processed_async_write_only_clears_its_own_cache_entry() {
-        let (_temp_dir, pool) = create_test_pool().await;
-        let cache: Cache<String, Bytes> = Cache::new(16);
-        let (sender, receiver) = mpsc::channel(8);
-        let writer = tokio::spawn(shard_writer_task(ShardWriter {
-            shard_id: 0,
-            pool,
-            receiver,
-            batch_size: 8,
-            batch_timeout_ms: 0,
-            inflight_cache: cache.clone(),
-            inflight_hcache: Cache::new(16),
-            metrics: Metrics::new(),
-            shutdown: CancellationToken::new(),
-        }));
-        // Waits until the writer has processed everything sent before it.
-        let barrier = || async {
-            let (responder, rx) = oneshot::channel();
-            sender
-                .send(ShardWriteOperation::Set {
-                    key: "barrier".to_string(),
-                    data: Bytes::from_static(b"b"),
-                    expires_at: None,
-                    responder,
-                })
-                .await
-                .unwrap();
-            rx.await.unwrap().unwrap();
-        };
-        let set_async = |key: &str, data: Bytes| ShardWriteOperation::SetAsync {
+    async fn queue_set(
+        cache: &Cache<String, Pending>,
+        sender: &mpsc::Sender<ShardWriteOperation>,
+        key: &str,
+        data: Bytes,
+    ) {
+        let op = ShardWriteOperation::SetAsync {
             key: key.to_string(),
-            data,
+            data: data.clone(),
             expires_at: None,
         };
+        queue_pending(cache, sender, key.to_string(), Pending::Value(data), op)
+            .await
+            .unwrap();
+    }
 
-        // SET k v1 then SET k v2: the cache holds v2 while v1's op is processed.
+    async fn queue_del(
+        cache: &Cache<String, Pending>,
+        sender: &mpsc::Sender<ShardWriteOperation>,
+        key: &str,
+    ) -> u64 {
+        let token = next_delete_token();
+        let op = ShardWriteOperation::DeleteAsync {
+            key: key.to_string(),
+            token,
+        };
+        queue_pending(cache, sender, key.to_string(), Pending::Deleted(token), op)
+            .await
+            .unwrap();
+        token
+    }
+
+    #[tokio::test]
+    async fn processed_async_op_only_clears_its_own_cache_entry() {
+        let cache: Cache<String, Pending> = Cache::new(16);
+        let hcache: Cache<String, Pending> = Cache::new(16);
+        let (sender, mut receiver) = mpsc::channel(16);
+
         let v2 = Bytes::from(vec![2u8; 16]);
-        record_pending_write(&cache, "k".to_string(), v2.clone()).await;
-        sender
-            .send(set_async("k", Bytes::from(vec![1u8; 16])))
-            .await
-            .unwrap();
-        // DEL d then SET d: the delete's op must not clear the newer SET.
-        record_pending_write(&cache, "d".to_string(), Bytes::from_static(b"new")).await;
-        sender
-            .send(ShardWriteOperation::DeleteAsync {
-                key: "d".to_string(),
-            })
-            .await
-            .unwrap();
-        barrier().await;
-        assert_eq!(
-            cache.get("k").await,
-            Some(v2.clone()),
+        queue_set(&cache, &sender, "k", Bytes::from(vec![1u8; 16])).await;
+        queue_set(&cache, &sender, "k", v2.clone()).await;
+        queue_del(&cache, &sender, "d").await;
+        queue_set(&cache, &sender, "d", Bytes::from_static(b"new")).await;
+        queue_del(&cache, &sender, "x").await;
+        let second = queue_del(&cache, &sender, "x").await;
+        let token = next_delete_token();
+        let op = ShardWriteOperation::HDeleteAsync {
+            namespace: "ns".to_string(),
+            key: "f".to_string(),
+            token,
+        };
+        queue_pending(
+            &hcache,
+            &sender,
+            "ns:f".to_string(),
+            Pending::Deleted(token),
+            op,
+        )
+        .await
+        .unwrap();
+
+        let mut ops = Vec::new();
+        while let Ok(op) = receiver.try_recv() {
+            ops.push(op);
+        }
+        let mut ops = ops.into_iter();
+        let mut first_batch = VecDeque::new();
+        let mut second_batch = VecDeque::new();
+        for _ in 0..3 {
+            first_batch.push_back(ops.next().unwrap());
+            second_batch.push_back(ops.next().unwrap());
+        }
+        second_batch.push_back(ops.next().unwrap());
+
+        // Each key's first op is processed while a newer op on it is queued.
+        clear_pending_entries(&first_batch, &cache, &hcache).await;
+        assert!(
+            matches!(cache.get("k").await, Some(Pending::Value(v)) if v == v2),
             "newer SET must stay visible"
         );
-        assert!(cache.contains_key("d"), "SET after DEL must stay visible");
+        assert!(
+            matches!(cache.get("d").await, Some(Pending::Value(_))),
+            "SET after DEL must stay visible"
+        );
+        assert!(
+            matches!(cache.get("x").await, Some(Pending::Deleted(t)) if t == second),
+            "newer DEL must stay visible"
+        );
 
-        // v2's own op clears it.
-        sender.send(set_async("k", v2)).await.unwrap();
-        barrier().await;
+        // Their own ops clear them.
+        clear_pending_entries(&second_batch, &cache, &hcache).await;
+        assert_eq!(cache.entry_count() + hcache.entry_count(), 0);
+        for key in ["k", "d", "x"] {
+            assert!(!cache.contains_key(key));
+        }
+        assert!(!hcache.contains_key("ns:f"));
+
+        // With the writer gone, nothing is recorded.
+        drop(receiver);
+        let op = ShardWriteOperation::DeleteAsync {
+            key: "gone".to_string(),
+            token: 0,
+        };
+        let result = queue_pending(&cache, &sender, "gone".to_string(), Pending::Deleted(0), op);
+        assert!(result.await.is_err());
+        assert!(!cache.contains_key("gone"));
+    }
+
+    #[tokio::test]
+    async fn failed_batch_clears_its_cache_entries() {
+        let (_temp_dir, pool) = create_test_pool().await;
+        pool.close().await;
+        let cache: Cache<String, Pending> = Cache::new(16);
+        let (sender, mut receiver) = mpsc::channel(16);
+        queue_set(&cache, &sender, "k", Bytes::from_static(b"v")).await;
+        queue_del(&cache, &sender, "d").await;
+        let mut batch = VecDeque::new();
+        while let Ok(op) = receiver.try_recv() {
+            batch.push_back(op);
+        }
+
+        // The transaction can't start: the ops are dropped, so their entries
+        // must go too, or reads would serve a write or delete that never lands.
+        process_batch(
+            0,
+            &pool,
+            &mut batch,
+            &mut HashSet::new(),
+            &cache,
+            &Cache::new(16),
+        )
+        .await;
         assert!(!cache.contains_key("k"));
-
-        drop(sender);
-        writer.await.unwrap();
+        assert!(!cache.contains_key("d"));
     }
 
     #[tokio::test]
