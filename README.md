@@ -633,11 +633,11 @@ redis-cli EXPIRE permanent_key 3600
 
 ### Race Condition Handling
 
-**The Problem:** Async writes could cause GET requests to miss recently SET data.
+**The Problem:** Async writes could cause GET requests to miss recently SET data, or still return data that was just deleted.
 
 **The Solution:** Inflight cache system:
-- Tracks pending write operations
-- Serves data from cache during async writes
+- Tracks pending write and delete operations
+- Serves data from cache during async writes, and treats keys with a pending delete as absent
 - Automatic cleanup after database commits
 
 ### Redis Cluster Compatibility
