@@ -552,6 +552,8 @@ mod tests {
             metrics: None,
             shutdown_timeout_secs: None,
             max_request_size_mb: None,
+            cleanup_chunk_size: None,
+            cleanup_interval_secs: None,
             sqlite: None,
         }
     }

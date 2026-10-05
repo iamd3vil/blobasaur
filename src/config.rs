@@ -21,6 +21,13 @@ pub struct Cfg {
     /// Max size of a single client request (command plus all arguments) in MB.
     /// Larger requests get an error and the connection is closed. Default: 100
     pub max_request_size_mb: Option<u64>,
+    /// Max expired rows the background cleanup deletes per statement. Each chunk
+    /// holds the shard's writer connection only briefly, so writes run between
+    /// chunks. Default: 1000
+    pub cleanup_chunk_size: Option<u32>,
+    /// Seconds between background expiry cleanup sweeps of each shard.
+    /// Default: 60
+    pub cleanup_interval_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -175,6 +182,16 @@ impl Cfg {
             ));
         }
 
+        if cfg.cleanup_chunk_size == Some(0) {
+            return Err(miette::miette!("cleanup_chunk_size must be greater than 0"));
+        }
+
+        if cfg.cleanup_interval_secs == Some(0) {
+            return Err(miette::miette!(
+                "cleanup_interval_secs must be greater than 0"
+            ));
+        }
+
         println!("Data directory: {}", cfg.data_dir);
         println!("Number of shards: {}", cfg.num_shards);
 
@@ -241,6 +258,16 @@ impl Cfg {
     pub fn max_request_size(&self) -> usize {
         let mb = self.max_request_size_mb.unwrap_or(100);
         usize::try_from(mb.saturating_mul(1024 * 1024)).unwrap_or(usize::MAX)
+    }
+
+    /// Max expired rows deleted per cleanup statement; see `cleanup_chunk_size`.
+    pub fn cleanup_chunk_size(&self) -> u32 {
+        self.cleanup_chunk_size.unwrap_or(1000)
+    }
+
+    /// Seconds between expiry cleanup sweeps; see `cleanup_interval_secs`.
+    pub fn cleanup_interval_secs(&self) -> u64 {
+        self.cleanup_interval_secs.unwrap_or(60)
     }
 
     pub fn is_compression(&self) -> bool {

@@ -79,7 +79,6 @@ pub async fn run(
     let mut background = Vec::new();
 
     // Spawn cleanup tasks for each shard
-    let cleanup_interval_secs = 60; // Clean up expired keys every 60 seconds
     for i in 0..cfg.num_shards {
         // Expiry cleanup deletes rows, so it shares the shard's single writer
         // connection: taking turns with the writer instead of holding the SQLite
@@ -88,7 +87,8 @@ pub async fn run(
         background.push(tokio::spawn(shard_manager::shard_cleanup_task(
             i,
             state.write_db_pools[i].clone(),
-            cleanup_interval_secs,
+            cfg.cleanup_interval_secs(),
+            cfg.cleanup_chunk_size(),
         )));
     }
 
@@ -2401,6 +2401,8 @@ mod tests {
                 metrics: None,
                 shutdown_timeout_secs: None,
                 max_request_size_mb: None,
+                cleanup_chunk_size: None,
+                cleanup_interval_secs: None,
                 sqlite: None,
             };
 
@@ -2480,6 +2482,8 @@ mod tests {
             metrics: None,
             shutdown_timeout_secs: None,
             max_request_size_mb: None,
+            cleanup_chunk_size: None,
+            cleanup_interval_secs: None,
             sqlite: Some(SqliteConfig {
                 cache_size_mb: None,
                 busy_timeout_ms: Some(250),

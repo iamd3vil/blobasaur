@@ -35,6 +35,17 @@ batch_timeout_ms = 10
 # in line with available RAM and expected concurrent large writes.
 # max_request_size_mb = 100
 
+# cleanup_chunk_size: Max expired rows the background expiry cleanup deletes per
+# statement (defaults to 1000). The cleanup shares each shard's writer
+# connection, so smaller chunks let writes run sooner during a mass expiry;
+# larger chunks finish the sweep in fewer statements.
+# cleanup_chunk_size = 1000
+
+# cleanup_interval_secs: Seconds between background sweeps that delete expired
+# keys from disk (defaults to 60). Expired keys are never returned to clients
+# either way; this only controls how soon their rows are removed.
+# cleanup_interval_secs = 60
+
 # shutdown_timeout_secs: On SIGINT/SIGTERM, max time to commit queued writes
 # before exiting (defaults to 30). Exceeding it exits non-zero and logs how
 # many acknowledged writes were not persisted. Keep your orchestrator's kill
