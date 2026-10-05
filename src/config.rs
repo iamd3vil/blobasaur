@@ -25,6 +25,9 @@ pub struct Cfg {
     /// holds the shard's writer connection only briefly, so writes run between
     /// chunks. Default: 1000
     pub cleanup_chunk_size: Option<u32>,
+    /// Seconds between background expiry cleanup sweeps of each shard.
+    /// Default: 60
+    pub cleanup_interval_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -183,6 +186,12 @@ impl Cfg {
             return Err(miette::miette!("cleanup_chunk_size must be greater than 0"));
         }
 
+        if cfg.cleanup_interval_secs == Some(0) {
+            return Err(miette::miette!(
+                "cleanup_interval_secs must be greater than 0"
+            ));
+        }
+
         println!("Data directory: {}", cfg.data_dir);
         println!("Number of shards: {}", cfg.num_shards);
 
@@ -254,6 +263,11 @@ impl Cfg {
     /// Max expired rows deleted per cleanup statement; see `cleanup_chunk_size`.
     pub fn cleanup_chunk_size(&self) -> u32 {
         self.cleanup_chunk_size.unwrap_or(1000)
+    }
+
+    /// Seconds between expiry cleanup sweeps; see `cleanup_interval_secs`.
+    pub fn cleanup_interval_secs(&self) -> u64 {
+        self.cleanup_interval_secs.unwrap_or(60)
     }
 
     pub fn is_compression(&self) -> bool {
