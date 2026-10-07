@@ -20,7 +20,6 @@ jobs:
       with:
         go-version-file: tests/goredis/go.mod
         cache-dependency-path: tests/goredis/go.sum
-    - name: Build
-      run: cargo build --verbose
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
     - name: Run tests
       run: cargo test --verbose
