@@ -187,3 +187,70 @@ async fn quit_replies_ok_and_closes_without_running_the_rest() {
         Some(":0")
     );
 }
+
+#[tokio::test]
+async fn hsetex_fnx_and_fxx_write_all_fields_or_none() {
+    let server = start(None).await;
+    assert_eq!(
+        server
+            .call(&[b"HSET", b"ns", b"old", b"v"])
+            .await
+            .as_deref(),
+        Some(":1")
+    );
+
+    // FNX with one existing field must not write the new one listed before it.
+    let fnx = [
+        &b"HSETEX"[..],
+        b"ns",
+        b"FNX",
+        b"FIELDS",
+        b"2",
+        b"new",
+        b"v",
+        b"old",
+        b"v2",
+    ];
+    assert_eq!(server.call(&fnx).await.as_deref(), Some(":0"));
+    assert_eq!(
+        server.call(&[b"HEXISTS", b"ns", b"new"]).await.as_deref(),
+        Some(":0")
+    );
+
+    // FXX with one missing field must not overwrite the existing one before it.
+    let fxx = [
+        &b"HSETEX"[..],
+        b"ns",
+        b"FXX",
+        b"FIELDS",
+        b"2",
+        b"old",
+        b"v2",
+        b"absent",
+        b"v",
+    ];
+    assert_eq!(server.call(&fxx).await.as_deref(), Some(":0"));
+    let mut client = server.connect().await;
+    client.send(&request(&[b"HGET", b"ns", b"old"])).await;
+    assert_eq!(client.bulk().await, b"v");
+}
+
+#[tokio::test]
+async fn hsetex_counts_a_repeated_new_field_once() {
+    let server = start(None).await;
+    let dup = [
+        &b"HSETEX"[..],
+        b"ns",
+        b"FNX",
+        b"FIELDS",
+        b"2",
+        b"f",
+        b"a",
+        b"f",
+        b"b",
+    ];
+    assert_eq!(server.call(&dup).await.as_deref(), Some(":1"));
+    let mut client = server.connect().await;
+    client.send(&request(&[b"HGET", b"ns", b"f"])).await;
+    assert_eq!(client.bulk().await, b"b");
+}

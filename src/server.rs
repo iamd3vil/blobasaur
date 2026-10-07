@@ -12,6 +12,7 @@ use crate::shard_manager::{
 use bytes::{Buf, Bytes, BytesMut};
 use futures::FutureExt;
 use redis_protocol::resp2::types::BytesFrame;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -1322,9 +1323,10 @@ async fn handle_hsetex(
         None => None,
     };
 
-    // Process multiple fields
-    let mut new_fields_added = 0;
-
+    // Check every field before writing any, so a redirect or a failed FNX/FXX
+    // condition leaves the hash untouched.
+    let mut checked = Vec::with_capacity(fields.len());
+    let mut seen = HashSet::with_capacity(fields.len());
     for (field_key, field_value) in fields {
         // Check if we should handle this hash operation locally in a cluster
         if let Some(ref cluster_manager) = state.cluster_manager
@@ -1341,7 +1343,6 @@ async fn handle_hsetex(
         }
 
         let shard_index = state.get_shard(&field_key);
-        let sender = &state.shard_senders[shard_index];
         let pool = &state.write_db_pools[shard_index];
         let table_name = format!("blobs_{}", namespace);
 
@@ -1383,23 +1384,21 @@ async fn handle_hsetex(
             },
         };
 
-        // Check FNX/FXX conditions if specified
-        if fnx || fxx {
-            if fnx && exists {
-                // FNX: Only set if field doesn't exist, return 0 for entire operation
-                let response = BytesFrame::Integer(0);
-                stream.write_all(&serialize_frame(&response)).await?;
-                return Ok(());
-            }
-            if fxx && !exists {
-                // FXX: Only set if field exists, return 0 for entire operation
-                let response = BytesFrame::Integer(0);
-                stream.write_all(&serialize_frame(&response)).await?;
-                return Ok(());
-            }
+        // FNX sets only if no field exists, FXX only if all of them do.
+        if (fnx && exists) || (fxx && !exists) {
+            let response = BytesFrame::Integer(0);
+            stream.write_all(&serialize_frame(&response)).await?;
+            return Ok(());
         }
 
-        let is_new_field = !exists;
+        // A field repeated in one command is created once; the last value wins.
+        let is_new_field = !exists && seen.insert(field_key.clone());
+        checked.push((field_key, field_value, shard_index, is_new_field));
+    }
+
+    let mut new_fields_added = 0;
+    for (field_key, field_value, shard_index, is_new_field) in checked {
+        let sender = &state.shard_senders[shard_index];
 
         // Compress data if storage compression is enabled
         let compressed_value = compress_if_enabled(state, field_value).await?;
