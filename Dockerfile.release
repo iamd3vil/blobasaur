@@ -1,0 +1,18 @@
+# Release image: packages the binary built by the Release workflow instead of
+# compiling it again. Build context is a directory holding that `blobasaur`.
+# To build from source, use Dockerfile.
+FROM alpine:3.21
+
+RUN apk add --no-cache ca-certificates
+
+WORKDIR /app
+
+COPY --chmod=755 blobasaur /usr/local/bin/blobasaur
+
+# Create data directory
+RUN mkdir -p /app/data
+
+# Expose Redis protocol port and gossip port
+EXPOSE 6379 7000
+
+CMD ["blobasaur"]
