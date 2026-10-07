@@ -1,8 +1,17 @@
 use std::time::{Duration, Instant};
 
 use metrics::{Counter, Gauge, Histogram};
-use metrics_exporter_prometheus::PrometheusBuilder;
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use miette::Result;
+
+const VALUE_SIZE_METRIC: &str = "blobasaur_value_size_bytes";
+const STORED_VALUE_SIZE_METRIC: &str = "blobasaur_stored_value_size_bytes";
+
+/// Bucket bounds for value sizes: powers of 4 from 64 B to 64 MiB.
+const VALUE_SIZE_BUCKETS: &[f64] = &[
+    64.0, 256.0, 1024.0, 4096.0, 16384.0, 65536.0, 262144.0, 1048576.0, 4194304.0, 16777216.0,
+    67108864.0,
+];
 
 /// Metrics collector for the blobasaur Redis server
 #[derive(Clone)]
@@ -54,6 +63,16 @@ pub struct Metrics {
     pub batch_operations_total: Counter,
     pub batch_size: Histogram,
     pub batch_duration_seconds: Histogram,
+
+    // Value size metrics (uncompressed bytes, by command)
+    pub value_size_get_bytes: Histogram,
+    pub value_size_set_bytes: Histogram,
+    pub value_size_hget_bytes: Histogram,
+    pub value_size_hset_bytes: Histogram,
+
+    // Stored value size metrics (after compression, by write command)
+    pub stored_value_size_set_bytes: Histogram,
+    pub stored_value_size_hset_bytes: Histogram,
 }
 
 impl Default for Metrics {
@@ -115,6 +134,22 @@ impl Metrics {
             batch_operations_total: metrics::counter!("blobasaur_batch_operations_total"),
             batch_size: metrics::histogram!("blobasaur_batch_size"),
             batch_duration_seconds: metrics::histogram!("blobasaur_batch_duration_seconds"),
+
+            // Value size metrics
+            value_size_get_bytes: metrics::histogram!(VALUE_SIZE_METRIC, "command" => "get"),
+            value_size_set_bytes: metrics::histogram!(VALUE_SIZE_METRIC, "command" => "set"),
+            value_size_hget_bytes: metrics::histogram!(VALUE_SIZE_METRIC, "command" => "hget"),
+            value_size_hset_bytes: metrics::histogram!(VALUE_SIZE_METRIC, "command" => "hset"),
+
+            // Stored value size metrics
+            stored_value_size_set_bytes: metrics::histogram!(
+                STORED_VALUE_SIZE_METRIC,
+                "command" => "set"
+            ),
+            stored_value_size_hset_bytes: metrics::histogram!(
+                STORED_VALUE_SIZE_METRIC,
+                "command" => "hset"
+            ),
         };
 
         // Initialize baseline metrics to ensure we have data
@@ -310,6 +345,17 @@ impl Metrics {
 /// Initialize the Prometheus metrics exporter
 pub fn init_metrics_exporter() -> Result<metrics_exporter_prometheus::PrometheusHandle> {
     let handle = PrometheusBuilder::new()
+        .set_buckets_for_metric(
+            Matcher::Full(VALUE_SIZE_METRIC.to_string()),
+            VALUE_SIZE_BUCKETS,
+        )
+        .and_then(|builder| {
+            builder.set_buckets_for_metric(
+                Matcher::Full(STORED_VALUE_SIZE_METRIC.to_string()),
+                VALUE_SIZE_BUCKETS,
+            )
+        })
+        .map_err(|e| miette::miette!("Failed to configure metric buckets: {}", e))?
         .install_recorder()
         .map_err(|e| miette::miette!("Failed to install Prometheus recorder: {}", e))?;
 

@@ -582,6 +582,7 @@ async fn handle_get(
             // Decompress if needed
             let data = decompress_if_enabled(state, data).await?;
 
+            state.metrics.value_size_get_bytes.record(data.len() as f64);
             write_bulk(stream, &data).await?;
             state.metrics.record_cache_hit();
             return Ok(());
@@ -611,6 +612,7 @@ async fn handle_get(
             // Decompress if needed
             let data = decompress_if_enabled(state, row.0.into()).await?;
 
+            state.metrics.value_size_get_bytes.record(data.len() as f64);
             write_bulk(stream, &data).await?;
             state.metrics.record_cache_hit();
         }
@@ -640,7 +642,9 @@ async fn handle_set(
     let shard_index = state.get_shard(&key);
     let sender = &state.shard_senders[shard_index];
 
+    let value_len = value.len() as f64;
     let value = compress_if_enabled(state, value).await?;
+    let stored_len = value.len() as f64;
 
     // Check if async_write is enabled
     if state.cfg.async_write.unwrap_or(false) {
@@ -668,6 +672,8 @@ async fn handle_set(
             stream.write_all(&serialize_frame(&response)).await?;
             state.metrics.record_error("storage");
         } else {
+            state.metrics.value_size_set_bytes.record(value_len);
+            state.metrics.stored_value_size_set_bytes.record(stored_len);
             let response = BytesFrame::SimpleString("OK".into());
             stream.write_all(&serialize_frame(&response)).await?;
             state.metrics.record_storage_operation();
@@ -694,6 +700,8 @@ async fn handle_set(
         } else {
             match responder_rx.await {
                 Ok(Ok(())) => {
+                    state.metrics.value_size_set_bytes.record(value_len);
+                    state.metrics.stored_value_size_set_bytes.record(stored_len);
                     let response = BytesFrame::SimpleString("OK".into());
                     stream.write_all(&serialize_frame(&response)).await?;
                     state.metrics.record_storage_operation();
@@ -1095,6 +1103,10 @@ async fn handle_hget(
             // Decompress if needed
             let data = decompress_if_enabled(state, data).await?;
 
+            state
+                .metrics
+                .value_size_hget_bytes
+                .record(data.len() as f64);
             write_bulk(stream, &data).await?;
             return Ok(());
         }
@@ -1126,6 +1138,10 @@ async fn handle_hget(
             // Decompress if needed
             let data = decompress_if_enabled(state, row.0.into()).await?;
 
+            state
+                .metrics
+                .value_size_hget_bytes
+                .record(data.len() as f64);
             write_bulk(stream, &data).await?;
         }
         Ok(None) => {
@@ -1171,6 +1187,8 @@ async fn handle_hset(
         stream.write_all(&serialize_frame(&response)).await?;
         return Ok(());
     }
+
+    let value_len = value.len() as f64;
 
     let shard_index = state.get_shard(&key);
     let pool = &state.write_db_pools[shard_index];
@@ -1218,6 +1236,7 @@ async fn handle_hset(
 
     // Compress data if storage compression is enabled
     let value = compress_if_enabled(state, value).await?;
+    let stored_len = value.len() as f64;
 
     // Check if async_write is enabled
     if state.cfg.async_write.unwrap_or(false) {
@@ -1248,6 +1267,11 @@ async fn handle_hset(
             let response = BytesFrame::Error("ERR internal error ".into());
             stream.write_all(&serialize_frame(&response)).await?;
         } else {
+            state.metrics.value_size_hset_bytes.record(value_len);
+            state
+                .metrics
+                .stored_value_size_hset_bytes
+                .record(stored_len);
             let response = BytesFrame::Integer(if existed_before { 0 } else { 1 });
             stream.write_all(&serialize_frame(&response)).await?;
         }
@@ -1269,6 +1293,11 @@ async fn handle_hset(
         } else {
             match responder_rx.await {
                 Ok(Ok(())) => {
+                    state.metrics.value_size_hset_bytes.record(value_len);
+                    state
+                        .metrics
+                        .stored_value_size_hset_bytes
+                        .record(stored_len);
                     let response = BytesFrame::Integer(if existed_before { 0 } else { 1 });
                     stream.write_all(&serialize_frame(&response)).await?;
                 }
@@ -1398,10 +1427,12 @@ async fn handle_hsetex(
 
     let mut new_fields_added = 0;
     for (field_key, field_value, shard_index, is_new_field) in checked {
+        let value_len = field_value.len() as f64;
         let sender = &state.shard_senders[shard_index];
 
         // Compress data if storage compression is enabled
         let compressed_value = compress_if_enabled(state, field_value).await?;
+        let stored_len = compressed_value.len() as f64;
 
         // Send the operation
         if state.cfg.async_write.unwrap_or(false) {
@@ -1441,6 +1472,11 @@ async fn handle_hsetex(
                 stream.write_all(&serialize_frame(&response)).await?;
                 return Ok(());
             }
+            state.metrics.value_size_hset_bytes.record(value_len);
+            state
+                .metrics
+                .stored_value_size_hset_bytes
+                .record(stored_len);
             if is_new_field {
                 new_fields_added += 1;
             }
@@ -1474,6 +1510,11 @@ async fn handle_hsetex(
 
             match responder_rx.await {
                 Ok(Ok(())) => {
+                    state.metrics.value_size_hset_bytes.record(value_len);
+                    state
+                        .metrics
+                        .stored_value_size_hset_bytes
+                        .record(stored_len);
                     if is_new_field {
                         new_fields_added += 1;
                     }

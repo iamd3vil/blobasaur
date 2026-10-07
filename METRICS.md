@@ -82,6 +82,11 @@ When metrics are enabled, Blobasaur starts an HTTP server with the following end
 - `blobasaur_batch_size` - Histogram of batch sizes
 - `blobasaur_batch_duration_seconds` - Histogram of batch processing times
 
+### Value Size Metrics
+
+- `blobasaur_value_size_bytes{command}` - Histogram of uncompressed value sizes in bytes, where `command` is `set`, `hset` (includes HSETEX fields), `get`, or `hget`. Writes are recorded only when accepted (committed in sync mode, queued in `async_write` mode); rejected or failed writes are not counted. Reads are recorded only on hits. Buckets are powers of 4 from 64 B to 64 MiB.
+- `blobasaur_stored_value_size_bytes{command}` - Histogram of value sizes as written to SQLite (after `storage_compression`), where `command` is `set` or `hset`. Recorded at the same points as the write side of `blobasaur_value_size_bytes`, so the two sums are directly comparable. Equal to the uncompressed size when compression is disabled. Same buckets.
+
 ### Vacuum Metrics
 
 - `blobasaur_vacuum_runs_total{mode,result}` - Total shard vacuum attempts by vacuum mode and outcome (`ok`, `error`, `cancelled`, etc.)
@@ -140,6 +145,21 @@ rate(blobasaur_cache_hits_total[5m]) / (rate(blobasaur_cache_hits_total[5m]) + r
 ### Command Latency (95th percentile)
 ```promql
 histogram_quantile(0.95, rate(blobasaur_command_duration_seconds_bucket[5m]))
+```
+
+### Value Size (95th percentile, by command)
+```promql
+histogram_quantile(0.95, sum by (le, command) (rate(blobasaur_value_size_bytes_bucket[5m])))
+```
+
+### Bytes Written per Second
+```promql
+sum(rate(blobasaur_value_size_bytes_sum{command=~"set|hset"}[5m]))
+```
+
+### Compression Ratio (stored / uncompressed bytes)
+```promql
+sum(rate(blobasaur_stored_value_size_bytes_sum[5m])) / sum(rate(blobasaur_value_size_bytes_sum{command=~"set|hset"}[5m]))
 ```
 
 ### Active Connections
