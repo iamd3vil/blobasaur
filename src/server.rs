@@ -101,8 +101,12 @@ pub async fn run(
             .and_then(|m| m.addr.clone())
             .unwrap_or_else(|| "0.0.0.0:9090".to_string());
 
+        let sampled = state.clone();
+        let sample = move || sampled.record_gauges();
         background.push(tokio::spawn(async move {
-            if let Err(e) = crate::http_server::run_metrics_server(handle, &metrics_addr).await {
+            if let Err(e) =
+                crate::http_server::run_metrics_server(handle, &metrics_addr, sample).await
+            {
                 tracing::error!("Failed to run metrics server: {}", e);
             }
         }));
@@ -154,7 +158,7 @@ pub async fn run(
                     "SHUTDOWN TIMEOUT: shard {} writer did not drain within {:?}; {} queued ops (plus the batch being committed) were acknowledged but NOT persisted",
                     shard_id,
                     drain_timeout,
-                    sender.max_capacity() - sender.capacity()
+                    sender.queue_depth()
                 );
                 drain_failed = true;
             }
@@ -579,19 +583,19 @@ async fn handle_get(
     // First check inflight cache for pending writes
     match state.inflight_cache.get(&key).await {
         Some(Pending::Value(data)) => {
+            state.metrics.record_read("get", "inflight", "hit");
             // Decompress if needed
             let data = decompress_if_enabled(state, data).await?;
 
             state.metrics.value_size_get_bytes.record(data.len() as f64);
             write_bulk(stream, &data).await?;
-            state.metrics.record_cache_hit();
             return Ok(());
         }
         Some(Pending::Deleted(_)) => {
+            state.metrics.record_read("get", "inflight", "miss");
             stream
                 .write_all(&serialize_frame(&BytesFrame::Null))
                 .await?;
-            state.metrics.record_cache_miss();
             return Ok(());
         }
         None => {}
@@ -600,28 +604,34 @@ async fn handle_get(
     let shard_index = state.get_shard(&key);
     let pool = &state.db_pools[shard_index];
 
-    match sqlx::query_as::<_, (Vec<u8>,)>(
+    let query = sqlx::query_as::<_, (Vec<u8>,)>(
         "SELECT data FROM blobs WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
     )
     .bind(&key)
-    .bind(chrono::Utc::now().timestamp())
-    .fetch_optional(pool)
+    .bind(chrono::Utc::now().timestamp());
+    let shard_metrics = &state.shard_senders[shard_index].metrics;
+    match async {
+        query
+            .fetch_optional(&mut *shard_metrics.acquire(pool, "read").await?)
+            .await
+    }
     .await
     {
         Ok(Some(row)) => {
+            state.metrics.record_read("get", "sqlite", "hit");
             // Decompress if needed
             let data = decompress_if_enabled(state, row.0.into()).await?;
 
             state.metrics.value_size_get_bytes.record(data.len() as f64);
             write_bulk(stream, &data).await?;
-            state.metrics.record_cache_hit();
         }
         Ok(None) => {
+            state.metrics.record_read("get", "sqlite", "miss");
             let response = BytesFrame::Null;
             stream.write_all(&serialize_frame(&response)).await?;
-            state.metrics.record_cache_miss();
         }
         Err(e) => {
+            state.metrics.record_read("get", "sqlite", "error");
             tracing::error!("Failed to GET key {}: {}", key, e);
             let response = BytesFrame::Error("ERR database error ".into());
             stream.write_all(&serialize_frame(&response)).await?;
@@ -1100,6 +1110,7 @@ async fn handle_hget(
     let namespaced_key = state.namespaced_key(&namespace, &key);
     match state.inflight_hcache.get(&namespaced_key).await {
         Some(Pending::Value(data)) => {
+            state.metrics.record_read("hget", "inflight", "hit");
             // Decompress if needed
             let data = decompress_if_enabled(state, data).await?;
 
@@ -1111,6 +1122,7 @@ async fn handle_hget(
             return Ok(());
         }
         Some(Pending::Deleted(_)) => {
+            state.metrics.record_read("hget", "inflight", "miss");
             stream
                 .write_all(&serialize_frame(&BytesFrame::Null))
                 .await?;
@@ -1128,13 +1140,19 @@ async fn handle_hget(
         table_name
     );
 
-    match sqlx::query_as::<_, (Vec<u8>,)>(&query)
+    let query = sqlx::query_as::<_, (Vec<u8>,)>(&query)
         .bind(&key)
-        .bind(chrono::Utc::now().timestamp())
-        .fetch_optional(pool)
-        .await
+        .bind(chrono::Utc::now().timestamp());
+    let shard_metrics = &state.shard_senders[shard_index].metrics;
+    match async {
+        query
+            .fetch_optional(&mut *shard_metrics.acquire(pool, "read").await?)
+            .await
+    }
+    .await
     {
         Ok(Some(row)) => {
+            state.metrics.record_read("hget", "sqlite", "hit");
             // Decompress if needed
             let data = decompress_if_enabled(state, row.0.into()).await?;
 
@@ -1145,15 +1163,18 @@ async fn handle_hget(
             write_bulk(stream, &data).await?;
         }
         Ok(None) => {
+            state.metrics.record_read("hget", "sqlite", "miss");
             let response = BytesFrame::Null;
             stream.write_all(&serialize_frame(&response)).await?;
         }
         Err(e) if is_missing_table(&e) => {
+            state.metrics.record_read("hget", "sqlite", "miss");
             stream
                 .write_all(&serialize_frame(&BytesFrame::Null))
                 .await?;
         }
         Err(e) => {
+            state.metrics.record_read("hget", "sqlite", "error");
             tracing::error!("Failed to HGET namespace {} key {}: {}", namespace, key, e);
             let response = BytesFrame::Error("ERR database error ".into());
             stream.write_all(&serialize_frame(&response)).await?;
@@ -3488,6 +3509,108 @@ mod tests {
         })
         .await;
         assert_bulk_string(frame, b"v2");
+
+        ctx.shutdown().await;
+    }
+
+    async fn hget_frame(ctx: &TestContext, field: &'static str) -> BytesFrame {
+        respond_with(ctx, move |state, mut stream| {
+            Box::pin(async move {
+                handle_hget(&mut stream, &state, "ns".to_string(), field.to_string()).await
+            })
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn application_metrics_count_hget_lookups_by_source() {
+        use crate::metrics::rendered_value;
+        // Every handle the context creates binds to this recorder.
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let mut ctx = TestContext::new_paused(true).await;
+        let reads = |output: &str, source: &str, result: &str| {
+            rendered_value(
+                output,
+                &format!(
+                    r#"blobasaur_reads_total{{command="hget",source="{source}",result="{result}"}}"#
+                ),
+            )
+        };
+
+        // No namespace table yet: a SQLite miss, not an error.
+        assert_null(hget_frame(&ctx, "f").await);
+        respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_hset(
+                    &mut stream,
+                    &state,
+                    "ns".to_string(),
+                    "f".to_string(),
+                    Bytes::from_static(b"v"),
+                )
+                .await
+            })
+        })
+        .await;
+        assert_bulk_string(hget_frame(&ctx, "f").await, b"v");
+
+        ctx.state.record_gauges();
+        let output = recorder.handle().render();
+        assert_eq!(reads(&output, "sqlite", "miss"), 1.0);
+        assert_eq!(reads(&output, "inflight", "hit"), 1.0);
+        assert_eq!(
+            rendered_value(&output, r#"blobasaur_write_queue_depth{shard="0"}"#),
+            1.0
+        );
+        assert_eq!(
+            rendered_value(&output, r#"blobasaur_async_writes_pending{shard="0"}"#),
+            1.0
+        );
+
+        // EXPIRE is synchronous, so it waits for the HSET ahead of it.
+        ctx.resume();
+        respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move { handle_expire(&mut stream, &state, "k".to_string(), 10).await })
+        })
+        .await;
+        assert_bulk_string(hget_frame(&ctx, "f").await, b"v");
+        assert_null(hget_frame(&ctx, "gone").await);
+
+        ctx.state.record_gauges();
+        let output = recorder.handle().render();
+        assert_eq!(reads(&output, "sqlite", "hit"), 1.0);
+        assert_eq!(reads(&output, "sqlite", "miss"), 2.0);
+        assert_eq!(
+            rendered_value(&output, r#"blobasaur_write_queue_depth{shard="0"}"#),
+            0.0
+        );
+        assert_eq!(
+            rendered_value(&output, r#"blobasaur_async_writes_pending{shard="0"}"#),
+            0.0
+        );
+        assert_eq!(
+            rendered_value(
+                &output,
+                r#"blobasaur_sqlite_pool_acquire_seconds_count{shard="0",pool="read",result="ok"}"#
+            ),
+            3.0
+        );
+        for state in ["idle", "in_use"] {
+            rendered_value(
+                &output,
+                &format!(
+                    r#"blobasaur_sqlite_pool_connections{{shard="0",pool="read",state="{state}"}}"#
+                ),
+            );
+        }
+
+        // Sampling and rendering again doesn't move any counter.
+        ctx.state.record_gauges();
+        let again = recorder.handle().render();
+        assert_eq!(reads(&again, "sqlite", "hit"), 1.0);
+        assert_eq!(reads(&again, "sqlite", "miss"), 2.0);
+        assert_eq!(reads(&again, "inflight", "hit"), 1.0);
 
         ctx.shutdown().await;
     }

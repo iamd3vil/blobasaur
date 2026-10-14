@@ -1,10 +1,11 @@
-use crate::metrics::Metrics;
+use crate::metrics::{Metrics, ShardMetrics};
 use crate::redis::protocol::HExpireCondition;
 use bytes::Bytes;
 use chrono::Utc;
+use metrics::Counter;
 use moka::future::Cache;
 use moka::ops::compute::Op;
-use sqlx::{Sqlite, SqlitePool};
+use sqlx::{Connection, Sqlite, SqlitePool, pool::PoolConnection};
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{mpsc, oneshot};
@@ -89,6 +90,41 @@ pub enum ShardWriteOperation {
     },
 }
 
+/// A shard's write queue. Every enqueue goes through [`ShardSender::reserve`],
+/// so time spent waiting for queue space is always measured.
+pub struct ShardSender {
+    sender: mpsc::Sender<ShardWriteOperation>,
+    pub metrics: ShardMetrics,
+}
+
+impl ShardSender {
+    pub fn new(sender: mpsc::Sender<ShardWriteOperation>, metrics: ShardMetrics) -> Self {
+        Self { sender, metrics }
+    }
+
+    pub async fn reserve(
+        &self,
+    ) -> Result<mpsc::Permit<'_, ShardWriteOperation>, mpsc::error::SendError<()>> {
+        let start = std::time::Instant::now();
+        let permit = self.sender.reserve().await?;
+        self.metrics
+            .write_enqueue_wait_seconds
+            .record(start.elapsed());
+        Ok(permit)
+    }
+
+    pub async fn send(&self, op: ShardWriteOperation) -> Result<(), mpsc::error::SendError<()>> {
+        self.reserve().await?.send(op);
+        Ok(())
+    }
+
+    /// Ops queued for the writer, not counting the batch it is processing.
+    /// Includes permits reserved but not yet sent, which are held only briefly.
+    pub fn queue_depth(&self) -> usize {
+        self.sender.max_capacity() - self.sender.capacity()
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VacuumMode {
@@ -170,15 +206,19 @@ impl Pending {
 /// [`clear_pending_write`] on the same key.
 pub async fn queue_pending(
     cache: &Cache<String, Pending>,
-    sender: &mpsc::Sender<ShardWriteOperation>,
+    sender: &ShardSender,
     key: String,
     pending: Pending,
     op: ShardWriteOperation,
 ) -> Result<(), mpsc::error::SendError<()>> {
     let permit = sender.reserve().await?;
+    let pending_writes = &sender.metrics.async_writes_pending;
     cache
         .entry(key)
         .and_compute_with(|_| async move {
+            // Counted only once the op is sent, so a cancelled call can't leak
+            // it, and before the writer can see it, so it never goes negative.
+            pending_writes.increment(1.0);
             permit.send(op);
             Op::Put(pending)
         })
@@ -229,6 +269,7 @@ pub async fn shard_writer_task(writer: ShardWriter) {
         shutdown,
     } = writer;
 
+    let shard_metrics = ShardMetrics::new(shard_id);
     // Load existing namespaced tables into memory
     let mut known_tables = load_existing_tables(&pool, shard_id).await;
     let batch_timeout = Duration::from_millis(batch_timeout_ms);
@@ -322,6 +363,7 @@ pub async fn shard_writer_task(writer: ShardWriter) {
                 &mut known_tables,
                 &inflight_cache,
                 &inflight_hcache,
+                &shard_metrics,
             )
             .await;
             let batch_duration = batch_start.elapsed();
@@ -357,6 +399,7 @@ pub async fn shard_writer_task(writer: ShardWriter) {
             &mut known_tables,
             &inflight_cache,
             &inflight_hcache,
+            &shard_metrics,
         )
         .await;
         let batch_duration = batch_start.elapsed();
@@ -457,6 +500,7 @@ async fn process_batch(
     known_tables: &mut HashSet<String>,
     inflight_cache: &Cache<String, Pending>,
     inflight_hcache: &Cache<String, Pending>,
+    shard_metrics: &ShardMetrics,
 ) {
     if batch.is_empty() {
         return;
@@ -470,56 +514,63 @@ async fn process_batch(
     );
 
     // Start transaction
-    let mut tx = match pool.begin().await {
-        Ok(tx) => tx,
-        Err(e) => {
-            tracing::error!("[Shard {}] Failed to start transaction: {}", shard_id, e);
-            let error_message = format!("Transaction start failed: {}", e);
-            clear_pending_entries(batch, inflight_cache, inflight_hcache).await;
+    let mut conn = shard_metrics.acquire(pool, "write").await;
+    let tx_start = std::time::Instant::now();
+    let mut begin_error = String::new();
+    let begun = begin(&mut conn, shard_metrics, tx_start).await;
+    let Some(mut tx) = begun.map_err(|e| begin_error = e).ok() else {
+        let e = begin_error;
+        // Return the connection before the bookkeeping, as on commit.
+        drop(conn);
+        tracing::error!("[Shard {}] Failed to start transaction: {}", shard_id, e);
+        let error_message = format!("Transaction start failed: {}", e);
+        clear_pending_entries(batch, inflight_cache, inflight_hcache).await;
 
-            // Send errors to all synchronous operations and clear batch
-            for operation in batch.drain(..) {
-                match operation {
-                    ShardWriteOperation::Set { responder, .. }
-                    | ShardWriteOperation::Delete { responder, .. }
-                    | ShardWriteOperation::HSet { responder, .. }
-                    | ShardWriteOperation::HSetEx { responder, .. }
-                    | ShardWriteOperation::HDelete { responder, .. } => {
-                        let _ = responder.send(Err(error_message.clone()));
-                    }
-                    ShardWriteOperation::Expire { responder, .. } => {
-                        let _ = responder.send(Err(error_message.clone()));
-                    }
-                    ShardWriteOperation::HExpire { responder, .. } => {
-                        let _ = responder.send(Err(error_message.clone()));
-                    }
-                    ShardWriteOperation::Vacuum {
+        // Send errors to all synchronous operations and clear batch
+        for operation in batch.drain(..) {
+            match operation {
+                ShardWriteOperation::Set { responder, .. }
+                | ShardWriteOperation::Delete { responder, .. }
+                | ShardWriteOperation::HSet { responder, .. }
+                | ShardWriteOperation::HSetEx { responder, .. }
+                | ShardWriteOperation::HDelete { responder, .. } => {
+                    let _ = responder.send(Err(error_message.clone()));
+                }
+                ShardWriteOperation::Expire { responder, .. } => {
+                    let _ = responder.send(Err(error_message.clone()));
+                }
+                ShardWriteOperation::HExpire { responder, .. } => {
+                    let _ = responder.send(Err(error_message.clone()));
+                }
+                ShardWriteOperation::Vacuum {
+                    mode,
+                    budget_bytes,
+                    dry_run,
+                    responder,
+                } => {
+                    let _ = responder.send(VacuumResult {
                         mode,
                         budget_bytes,
                         dry_run,
-                        responder,
-                    } => {
-                        let _ = responder.send(VacuumResult {
-                            mode,
-                            budget_bytes,
-                            dry_run,
-                            before: None,
-                            after: None,
-                            duration: Duration::ZERO,
-                            incremental_pages_requested: None,
-                            estimated_reclaimed_pages: None,
-                            errors: vec![error_message.clone()],
-                        });
-                    }
-                    ShardWriteOperation::SetAsync { .. }
-                    | ShardWriteOperation::DeleteAsync { .. }
-                    | ShardWriteOperation::HSetAsync { .. }
-                    | ShardWriteOperation::HSetExAsync { .. }
-                    | ShardWriteOperation::HDeleteAsync { .. } => {}
+                        before: None,
+                        after: None,
+                        duration: Duration::ZERO,
+                        incremental_pages_requested: None,
+                        estimated_reclaimed_pages: None,
+                        errors: vec![error_message.clone()],
+                    });
+                }
+                ShardWriteOperation::SetAsync { .. }
+                | ShardWriteOperation::DeleteAsync { .. }
+                | ShardWriteOperation::HSetAsync { .. }
+                | ShardWriteOperation::HSetExAsync { .. }
+                | ShardWriteOperation::HDeleteAsync { .. } => {
+                    shard_metrics.async_write_failures_total.increment(1);
+                    shard_metrics.async_writes_pending.decrement(1.0);
                 }
             }
-            return;
         }
+        return;
     };
 
     // One entry per op, in batch order.
@@ -853,6 +904,15 @@ async fn process_batch(
         tracing::error!("[Shard {}] Transaction commit failed: {}", shard_id, e);
         e.to_string()
     });
+    // Return the writer connection before the bookkeeping below.
+    drop(conn);
+    shard_metrics.record_transaction(commit_result.is_ok(), tx_start.elapsed());
+    if let Err(e) = &commit_result {
+        shard_metrics.record_sqlite_error("commit", e);
+    }
+    for e in results.iter().filter_map(|r| r.as_ref().err()) {
+        shard_metrics.record_sqlite_error("execute", e);
+    }
 
     clear_pending_entries(batch, inflight_cache, inflight_hcache).await;
 
@@ -910,6 +970,10 @@ async fn process_batch(
                         e
                     );
                 }
+                if op_result(operation_idx).is_err() {
+                    shard_metrics.async_write_failures_total.increment(1);
+                }
+                shard_metrics.async_writes_pending.decrement(1.0);
             }
             ShardWriteOperation::Vacuum {
                 mode,
@@ -938,6 +1002,21 @@ async fn process_batch(
             }
         }
     }
+}
+
+/// Begins the batch transaction on the writer connection, if there is one.
+/// A failed acquire was already recorded by [`ShardMetrics::acquire`].
+async fn begin<'c>(
+    conn: &'c mut Result<PoolConnection<Sqlite>, sqlx::Error>,
+    shard_metrics: &ShardMetrics,
+    tx_start: std::time::Instant,
+) -> Result<sqlx::Transaction<'c, Sqlite>, String> {
+    let conn = conn.as_mut().map_err(|e| e.to_string())?;
+    conn.begin().await.map_err(|e| {
+        shard_metrics.record_sqlite_error("begin", &e.to_string());
+        shard_metrics.record_transaction(false, tx_start.elapsed());
+        e.to_string()
+    })
 }
 
 async fn handle_hexpire_operation(
@@ -1385,11 +1464,14 @@ async fn ensure_namespaced_table_exists(
 /// cleanup shares the shard's single writer connection, so each chunk is its own
 /// statement: the pool hands out connections in FIFO order, letting a waiting
 /// writer batch run between chunks instead of stalling behind one long DELETE.
+/// Each chunk's rows are added to `deleted` as they go, so a later failing
+/// chunk doesn't lose the count.
 async fn delete_expired(
     pool: &SqlitePool,
     table: &str,
     now: i64,
     chunk_size: u32,
+    deleted_counter: &Counter,
 ) -> Result<u64, sqlx::Error> {
     let query = format!(
         "DELETE FROM {table} WHERE rowid IN (
@@ -1404,6 +1486,7 @@ async fn delete_expired(
             .execute(pool)
             .await?
             .rows_affected();
+        deleted_counter.increment(deleted);
         total += deleted;
         if deleted < u64::from(chunk_size) {
             return Ok(total);
@@ -1419,6 +1502,7 @@ pub async fn shard_cleanup_task(
     chunk_size: u32,
 ) {
     let mut interval = interval(Duration::from_secs(cleanup_interval_secs));
+    let shard_metrics = ShardMetrics::new(shard_id);
 
     tracing::info!(
         "[Shard {}] Starting cleanup task with interval {} seconds",
@@ -1429,6 +1513,8 @@ pub async fn shard_cleanup_task(
     loop {
         interval.tick().await;
 
+        let started = std::time::Instant::now();
+        let mut ok = true;
         let now = chrono::Utc::now().timestamp();
 
         // The main blobs table plus every namespaced "blobs_*" table
@@ -1446,11 +1532,14 @@ pub async fn shard_cleanup_task(
                     shard_id,
                     e
                 );
+                shard_metrics.record_cleanup_error("discover");
+                ok = false;
             }
         }
 
         for table_name in tables {
-            match delete_expired(&pool, &table_name, now, chunk_size).await {
+            let deleted = &shard_metrics.cleanup_deleted_keys_total;
+            match delete_expired(&pool, &table_name, now, chunk_size, deleted).await {
                 Ok(deleted_count) => {
                     if deleted_count > 0 {
                         tracing::info!(
@@ -1468,9 +1557,12 @@ pub async fn shard_cleanup_task(
                         table_name,
                         e
                     );
+                    shard_metrics.record_cleanup_error("delete");
+                    ok = false;
                 }
             }
         }
+        shard_metrics.record_cleanup(ok, started.elapsed());
     }
 }
 
@@ -1585,7 +1677,7 @@ mod tests {
         .await
         .unwrap();
 
-        let deleted = delete_expired(&pool, "blobs", now, chunk_size)
+        let deleted = delete_expired(&pool, "blobs", now, chunk_size, &Counter::noop())
             .await
             .unwrap();
         assert_eq!(deleted, u64::from(expired));
@@ -1648,9 +1740,14 @@ mod tests {
         assert_eq!(classify_vacuum_error_kinds(&mixed), (true, true));
     }
 
+    fn test_channel(capacity: usize) -> (ShardSender, mpsc::Receiver<ShardWriteOperation>) {
+        let (sender, receiver) = mpsc::channel(capacity);
+        (ShardSender::new(sender, ShardMetrics::new(0)), receiver)
+    }
+
     async fn queue_set(
         cache: &Cache<String, Pending>,
-        sender: &mpsc::Sender<ShardWriteOperation>,
+        sender: &ShardSender,
         key: &str,
         data: Bytes,
     ) {
@@ -1664,11 +1761,7 @@ mod tests {
             .unwrap();
     }
 
-    async fn queue_del(
-        cache: &Cache<String, Pending>,
-        sender: &mpsc::Sender<ShardWriteOperation>,
-        key: &str,
-    ) -> u64 {
+    async fn queue_del(cache: &Cache<String, Pending>, sender: &ShardSender, key: &str) -> u64 {
         let token = next_delete_token();
         let op = ShardWriteOperation::DeleteAsync {
             key: key.to_string(),
@@ -1684,7 +1777,7 @@ mod tests {
     async fn clearing_a_large_async_value_frees_it() {
         let cache: Cache<String, Pending> = Cache::new(16);
         let hcache: Cache<String, Pending> = Cache::new(16);
-        let (sender, mut receiver) = mpsc::channel(16);
+        let (sender, mut receiver) = test_channel(16);
 
         let value = Bytes::from(vec![1u8; FREE_NOW_BYTES]);
         queue_set(&cache, &sender, "k", value.clone()).await;
@@ -1700,7 +1793,7 @@ mod tests {
     async fn processed_async_op_only_clears_its_own_cache_entry() {
         let cache: Cache<String, Pending> = Cache::new(16);
         let hcache: Cache<String, Pending> = Cache::new(16);
-        let (sender, mut receiver) = mpsc::channel(16);
+        let (sender, mut receiver) = test_channel(16);
 
         let v2 = Bytes::from(vec![2u8; 16]);
         queue_set(&cache, &sender, "k", Bytes::from(vec![1u8; 16])).await;
@@ -1777,7 +1870,7 @@ mod tests {
         let (_temp_dir, pool) = create_test_pool().await;
         pool.close().await;
         let cache: Cache<String, Pending> = Cache::new(16);
-        let (sender, mut receiver) = mpsc::channel(16);
+        let (sender, mut receiver) = test_channel(16);
         queue_set(&cache, &sender, "k", Bytes::from_static(b"v")).await;
         queue_del(&cache, &sender, "d").await;
         let mut batch = VecDeque::new();
@@ -1794,10 +1887,168 @@ mod tests {
             &mut HashSet::new(),
             &cache,
             &Cache::new(16),
+            &ShardMetrics::new(0),
         )
         .await;
         assert!(!cache.contains_key("k"));
         assert!(!cache.contains_key("d"));
+    }
+
+    #[tokio::test]
+    async fn application_metrics_count_async_write_outcomes_once() {
+        use crate::metrics::rendered_value;
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let value = |series: &str| rendered_value(&recorder.handle().render(), series);
+
+        let (_temp_dir, pool) = create_test_pool().await;
+        let cache: Cache<String, Pending> = Cache::new(16);
+        let hcache: Cache<String, Pending> = Cache::new(16);
+        let (sender, mut receiver) = test_channel(16);
+        let shard_metrics = ShardMetrics::new(0);
+
+        // Two writes to one key are two pending ops, plus one whose statement
+        // fails: a namespace that isn't a valid table name.
+        queue_set(&cache, &sender, "k", Bytes::from_static(b"1")).await;
+        queue_set(&cache, &sender, "k", Bytes::from_static(b"2")).await;
+        let op = ShardWriteOperation::HSetAsync {
+            namespace: "bad name".to_string(),
+            key: "f".to_string(),
+            data: Bytes::from_static(b"v"),
+        };
+        let pending = Pending::Value(Bytes::from_static(b"v"));
+        queue_pending(&hcache, &sender, "bad name:f".to_string(), pending, op)
+            .await
+            .unwrap();
+        assert_eq!(sender.queue_depth(), 3);
+        assert_eq!(value(r#"blobasaur_async_writes_pending{shard="0"}"#), 3.0);
+        assert_eq!(
+            value(r#"blobasaur_write_enqueue_wait_seconds_count{shard="0"}"#),
+            3.0
+        );
+
+        let mut batch = VecDeque::new();
+        while let Ok(op) = receiver.try_recv() {
+            batch.push_back(op);
+        }
+        assert_eq!(sender.queue_depth(), 0);
+        let tables = &mut HashSet::new();
+        process_batch(
+            0,
+            &pool,
+            &mut batch,
+            tables,
+            &cache,
+            &hcache,
+            &shard_metrics,
+        )
+        .await;
+
+        // The statement failed but the transaction committed.
+        let output = recorder.handle().render();
+        assert_eq!(
+            rendered_value(&output, r#"blobasaur_async_writes_pending{shard="0"}"#),
+            0.0
+        );
+        assert_eq!(
+            rendered_value(
+                &output,
+                r#"blobasaur_async_write_failures_total{shard="0"}"#
+            ),
+            1.0
+        );
+        assert_eq!(
+            rendered_value(
+                &output,
+                r#"blobasaur_sqlite_errors_total{shard="0",stage="execute",kind="other"}"#
+            ),
+            1.0
+        );
+        assert_eq!(
+            rendered_value(
+                &output,
+                r#"blobasaur_sqlite_transaction_duration_seconds_count{shard="0",result="ok"}"#
+            ),
+            1.0
+        );
+        assert_eq!(
+            rendered_value(
+                &output,
+                r#"blobasaur_sqlite_pool_acquire_seconds_count{shard="0",pool="write",result="ok"}"#
+            ),
+            1.0
+        );
+
+        // No connection: the whole batch fails, counted once per op.
+        queue_set(&cache, &sender, "k", Bytes::from_static(b"3")).await;
+        let mut batch = VecDeque::from([receiver.try_recv().unwrap()]);
+        pool.close().await;
+        process_batch(
+            0,
+            &pool,
+            &mut batch,
+            tables,
+            &cache,
+            &hcache,
+            &shard_metrics,
+        )
+        .await;
+        let output = recorder.handle().render();
+        assert_eq!(
+            rendered_value(&output, r#"blobasaur_async_writes_pending{shard="0"}"#),
+            0.0
+        );
+        assert_eq!(
+            rendered_value(
+                &output,
+                r#"blobasaur_async_write_failures_total{shard="0"}"#
+            ),
+            2.0
+        );
+        assert_eq!(
+            rendered_value(
+                &output,
+                r#"blobasaur_sqlite_errors_total{shard="0",stage="acquire",kind="other"}"#
+            ),
+            1.0
+        );
+
+        // Scrapes don't change counters.
+        assert_eq!(
+            value(r#"blobasaur_async_write_failures_total{shard="0"}"#),
+            2.0
+        );
+    }
+
+    #[tokio::test]
+    async fn application_metrics_count_cleanup_deletes() {
+        let counter_value = {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            let (_dir, pool) = create_test_pool().await;
+            sqlx::query(
+                "INSERT INTO blobs (key, data, created_at, updated_at, expires_at)
+                 VALUES ('a', x'00', 0, 0, 1), ('b', x'00', 0, 0, 1), ('c', x'00', 0, 0, NULL)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            let counter = ShardMetrics::new(0).cleanup_deleted_keys_total;
+            // Chunk size 1: the count accumulates per chunk.
+            assert_eq!(
+                delete_expired(&pool, "blobs", 10, 1, &counter)
+                    .await
+                    .unwrap(),
+                2
+            );
+            let missing = delete_expired(&pool, "blobs_missing", 10, 1, &counter).await;
+            assert!(missing.is_err());
+            crate::metrics::rendered_value(
+                &recorder.handle().render(),
+                r#"blobasaur_cleanup_deleted_keys_total{shard="0"}"#,
+            )
+        };
+        assert_eq!(counter_value, 2.0);
     }
 
     #[tokio::test]

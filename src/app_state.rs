@@ -15,8 +15,8 @@ use crate::compression::{self, Compressor};
 use crate::{
     cluster::ClusterManager,
     config::Cfg,
-    metrics::Metrics,
-    shard_manager::{Pending, ShardWriteOperation, wal_checkpoint_truncate},
+    metrics::{Metrics, ShardMetrics},
+    shard_manager::{Pending, ShardSender, ShardWriteOperation, wal_checkpoint_truncate},
 };
 
 const CREATE_BLOBS_TABLE: &str = "CREATE TABLE IF NOT EXISTS blobs (
@@ -33,7 +33,7 @@ struct ShardNode(u64);
 
 pub struct AppState {
     pub cfg: Cfg,
-    pub shard_senders: Vec<mpsc::Sender<ShardWriteOperation>>,
+    pub shard_senders: Vec<ShardSender>,
     pub db_pools: Vec<SqlitePool>,
     pub write_db_pools: Vec<SqlitePool>,
     /// Cache for inflight write operations to prevent race conditions in async mode.
@@ -65,9 +65,9 @@ impl AppState {
         shard_receivers_out.clear();
 
         let queue_capacity = cfg.batch_size.unwrap_or(100);
-        for _ in 0..cfg.num_shards {
+        for i in 0..cfg.num_shards {
             let (sender, receiver) = mpsc::channel(queue_capacity);
-            shard_senders_vec.push(sender);
+            shard_senders_vec.push(ShardSender::new(sender, ShardMetrics::new(i)));
             shard_receivers_out.push(receiver); // Populate the output vector with receivers
         }
 
@@ -232,6 +232,32 @@ impl AppState {
             metrics,
             ring,
         })
+    }
+
+    /// Set the gauges that are sampled rather than updated in place: queue
+    /// depth and pool connections. Called on each metrics scrape.
+    pub fn record_gauges(&self) {
+        for (i, sender) in self.shard_senders.iter().enumerate() {
+            let shard = i.to_string();
+            metrics::gauge!("blobasaur_write_queue_depth", "shard" => shard.clone())
+                .set(sender.queue_depth() as f64);
+            for (name, pool) in [
+                ("read", &self.db_pools[i]),
+                ("write", &self.write_db_pools[i]),
+            ] {
+                let idle = pool.num_idle();
+                let in_use = (pool.size() as usize).saturating_sub(idle);
+                for (state, value) in [("idle", idle), ("in_use", in_use)] {
+                    metrics::gauge!(
+                        "blobasaur_sqlite_pool_connections",
+                        "shard" => shard.clone(),
+                        "pool" => name,
+                        "state" => state
+                    )
+                    .set(value as f64);
+                }
+            }
+        }
     }
 
     pub fn get_shard(&self, key: &str) -> usize {

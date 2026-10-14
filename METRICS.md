@@ -54,10 +54,27 @@ When metrics are enabled, Blobasaur starts an HTTP server with the following end
 - `blobasaur_connections_total` - Total number of connections accepted
 - `blobasaur_connections_dropped_total` - Total number of connections dropped
 
-### Cache Metrics
+### Tokio runtime metrics
 
-- `blobasaur_cache_hits_total` - Total cache hits (data found in memory/storage)
-- `blobasaur_cache_misses_total` - Total cache misses (data not found)
+These metrics are sampled from the server's Tokio runtime on every `/metrics` scrape. They use Tokio's stable API and need no additional configuration or `tokio_unstable` build flags.
+
+| Metric | Type | Description |
+| --- | --- | --- |
+| `blobasaur_tokio_workers` | Gauge | Number of async runtime worker threads |
+| `blobasaur_tokio_alive_tasks` | Gauge | Alive async tasks, including background and HTTP tasks, not just Redis connections |
+| `blobasaur_tokio_global_queue_depth` | Gauge | Tasks waiting in the global scheduling queue, excluding worker-local queues |
+| `blobasaur_tokio_worker_busy_duration_seconds_total{worker}` | Counter | Cumulative seconds each worker has spent processing work, not CPU time |
+| `blobasaur_tokio_worker_parks_total{worker}` | Counter | Times each worker has parked waiting for work |
+| `blobasaur_tokio_worker_park_unparks_total{worker}` | Counter | Combined park and unpark transitions for each worker |
+| `blobasaur_tokio_worker_parked{worker}` | Gauge | `1` when a worker is parked waiting for work, otherwise `0` |
+
+Worker labels are zero-based indices. Per-worker metrics require a target with 64-bit atomics. Runtime values are read independently, so a scrape is not an atomic snapshot of all workers. Tokio publishes worker statistics periodically, so busy time can lag current activity. Counters start at runtime creation and reset when the process restarts.
+
+Blocking-pool size, worker-local queue depth, poll counts, and work-steal counts require Tokio's unstable API in the pinned Tokio version and are not exported.
+
+### Read Metrics
+
+- `blobasaur_reads_total{command,source,result}` - GET/HGET lookups. `command` is `get` or `hget`. `source` is `inflight` if the inflight cache answered (an async write or delete acknowledged but not yet committed; only used with `async_write`, and an entry lasts until its batch commits), otherwise `sqlite`. `result` is `hit` (value found), `miss` (nothing found, including a pending delete or a missing namespace table), or `error` (SQLite error)
 
 ### Error Metrics
 
@@ -81,6 +98,28 @@ When metrics are enabled, Blobasaur starts an HTTP server with the following end
 - `blobasaur_batch_operations_total` - Total batch operations processed
 - `blobasaur_batch_size` - Histogram of batch sizes
 - `blobasaur_batch_duration_seconds` - Histogram of batch processing times
+
+### Write Queue Metrics
+
+- `blobasaur_write_queue_depth{shard}` - Ops waiting in the shard's write queue, not counting the batch being written. Sampled on each scrape. The queue holds `batch_size` ops (default 100); a value at that limit means writers are blocked on it
+- `blobasaur_write_enqueue_wait_seconds{shard}` - Histogram of time a SET/DEL/HSET/HSETEX/HDEL/EXPIRE/HEXPIRE/vacuum request waited for queue space, excluding SQLite execution
+- `blobasaur_async_writes_pending{shard}` - `async_write` ops acknowledged to clients but not yet committed or failed, whether queued or in the batch being written
+- `blobasaur_async_write_failures_total{shard}` - `async_write` ops that were acknowledged and then failed to persist, because their statement or their transaction failed. Each op counts once
+
+### SQLite Metrics
+
+- `blobasaur_sqlite_transaction_duration_seconds{shard,result}` - Histogram of writer batch transactions, from BEGIN through commit. `result` is `ok`, or `error` if BEGIN or COMMIT failed. A transaction with some failed statements still commits, so it counts as `ok`
+- `blobasaur_sqlite_errors_total{shard,stage,kind}` - SQLite and pool failures. `stage` is `acquire` (getting a connection), `begin`, `execute` (one per failed writer statement), or `commit`. `kind` is `busy`, `locked`, `constraint`, `io`, `pool_timeout`, or `other`. Read query errors are not included; see `blobasaur_reads_total{result="error"}`
+- `blobasaur_sqlite_pool_connections{shard,pool,state}` - Open connections in the shard's `read` or `write` pool, by `state` `idle` or `in_use`. Sampled on each scrape
+- `blobasaur_sqlite_pool_acquire_seconds{shard,pool,result}` - Histogram of time waiting for a pool connection, separate from the query. Measured for GET/HGET reads (`read`) and writer batches (`write`); `result` is `ok` or `error`
+
+### Expiry Cleanup Metrics
+
+- `blobasaur_cleanup_deleted_keys_total{shard}` - Expired rows deleted by the cleanup task, across all tables
+- `blobasaur_cleanup_duration_seconds{shard,result}` - Histogram of complete cleanup passes; `result` is `error` if any table lookup or delete failed
+- `blobasaur_cleanup_errors_total{shard,stage}` - Cleanup failures; `stage` is `discover` (listing tables) or `delete`
+
+The latency histograms in the three sections above use buckets from 100 µs to 30 s.
 
 ### Value Size Metrics
 
@@ -137,9 +176,57 @@ rate(blobasaur_commands_total[5m])
 rate(blobasaur_errors_total[5m])
 ```
 
-### Cache Hit Rate
+### Read Hit Rate (lookups that found a value)
 ```promql
-rate(blobasaur_cache_hits_total[5m]) / (rate(blobasaur_cache_hits_total[5m]) + rate(blobasaur_cache_misses_total[5m]))
+sum(rate(blobasaur_reads_total{result="hit"}[5m])) / sum(rate(blobasaur_reads_total{result=~"hit|miss"}[5m]))
+```
+
+### Write backpressure
+
+Queue saturation per shard, as a fraction of the queue capacity (here the default 100):
+
+```promql
+max by (shard) (blobasaur_write_queue_depth) / 100
+```
+
+95th percentile wait for queue space:
+
+```promql
+histogram_quantile(0.95, sum by (le, shard) (rate(blobasaur_write_enqueue_wait_seconds_bucket[5m])))
+```
+
+### Async writes lost after acknowledgement
+
+```promql
+sum by (shard) (rate(blobasaur_async_write_failures_total[5m]))
+```
+
+### SQLite bottlenecks
+
+Writer transaction p95, connection wait p95, and errors by kind:
+
+```promql
+histogram_quantile(0.95, sum by (le, shard) (rate(blobasaur_sqlite_transaction_duration_seconds_bucket[5m])))
+```
+
+```promql
+histogram_quantile(0.95, sum by (le, pool) (rate(blobasaur_sqlite_pool_acquire_seconds_bucket[5m])))
+```
+
+```promql
+sum by (stage, kind) (rate(blobasaur_sqlite_errors_total[5m]))
+```
+
+### Reads answered from the inflight cache
+
+```promql
+sum by (command) (rate(blobasaur_reads_total{source="inflight"}[5m])) / sum by (command) (rate(blobasaur_reads_total[5m]))
+```
+
+### Expired keys deleted per second
+
+```promql
+sum(rate(blobasaur_cleanup_deleted_keys_total[5m]))
 ```
 
 ### Command Latency (95th percentile)
@@ -166,6 +253,28 @@ sum(rate(blobasaur_stored_value_size_bytes_sum[5m])) / sum(rate(blobasaur_value_
 ```promql
 blobasaur_connections_active
 ```
+
+### Tokio worker utilization
+
+Fraction of time each worker spends processing work, averaged over five minutes:
+
+```promql
+rate(blobasaur_tokio_worker_busy_duration_seconds_total[5m])
+```
+
+Average utilization across workers for each instance:
+
+```promql
+avg by (instance) (rate(blobasaur_tokio_worker_busy_duration_seconds_total[5m]))
+```
+
+### Tokio task backlog
+
+```promql
+blobasaur_tokio_global_queue_depth
+```
+
+This only measures the global queue. A zero value does not rule out work waiting in worker-local queues.
 
 ### Top Commands by Volume
 ```promql
@@ -194,11 +303,11 @@ You can import this basic dashboard configuration into Grafana:
         ]
       },
       {
-        "title": "Cache Hit Rate",
+        "title": "Read Hit Rate",
         "type": "stat",
         "targets": [
           {
-            "expr": "rate(blobasaur_cache_hits_total[5m]) / (rate(blobasaur_cache_hits_total[5m]) + rate(blobasaur_cache_misses_total[5m]))",
+            "expr": "sum(rate(blobasaur_reads_total{result=\"hit\"}[5m])) / sum(rate(blobasaur_reads_total{result=~\"hit|miss\"}[5m]))",
             "legendFormat": "Hit Rate"
           }
         ]
