@@ -6,6 +6,7 @@ use std::future::Future;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use blobasaur::cluster::ClusterManager;
@@ -90,12 +91,20 @@ struct Node {
     handle: JoinHandle<miette::Result<()>>,
 }
 
+/// A UDP port for a node's gossip. It's free now but bound only later, so
+/// never hand the same one to two tests running in parallel.
 fn free_udp_port() -> u16 {
-    UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    static ISSUED: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
+    loop {
+        let port = UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        if ISSUED.lock().unwrap().insert(port) {
+            return port;
+        }
+    }
 }
 
 fn cfg(dir: &Path, o: &Opts, addr: SocketAddr, gossip_port: u16) -> Cfg {
@@ -791,6 +800,36 @@ async fn replication_needs_a_cluster() {
     let result = server::run(config, listener, CancellationToken::new()).await;
     assert!(
         format!("{:?}", result.unwrap_err()).contains("requires [cluster]"),
+        "wrong error"
+    );
+}
+
+#[tokio::test]
+async fn a_half_copied_replica_never_starts_as_a_primary_even_unreplicated() {
+    let dir = TempDir::new().unwrap();
+    let o = Opts {
+        plain: true,
+        ..Opts::primary("p", 1)
+    };
+    // A shard left mid-copy by a replica.
+    start(dir.path(), &o).await.stop().await;
+    let mut db = connect_db(dir.path(), 0).await;
+    for (k, v) in [("role", "replica"), ("synced", "0")] {
+        sqlx::query("INSERT OR REPLACE INTO repl_state (k, v) VALUES (?, ?)")
+            .bind(k)
+            .bind(v)
+            .execute(&mut db)
+            .await
+            .unwrap();
+    }
+    drop(db);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let config = cfg(dir.path(), &o, addr, free_udp_port());
+    let result = server::run(config, listener, CancellationToken::new()).await;
+    assert!(
+        format!("{:?}", result.unwrap_err()).contains("incomplete copy"),
         "wrong error"
     );
 }

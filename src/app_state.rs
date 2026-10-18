@@ -154,7 +154,8 @@ impl AppState {
         // Without replication this only marks the index as stale.
         let enabled = cfg.replication_enabled();
         let replica = cfg.replica_of().is_some();
-        if enabled && !replica {
+        // Also without replication: a half-copied replica must not serve as a primary.
+        if !replica {
             let options: Vec<_> = (0..cfg.num_shards)
                 .map(|i| build_sqlite_connect_options(&cfg, i))
                 .collect();
