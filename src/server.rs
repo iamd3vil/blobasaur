@@ -1,5 +1,5 @@
 use crate::AppState;
-use crate::cluster::ClusterManager;
+use crate::cluster::{ClusterManager, Route, SlotRange};
 use crate::config::Cfg;
 use crate::metrics::Timer;
 use crate::redis::{
@@ -359,6 +359,26 @@ struct ShardVacuumDispatchResult {
     vacuum_result: Option<VacuumResult>,
 }
 
+/// Checks that this node serves the slot `slot` computes. Otherwise replies MOVED or
+/// CLUSTERDOWN and returns false.
+async fn route_or_reply(
+    stream: &mut TcpStream,
+    state: &AppState,
+    slot: impl FnOnce(&ClusterManager) -> u16,
+) -> std::io::Result<bool> {
+    let Some(ref cluster_manager) = state.cluster_manager else {
+        return Ok(true);
+    };
+    let error = match cluster_manager.route(slot(cluster_manager)).await {
+        Route::Local => return Ok(true),
+        Route::Moved(redirect) => redirect,
+        Route::ClusterDown => "CLUSTERDOWN Hash slot not served".to_string(),
+    };
+    let response = BytesFrame::Error(error.into());
+    stream.write_all(&serialize_frame(&response)).await?;
+    Ok(false)
+}
+
 async fn handle_redis_command(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
@@ -386,12 +406,7 @@ async fn handle_redis_command_inner(
 ) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         RedisCommand::Get { key } => {
-            if let Some(ref cluster_manager) = state.cluster_manager
-                && !cluster_manager.should_handle_locally(&key).await
-                && let Some(redirect) = cluster_manager.get_redirect_response(&key).await
-            {
-                let response = BytesFrame::Error(redirect.into());
-                stream.write_all(&serialize_frame(&response)).await?;
+            if !route_or_reply(stream, state, |_| ClusterManager::calculate_slot(&key)).await? {
                 return Ok(());
             }
             handle_get(stream, state, key).await?;
@@ -401,12 +416,7 @@ async fn handle_redis_command_inner(
             value,
             ttl_seconds,
         } => {
-            if let Some(ref cluster_manager) = state.cluster_manager
-                && !cluster_manager.should_handle_locally(&key).await
-                && let Some(redirect) = cluster_manager.get_redirect_response(&key).await
-            {
-                let response = BytesFrame::Error(redirect.into());
-                stream.write_all(&serialize_frame(&response)).await?;
+            if !route_or_reply(stream, state, |_| ClusterManager::calculate_slot(&key)).await? {
                 return Ok(());
             }
             handle_set(stream, state, key, value, ttl_seconds).await?;
@@ -415,12 +425,7 @@ async fn handle_redis_command_inner(
             handle_del_multiple(stream, state, keys).await?;
         }
         RedisCommand::Exists { key } => {
-            if let Some(ref cluster_manager) = state.cluster_manager
-                && !cluster_manager.should_handle_locally(&key).await
-                && let Some(redirect) = cluster_manager.get_redirect_response(&key).await
-            {
-                let response = BytesFrame::Error(redirect.into());
-                stream.write_all(&serialize_frame(&response)).await?;
+            if !route_or_reply(stream, state, |_| ClusterManager::calculate_slot(&key)).await? {
                 return Ok(());
             }
             handle_exists(stream, state, key).await?;
@@ -431,8 +436,8 @@ async fn handle_redis_command_inner(
         RedisCommand::Info { section } => {
             handle_info(stream, state, section).await?;
         }
-        RedisCommand::Command => {
-            handle_command(stream).await?;
+        RedisCommand::Command { args } => {
+            handle_command(stream, &args).await?;
         }
         RedisCommand::HGet { namespace, key } => {
             handle_hget(stream, state, namespace, key).await?;
@@ -494,23 +499,13 @@ async fn handle_redis_command_inner(
             handle_cluster_keyslot(stream, key).await?;
         }
         RedisCommand::Ttl { key } => {
-            if let Some(ref cluster_manager) = state.cluster_manager
-                && !cluster_manager.should_handle_locally(&key).await
-                && let Some(redirect) = cluster_manager.get_redirect_response(&key).await
-            {
-                let response = BytesFrame::Error(redirect.into());
-                stream.write_all(&serialize_frame(&response)).await?;
+            if !route_or_reply(stream, state, |_| ClusterManager::calculate_slot(&key)).await? {
                 return Ok(());
             }
             handle_ttl(stream, state, key).await?;
         }
         RedisCommand::Expire { key, seconds } => {
-            if let Some(ref cluster_manager) = state.cluster_manager
-                && !cluster_manager.should_handle_locally(&key).await
-                && let Some(redirect) = cluster_manager.get_redirect_response(&key).await
-            {
-                let response = BytesFrame::Error(redirect.into());
-                stream.write_all(&serialize_frame(&response)).await?;
+            if !route_or_reply(stream, state, |_| ClusterManager::calculate_slot(&key)).await? {
                 return Ok(());
             }
             handle_expire(stream, state, key, seconds).await?;
@@ -744,12 +739,7 @@ async fn handle_del_multiple(
 
     for key in keys {
         // Check cluster routing for each key
-        if let Some(ref cluster_manager) = state.cluster_manager
-            && !cluster_manager.should_handle_locally(&key).await
-            && let Some(redirect) = cluster_manager.get_redirect_response(&key).await
-        {
-            let response = BytesFrame::Error(redirect.into());
-            stream.write_all(&serialize_frame(&response)).await?;
+        if !route_or_reply(stream, state, |_| ClusterManager::calculate_slot(&key)).await? {
             return Ok(());
         }
 
@@ -972,10 +962,81 @@ async fn handle_info(
     Ok(())
 }
 
-async fn handle_command(stream: &mut TcpStream) -> Result<(), Box<dyn std::error::Error>> {
-    // Return a minimal COMMAND response - just an empty array for now
-    // A full implementation would return detailed command information
-    let response = BytesFrame::Array(vec![]);
+/// COMMAND metadata: name, arity, flags, first key, last key, key step.
+type CommandInfo = (&'static str, i64, &'static [&'static str], i64, i64, i64);
+
+/// Cluster clients route by the first key and send only `readonly` commands to
+/// replicas. Hash commands that Blobasaur routes by field (HGET, HEXISTS, HSET,
+/// HDEL) use position 2. The field position of HSETEX, HEXPIRE and HEXPIREAT
+/// depends on their options, so they stay at 1.
+#[rustfmt::skip]
+const COMMANDS: &[CommandInfo] = &[
+    ("get", 2, &["readonly", "fast"], 1, 1, 1),
+    ("set", -3, &["write", "denyoom"], 1, 1, 1),
+    ("del", -2, &["write"], 1, -1, 1),
+    ("exists", 2, &["readonly", "fast"], 1, 1, 1),
+    ("ttl", 2, &["readonly", "fast"], 1, 1, 1),
+    ("expire", 3, &["write", "fast"], 1, 1, 1),
+    ("hget", 3, &["readonly", "fast"], 2, 2, 1),
+    ("hexists", 3, &["readonly", "fast"], 2, 2, 1),
+    ("hset", 4, &["write", "denyoom", "fast"], 2, 2, 1),
+    ("hdel", 3, &["write", "fast"], 2, 2, 1),
+    ("hsetex", -6, &["write", "denyoom", "fast"], 1, 1, 1),
+    ("hexpire", -6, &["write", "fast"], 1, 1, 1),
+    ("hexpireat", -6, &["write", "fast"], 1, 1, 1),
+    ("ping", -1, &["fast"], 0, 0, 0),
+    ("info", -1, &[], 0, 0, 0),
+    ("command", -1, &[], 0, 0, 0),
+    ("cluster", -2, &[], 0, 0, 0),
+    ("hello", -1, &["fast"], 0, 0, 0),
+    ("client", -2, &[], 0, 0, 0),
+    ("quit", -1, &["fast"], 0, 0, 0),
+    ("blobasaur.vacuum", -7, &["admin"], 0, 0, 0),
+];
+
+fn command_info_frame(info: &CommandInfo) -> BytesFrame {
+    let (name, arity, flags, first_key, last_key, step) = *info;
+    BytesFrame::Array(vec![
+        BytesFrame::BulkString(name.into()),
+        BytesFrame::Integer(arity),
+        BytesFrame::Array(
+            flags
+                .iter()
+                .map(|flag| BytesFrame::SimpleString((*flag).into()))
+                .collect(),
+        ),
+        BytesFrame::Integer(first_key),
+        BytesFrame::Integer(last_key),
+        BytesFrame::Integer(step),
+    ])
+}
+
+async fn handle_command(
+    stream: &mut TcpStream,
+    args: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let subcommand = args
+        .first()
+        .map_or("INFO".to_string(), |arg| arg.to_ascii_uppercase());
+    let response = match subcommand.as_str() {
+        "INFO" if args.len() <= 1 => {
+            BytesFrame::Array(COMMANDS.iter().map(command_info_frame).collect())
+        }
+        "COUNT" => BytesFrame::Integer(COMMANDS.len() as i64),
+        "DOCS" => BytesFrame::Array(vec![]),
+        "INFO" => BytesFrame::Array(
+            args[1..]
+                .iter()
+                .map(|name| {
+                    COMMANDS
+                        .iter()
+                        .find(|info| info.0.eq_ignore_ascii_case(name))
+                        .map_or(BytesFrame::Null, command_info_frame)
+                })
+                .collect(),
+        ),
+        _ => BytesFrame::Error(format!("ERR unknown subcommand '{}'", args[0]).into()),
+    };
     stream.write_all(&serialize_frame(&response)).await?;
     Ok(())
 }
@@ -1093,16 +1154,11 @@ async fn handle_hget(
     }
 
     // Check if we should handle this hash operation locally in a cluster
-    if let Some(ref cluster_manager) = state.cluster_manager
-        && !cluster_manager
-            .should_handle_hash_locally(&namespace, &key)
-            .await
-        && let Some(redirect) = cluster_manager
-            .get_hash_redirect_response(&namespace, &key)
-            .await
+    if !route_or_reply(stream, state, |cm| {
+        cm.calculate_slot_for_hash(&namespace, &key)
+    })
+    .await?
     {
-        let response = BytesFrame::Error(redirect.into());
-        stream.write_all(&serialize_frame(&response)).await?;
         return Ok(());
     }
 
@@ -1196,16 +1252,11 @@ async fn handle_hset(
     }
 
     // Check if we should handle this hash operation locally in a cluster
-    if let Some(ref cluster_manager) = state.cluster_manager
-        && !cluster_manager
-            .should_handle_hash_locally(&namespace, &key)
-            .await
-        && let Some(redirect) = cluster_manager
-            .get_hash_redirect_response(&namespace, &key)
-            .await
+    if !route_or_reply(stream, state, |cm| {
+        cm.calculate_slot_for_hash(&namespace, &key)
+    })
+    .await?
     {
-        let response = BytesFrame::Error(redirect.into());
-        stream.write_all(&serialize_frame(&response)).await?;
         return Ok(());
     }
 
@@ -1379,16 +1430,11 @@ async fn handle_hsetex(
     let mut seen = HashSet::with_capacity(fields.len());
     for (field_key, field_value) in fields {
         // Check if we should handle this hash operation locally in a cluster
-        if let Some(ref cluster_manager) = state.cluster_manager
-            && !cluster_manager
-                .should_handle_hash_locally(&namespace, &field_key)
-                .await
-            && let Some(redirect) = cluster_manager
-                .get_hash_redirect_response(&namespace, &field_key)
-                .await
+        if !route_or_reply(stream, state, |cm| {
+            cm.calculate_slot_for_hash(&namespace, &field_key)
+        })
+        .await?
         {
-            let response = BytesFrame::Error(redirect.into());
-            stream.write_all(&serialize_frame(&response)).await?;
             return Ok(());
         }
 
@@ -1573,16 +1619,11 @@ async fn handle_hdel(
     }
 
     // Check if we should handle this hash operation locally in a cluster
-    if let Some(ref cluster_manager) = state.cluster_manager
-        && !cluster_manager
-            .should_handle_hash_locally(&namespace, &key)
-            .await
-        && let Some(redirect) = cluster_manager
-            .get_hash_redirect_response(&namespace, &key)
-            .await
+    if !route_or_reply(stream, state, |cm| {
+        cm.calculate_slot_for_hash(&namespace, &key)
+    })
+    .await?
     {
-        let response = BytesFrame::Error(redirect.into());
-        stream.write_all(&serialize_frame(&response)).await?;
         return Ok(());
     }
 
@@ -1719,16 +1760,11 @@ async fn handle_hexists(
     }
 
     // Check if we should handle this hash operation locally in a cluster
-    if let Some(ref cluster_manager) = state.cluster_manager
-        && !cluster_manager
-            .should_handle_hash_locally(&namespace, &key)
-            .await
-        && let Some(redirect) = cluster_manager
-            .get_hash_redirect_response(&namespace, &key)
-            .await
+    if !route_or_reply(stream, state, |cm| {
+        cm.calculate_slot_for_hash(&namespace, &key)
+    })
+    .await?
     {
-        let response = BytesFrame::Error(redirect.into());
-        stream.write_all(&serialize_frame(&response)).await?;
         return Ok(());
     }
 
@@ -1832,16 +1868,11 @@ async fn handle_hexpire_internal(
 
     for field_key in fields {
         // Check cluster routing for each field
-        if let Some(ref cluster_manager) = state.cluster_manager
-            && !cluster_manager
-                .should_handle_hash_locally(&namespace, &field_key)
-                .await
-            && let Some(redirect) = cluster_manager
-                .get_hash_redirect_response(&namespace, &field_key)
-                .await
+        if !route_or_reply(stream, state, |cm| {
+            cm.calculate_slot_for_hash(&namespace, &field_key)
+        })
+        .await?
         {
-            let response = BytesFrame::Error(redirect.into());
-            stream.write_all(&serialize_frame(&response)).await?;
             return Ok(());
         }
 
@@ -1932,87 +1963,37 @@ async fn handle_cluster_info(
     Ok(())
 }
 
+/// Redis CLUSTER SLOTS format: `[start, end, [ip, port, node_id]]` per range.
+fn cluster_slots_frame(ranges: &[SlotRange]) -> BytesFrame {
+    BytesFrame::Array(
+        ranges
+            .iter()
+            .map(|range| {
+                // Replica entries, if any, are appended after the primary's.
+                BytesFrame::Array(vec![
+                    BytesFrame::Integer(range.start as i64),
+                    BytesFrame::Integer(range.end as i64),
+                    BytesFrame::Array(vec![
+                        BytesFrame::BulkString(range.ip.clone().into()),
+                        BytesFrame::Integer(range.port as i64),
+                        BytesFrame::BulkString(range.node_id.clone().into()),
+                    ]),
+                ])
+            })
+            .collect(),
+    )
+}
+
 async fn handle_cluster_slots(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(ref cluster_manager) = state.cluster_manager {
-        let local_slots = cluster_manager.get_local_slots().await;
-
-        // Build Redis CLUSTER SLOTS response
-        // Format: Array of [start_slot, end_slot, [master_ip, master_port]]
-        let mut slot_ranges = Vec::new();
-
-        if !local_slots.is_empty() {
-            let mut sorted_slots: Vec<u16> = local_slots.iter().copied().collect();
-            sorted_slots.sort();
-
-            let mut start = sorted_slots[0];
-            let mut end = sorted_slots[0];
-
-            for &slot in &sorted_slots[1..] {
-                if slot == end + 1 {
-                    end = slot;
-                } else {
-                    // Add completed range
-                    let advertise_addr = state
-                        .cfg
-                        .cluster
-                        .as_ref()
-                        .and_then(|c| c.advertise_addr.clone())
-                        .unwrap_or("127.0.0.1:6379".to_string());
-                    let parts: Vec<&str> = advertise_addr.split(':').collect();
-                    let ip = parts.first().cloned().unwrap_or("127.0.0.1").to_string();
-                    let port = parts
-                        .get(1)
-                        .and_then(|p| p.parse::<i64>().ok())
-                        .unwrap_or(6379);
-
-                    let range = BytesFrame::Array(vec![
-                        BytesFrame::Integer(start as i64),
-                        BytesFrame::Integer(end as i64),
-                        BytesFrame::Array(vec![
-                            BytesFrame::BulkString(ip.into()),
-                            BytesFrame::Integer(port),
-                        ]),
-                    ]);
-                    slot_ranges.push(range);
-                    start = slot;
-                    end = slot;
-                }
-            }
-
-            let advertise_addr = state
-                .cfg
-                .cluster
-                .as_ref()
-                .and_then(|c| c.advertise_addr.clone())
-                .unwrap_or("127.0.0.1:6379".to_string());
-            let parts: Vec<&str> = advertise_addr.split(':').collect();
-            let ip = parts.first().cloned().unwrap_or("127.0.0.1").to_string();
-            let port = parts
-                .get(1)
-                .and_then(|p| p.parse::<i64>().ok())
-                .unwrap_or(6379);
-
-            // Add the last range
-            let range = BytesFrame::Array(vec![
-                BytesFrame::Integer(start as i64),
-                BytesFrame::Integer(end as i64),
-                BytesFrame::Array(vec![
-                    BytesFrame::BulkString(ip.into()),
-                    BytesFrame::Integer(port),
-                ]),
-            ]);
-            slot_ranges.push(range);
-        }
-
-        let response = BytesFrame::Array(slot_ranges);
-        stream.write_all(&serialize_frame(&response)).await?;
+    let response = if let Some(ref cluster_manager) = state.cluster_manager {
+        cluster_slots_frame(&cluster_manager.get_cluster_slots().await)
     } else {
-        let response = BytesFrame::Error("ERR This instance has cluster support disabled ".into());
-        stream.write_all(&serialize_frame(&response)).await?;
-    }
+        BytesFrame::Error("ERR This instance has cluster support disabled ".into())
+    };
+    stream.write_all(&serialize_frame(&response)).await?;
     Ok(())
 }
 
@@ -2710,6 +2691,112 @@ mod tests {
             }
             other => panic!("Expected error containing {}, got {:?}", expected, other),
         }
+    }
+
+    fn text(frame: &BytesFrame) -> String {
+        match frame {
+            BytesFrame::BulkString(s) | BytesFrame::SimpleString(s) => {
+                String::from_utf8_lossy(s).into_owned()
+            }
+            other => panic!("Expected string, got {:?}", other),
+        }
+    }
+
+    fn int(frame: &BytesFrame) -> i64 {
+        match frame {
+            BytesFrame::Integer(v) => *v,
+            other => panic!("Expected integer, got {:?}", other),
+        }
+    }
+
+    fn items(frame: &BytesFrame) -> &[BytesFrame] {
+        match frame {
+            BytesFrame::Array(items) => items,
+            other => panic!("Expected array, got {:?}", other),
+        }
+    }
+
+    async fn command_reply(ctx: &TestContext, args: &[&str]) -> BytesFrame {
+        let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+        respond_with(ctx, |_, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_command(&mut stream, &args).await
+            })
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn command_reply_has_routing_metadata() {
+        let ctx = TestContext::new(false).await;
+
+        let reply = command_reply(&ctx, &[]).await;
+        assert_eq!(items(&reply).len(), COMMANDS.len());
+        for entry in items(&reply) {
+            assert_eq!(items(entry).len(), 6);
+        }
+
+        // name, arity, flags, first key, last key, step
+        let info = command_reply(&ctx, &["INFO", "HGET", "nosuch", "get"]).await;
+        let [hget, missing, get] = items(&info) else {
+            panic!("expected 3 entries, got {:?}", info);
+        };
+        let hget = items(hget);
+        assert_eq!(text(&hget[0]), "hget");
+        assert_eq!(int(&hget[1]), 3);
+        assert_eq!(text(&items(&hget[2])[0]), "readonly");
+        assert_eq!(
+            (int(&hget[3]), int(&hget[4]), int(&hget[5])),
+            (2, 2, 1),
+            "HGET is routed by its field"
+        );
+        assert_null(missing.clone());
+        assert_eq!(text(&items(get)[0]), "get");
+
+        // Reads are the only commands go-redis may send to a replica.
+        let readonly: Vec<&str> = COMMANDS
+            .iter()
+            .filter(|c| c.2.contains(&"readonly"))
+            .map(|c| c.0)
+            .collect();
+        assert_eq!(readonly, ["get", "exists", "ttl", "hget", "hexists"]);
+        let key_pos = |name: &str| COMMANDS.iter().find(|c| c.0 == name).unwrap().3;
+        for name in ["hset", "hdel", "hexists"] {
+            assert_eq!(key_pos(name), 2, "{name}");
+        }
+        for name in ["hsetex", "hexpire", "hexpireat"] {
+            assert_eq!(key_pos(name), 1, "{name}");
+        }
+
+        assert_integer_response(command_reply(&ctx, &["count"]).await, COMMANDS.len() as i64);
+        assert_array_len(command_reply(&ctx, &["DOCS"]).await, 0);
+        assert_error_contains(command_reply(&ctx, &["nope"]).await, "unknown subcommand");
+
+        ctx.shutdown().await;
+    }
+
+    #[test]
+    fn cluster_slots_frame_matches_redis_format() {
+        let ranges = [SlotRange {
+            start: 0,
+            end: 5460,
+            node_id: "node-1".to_string(),
+            ip: "10.0.0.1".to_string(),
+            port: 6379,
+        }];
+
+        let frame = cluster_slots_frame(&ranges);
+        let [range] = items(&frame) else {
+            panic!("expected one range, got {:?}", frame);
+        };
+        let range = items(range);
+        assert_eq!((int(&range[0]), int(&range[1])), (0, 5460));
+        let node = items(&range[2]);
+        assert_eq!(text(&node[0]), "10.0.0.1");
+        assert_eq!(int(&node[1]), 6379);
+        assert_eq!(text(&node[2]), "node-1");
+        assert_eq!(range.len(), 3);
     }
 
     #[test]
@@ -3850,10 +3937,10 @@ mod tests {
         let frame = respond_with(&ctx, |_, stream| {
             Box::pin(async move {
                 let mut stream = stream;
-                handle_command(&mut stream).await
+                handle_command(&mut stream, &[]).await
             })
         });
-        assert_array_len(frame.await, 0);
+        assert_array_len(frame.await, COMMANDS.len());
 
         let frame = respond_with(&ctx, |_, stream| {
             Box::pin(async move {

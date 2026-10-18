@@ -108,7 +108,9 @@ pub enum RedisCommand {
     Info {
         section: Option<String>,
     },
-    Command,
+    Command {
+        args: Vec<String>,
+    },
     // Cluster commands
     ClusterNodes,
     ClusterInfo,
@@ -162,7 +164,7 @@ impl RedisCommand {
             RedisCommand::HExpireAt { .. } => "HEXPIREAT".to_string(),
             RedisCommand::Ping { .. } => "PING".to_string(),
             RedisCommand::Info { .. } => "INFO".to_string(),
-            RedisCommand::Command => "COMMAND".to_string(),
+            RedisCommand::Command { .. } => "COMMAND".to_string(),
             RedisCommand::ClusterNodes => "CLUSTER NODES".to_string(),
             RedisCommand::ClusterInfo => "CLUSTER INFO".to_string(),
             RedisCommand::ClusterSlots => "CLUSTER SLOTS".to_string(),
@@ -418,7 +420,13 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
             };
             Ok(RedisCommand::Info { section })
         }
-        "COMMAND" => Ok(RedisCommand::Command),
+        "COMMAND" => {
+            let args = elements[1..]
+                .iter()
+                .map(extract_string)
+                .collect::<Result<_, _>>()?;
+            Ok(RedisCommand::Command { args })
+        }
         "HGET" => {
             if elements.len() != 3 {
                 return Err(ParseError::Invalid(
@@ -1700,7 +1708,14 @@ mod tests {
         let input = b"*1\r\n$7\r\nCOMMAND\r\n";
         let (resp, _) = parse_resp_with_remaining(input).unwrap();
         let command = parse_command(resp).unwrap();
-        assert_eq!(command, RedisCommand::Command);
+        assert_eq!(command, RedisCommand::Command { args: vec![] });
+
+        assert_eq!(
+            parse(&["COMMAND", "INFO", "get"]).unwrap(),
+            RedisCommand::Command {
+                args: vec!["INFO".to_string(), "get".to_string()]
+            }
+        );
     }
 
     #[test]

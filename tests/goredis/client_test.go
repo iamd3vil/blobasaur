@@ -183,6 +183,26 @@ func TestCommandErrorsKeepConnection(t *testing.T) {
 	})
 }
 
+// Cluster clients read COMMAND to route by key position and to send only
+// readonly commands to replicas.
+func TestCommandMetadata(t *testing.T) {
+	forEachProtocol(t, func(t *testing.T, rdb *redis.Client, p string) {
+		cmds, err := rdb.Command(ctx).Result()
+		if err != nil {
+			t.Fatalf("COMMAND: %v", err)
+		}
+		for name, readOnly := range map[string]bool{"get": true, "hget": true, "set": false, "hset": false} {
+			info := cmds[name]
+			if info == nil || info.ReadOnly != readOnly {
+				t.Fatalf("%s: got %+v, want readonly=%v", name, info, readOnly)
+			}
+		}
+		if cmds["hget"].FirstKeyPos != 2 || cmds["hsetex"].FirstKeyPos != 1 {
+			t.Fatalf("hash key positions: hget=%d hsetex=%d", cmds["hget"].FirstKeyPos, cmds["hsetex"].FirstKeyPos)
+		}
+	})
+}
+
 func TestPipeline(t *testing.T) {
 	forEachProtocol(t, func(t *testing.T, rdb *redis.Client, p string) {
 		pipe := rdb.Pipeline()
