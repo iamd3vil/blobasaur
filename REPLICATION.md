@@ -366,7 +366,9 @@ fails. Today it logs the error and runs without a cluster manager.
 - `primary`: `Option<String>`, the node id being replicated
 - `slot_ranges`: the node's slots as `[start, end]` ranges. One UDP datagram
   can't carry a list of all 16384 slots, so ranges are the primary form; the
-  legacy `slots` list is still emitted when the node has at most 8192 slots.
+  legacy `slots` list is still emitted while the whole gossip value stays
+  under 56000 bytes (chitchat's datagram is 65507 bytes), and omitted above
+  that, with a one-time warning. See the upgrade notes in `CLUSTERING.md`.
 
 Replicas gossip no slots, so slot ownership logic is unaffected. The replica's
 sync task resolves the primary's address from gossip and reconnects when it
