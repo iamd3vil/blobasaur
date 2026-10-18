@@ -19,6 +19,7 @@ mod http_server;
 mod metrics;
 mod migration;
 mod redis;
+mod replication;
 mod server;
 mod shard_manager;
 
@@ -60,7 +61,13 @@ enum Command {
 }
 
 #[derive(Options, Debug)]
-struct ServeOptions {}
+struct ServeOptions {
+    #[options(
+        no_short,
+        help = "Start a new replication history (replid), e.g. after restoring a backup"
+    )]
+    new_replid: bool,
+}
 
 #[derive(Options, Debug)]
 enum ShardCommand {
@@ -203,10 +210,9 @@ async fn main() -> Result<()> {
     // Handle different commands
     match args.command {
         Some(Command::Shard(shard_cmd)) => handle_shard_command(shard_cmd, &args.config).await,
-        Some(Command::Serve(_)) | None => {
-            // Default to serving if no command specified
-            run_server(&args.config).await
-        }
+        Some(Command::Serve(opts)) => run_server(&args.config, opts.new_replid).await,
+        // Default to serving if no command specified
+        None => run_server(&args.config, false).await,
     }
 }
 
@@ -801,8 +807,9 @@ fn print_vacuum_report(reports: &[NodeVacuumReport]) -> bool {
     node_failures > 0 || shard_failures > 0
 }
 
-async fn run_server(config_path: &str) -> Result<()> {
-    let cfg = config::Cfg::load(config_path).wrap_err("loading config")?;
+async fn run_server(config_path: &str, new_replid: bool) -> Result<()> {
+    let mut cfg = config::Cfg::load(config_path).wrap_err("loading config")?;
+    cfg.new_replid = new_replid;
 
     // Install handlers before startup so an early SIGTERM still drains cleanly.
     let mut sigint = signal(SignalKind::interrupt()).map_err(|e| miette!("SIGINT handler: {e}"))?;
@@ -870,6 +877,7 @@ mod tests {
             max_request_size_mb: None,
             cleanup_chunk_size: None,
             cleanup_interval_secs: None,
+            new_replid: false,
             sqlite: None,
         };
 
@@ -897,6 +905,7 @@ mod tests {
             max_request_size_mb: None,
             cleanup_chunk_size: None,
             cleanup_interval_secs: None,
+            new_replid: false,
             sqlite: None,
         };
 
@@ -932,6 +941,7 @@ mod tests {
             max_request_size_mb: None,
             cleanup_chunk_size: None,
             cleanup_interval_secs: None,
+            new_replid: false,
             sqlite: None,
         };
 

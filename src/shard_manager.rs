@@ -1,14 +1,17 @@
 use crate::metrics::{Metrics, ShardMetrics};
 use crate::redis::protocol::HExpireCondition;
+use crate::replication;
 use bytes::Bytes;
 use chrono::Utc;
 use metrics::Counter;
 use moka::future::Cache;
 use moka::ops::compute::Op;
 use sqlx::{Connection, Sqlite, SqlitePool, pool::PoolConnection};
+use std::borrow::Cow;
 use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Duration, interval, timeout};
 use tokio_util::sync::CancellationToken;
 
@@ -171,6 +174,8 @@ pub struct ShardWriter {
     pub inflight_cache: Cache<String, Pending>,
     pub inflight_hcache: Cache<String, Pending>,
     pub metrics: Metrics,
+    /// Published with the highest LSN after each commit that logged changes.
+    pub commit_watch: Arc<watch::Sender<u64>>,
     /// Cancel to make the writer commit everything queued and return.
     pub shutdown: CancellationToken,
 }
@@ -266,6 +271,7 @@ pub async fn shard_writer_task(writer: ShardWriter) {
         inflight_cache,
         inflight_hcache,
         metrics,
+        commit_watch,
         shutdown,
     } = writer;
 
@@ -356,7 +362,7 @@ pub async fn shard_writer_task(writer: ShardWriter) {
         if !batch.is_empty() {
             let processed_batch_size = batch.len();
             let batch_start = std::time::Instant::now();
-            process_batch(
+            let committed = process_batch(
                 shard_id,
                 &pool,
                 &mut batch,
@@ -366,6 +372,9 @@ pub async fn shard_writer_task(writer: ShardWriter) {
                 &shard_metrics,
             )
             .await;
+            if let Some(lsn) = committed {
+                replication::publish(&commit_watch, lsn);
+            }
             let batch_duration = batch_start.elapsed();
             metrics.record_batch_operation(processed_batch_size, batch_duration);
         }
@@ -392,7 +401,7 @@ pub async fn shard_writer_task(writer: ShardWriter) {
         let processed_batch_size = batch.len();
         drained += processed_batch_size;
         let batch_start = std::time::Instant::now();
-        process_batch(
+        let committed = process_batch(
             shard_id,
             &pool,
             &mut batch,
@@ -402,6 +411,9 @@ pub async fn shard_writer_task(writer: ShardWriter) {
             &shard_metrics,
         )
         .await;
+        if let Some(lsn) = committed {
+            replication::publish(&commit_watch, lsn);
+        }
         let batch_duration = batch_start.elapsed();
         metrics.record_batch_operation(processed_batch_size, batch_duration);
     }
@@ -493,6 +505,11 @@ async fn clear_pending_entries(
     }
 }
 
+/// The `repl_log` entry an op's data change needs: table, key, tombstone.
+type LogEntry<'a> = (Cow<'a, str>, &'a str, bool);
+
+/// Writes `batch` in one transaction, each op under its own savepoint together
+/// with its `repl_log` entry. Returns the highest LSN it committed, if any.
 async fn process_batch(
     shard_id: usize,
     pool: &SqlitePool,
@@ -501,9 +518,9 @@ async fn process_batch(
     inflight_cache: &Cache<String, Pending>,
     inflight_hcache: &Cache<String, Pending>,
     shard_metrics: &ShardMetrics,
-) {
+) -> Option<u64> {
     if batch.is_empty() {
-        return;
+        return None;
     }
 
     let batch_size = batch.len();
@@ -570,7 +587,7 @@ async fn process_batch(
                 }
             }
         }
-        return;
+        return None;
     };
 
     // One entry per op, in batch order.
@@ -578,12 +595,21 @@ async fn process_batch(
     let mut expire_results: Vec<(usize, bool)> = Vec::new();
     let mut hexpire_results: Vec<(usize, i64)> = Vec::new();
     let mut sync_operations: Vec<usize> = Vec::new();
+    // Namespace tables created by this batch, which `known_tables` already lists.
+    let mut added_tables: Vec<String> = Vec::new();
+    let mut last_lsn: Option<i64> = None;
 
     // Execute all operations in the transaction
     for (idx, operation) in batch.iter_mut().enumerate() {
         let value = take_value(operation);
         let operation = &*operation;
-        let result = match operation {
+        if let Err(e) = sqlx::query("SAVEPOINT op").execute(&mut *tx).await {
+            tracing::error!("[Shard {}] SAVEPOINT error: {}", shard_id, e);
+            results.push(Err(e.to_string()));
+            continue;
+        }
+        let added_before = added_tables.len();
+        let result: Result<Option<LogEntry>, String> = match operation {
             ShardWriteOperation::Set {
                 key, expires_at, ..
             }
@@ -604,6 +630,7 @@ async fn process_batch(
                     .map(|row| row.is_some())
                     .unwrap_or(false);
 
+                let live = Some((Cow::Borrowed("blobs"), key.as_str(), false));
                 if exists {
                     // Update existing record - update data, updated_at, expires_at, and version
                     sqlx::query("UPDATE blobs SET data = ?, updated_at = ?, expires_at = ?, version = version + 1 WHERE key = ?")
@@ -613,7 +640,7 @@ async fn process_batch(
                         .bind(key)
                         .execute(&mut *tx)
                         .await
-                        .map(|_| ())
+                        .map(|_| live)
                         .map_err(|e| {
                             tracing::error!("[Shard {}] UPDATE error for key {}: {}", shard_id, key, e);
                             e.to_string()
@@ -628,7 +655,7 @@ async fn process_batch(
                         .bind(expires_at)
                         .execute(&mut *tx)
                         .await
-                        .map(|_| ())
+                        .map(|_| live)
                         .map_err(|e| {
                             tracing::error!("[Shard {}] INSERT error for key {}: {}", shard_id, key, e);
                             e.to_string()
@@ -645,7 +672,13 @@ async fn process_batch(
                     .bind(key)
                     .execute(&mut *tx)
                     .await
-                    .map(|_| ())
+                    .map(|r| {
+                        (r.rows_affected() > 0).then_some((
+                            Cow::Borrowed("blobs"),
+                            key.as_str(),
+                            true,
+                        ))
+                    })
                     .map_err(|e| {
                         tracing::error!("[Shard {}] DELETE error for key {}: {}", shard_id, key, e);
                         e.to_string()
@@ -660,8 +693,13 @@ async fn process_batch(
                 let table_name = format!("blobs_{}", namespace);
 
                 // Ensure table exists
-                if let Err(e) =
-                    ensure_namespaced_table_exists(&mut tx, &table_name, known_tables).await
+                if let Err(e) = ensure_namespaced_table_exists(
+                    &mut tx,
+                    &table_name,
+                    known_tables,
+                    &mut added_tables,
+                )
+                .await
                 {
                     tracing::error!("[Shard {}] Failed to ensure table exists: {}", shard_id, e);
                     Err(e)
@@ -689,7 +727,7 @@ async fn process_batch(
                             .bind(key)
                             .execute(&mut *tx)
                             .await
-                            .map(|_| ())
+                            .map(|_| Some((Cow::Owned(table_name), key.as_str(), false)))
                             .map_err(|e| {
                                 tracing::error!(
                                     "[Shard {}] HSET UPDATE error for namespace {} key {}: {}",
@@ -713,7 +751,7 @@ async fn process_batch(
                             .bind(now)
                             .execute(&mut *tx)
                             .await
-                            .map(|_| ())
+                            .map(|_| Some((Cow::Owned(table_name), key.as_str(), false)))
                             .map_err(|e| {
                                 tracing::error!(
                                     "[Shard {}] HSET INSERT error for namespace {} key {}: {}",
@@ -746,8 +784,13 @@ async fn process_batch(
                 let table_name = format!("blobs_{}", namespace);
 
                 // Ensure table exists
-                if let Err(e) =
-                    ensure_namespaced_table_exists(&mut tx, &table_name, known_tables).await
+                if let Err(e) = ensure_namespaced_table_exists(
+                    &mut tx,
+                    &table_name,
+                    known_tables,
+                    &mut added_tables,
+                )
+                .await
                 {
                     tracing::error!("[Shard {}] Failed to ensure table exists: {}", shard_id, e);
                     Err(e)
@@ -776,7 +819,7 @@ async fn process_batch(
                             .bind(key)
                             .execute(&mut *tx)
                             .await
-                            .map(|_| ())
+                            .map(|_| Some((Cow::Owned(table_name), key.as_str(), false)))
                             .map_err(|e| {
                                 tracing::error!(
                                     "[Shard {}] HSETEX UPDATE error for namespace {} key {}: {}",
@@ -801,7 +844,7 @@ async fn process_batch(
                             .bind(*expires_at)
                             .execute(&mut *tx)
                             .await
-                            .map(|_| ())
+                            .map(|_| Some((Cow::Owned(table_name), key.as_str(), false)))
                             .map_err(|e| {
                                 tracing::error!(
                                     "[Shard {}] HSETEX INSERT error for namespace {} key {}: {}",
@@ -830,7 +873,13 @@ async fn process_batch(
                         .bind(key)
                         .execute(&mut *tx)
                         .await
-                        .map(|_| ())
+                        .map(|r| {
+                            (r.rows_affected() > 0).then_some((
+                                Cow::Owned(table_name),
+                                key.as_str(),
+                                true,
+                            ))
+                        })
                         .map_err(|e| {
                             tracing::error!(
                                 "[Shard {}] HDEL error for namespace {} key {}: {}",
@@ -843,7 +892,7 @@ async fn process_batch(
                         })
                 } else {
                     // Table doesn't exist, operation succeeds (key doesn't exist)
-                    Ok(())
+                    Ok(None)
                 }
             }
             ShardWriteOperation::Expire {
@@ -861,7 +910,7 @@ async fn process_batch(
                     Ok(result) => {
                         let rows_affected = result.rows_affected() > 0;
                         expire_results.push((idx, rows_affected));
-                        Ok(())
+                        Ok(rows_affected.then_some((Cow::Borrowed("blobs"), key.as_str(), false)))
                     }
                     Err(e) => {
                         tracing::error!("[Shard {}] EXPIRE error for key {}: {}", shard_id, key, e);
@@ -889,14 +938,39 @@ async fn process_batch(
                 )
                 .await;
                 hexpire_results.push((idx, result_code));
-                operation_result
+                // TTL set: live; field deleted: tombstone; nothing changed: no entry.
+                operation_result.map(|()| {
+                    let table = Cow::Owned(format!("blobs_{}", namespace));
+                    match result_code {
+                        1 => Some((table, key.as_str(), false)),
+                        2 => Some((table, key.as_str(), true)),
+                        _ => None,
+                    }
+                })
             }
             ShardWriteOperation::Vacuum { .. } => {
                 Err("Vacuum operation reached transactional batch unexpectedly".to_string())
             }
         };
 
-        results.push(result);
+        // The log entry joins the op's savepoint: both commit or neither does.
+        match finish_op(&mut tx, shard_id, result).await {
+            Ok(lsn) => {
+                last_lsn = last_lsn.max(lsn);
+                results.push(Ok(()));
+            }
+            Err(e) => {
+                for statement in ["ROLLBACK TO op", "RELEASE op"] {
+                    if let Err(e) = sqlx::query(statement).execute(&mut *tx).await {
+                        tracing::error!("[Shard {}] {} error: {}", shard_id, statement, e);
+                    }
+                }
+                for table in added_tables.drain(added_before..) {
+                    known_tables.remove(&table);
+                }
+                results.push(Err(e));
+            }
+        }
     }
 
     // Commit transaction
@@ -906,6 +980,11 @@ async fn process_batch(
     });
     // Return the writer connection before the bookkeeping below.
     drop(conn);
+    if commit_result.is_err() {
+        for table in &added_tables {
+            known_tables.remove(table);
+        }
+    }
     shard_metrics.record_transaction(commit_result.is_ok(), tx_start.elapsed());
     if let Err(e) = &commit_result {
         shard_metrics.record_sqlite_error("commit", e);
@@ -1002,6 +1081,55 @@ async fn process_batch(
             }
         }
     }
+
+    commit_result.ok().and(last_lsn).map(|lsn| lsn as u64)
+}
+
+/// Writes the op's `repl_log` entry, if its data change needs one, and releases
+/// its savepoint. Returns the entry's LSN. On error the caller rolls back.
+async fn finish_op(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    shard_id: usize,
+    result: Result<Option<LogEntry<'_>>, String>,
+) -> Result<Option<i64>, String> {
+    let lsn = match result? {
+        Some((table, key, deleted)) => {
+            Some(log_change(tx, &table, key, deleted).await.map_err(|e| {
+                tracing::error!(
+                    "[Shard {}] repl_log error for {} key {}: {}",
+                    shard_id,
+                    table,
+                    key,
+                    e
+                );
+                e.to_string()
+            })?)
+        }
+        None => None,
+    };
+    sqlx::query("RELEASE op")
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(lsn)
+}
+
+/// Records that `key` of `table` changed (or was deleted) and returns the new
+/// LSN. INSERT OR REPLACE, not an upsert: the row must get a new LSN.
+async fn log_change(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    table: &str,
+    key: &str,
+    deleted: bool,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query("INSERT OR REPLACE INTO repl_log (tbl, key, deleted, at) VALUES (?, ?, ?, ?)")
+        .bind(table)
+        .bind(key)
+        .bind(deleted)
+        .bind(Utc::now().timestamp())
+        .execute(&mut **tx)
+        .await
+        .map(|r| r.last_insert_rowid())
 }
 
 /// Begins the batch transaction on the writer connection, if there is one.
@@ -1403,11 +1531,14 @@ async fn load_existing_tables(pool: &SqlitePool, shard_id: usize) -> HashSet<Str
     tables
 }
 
-// Ensure a namespaced table exists, creating it if necessary
+// Ensure a namespaced table exists, creating it if necessary. A table this
+// creates is added to `known_tables` at once, and to `added_tables` so the
+// caller can take it back out if the transaction doesn't keep it.
 async fn ensure_namespaced_table_exists(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     table_name: &str,
     known_tables: &mut HashSet<String>,
+    added_tables: &mut Vec<String>,
 ) -> Result<(), String> {
     if known_tables.contains(table_name) {
         return Ok(());
@@ -1437,6 +1568,7 @@ async fn ensure_namespaced_table_exists(
             match sqlx::query(&index_query).execute(&mut **tx).await {
                 Ok(_) => {
                     known_tables.insert(table_name.to_string());
+                    added_tables.push(table_name.to_string());
                     tracing::info!(
                         "Created namespaced table and expires_at index: {}",
                         table_name
@@ -1462,36 +1594,50 @@ async fn ensure_namespaced_table_exists(
 
 /// Deletes expired rows from `table` in chunks of `chunk_size`. The
 /// cleanup shares the shard's single writer connection, so each chunk is its own
-/// statement: the pool hands out connections in FIFO order, letting a waiting
+/// transaction: the pool hands out connections in FIFO order, letting a waiting
 /// writer batch run between chunks instead of stalling behind one long DELETE.
-/// Each chunk's rows are added to `deleted` as they go, so a later failing
-/// chunk doesn't lose the count.
+/// A chunk deletes its rows and logs a tombstone for each, and publishes its
+/// LSN once committed. Each chunk's rows are added to `deleted` as they go, so
+/// a later failing chunk doesn't lose the count. Stops between chunks once
+/// `cancel` is cancelled.
 async fn delete_expired(
     pool: &SqlitePool,
     table: &str,
     now: i64,
     chunk_size: u32,
     deleted_counter: &Counter,
+    commit_watch: &watch::Sender<u64>,
+    cancel: &CancellationToken,
 ) -> Result<u64, sqlx::Error> {
     let query = format!(
         "DELETE FROM {table} WHERE rowid IN (
             SELECT rowid FROM {table} WHERE expires_at IS NOT NULL AND expires_at <= ? LIMIT ?
-        )"
+        ) RETURNING key"
     );
     let mut total = 0;
-    loop {
-        let deleted = sqlx::query(&query)
+    while !cancel.is_cancelled() {
+        let mut tx = pool.begin().await?;
+        let keys = sqlx::query_scalar::<_, String>(&query)
             .bind(now)
             .bind(chunk_size)
-            .execute(pool)
-            .await?
-            .rows_affected();
+            .fetch_all(&mut *tx)
+            .await?;
+        let mut last_lsn = None;
+        for key in &keys {
+            last_lsn = Some(log_change(&mut tx, table, key, true).await?);
+        }
+        tx.commit().await?;
+        if let Some(lsn) = last_lsn {
+            replication::publish(commit_watch, lsn as u64);
+        }
+        let deleted = keys.len() as u64;
         deleted_counter.increment(deleted);
         total += deleted;
         if deleted < u64::from(chunk_size) {
-            return Ok(total);
+            break;
         }
     }
+    Ok(total)
 }
 
 /// Background task to clean up expired keys from a shard
@@ -1500,6 +1646,8 @@ pub async fn shard_cleanup_task(
     pool: SqlitePool,
     cleanup_interval_secs: u64,
     chunk_size: u32,
+    commit_watch: Arc<watch::Sender<u64>>,
+    cancel: CancellationToken,
 ) {
     let mut interval = interval(Duration::from_secs(cleanup_interval_secs));
     let shard_metrics = ShardMetrics::new(shard_id);
@@ -1511,7 +1659,11 @@ pub async fn shard_cleanup_task(
     );
 
     loop {
-        interval.tick().await;
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            _ = interval.tick() => {}
+        }
 
         let started = std::time::Instant::now();
         let mut ok = true;
@@ -1539,7 +1691,17 @@ pub async fn shard_cleanup_task(
 
         for table_name in tables {
             let deleted = &shard_metrics.cleanup_deleted_keys_total;
-            match delete_expired(&pool, &table_name, now, chunk_size, deleted).await {
+            match delete_expired(
+                &pool,
+                &table_name,
+                now,
+                chunk_size,
+                deleted,
+                &commit_watch,
+                &cancel,
+            )
+            .await
+            {
                 Ok(deleted_count) => {
                     if deleted_count > 0 {
                         tracing::info!(
@@ -1564,11 +1726,14 @@ pub async fn shard_cleanup_task(
         }
         shard_metrics.record_cleanup(ok, started.elapsed());
     }
+
+    tracing::info!("[Shard {}] Cleanup task stopped", shard_id);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app_state::{CREATE_REPL_LOG, CREATE_REPL_STATE};
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
     use std::str::FromStr;
     use tempfile::TempDir;
@@ -1647,6 +1812,13 @@ mod tests {
         .await
         .expect("failed to create expires index");
 
+        for ddl in [CREATE_REPL_LOG, CREATE_REPL_STATE] {
+            sqlx::query(ddl)
+                .execute(&pool)
+                .await
+                .expect("failed to create change index");
+        }
+
         (temp_dir, pool)
     }
 
@@ -1677,9 +1849,17 @@ mod tests {
         .await
         .unwrap();
 
-        let deleted = delete_expired(&pool, "blobs", now, chunk_size, &Counter::noop())
-            .await
-            .unwrap();
+        let deleted = delete_expired(
+            &pool,
+            "blobs",
+            now,
+            chunk_size,
+            &Counter::noop(),
+            &watch::channel(0).0,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
         assert_eq!(deleted, u64::from(expired));
 
         let keys: Vec<(String,)> = sqlx::query_as("SELECT key FROM blobs ORDER BY key")
@@ -2035,13 +2215,23 @@ mod tests {
             .unwrap();
             let counter = ShardMetrics::new(0).cleanup_deleted_keys_total;
             // Chunk size 1: the count accumulates per chunk.
+            let (commit_watch, cancel) = (watch::channel(0).0, CancellationToken::new());
             assert_eq!(
-                delete_expired(&pool, "blobs", 10, 1, &counter)
+                delete_expired(&pool, "blobs", 10, 1, &counter, &commit_watch, &cancel)
                     .await
                     .unwrap(),
                 2
             );
-            let missing = delete_expired(&pool, "blobs_missing", 10, 1, &counter).await;
+            let missing = delete_expired(
+                &pool,
+                "blobs_missing",
+                10,
+                1,
+                &counter,
+                &commit_watch,
+                &cancel,
+            )
+            .await;
             assert!(missing.is_err());
             crate::metrics::rendered_value(
                 &recorder.handle().render(),
@@ -2072,6 +2262,7 @@ mod tests {
             inflight_cache: Cache::new(16),
             inflight_hcache: Cache::new(16),
             metrics: Metrics::new(),
+            commit_watch: Arc::new(watch::channel(0).0),
             shutdown: CancellationToken::new(),
         }));
 
@@ -2139,6 +2330,7 @@ mod tests {
                 inflight_cache: Cache::new(128),
                 inflight_hcache: Cache::new(128),
                 metrics: Metrics::new(),
+                commit_watch: Arc::new(watch::channel(0).0),
                 shutdown,
             }),
         )
@@ -2184,6 +2376,7 @@ mod tests {
             inflight_cache: Cache::new(128),
             inflight_hcache: Cache::new(128),
             metrics: Metrics::new(),
+            commit_watch: Arc::new(watch::channel(0).0),
             shutdown: CancellationToken::new(),
         }));
 
@@ -2392,5 +2585,483 @@ mod tests {
         wal_checkpoint_truncate(&writer)
             .await
             .expect("checkpoint should complete once the reader is gone");
+    }
+
+    type OpResult<T> = oneshot::Receiver<Result<T, String>>;
+
+    fn set(key: &str) -> (ShardWriteOperation, OpResult<()>) {
+        let (responder, rx) = oneshot::channel();
+        let op = ShardWriteOperation::Set {
+            key: key.to_string(),
+            data: Bytes::from_static(b"v"),
+            expires_at: None,
+            responder,
+        };
+        (op, rx)
+    }
+
+    fn del(key: &str) -> (ShardWriteOperation, OpResult<()>) {
+        let (responder, rx) = oneshot::channel();
+        let key = key.to_string();
+        (ShardWriteOperation::Delete { key, responder }, rx)
+    }
+
+    fn hset(namespace: &str, key: &str) -> (ShardWriteOperation, OpResult<()>) {
+        let (responder, rx) = oneshot::channel();
+        let op = ShardWriteOperation::HSet {
+            namespace: namespace.to_string(),
+            key: key.to_string(),
+            data: Bytes::from_static(b"v"),
+            responder,
+        };
+        (op, rx)
+    }
+
+    fn hdel(namespace: &str, key: &str) -> (ShardWriteOperation, OpResult<()>) {
+        let (responder, rx) = oneshot::channel();
+        let (namespace, key) = (namespace.to_string(), key.to_string());
+        let op = ShardWriteOperation::HDelete {
+            namespace,
+            key,
+            responder,
+        };
+        (op, rx)
+    }
+
+    fn expire(key: &str, expires_at: i64) -> (ShardWriteOperation, OpResult<bool>) {
+        let (responder, rx) = oneshot::channel();
+        let key = key.to_string();
+        let op = ShardWriteOperation::Expire {
+            key,
+            expires_at,
+            responder,
+        };
+        (op, rx)
+    }
+
+    fn hexpire(
+        key: &str,
+        expires_at: i64,
+        condition: Option<HExpireCondition>,
+    ) -> (ShardWriteOperation, OpResult<i64>) {
+        let (responder, rx) = oneshot::channel();
+        let op = ShardWriteOperation::HExpire {
+            namespace: "ns".to_string(),
+            key: key.to_string(),
+            expires_at,
+            condition,
+            responder,
+        };
+        (op, rx)
+    }
+
+    /// Runs `ops` as one batch; returns the LSN `process_batch` reports.
+    async fn run_batch(
+        pool: &SqlitePool,
+        known_tables: &mut HashSet<String>,
+        ops: Vec<ShardWriteOperation>,
+    ) -> Option<u64> {
+        process_batch(
+            0,
+            pool,
+            &mut VecDeque::from(ops),
+            known_tables,
+            &Cache::new(16),
+            &Cache::new(16),
+            &ShardMetrics::new(0),
+        )
+        .await
+    }
+
+    fn blobs_only() -> HashSet<String> {
+        HashSet::from(["blobs".to_string()])
+    }
+
+    /// `(tbl, key, deleted)` in LSN order.
+    async fn repl_log(pool: &SqlitePool) -> Vec<(String, String, bool)> {
+        sqlx::query_as("SELECT tbl, key, deleted FROM repl_log ORDER BY lsn")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn lsn_of(pool: &SqlitePool, tbl: &str, key: &str) -> Option<i64> {
+        sqlx::query_scalar("SELECT lsn FROM repl_log WHERE tbl = ? AND key = ?")
+            .bind(tbl)
+            .bind(key)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn keys(pool: &SqlitePool, table: &str) -> Vec<String> {
+        sqlx::query_scalar(&format!("SELECT key FROM {table}"))
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    fn row(tbl: &str, key: &str, deleted: bool) -> (String, String, bool) {
+        (tbl.to_string(), key.to_string(), deleted)
+    }
+
+    #[tokio::test]
+    async fn writes_keep_one_log_row_per_key_with_increasing_lsns() {
+        let (_dir, pool) = create_test_pool().await;
+        let known = &mut blobs_only();
+
+        let first = run_batch(
+            &pool,
+            known,
+            vec![set("a").0, set("b").0, set("a").0, hset("ns", "f").0],
+        )
+        .await
+        .unwrap();
+        let (a, b) = (
+            lsn_of(&pool, "blobs", "a").await.unwrap(),
+            lsn_of(&pool, "blobs", "b").await.unwrap(),
+        );
+        assert!(b < a, "a was rewritten after b");
+        assert_eq!(first as i64, lsn_of(&pool, "blobs_ns", "f").await.unwrap());
+
+        let second = run_batch(&pool, known, vec![set("b").0]).await.unwrap();
+        assert!(second > first);
+        assert!(lsn_of(&pool, "blobs", "b").await.unwrap() > a);
+        assert_eq!(repl_log(&pool).await.len(), 3);
+        assert!(repl_log(&pool).await.iter().all(|(_, _, deleted)| !deleted));
+    }
+
+    #[tokio::test]
+    async fn deletes_log_a_tombstone_only_when_a_row_was_deleted() {
+        let (_dir, pool) = create_test_pool().await;
+        let known = &mut blobs_only();
+        run_batch(&pool, known, vec![set("a").0, hset("ns", "f").0]).await;
+
+        run_batch(
+            &pool,
+            known,
+            vec![
+                del("a").0,
+                del("missing").0,
+                hdel("ns", "f").0,
+                hdel("ns", "missing").0,
+                hdel("no-such-namespace", "f").0,
+            ],
+        )
+        .await;
+        assert_eq!(
+            repl_log(&pool).await,
+            vec![row("blobs", "a", true), row("blobs_ns", "f", true)]
+        );
+
+        // A tombstone is replaced by a live row when the key comes back.
+        run_batch(&pool, known, vec![set("a").0]).await;
+        assert_eq!(
+            repl_log(&pool).await,
+            vec![row("blobs_ns", "f", true), row("blobs", "a", false)]
+        );
+    }
+
+    #[tokio::test]
+    async fn expire_logs_only_when_a_row_was_updated() {
+        let (_dir, pool) = create_test_pool().await;
+        let known = &mut blobs_only();
+        let first = run_batch(&pool, known, vec![set("a").0]).await.unwrap();
+
+        let (expire_a, a) = expire("a", 4_000_000_000);
+        let (expire_missing, missing) = expire("missing", 4_000_000_000);
+        let second = run_batch(&pool, known, vec![expire_a, expire_missing])
+            .await
+            .unwrap();
+        assert_eq!(
+            (a.await.unwrap(), missing.await.unwrap()),
+            (Ok(true), Ok(false))
+        );
+        assert!(second > first);
+        assert_eq!(repl_log(&pool).await, vec![row("blobs", "a", false)]);
+
+        // Nothing changed, so nothing was committed to the log.
+        assert_eq!(
+            run_batch(&pool, known, vec![expire("missing", 1).0]).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn hexpire_results_map_to_log_entries() {
+        let (_dir, pool) = create_test_pool().await;
+        let known = &mut blobs_only();
+        let far = 4_000_000_000;
+        run_batch(&pool, known, vec![hset("ns", "f").0]).await;
+        let mut lsn = lsn_of(&pool, "blobs_ns", "f").await.unwrap();
+
+        // (op, expected result, whether the log changes)
+        let steps = [
+            (hexpire("f", far, None), 1, Some(false)),
+            (hexpire("f", far + 1, Some(HExpireCondition::Nx)), 0, None),
+            (hexpire("missing", far, None), -2, None),
+            (hexpire("f", 1, None), 2, Some(true)),
+        ];
+        for ((op, result), code, logged) in steps {
+            let committed = run_batch(&pool, known, vec![op]).await;
+            assert_eq!(result.await.unwrap(), Ok(code));
+            match logged {
+                Some(deleted) => {
+                    assert!(committed.unwrap() as i64 > lsn);
+                    lsn = lsn_of(&pool, "blobs_ns", "f").await.unwrap();
+                    assert_eq!(repl_log(&pool).await, vec![row("blobs_ns", "f", deleted)]);
+                }
+                None => assert_eq!(committed, None, "result {code} must not log"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_op_leaves_no_data_or_log_row_and_others_commit() {
+        let (_dir, pool) = create_test_pool().await;
+        // The log row of a key named "bad" can't be written, after its data was.
+        sqlx::query(
+            "CREATE TRIGGER fail_bad BEFORE INSERT ON repl_log WHEN NEW.key = 'bad'
+             BEGIN SELECT RAISE(ABORT, 'forced failure'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let known = &mut blobs_only();
+
+        let (good, good_rx) = set("good");
+        let (bad, bad_rx) = set("bad");
+        // Creates blobs_ns1, then fails: the table goes and so does its name in
+        // `known_tables`, or the next op would fail on the missing table.
+        let (bad_hset, bad_hset_rx) = hset("ns1", "bad");
+        let (next_hset, next_hset_rx) = hset("ns1", "next");
+        let committed = run_batch(&pool, known, vec![good, bad, bad_hset, next_hset]).await;
+
+        assert_eq!(good_rx.await.unwrap(), Ok(()));
+        assert_eq!(next_hset_rx.await.unwrap(), Ok(()));
+        for rx in [bad_rx, bad_hset_rx] {
+            let error = rx.await.unwrap().unwrap_err();
+            assert!(error.contains("forced failure"), "{error}");
+        }
+        assert_eq!(keys(&pool, "blobs").await, vec!["good"]);
+        assert_eq!(keys(&pool, "blobs_ns1").await, vec!["next"]);
+        assert_eq!(
+            repl_log(&pool).await,
+            vec![row("blobs", "good", false), row("blobs_ns1", "next", false)]
+        );
+        assert_eq!(
+            committed.unwrap() as i64,
+            lsn_of(&pool, "blobs_ns1", "next").await.unwrap()
+        );
+        assert!(known.contains("blobs_ns1"));
+    }
+
+    #[tokio::test]
+    async fn known_tables_forgets_a_table_whose_creation_rolled_back() {
+        let (_dir, pool) = create_test_pool().await;
+        sqlx::query(
+            "CREATE TRIGGER fail_bad BEFORE INSERT ON repl_log WHEN NEW.key = 'bad'
+             BEGIN SELECT RAISE(ABORT, 'forced failure'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let known = &mut blobs_only();
+
+        let (op, rx) = hset("ns1", "bad");
+        assert_eq!(run_batch(&pool, known, vec![op]).await, None);
+        assert!(rx.await.unwrap().is_err());
+        assert_eq!(*known, blobs_only());
+        let tables: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'blobs_ns1'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(tables.is_empty());
+    }
+
+    #[tokio::test]
+    async fn known_tables_forgets_tables_added_by_a_batch_that_failed_to_commit() {
+        let (_dir, pool) = create_test_pool().await;
+        // A deferred foreign key that the log row of "boom" violates: the op
+        // and its savepoint succeed, but the commit is refused.
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for ddl in [
+            "CREATE TABLE fk_parent (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE fk_child (p INTEGER REFERENCES fk_parent(id) DEFERRABLE INITIALLY DEFERRED)",
+            "CREATE TRIGGER fail_commit AFTER INSERT ON repl_log WHEN NEW.key = 'boom'
+             BEGIN INSERT INTO fk_child VALUES (999); END",
+        ] {
+            sqlx::query(ddl).execute(&pool).await.unwrap();
+        }
+        let known = &mut blobs_only();
+
+        let (op, rx) = hset("ns1", "boom");
+        assert_eq!(run_batch(&pool, known, vec![op]).await, None);
+        let error = rx.await.unwrap().unwrap_err();
+        assert!(error.contains("FOREIGN KEY"), "{error}");
+        assert_eq!(*known, blobs_only());
+        assert!(repl_log(&pool).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn writer_publishes_the_highest_committed_lsn() {
+        let (_dir, pool) = create_test_pool().await;
+        let (sender, receiver) = mpsc::channel(8);
+        let commit_watch = Arc::new(watch::channel(0).0);
+        let writer = tokio::spawn(shard_writer_task(ShardWriter {
+            shard_id: 0,
+            pool: pool.clone(),
+            receiver,
+            batch_size: 8,
+            batch_timeout_ms: 0,
+            inflight_cache: Cache::new(16),
+            inflight_hcache: Cache::new(16),
+            metrics: Metrics::new(),
+            commit_watch: commit_watch.clone(),
+            shutdown: CancellationToken::new(),
+        }));
+
+        let mut seen = 0;
+        for key in ["a", "b", "a"] {
+            let (op, rx) = set(key);
+            sender.send(op).await.unwrap();
+            assert_eq!(rx.await.unwrap(), Ok(()));
+            let published = *commit_watch.borrow();
+            assert!(published > seen, "published {published} after {seen}");
+            seen = published;
+        }
+        assert_eq!(seen as i64, lsn_of(&pool, "blobs", "a").await.unwrap());
+
+        // A batch that logs nothing leaves the watermark alone.
+        let (op, rx) = del("missing");
+        sender.send(op).await.unwrap();
+        assert_eq!(rx.await.unwrap(), Ok(()));
+        assert_eq!(*commit_watch.borrow(), seen);
+
+        drop(sender);
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cleanup_logs_tombstones_in_the_chunk_transaction() {
+        let (_dir, pool) = create_test_pool().await;
+        let known = &mut blobs_only();
+        run_batch(&pool, known, vec![set("live").0, hset("ns", "old").0]).await;
+        for table in ["blobs", "blobs_ns"] {
+            for key in ["old1", "old2", "old3"] {
+                sqlx::query(&format!(
+                    "INSERT INTO {table} (key, data, created_at, updated_at, expires_at)
+                     VALUES (?, x'00', 0, 0, 1)"
+                ))
+                .bind(key)
+                .execute(&pool)
+                .await
+                .unwrap();
+                sqlx::query(
+                    "INSERT OR REPLACE INTO repl_log (tbl, key, deleted, at) VALUES (?, ?, 0, 0)",
+                )
+                .bind(table)
+                .bind(key)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        }
+        let live = lsn_of(&pool, "blobs", "live").await.unwrap();
+        let commit_watch = watch::channel(0).0;
+
+        // Chunks of 2: two commits for three expired rows.
+        let cancel = CancellationToken::new();
+        let deleted = delete_expired(
+            &pool,
+            "blobs",
+            10,
+            2,
+            &Counter::noop(),
+            &commit_watch,
+            &cancel,
+        )
+        .await;
+        assert_eq!(deleted.unwrap(), 3);
+        let log = repl_log(&pool).await;
+        let tombstones: Vec<_> = log.iter().filter(|(_, _, deleted)| *deleted).collect();
+        assert_eq!(tombstones.len(), 3);
+        assert!(tombstones.iter().all(|(tbl, _, _)| tbl == "blobs"));
+        let max_lsn: i64 = sqlx::query_scalar("SELECT MAX(lsn) FROM repl_log")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(*commit_watch.borrow() as i64, max_lsn);
+        assert!(*commit_watch.borrow() as i64 > live);
+        assert_eq!(lsn_of(&pool, "blobs", "live").await, Some(live));
+
+        // The namespaced table's tombstones name it.
+        let deleted = delete_expired(
+            &pool,
+            "blobs_ns",
+            10,
+            2,
+            &Counter::noop(),
+            &commit_watch,
+            &cancel,
+        )
+        .await;
+        assert_eq!(deleted.unwrap(), 3);
+        assert!(lsn_of(&pool, "blobs_ns", "old1").await.is_some());
+        assert!(
+            repl_log(&pool)
+                .await
+                .contains(&row("blobs_ns", "old3", true))
+        );
+        assert!(
+            repl_log(&pool)
+                .await
+                .contains(&row("blobs_ns", "old", false))
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_stops_between_chunks_once_cancelled() {
+        let (_dir, pool) = create_test_pool().await;
+        sqlx::query(
+            "INSERT INTO blobs (key, data, created_at, updated_at, expires_at)
+             VALUES ('a', x'00', 0, 0, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let commit_watch = Arc::new(watch::channel(0).0);
+        let deleted = delete_expired(
+            &pool,
+            "blobs",
+            10,
+            1,
+            &Counter::noop(),
+            &commit_watch,
+            &cancel,
+        )
+        .await;
+        assert_eq!(deleted.unwrap(), 0);
+
+        // The task itself exits instead of waiting for its next sweep.
+        timeout(
+            Duration::from_secs(5),
+            shard_cleanup_task(0, pool.clone(), 3600, 1, commit_watch, cancel),
+        )
+        .await
+        .expect("cleanup task did not stop");
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM blobs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }

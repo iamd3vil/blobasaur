@@ -28,6 +28,10 @@ pub struct Cfg {
     /// Seconds between background expiry cleanup sweeps of each shard.
     /// Default: 60
     pub cleanup_interval_secs: Option<u64>,
+    /// Set by `serve --new-replid`, never from the config file: start a new
+    /// replication history even if the stored one looks intact.
+    #[serde(skip)]
+    pub new_replid: bool,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]

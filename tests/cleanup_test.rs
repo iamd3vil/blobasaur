@@ -99,6 +99,7 @@ async fn cleanup_deletes_expired_rows_in_chunks_and_keeps_live_ones() {
         // so cleanup within the deadline needs the chunk loop, not repeated sweeps
         cleanup_chunk_size: Some(2),
         cleanup_interval_secs: Some(1),
+        new_replid: false,
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
