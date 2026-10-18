@@ -8,6 +8,7 @@ use chitchat::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
@@ -256,13 +257,19 @@ impl ReplicaState {
     }
 }
 
+/// The gossip server and the task reading its state.
+type Gossip = (ChitchatHandle, JoinHandle<()>);
+
 /// Manages cluster state and gossip protocol
 pub struct ClusterManager {
     node_id: String,
     nodes: Arc<RwLock<HashMap<String, ClusterNode>>>,
     local_slots: Arc<RwLock<HashSet<u16>>>,
     config: ClusterConfig,
-    chitchat_handle: Arc<Option<ChitchatHandle>>,
+    /// Gossip state; `None` only in tests.
+    chitchat: Option<Arc<tokio::sync::Mutex<Chitchat>>>,
+    /// What [`Self::shutdown`] stops.
+    running: Arc<Mutex<Option<Gossip>>>,
     local_addr: SocketAddr,
     namespace_strategy: NamespaceDistributionStrategy,
     /// Set on a replica; its role is derived from this.
@@ -371,7 +378,8 @@ impl ClusterManager {
             nodes,
             local_slots,
             config: config.clone(),
-            chitchat_handle: Arc::new(Some(chitchat_handle)),
+            chitchat: Some(chitchat_handle.chitchat()),
+            running: Arc::new(Mutex::new(None)),
             local_addr: redis_addr,
             namespace_strategy: NamespaceDistributionStrategy::default(),
             replica,
@@ -379,9 +387,10 @@ impl ClusterManager {
 
         // Start gossip processing task
         let gossip_manager = cluster_manager.clone();
-        tokio::spawn(async move {
+        let gossip_task = tokio::spawn(async move {
             gossip_manager.gossip_task().await;
         });
+        *cluster_manager.running.lock().unwrap() = Some((chitchat_handle, gossip_task));
 
         info!("Cluster manager initialized for node: {}", config.node_id);
 
@@ -400,9 +409,8 @@ impl ClusterManager {
             interval.tick().await;
             debug!("Gossip task tick for node: {}", self.node_id);
 
-            if let Some(handle) = self.chitchat_handle.as_ref() {
+            if let Some(chitchat_arc) = &self.chitchat {
                 // Get current cluster state from chitchat
-                let chitchat_arc = handle.chitchat();
                 let chitchat_guard = chitchat_arc.lock().await;
 
                 // Log cluster state for debugging
@@ -501,7 +509,7 @@ impl ClusterManager {
                 }
             } else {
                 warn!(
-                    "Gossip task running but chitchat_handle is None for node: {}",
+                    "Gossip task running without chitchat for node: {}",
                     self.node_id
                 );
             }
@@ -586,8 +594,7 @@ impl ClusterManager {
         );
         tokio::time::sleep(wait).await;
 
-        if let Some(handle) = self.chitchat_handle.as_ref() {
-            let chitchat = handle.chitchat();
+        if let Some(chitchat) = &self.chitchat {
             let chitchat = chitchat.lock().await;
             for node in live_peers(&chitchat, &self.node_id).values() {
                 let overlap: HashSet<u16> = slots.intersection(&node.slots).copied().collect();
@@ -847,21 +854,18 @@ impl ClusterManager {
         if self.replica.is_some() {
             return Err("ERR this node is a replica".into());
         }
+        // Checked before it is installed: a rejected change is never routed on.
         let mut local_slots = self.local_slots.write().await;
-        let added: Vec<u16> = slots
-            .iter()
-            .copied()
-            .filter(|slot| local_slots.insert(*slot))
-            .collect();
+        let mut candidate = local_slots.clone();
+        candidate.extend(&slots);
+        self.gossip_data(&candidate)
+            .map_err(|e| format!("ERR {}", e))?;
+        *local_slots = candidate;
         drop(local_slots);
 
-        if let Err(e) = self.update_gossip_data().await {
-            let mut local_slots = self.local_slots.write().await;
-            for slot in &added {
-                local_slots.remove(slot);
-            }
-            return Err(format!("ERR {}", e).into());
-        }
+        self.update_gossip_data()
+            .await
+            .map_err(|e| format!("ERR {}", e))?;
 
         info!("Added slots {:?} to local node", slots);
         Ok(())
@@ -875,38 +879,45 @@ impl ClusterManager {
         if self.replica.is_some() {
             return Err("ERR this node is a replica".into());
         }
+        // Checked before it is installed: a rejected change is never routed on.
         let mut local_slots = self.local_slots.write().await;
-        let removed: Vec<u16> = slots
-            .iter()
-            .copied()
-            .filter(|slot| local_slots.remove(slot))
-            .collect();
+        let mut candidate = local_slots.clone();
+        for slot in &slots {
+            candidate.remove(slot);
+        }
+        self.gossip_data(&candidate)
+            .map_err(|e| format!("ERR {}", e))?;
+        *local_slots = candidate;
         drop(local_slots);
 
-        if let Err(e) = self.update_gossip_data().await {
-            self.local_slots.write().await.extend(removed);
-            return Err(format!("ERR {}", e).into());
-        }
+        self.update_gossip_data()
+            .await
+            .map_err(|e| format!("ERR {}", e))?;
 
         info!("Removed slots {:?} from local node", slots);
         Ok(())
     }
 
+    /// This node's gossip value if it owned `slots`; errors if that can't be
+    /// encoded within a datagram.
+    fn gossip_data(&self, slots: &HashSet<u16>) -> Result<NodeGossipData, String> {
+        let (local_ip, local_port) = local_endpoint(&self.config, self.local_addr);
+        NodeGossipData::new(
+            format!("{}:{}", local_ip, local_port),
+            slots,
+            self.role(),
+            self.replica_primary(),
+        )
+    }
+
     /// Update gossip data with the current slots and role. Errors, leaving the
     /// gossiped value as it was, if the slots can't be encoded within a datagram.
     async fn update_gossip_data(&self) -> Result<(), String> {
-        if let Some(handle) = self.chitchat_handle.as_ref() {
-            let (local_ip, local_port) = local_endpoint(&self.config, self.local_addr);
-            let chitchat_arc = handle.chitchat();
+        if let Some(chitchat_arc) = &self.chitchat {
             // Read the state under the chitchat lock, so concurrent updates
             // publish the latest one last.
             let mut chitchat_guard = chitchat_arc.lock().await;
-            let gossip_data = NodeGossipData::new(
-                format!("{}:{}", local_ip, local_port),
-                &*self.local_slots.read().await,
-                self.role(),
-                self.replica_primary(),
-            )?;
+            let gossip_data = self.gossip_data(&*self.local_slots.read().await)?;
 
             if let Ok(gossip_data_json) = serde_json::to_string(&gossip_data) {
                 debug!("Updating gossip data: {}", gossip_data_json);
@@ -931,18 +942,24 @@ impl ClusterManager {
         self.local_slots.read().await.clone()
     }
 
-    /// Shutdown the cluster manager
+    /// Stops gossip: the node stops advertising itself and frees its UDP port.
     pub async fn shutdown(&self) {
-        if let Some(handle) = self.chitchat_handle.as_ref() {
-            let chitchat_arc = handle.chitchat();
-            let mut chitchat_guard = chitchat_arc.lock().await;
-            chitchat_guard
+        if let Some(chitchat_arc) = &self.chitchat {
+            chitchat_arc
+                .lock()
+                .await
                 .self_node_state()
                 .set("node_status", "shutting_down");
-            drop(chitchat_guard);
-            // Note: We don't call handle.shutdown() as it would consume the handle
         }
         info!("Shutting down cluster manager");
+        let running = self.running.lock().unwrap().take();
+        if let Some((handle, gossip_task)) = running {
+            gossip_task.abort();
+            let _ = gossip_task.await;
+            if let Err(e) = handle.shutdown().await {
+                warn!("Failed to stop gossip: {}", e);
+            }
+        }
     }
 }
 
@@ -954,7 +971,8 @@ impl Clone for ClusterManager {
             nodes: Arc::clone(&self.nodes),
             local_slots: Arc::clone(&self.local_slots),
             config: self.config.clone(),
-            chitchat_handle: Arc::clone(&self.chitchat_handle),
+            chitchat: self.chitchat.clone(),
+            running: Arc::clone(&self.running),
             local_addr: self.local_addr,
             namespace_strategy: self.namespace_strategy,
             replica: self.replica.clone(),
@@ -1130,7 +1148,8 @@ mod tests {
             nodes: Arc::new(RwLock::new(nodes)),
             local_slots: Arc::new(RwLock::new(local.iter().copied().collect())),
             config,
-            chitchat_handle: Arc::new(None),
+            chitchat: None,
+            running: Arc::new(Mutex::new(None)),
             local_addr: "0.0.0.0:6379".parse().unwrap(),
             namespace_strategy: NamespaceDistributionStrategy::default(),
             replica: None,
@@ -1452,6 +1471,52 @@ mod tests {
             local_endpoint(&config, redis_addr),
             ("127.0.0.1".to_string(), 6379)
         );
+    }
+
+    #[tokio::test]
+    async fn test_a_slot_change_that_cannot_be_gossiped_is_never_installed() {
+        // Two of every three slots: too long both as a list and as ranges.
+        let unencodable: Vec<u16> = (0..16384).filter(|slot| slot % 3 != 2).collect();
+        let manager = manager_with(&[1, 2, 3], &[]);
+        let err = manager.add_slots(unencodable.clone()).await.unwrap_err();
+        assert!(err.to_string().starts_with("ERR "), "{err}");
+        assert_eq!(manager.get_local_slots().await, [1, 2, 3].into());
+
+        // Removing a slot can break the encoding too.
+        let owned: Vec<u16> = unencodable.iter().copied().chain([16383]).collect();
+        let manager = manager_with(&owned, &[]);
+        assert!(manager.remove_slots(vec![16383]).await.is_err());
+        assert_eq!(manager.get_local_slots().await, owned.into_iter().collect());
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_stops_gossip_and_frees_its_port() {
+        let port = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let config = ClusterConfig {
+            enabled: true,
+            node_id: "test-node".to_string(),
+            seeds: vec![],
+            port,
+            slots: None,
+            slot_ranges: None,
+            gossip_interval_ms: Some(100),
+            advertise_addr: Some("127.0.0.1:6379".to_string()),
+        };
+        let bind: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let manager =
+            ClusterManager::new(&config, bind, "127.0.0.1:6379".parse().unwrap(), None, 1)
+                .await
+                .unwrap();
+        assert!(
+            std::net::UdpSocket::bind(bind).is_err(),
+            "gossip isn't running"
+        );
+        manager.shutdown().await;
+        std::net::UdpSocket::bind(bind).expect("the gossip port is still taken");
     }
 
     #[tokio::test]

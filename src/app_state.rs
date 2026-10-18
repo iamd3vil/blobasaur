@@ -266,10 +266,10 @@ impl AppState {
                 match manager {
                     Ok(manager) => {
                         // A slot conflict stops startup, replication or not.
-                        manager
-                            .claim_slots()
-                            .await
-                            .map_err(|e| miette!("slot conflict: {}", e))?;
+                        if let Err(e) = manager.claim_slots().await {
+                            manager.shutdown().await;
+                            return Err(miette!("slot conflict: {}", e));
+                        }
                         tracing::info!("Cluster manager initialized successfully");
                         Some(manager)
                     }
