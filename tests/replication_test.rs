@@ -53,6 +53,8 @@ struct Opts<'a> {
     /// The slots a primary owns; 0 to `OWNED_SLOTS` if unset.
     range: Option<(u16, u16)>,
     new_replid: bool,
+    /// Run without a `[replication]` section: a plain cluster node.
+    plain: bool,
 }
 
 impl<'a> Opts<'a> {
@@ -68,6 +70,7 @@ impl<'a> Opts<'a> {
             async_write: false,
             range: None,
             new_replid: false,
+            plain: false,
         }
     }
 
@@ -123,7 +126,7 @@ fn cfg(dir: &Path, o: &Opts, addr: SocketAddr, gossip_port: u16) -> Cfg {
             // Peers gossip to the advertised host, so it can't be left at 0.0.0.0.
             advertise_addr: Some(addr.to_string()),
         }),
-        replication: Some(ReplicationConfig {
+        replication: (!o.plain).then(|| ReplicationConfig {
             replica_of: o.replica_of.map(str::to_string),
             tombstone_retention_secs: Some(o.retention_secs),
         }),
@@ -524,6 +527,60 @@ async fn replica_restart_resumes_from_applied_lsn() {
     .await;
     assert!(has_marker(rdir.path(), SHARDS).await, "the shard was reset");
     assert_eq!(state(rdir.path(), 0, "replid").await.unwrap(), replid);
+
+    replica.stop().await;
+    primary.stop().await;
+}
+
+#[tokio::test]
+async fn a_replica_run_without_replication_resyncs_when_it_is_replicated_again() {
+    let (pdir, rdir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let primary = start(pdir.path(), &Opts::primary("p", 1)).await;
+    let ropts = |seeds| Opts::replica("r", "p", seeds, 1);
+    let replica = start(rdir.path(), &ropts(vec![primary.gossip.clone()])).await;
+
+    let mut client = Client::connect(primary.addr).await;
+    for i in 0..5 {
+        ok(&mut client, &["SET", &k(&format!("k{i}")), "v"]).await;
+    }
+    wait_for("the first copy", || converged(pdir.path(), rdir.path(), 1)).await;
+    wait_for("synced", || all_synced(rdir.path(), 1)).await;
+    let replid = state(rdir.path(), 0, "replid").await.unwrap();
+    replica.stop().await;
+
+    // As a plain node it leaves the index alone but marks it stale, and its
+    // data may drift: a marker only a reset would remove stands for that.
+    plant_marker(rdir.path()).await;
+    let plain = start(
+        rdir.path(),
+        &Opts {
+            plain: true,
+            ..ropts(vec![primary.gossip.clone()])
+        },
+    )
+    .await;
+    let mut client_r = Client::connect(plain.addr).await;
+    assert_eq!(client_r.call(&["PING"]).await, ["+PONG"]);
+    assert_eq!(state(rdir.path(), 0, "indexed").await.as_deref(), Some("0"));
+    assert_eq!(state(rdir.path(), 0, "replid").await, Some(replid.clone()));
+    plain.stop().await;
+    // Neither its start nor its stop touched the markers of the replicated run.
+    assert_eq!(
+        state(rdir.path(), 0, "clean_shutdown").await.as_deref(),
+        Some("1")
+    );
+
+    // Replicated again, it forgets its history and the primary resyncs it.
+    ok(&mut client, &["SET", &k("later"), "v"]).await;
+    let replica = start(rdir.path(), &ropts(vec![primary.gossip.clone()])).await;
+    wait_for("the full copy", || converged(pdir.path(), rdir.path(), 1)).await;
+    wait_for("synced again", || all_synced(rdir.path(), 1)).await;
+    assert!(!has_marker(rdir.path(), 1).await, "the shard was not reset");
+    assert_eq!(state(rdir.path(), 0, "indexed").await.as_deref(), Some("1"));
+    assert_eq!(
+        state(rdir.path(), 0, "replid").await,
+        state(pdir.path(), 0, "replid").await
+    );
 
     replica.stop().await;
     primary.stop().await;

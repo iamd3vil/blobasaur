@@ -231,6 +231,8 @@ pub struct ShardWriter {
     pub key_count: Arc<AtomicI64>,
     /// Published with the highest LSN after each commit that logged changes.
     pub commit_watch: Arc<watch::Sender<u64>>,
+    /// Whether to write the change index (`repl_log`) and publish LSNs.
+    pub replication: bool,
     /// Cancel to make the writer commit everything queued and return.
     pub shutdown: CancellationToken,
 }
@@ -1024,6 +1026,7 @@ pub async fn shard_writer_task(writer: ShardWriter) {
         metrics,
         key_count,
         commit_watch,
+        replication,
         shutdown,
     } = writer;
 
@@ -1134,6 +1137,7 @@ pub async fn shard_writer_task(writer: ShardWriter) {
                 &inflight_hcache,
                 &shard_metrics,
                 &key_count,
+                replication,
             )
             .await;
             if let Some(lsn) = committed {
@@ -1185,6 +1189,7 @@ pub async fn shard_writer_task(writer: ShardWriter) {
             &inflight_hcache,
             &shard_metrics,
             &key_count,
+            replication,
         )
         .await;
         if let Some(lsn) = committed {
@@ -1292,7 +1297,8 @@ async fn clear_pending_entries(
 type LogEntry<'a> = (Cow<'a, str>, &'a str, bool);
 
 /// Writes `batch` in one transaction, each op under its own savepoint together
-/// with its `repl_log` entry. Returns the highest LSN it committed, if any.
+/// with its `repl_log` entry, unless `replication` is off. Returns the highest
+/// LSN it committed, if any.
 #[allow(clippy::too_many_arguments)]
 async fn process_batch(
     shard_id: usize,
@@ -1303,6 +1309,7 @@ async fn process_batch(
     inflight_hcache: &Cache<String, Pending>,
     shard_metrics: &ShardMetrics,
     key_count: &AtomicI64,
+    replication: bool,
 ) -> Option<u64> {
     if batch.is_empty() {
         return None;
@@ -1748,7 +1755,7 @@ async fn process_batch(
         };
 
         // The log entry joins the op's savepoint: both commit or neither does.
-        match finish_op(&mut tx, shard_id, result).await {
+        match finish_op(&mut tx, shard_id, replication, result).await {
             Ok(lsn) => {
                 batch_delta += op_delta;
                 last_lsn = last_lsn.max(lsn);
@@ -2003,15 +2010,17 @@ async fn rollback_op(tx: &mut sqlx::Transaction<'_, Sqlite>) -> Result<(), sqlx:
     Ok(())
 }
 
-/// Writes the op's `repl_log` entry, if its data change needs one, and releases
-/// its savepoint. Returns the entry's LSN. On error the caller rolls back.
+/// Writes the op's `repl_log` entry, if replication is on and its data change
+/// needs one, and releases its savepoint. Returns the entry's LSN. On error the
+/// caller rolls back.
 async fn finish_op(
     tx: &mut sqlx::Transaction<'_, Sqlite>,
     shard_id: usize,
+    replication: bool,
     result: Result<Option<LogEntry<'_>>, String>,
 ) -> Result<Option<i64>, String> {
     let lsn = match result? {
-        Some((table, key, deleted)) => {
+        Some((table, key, deleted)) if replication => {
             Some(log_change(tx, &table, key, deleted).await.map_err(|e| {
                 tracing::error!(
                     "[Shard {}] repl_log error for {} key {}: {}",
@@ -2023,7 +2032,7 @@ async fn finish_op(
                 e.to_string()
             })?)
         }
-        None => None,
+        _ => None,
     };
     sqlx::query("RELEASE op")
         .execute(&mut **tx)
@@ -2616,10 +2625,10 @@ async fn ensure_namespaced_table_inner(
 /// queued. The cleanup shares the shard's single writer connection, so each
 /// chunk is its own transaction: the pool hands out connections in FIFO order,
 /// letting a waiting writer batch run between chunks instead of stalling behind
-/// one long DELETE. A chunk deletes its rows and logs a tombstone for each, and
-/// publishes its LSN once committed. Each chunk's rows are added to `deleted`
-/// as they go, so a later failing chunk doesn't lose the count. Stops between
-/// chunks once `cancel` is cancelled.
+/// one long DELETE. With a `commit_watch` (replication on), a chunk logs a
+/// tombstone for each row it deletes and publishes its LSN once committed. Each
+/// chunk's rows are added to `deleted` as they go, so a later failing chunk
+/// doesn't lose the count. Stops between chunks once `cancel` is cancelled.
 #[allow(clippy::too_many_arguments)]
 async fn delete_expired(
     pool: &SqlitePool,
@@ -2630,7 +2639,7 @@ async fn delete_expired(
     inflight_cache: &Cache<String, Pending>,
     namespace: Option<&str>,
     key_count: &AtomicI64,
-    commit_watch: &watch::Sender<u64>,
+    commit_watch: Option<&watch::Sender<u64>>,
     cancel: &CancellationToken,
 ) -> Result<u64, sqlx::Error> {
     const MAX_IN_PARAMS: usize = 500;
@@ -2682,14 +2691,16 @@ async fn delete_expired(
                 query = query.bind(*rowid);
             }
             let keys = query.bind(now).fetch_all(&mut *tx).await?;
-            for key in &keys {
-                last_lsn = Some(log_change(&mut tx, table, key, true).await?);
+            if commit_watch.is_some() {
+                for key in &keys {
+                    last_lsn = Some(log_change(&mut tx, table, key, true).await?);
+                }
             }
             chunk_deleted += keys.len() as u64;
         }
 
         tx.commit().await?;
-        if let Some(lsn) = last_lsn {
+        if let (Some(lsn), Some(commit_watch)) = (last_lsn, commit_watch) {
             replication::publish(commit_watch, lsn as u64);
         }
         if chunk_deleted > 0 {
@@ -2706,7 +2717,8 @@ async fn delete_expired(
 }
 
 /// Background task to clean up expired keys from a shard, and to trim old
-/// tombstones from its change index.
+/// tombstones from its change index. `tombstone_retention_secs` is `None`
+/// without replication: no tombstones are written or trimmed then.
 #[allow(clippy::too_many_arguments)]
 pub async fn shard_cleanup_task(
     shard_id: usize,
@@ -2718,7 +2730,7 @@ pub async fn shard_cleanup_task(
     key_count: Arc<AtomicI64>,
     commit_watch: Arc<watch::Sender<u64>>,
     pins: Arc<replication::ShardPins>,
-    tombstone_retention_secs: u64,
+    tombstone_retention_secs: Option<u64>,
     cancel: CancellationToken,
 ) {
     let mut interval = interval(Duration::from_secs(cleanup_interval_secs));
@@ -2793,7 +2805,7 @@ pub async fn shard_cleanup_task(
                 cache,
                 namespace.as_deref(),
                 &key_count,
-                &commit_watch,
+                tombstone_retention_secs.map(|_| &*commit_watch),
                 &cancel,
             )
             .await
@@ -2820,7 +2832,9 @@ pub async fn shard_cleanup_task(
                 }
             }
         }
-        if let Err(e) = replication::trim_tombstones(&pool, &pins, tombstone_retention_secs).await {
+        if let Some(retention) = tombstone_retention_secs
+            && let Err(e) = replication::trim_tombstones(&pool, &pins, retention).await
+        {
             tracing::error!("[Shard {}] Error trimming tombstones: {}", shard_id, e);
             shard_metrics.record_cleanup_error("trim");
             ok = false;
@@ -3079,7 +3093,7 @@ mod tests {
             &cache,
             None,
             &key_count,
-            &watch::channel(0).0,
+            Some(&watch::channel(0).0),
             &CancellationToken::new(),
         )
         .await
@@ -3594,6 +3608,7 @@ mod tests {
             &Cache::new(16),
             &ShardMetrics::new(0),
             &key_count,
+            true,
         )
         .await;
         assert_eq!(key_count.load(Ordering::Relaxed), 0);
@@ -3649,6 +3664,7 @@ mod tests {
             &hcache,
             &shard_metrics,
             &key_count,
+            true,
         )
         .await;
         assert_eq!(key_count.load(Ordering::Relaxed), 1);
@@ -3701,6 +3717,7 @@ mod tests {
             &hcache,
             &shard_metrics,
             &key_count,
+            true,
         )
         .await;
         assert_eq!(key_count.load(Ordering::Relaxed), 1);
@@ -3759,11 +3776,11 @@ mod tests {
                     &cache,
                     None,
                     &key_count,
-                    &commit_watch,
+                    Some(&commit_watch),
                     &cancel
                 )
-                    .await
-                    .unwrap(),
+                .await
+                .unwrap(),
                 2
             );
             assert_eq!(key_count.load(Ordering::Relaxed), 1);
@@ -3776,7 +3793,7 @@ mod tests {
                 &cache,
                 None,
                 &key_count,
-                &commit_watch,
+                Some(&commit_watch),
                 &cancel,
             )
             .await;
@@ -3815,6 +3832,7 @@ mod tests {
             metrics: Metrics::new(),
             key_count: key_count.clone(),
             commit_watch: Arc::new(watch::channel(0).0),
+            replication: true,
             shutdown: CancellationToken::new(),
         }));
 
@@ -4129,6 +4147,7 @@ mod tests {
                 metrics: Metrics::new(),
                 key_count: key_count.clone(),
                 commit_watch: Arc::new(watch::channel(0).0),
+                replication: true,
                 shutdown,
             }),
         )
@@ -4162,6 +4181,7 @@ mod tests {
             inflight_hcache: Cache::new(128),
             metrics: Metrics::new(),
             commit_watch: Arc::new(watch::channel(0).0),
+            replication: true,
             shutdown: CancellationToken::new(),
         }));
         for i in 0..5 {
@@ -4230,6 +4250,7 @@ mod tests {
             metrics: Metrics::new(),
             key_count: Arc::new(AtomicI64::new(1)),
             commit_watch: Arc::new(watch::channel(0).0),
+            replication: true,
             shutdown: CancellationToken::new(),
         }));
 
@@ -5778,6 +5799,7 @@ mod tests {
             &Cache::new(16),
             &ShardMetrics::new(0),
             &AtomicI64::new(0),
+            true,
         )
         .await
     }
@@ -6087,6 +6109,7 @@ mod tests {
             metrics: Metrics::new(),
             key_count: Arc::new(AtomicI64::new(0)),
             commit_watch: commit_watch.clone(),
+            replication: true,
             shutdown: CancellationToken::new(),
         }));
 
@@ -6153,7 +6176,7 @@ mod tests {
             &cache,
             None,
             &key_count,
-            &commit_watch,
+            Some(&commit_watch),
             &cancel,
         )
         .await;
@@ -6180,7 +6203,7 @@ mod tests {
             &cache,
             Some("ns"),
             &key_count,
-            &commit_watch,
+            Some(&commit_watch),
             &cancel,
         )
         .await;
@@ -6196,6 +6219,54 @@ mod tests {
                 .await
                 .contains(&row(&ns_table, "old", false))
         );
+    }
+
+    #[tokio::test]
+    async fn without_replication_writes_and_cleanup_leave_repl_log_empty() {
+        let (_dir, pool) = create_test_pool().await;
+        let ops = vec![
+            set("a").0,
+            set("b").0,
+            hset("ns", "f").0,
+            del("a").0,
+            hdel("ns", "f").0,
+        ];
+        let committed = process_batch(
+            0,
+            &pool,
+            &mut VecDeque::from(ops),
+            &mut blobs_only(),
+            &Cache::new(16),
+            &Cache::new(16),
+            &ShardMetrics::new(0),
+            &AtomicI64::new(0),
+            false,
+        )
+        .await;
+        assert_eq!(committed, None);
+        assert_eq!(keys(&pool, "blobs").await, vec!["b".to_string()]);
+        assert!(keys(&pool, &namespace_table("ns")).await.is_empty());
+
+        sqlx::query("UPDATE blobs SET expires_at = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let deleted = delete_expired(
+            &pool,
+            "blobs",
+            10,
+            1,
+            &Counter::noop(),
+            &Cache::new(16),
+            None,
+            &AtomicI64::new(1),
+            None,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(deleted.unwrap(), 1);
+        assert!(keys(&pool, "blobs").await.is_empty());
+        assert!(repl_log(&pool).await.is_empty());
     }
 
     #[tokio::test]
@@ -6224,7 +6295,7 @@ mod tests {
             &cache,
             None,
             &key_count,
-            &commit_watch,
+            Some(&commit_watch),
             &cancel,
         )
         .await;
@@ -6243,7 +6314,7 @@ mod tests {
                 key_count,
                 commit_watch,
                 Arc::default(),
-                86400,
+                Some(86400),
                 cancel,
             ),
         )

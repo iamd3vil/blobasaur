@@ -67,7 +67,11 @@ watermark. This is why there is no partial resync across a change of primary.
 
 ## Change index
 
-Created in every shard DB, primary and replica alike:
+The tables are created in every shard DB (DDL only), but the index is only
+written, backfilled and trimmed when the config has a `[replication]` section,
+on a primary (an empty section is enough) and a replica alike. Without it,
+writes pay nothing for replication; see
+[Enabling and disabling](#enabling-and-disabling).
 
 ```sql
 CREATE TABLE IF NOT EXISTS repl_log (
@@ -108,9 +112,11 @@ Required details:
 
 ### Backfill of existing data
 
-Existing shard DBs already hold rows the index has never seen. On startup,
-before the writer, cleanup, or replication tasks start, each shard runs, per
-table (`blobs` and every `blobs_*`):
+Existing shard DBs already hold rows the index has never seen. On startup with
+replication enabled, before the writer, cleanup, or replication tasks start,
+each shard whose `repl_state.indexed` is not 1 (see
+[Enabling and disabling](#enabling-and-disabling)) runs, per table (`blobs` and
+every `blobs_*`):
 
 ```sql
 INSERT OR IGNORE INTO repl_log (tbl, key, deleted, at)
@@ -119,6 +125,35 @@ SELECT '<tbl>', key, 0, <now> FROM <tbl>;
 
 then sets `repl_state.indexed = 1`. `INSERT OR IGNORE` makes a crash part-way
 safe to rerun; the marker skips it on later starts.
+
+### Enabling and disabling
+
+Replication is enabled by a `[replication]` section in the config, empty on a
+primary or with `replica_of` on a replica. Without it, `process_batch` and
+expiry cleanup write no `repl_log` rows, write no tombstones, publish no LSN and
+trim nothing, and none of the replication metrics are emitted. The per-op
+savepoints stay (they also keep a batch from half-committing). `BLOBASAUR.SYNC`
+and `BLOBASAUR.WATERMARK` reply with an error, and startup does no backfill,
+replid or boot-id work and writes no markers; graceful shutdown doesn't write
+`clean_shutdown`.
+
+A run without replication leaves the index stale, so a start without
+`[replication]` sets `indexed = 0` on every shard that had `indexed = 1`, and
+changes nothing else. A start with replication on and `indexed != 1` (never
+indexed, or invalidated that way) can't trust the index. Inside the init
+transaction it rebuilds it and starts a new history:
+
+- deletes every `repl_log` row, backfills from every blob table, sets
+  `indexed = 1`, and deletes `trimmed_through`. The `AUTOINCREMENT` sequence
+  is not reset: LSNs must never be reused.
+- primary: generates a new replid, so every replica resyncs.
+- replica: deletes the stored replid, `applied_lsn`, `caught_up_lsn` and the last
+  watermark time, and sets `synced = 0`, so its next handshake gets `RESYNC`.
+  Its local data may have diverged while it ran unreplicated.
+
+A warning is logged when this happens on a node that already had a replid.
+First-time enabling takes this same path. A node that is already indexed
+restarts as described elsewhere in this document.
 
 ### Durability
 
@@ -172,6 +207,8 @@ generates a new `replid`.
 
 ## Primary write path
 
+(With replication disabled, none of the `repl_log` writes below happen.)
+
 In `process_batch` (`src/shard_manager.rs`), each op runs inside
 `SAVEPOINT op` / `RELEASE op`, and on any statement error rolls back to the
 savepoint. The data change and its `repl_log` row therefore commit together or
@@ -205,6 +242,9 @@ shard's only writer connection).
 
 `shard_cleanup_task` changes each chunk to one transaction that runs
 `DELETE … RETURNING key` and writes a tombstone for every deleted key.
+
+(Without replication, a chunk is still one transaction but writes no
+tombstones and publishes nothing.)
 
 Cleanup deletes must be replicated. A replica that is behind may hold a key
 without its later `EXPIRE`; if the primary then cleaned it up without a

@@ -245,8 +245,10 @@ impl AppState {
         }
 
         // Index pre-existing rows and settle the replid before any writer runs.
+        // Without replication this only marks the index as stale.
+        let enabled = cfg.replication_enabled();
         let replica = cfg.replica_of().is_some();
-        if !replica {
+        if enabled && !replica {
             let options: Vec<_> = (0..cfg.num_shards)
                 .map(|i| build_sqlite_connect_options(&cfg, i))
                 .collect();
@@ -255,7 +257,7 @@ impl AppState {
         let mut commit_watch = Vec::with_capacity(cfg.num_shards);
         for i in 0..cfg.num_shards {
             let options = build_sqlite_connect_options(&cfg, i);
-            let lsn = replication::init_shard(&options, cfg.new_replid, replica)
+            let lsn = replication::init_shard(&options, enabled, cfg.new_replid, replica)
                 .await
                 .map_err(|e| miette!("failed to initialize change index of shard {}: {}", i, e))?;
             commit_watch.push(Arc::new(watch::channel(lsn).0));
@@ -446,7 +448,7 @@ impl AppState {
             ring,
         };
         // A new replica has none until its first sync.
-        for (i, pool) in state.db_pools.iter().enumerate() {
+        for (i, pool) in state.db_pools.iter().enumerate().filter(|_| enabled) {
             if let Ok((replid, ..)) = replication::primary_state(pool).await
                 && !replid.is_empty()
             {
@@ -492,6 +494,9 @@ impl AppState {
     /// Records that shard `shard_id` stopped cleanly; see
     /// [`replication::mark_clean_shutdown`]. Its pools must be closed first.
     pub async fn mark_clean_shutdown(&self, shard_id: usize) -> Result<()> {
+        if !self.cfg.replication_enabled() {
+            return Ok(());
+        }
         replication::mark_clean_shutdown(&build_sqlite_connect_options(&self.cfg, shard_id)).await
     }
 
@@ -505,15 +510,21 @@ impl AppState {
                 .set(self.shard_key_count(i) as f64);
             metrics::gauge!("blobasaur_write_queue_depth", "shard" => shard.clone())
                 .set(sender.queue_depth() as f64);
-            let role = if self.cfg.replica_of().is_some() {
-                "replica"
-            } else {
-                metrics::gauge!("blobasaur_replication_latest_lsn", "shard" => shard.clone())
-                    .set(*self.commit_watch[i].borrow() as f64);
-                "primary"
-            };
-            metrics::gauge!("blobasaur_replication_role", "shard" => shard.clone(), "role" => role)
+            if self.cfg.replication_enabled() {
+                let role = if self.cfg.replica_of().is_some() {
+                    "replica"
+                } else {
+                    metrics::gauge!("blobasaur_replication_latest_lsn", "shard" => shard.clone())
+                        .set(*self.commit_watch[i].borrow() as f64);
+                    "primary"
+                };
+                metrics::gauge!(
+                    "blobasaur_replication_role",
+                    "shard" => shard.clone(),
+                    "role" => role
+                )
                 .set(1.0);
+            }
             for (name, pool) in [
                 ("read", &self.db_pools[i]),
                 ("write", &self.write_db_pools[i]),
@@ -1031,7 +1042,11 @@ mod tests {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let _guard = metrics::set_default_local_recorder(&recorder);
         let temp_dir = TempDir::new().expect("failed to create temp dir");
-        let cfg = test_cfg(temp_dir.path().to_string_lossy().into_owned(), 1);
+        let mut cfg = test_cfg(temp_dir.path().to_string_lossy().into_owned(), 1);
+        cfg.replication = Some(crate::config::ReplicationConfig {
+            replica_of: None,
+            tombstone_retention_secs: None,
+        });
         let mut receivers = Vec::new();
         let state = AppState::new(cfg, &mut receivers).await.unwrap();
         let series =

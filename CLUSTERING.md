@@ -265,6 +265,8 @@ replica_of = "node-1"            # node id; its address is found through gossip
 tombstone_retention_secs = 86400 # on the primary; see below
 ```
 
+- **A primary needs a `[replication]` section too**, or it keeps no change index and replicas cannot sync: an empty `[replication]` is enough (or one with only `tombstone_retention_secs`). Without the section a node pays nothing per write for replication, and `BLOBASAUR.SYNC` and `BLOBASAUR.WATERMARK` return an error.
+- Turning replication off and on again makes replicas resync. While it is off the node keeps no change index, so on the next start with `[replication]` it rebuilds the index and starts a new history (a new replid on a primary). Every replica of it then copies everything again. A replica that ran without `[replication]` forgets its sync state and resyncs from its primary on the next start, because its data may have drifted in between.
 - `num_shards` and the storage compression algorithm must match the primary. The primary rejects a replica that differs.
 - A new replica copies everything from the primary on first start; nothing else to do.
 - `tombstone_retention_secs` (default 86400) is how long a primary remembers deletes for disconnected replicas. A replica away for longer does a full resync.

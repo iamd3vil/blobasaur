@@ -76,6 +76,7 @@ pub async fn run(
                 metrics: state.metrics.clone(),
                 key_count: state.shard_key_counts[i].clone(),
                 commit_watch: state.commit_watch[i].clone(),
+                replication: cfg.replication_enabled(),
                 shutdown: writers_shutdown.clone(),
             },
         )));
@@ -100,7 +101,8 @@ pub async fn run(
             state.shard_key_counts[i].clone(),
             state.commit_watch[i].clone(),
             state.repl_pins[i].clone(),
-            cfg.tombstone_retention_secs(),
+            cfg.replication_enabled()
+                .then(|| cfg.tombstone_retention_secs()),
             writers_shutdown.clone(),
         )));
     }
@@ -2718,10 +2720,14 @@ async fn handle_blobasaur_watermark(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let shards = futures::future::try_join_all(
-        (0..state.shard_senders.len()).map(|shard| replication::shard_watermark(state, shard)),
-    )
-    .await;
+    let shards = if state.cfg.replication_enabled() {
+        futures::future::try_join_all(
+            (0..state.shard_senders.len()).map(|shard| replication::shard_watermark(state, shard)),
+        )
+        .await
+    } else {
+        Err(miette::miette!("replication is not enabled"))
+    };
     let response = match shards {
         Ok(shards) => BytesFrame::Array(
             shards
@@ -2978,6 +2984,7 @@ mod tests {
                             metrics: state.metrics.clone(),
                             key_count: state.shard_key_counts[i].clone(),
                             commit_watch: state.commit_watch[i].clone(),
+                            replication: state.cfg.replication_enabled(),
                             shutdown: CancellationToken::new(),
                         },
                     )));
