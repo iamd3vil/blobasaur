@@ -439,16 +439,19 @@ async fn route_or_reply(
     state: &AppState,
     slot: impl FnOnce(&ClusterManager) -> u16,
 ) -> std::io::Result<bool> {
-    route_read_or_reply(stream, state, false, false, slot).await
+    route_read_or_reply(stream, state, false, false, &mut None, slot).await
 }
 
 /// Like [`route_or_reply`], with `is_read` set for a read command, which a replica
-/// serves if the connection sent `READONLY` (`conn_readonly`).
+/// serves if the connection sent `READONLY` (`conn_readonly`). A redirect drops
+/// the replica read `gate` before replying: a client that stops reading must
+/// not hold up a resync.
 async fn route_read_or_reply(
     stream: &mut TcpStream,
     state: &AppState,
     is_read: bool,
     conn_readonly: bool,
+    gate: &mut Option<RwLockReadGuard<'_, ()>>,
     slot: impl FnOnce(&ClusterManager) -> u16,
 ) -> std::io::Result<bool> {
     let Some(ref cluster_manager) = state.cluster_manager else {
@@ -462,6 +465,7 @@ async fn route_read_or_reply(
         Route::Moved(redirect) => redirect,
         Route::ClusterDown => "CLUSTERDOWN Hash slot not served".to_string(),
     };
+    *gate = None;
     let response = BytesFrame::Error(error.into());
     stream.write_all(&serialize_frame(&response)).await?;
     Ok(false)
@@ -497,10 +501,10 @@ async fn handle_redis_command_inner(
     let readonly = *conn_readonly;
     match command {
         RedisCommand::Get { key } => {
-            let gate = state
+            let mut gate = state
                 .replica_read_gate(state.get_shard(&key), readonly)
                 .await;
-            if !route_read_or_reply(stream, state, true, readonly, |_| {
+            if !route_read_or_reply(stream, state, true, readonly, &mut gate, |_| {
                 ClusterManager::calculate_slot(&key)
             })
             .await?
@@ -523,10 +527,10 @@ async fn handle_redis_command_inner(
             handle_del_multiple(stream, state, keys).await?;
         }
         RedisCommand::Exists { key } => {
-            let gate = state
+            let mut gate = state
                 .replica_read_gate(state.get_shard(&key), readonly)
                 .await;
-            if !route_read_or_reply(stream, state, true, readonly, |_| {
+            if !route_read_or_reply(stream, state, true, readonly, &mut gate, |_| {
                 ClusterManager::calculate_slot(&key)
             })
             .await?
@@ -604,10 +608,10 @@ async fn handle_redis_command_inner(
             handle_cluster_keyslot(stream, key).await?;
         }
         RedisCommand::Ttl { key } => {
-            let gate = state
+            let mut gate = state
                 .replica_read_gate(state.get_shard(&key), readonly)
                 .await;
-            if !route_read_or_reply(stream, state, true, readonly, |_| {
+            if !route_read_or_reply(stream, state, true, readonly, &mut gate, |_| {
                 ClusterManager::calculate_slot(&key)
             })
             .await?
@@ -1283,11 +1287,11 @@ async fn handle_hget(
         return Ok(());
     }
 
-    let gate = state
+    let mut gate = state
         .replica_read_gate(state.get_shard(&key), conn_readonly)
         .await;
     // Check if we should handle this hash operation locally in a cluster
-    if !route_read_or_reply(stream, state, true, conn_readonly, |cm| {
+    if !route_read_or_reply(stream, state, true, conn_readonly, &mut gate, |cm| {
         cm.calculate_slot_for_hash(&namespace, &key)
     })
     .await?
@@ -1894,11 +1898,11 @@ async fn handle_hexists(
         return Ok(());
     }
 
-    let gate = state
+    let mut gate = state
         .replica_read_gate(state.get_shard(&key), conn_readonly)
         .await;
     // Check if we should handle this hash operation locally in a cluster
-    if !route_read_or_reply(stream, state, true, conn_readonly, |cm| {
+    if !route_read_or_reply(stream, state, true, conn_readonly, &mut gate, |cm| {
         cm.calculate_slot_for_hash(&namespace, &key)
     })
     .await?
