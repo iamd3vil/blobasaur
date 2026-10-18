@@ -91,22 +91,45 @@ async fn connect_full(options: &SqliteConnectOptions) -> Result<SqliteConnection
 }
 
 /// Startup step for one shard, after its tables exist and before its writer
-/// or cleanup task runs: indexes rows from before the change index (once),
-/// settles the role and replid and records this boot. A replica never touches
-/// its replid: it is the primary's identity there, stored by [`reset`]. Returns
-/// the shard's highest committed LSN.
+/// or cleanup task runs. Without replication the change index goes stale, so
+/// it only marks it as such (`indexed = 0`). With it, a shard whose index
+/// isn't trusted (never built, or stale from a run without replication)
+/// rebuilds it and starts a new history; then it settles the role and replid
+/// and records this boot. A replica never touches its replid: it is the
+/// primary's identity there, stored by [`reset`]. Returns the shard's highest
+/// committed LSN.
 pub async fn init_shard(
     options: &SqliteConnectOptions,
+    enabled: bool,
     force_new_replid: bool,
     replica: bool,
 ) -> Result<u64> {
     let mut conn = connect_full(options).await?;
+    if !enabled {
+        sqlx::query("UPDATE repl_state SET v = '0' WHERE k = 'indexed'")
+            .execute(&mut conn)
+            .await
+            .map_err(|e| miette!("failed to invalidate the change index: {}", e))?;
+        return Ok(0);
+    }
     let mut tx = conn
         .begin()
         .await
         .map_err(|e| miette!("failed to begin repl init: {}", e))?;
 
-    if get_state(&mut tx, "indexed").await?.as_deref() != Some("1") {
+    let replid = get_state(&mut tx, "replid").await?;
+    let rebuild = get_state(&mut tx, "indexed").await?.as_deref() != Some("1");
+    if rebuild {
+        // The index can't be trusted, so start a new history. The AUTOINCREMENT
+        // sequence is kept: LSNs must never be reused.
+        sqlx::query("DELETE FROM repl_log")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| miette!("failed to clear repl_log: {}", e))?;
+        sqlx::query("DELETE FROM repl_state WHERE k = 'trimmed_through'")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| miette!("failed to clear trimmed_through: {}", e))?;
         let mut tables = vec!["blobs".to_string()];
         tables.extend(
             sqlx::query_scalar::<_, String>(
@@ -138,19 +161,32 @@ pub async fn init_shard(
         ));
     }
 
-    let replid = get_state(&mut tx, "replid").await?;
     let stored_boot_id = get_state(&mut tx, "boot_id").await?;
     let clean_shutdown = get_state(&mut tx, "clean_shutdown").await?.as_deref() == Some("1");
     let boot_id = std::fs::read_to_string(BOOT_ID_PATH)
         .ok()
         .map(|id| id.trim().to_string());
     if replica {
+        if rebuild {
+            // The data may have diverged while it ran unreplicated: forget the
+            // primary's history, so the next handshake gets RESYNC.
+            if replid.is_some() {
+                tracing::warn!("Change index was not kept up to date: replica will resync");
+            }
+            sqlx::query(
+                "DELETE FROM repl_state
+                 WHERE k IN ('replid', 'applied_lsn', 'caught_up_lsn', 'watermark_ms')",
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| miette!("failed to reset replica state: {}", e))?;
+        }
         // Data that isn't a copy of the configured primary doesn't count as synced.
-        if stored_role.as_deref() != Some("replica") {
+        if rebuild || stored_role.as_deref() != Some("replica") {
             set_state(&mut tx, "synced", "0").await?;
         }
     } else if needs_new_replid(
-        force_new_replid || promotion,
+        force_new_replid || promotion || rebuild,
         replid.as_deref(),
         stored_boot_id.as_deref(),
         boot_id.as_deref(),
@@ -160,6 +196,7 @@ pub async fn init_shard(
             tracing::warn!(
                 forced = force_new_replid,
                 promotion,
+                rebuild,
                 clean_shutdown,
                 "Generating a new replid: replicas will resync"
             );
@@ -646,7 +683,9 @@ pub async fn serve_sync(
     req: SyncRequest,
 ) -> io::Result<()> {
     let cfg = &state.cfg;
-    let error = if cfg.replica_of().is_some() {
+    let error = if !cfg.replication_enabled() {
+        Some("replication is not enabled on this node".to_string())
+    } else if cfg.replica_of().is_some() {
         Some("this node is a replica".to_string())
     } else if req.num_shards != cfg.num_shards {
         Some(format!(
@@ -1217,32 +1256,32 @@ mod tests {
         let (options, mut conn) = shard(&dir).await;
 
         // First start: a replid and this boot are stored, nothing is "unclean".
-        init_shard(&options, false, false).await.unwrap();
+        init_shard(&options, true, false, false).await.unwrap();
         let replid = state(&mut conn, "replid").await.unwrap();
         assert_eq!(replid.len(), 40);
         assert_eq!(state(&mut conn, "clean_shutdown").await.unwrap(), "0");
 
         // Same boot, no clean shutdown (process crash): kept.
-        init_shard(&options, false, false).await.unwrap();
+        init_shard(&options, true, false, false).await.unwrap();
         assert_eq!(state(&mut conn, "replid").await.unwrap(), replid);
 
         // Another boot after a clean shutdown: kept.
         mark_clean_shutdown(&options).await.unwrap();
         assert_eq!(state(&mut conn, "clean_shutdown").await.unwrap(), "1");
         set_state(&mut conn, "boot_id", "old-boot").await.unwrap();
-        init_shard(&options, false, false).await.unwrap();
+        init_shard(&options, true, false, false).await.unwrap();
         assert_eq!(state(&mut conn, "replid").await.unwrap(), replid);
         assert_eq!(state(&mut conn, "clean_shutdown").await.unwrap(), "0");
 
         // Another boot, not shut down cleanly (power loss): new replid.
         set_state(&mut conn, "boot_id", "old-boot").await.unwrap();
-        init_shard(&options, false, false).await.unwrap();
+        init_shard(&options, true, false, false).await.unwrap();
         let after_crash = state(&mut conn, "replid").await.unwrap();
         assert_ne!(after_crash, replid);
         assert_ne!(state(&mut conn, "boot_id").await.unwrap(), "old-boot");
 
         // `--new-replid`.
-        init_shard(&options, true, false).await.unwrap();
+        init_shard(&options, true, true, false).await.unwrap();
         assert_ne!(state(&mut conn, "replid").await.unwrap(), after_crash);
     }
 
@@ -1263,7 +1302,7 @@ mod tests {
                 .unwrap();
         }
 
-        let lsn = init_shard(&options, false, false).await.unwrap();
+        let lsn = init_shard(&options, true, false, false).await.unwrap();
         let expected = vec![
             ("blobs".to_string(), "a".to_string(), false),
             ("blobs".to_string(), "b".to_string(), false),
@@ -1279,8 +1318,106 @@ mod tests {
             .execute(&mut conn)
             .await
             .unwrap();
-        assert_eq!(init_shard(&options, false, false).await.unwrap(), 3);
+        assert_eq!(init_shard(&options, true, false, false).await.unwrap(), 3);
         assert_eq!(log(&mut conn).await, expected);
+    }
+
+    #[tokio::test]
+    async fn init_shard_without_replication_only_invalidates_the_index() {
+        let dir = TempDir::new().unwrap();
+        let (options, mut conn) = shard(&dir).await;
+        init_shard(&options, true, false, false).await.unwrap();
+        let replid = state(&mut conn, "replid").await.unwrap();
+        let boot_id = state(&mut conn, "boot_id").await;
+        set_state(&mut conn, "clean_shutdown", "1").await.unwrap();
+        sqlx::query("INSERT INTO repl_log (tbl, key, deleted, at) VALUES ('blobs', 'a', 0, 0)")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+
+        init_shard(&options, false, true, false).await.unwrap();
+        assert_eq!(state(&mut conn, "indexed").await.unwrap(), "0");
+        assert_eq!(state(&mut conn, "replid").await.unwrap(), replid);
+        assert_eq!(state(&mut conn, "boot_id").await, boot_id);
+        assert_eq!(state(&mut conn, "clean_shutdown").await.unwrap(), "1");
+        assert_eq!(log(&mut conn).await.len(), 1);
+
+        // A shard that never had replication gets no rows at all.
+        let dir = TempDir::new().unwrap();
+        let (options, mut conn) = shard(&dir).await;
+        init_shard(&options, false, false, false).await.unwrap();
+        assert_eq!(state(&mut conn, "indexed").await, None);
+        assert_eq!(state(&mut conn, "replid").await, None);
+    }
+
+    #[tokio::test]
+    async fn a_primary_reenabled_after_an_unreplicated_run_rebuilds_its_index() {
+        let dir = TempDir::new().unwrap();
+        let (options, mut conn) = shard(&dir).await;
+        let insert =
+            "INSERT INTO blobs (key, data, created_at, updated_at) VALUES (?, x'00', 0, 0)";
+        for key in ["a", "b", "gone"] {
+            sqlx::query(insert)
+                .bind(key)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+        init_shard(&options, true, false, false).await.unwrap();
+        let replid = state(&mut conn, "replid").await.unwrap();
+        set_state(&mut conn, "trimmed_through", "2").await.unwrap();
+        let old_top = watermark(&mut conn).await.unwrap();
+        assert_eq!(old_top, 3);
+
+        // Unreplicated run: writes and a delete never reach the index.
+        init_shard(&options, false, false, false).await.unwrap();
+        sqlx::query(insert)
+            .bind("new")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM blobs WHERE key = 'gone'")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+
+        init_shard(&options, true, false, false).await.unwrap();
+        let live = |key: &str| ("blobs".to_string(), key.to_string(), false);
+        assert_eq!(log(&mut conn).await, [live("a"), live("b"), live("new")]);
+        assert_eq!(state(&mut conn, "indexed").await.unwrap(), "1");
+        assert_eq!(state(&mut conn, "trimmed_through").await, None);
+        assert_ne!(state(&mut conn, "replid").await.unwrap(), replid);
+        // LSNs continue past the old history; they are never reused.
+        let first: i64 = sqlx::query_scalar("SELECT MIN(lsn) FROM repl_log")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert!(first > old_top);
+        assert_eq!(watermark(&mut conn).await.unwrap(), old_top + 3);
+    }
+
+    #[tokio::test]
+    async fn a_replica_reenabled_after_an_unreplicated_run_forgets_its_history() {
+        let dir = TempDir::new().unwrap();
+        let (options, mut conn) = shard(&dir).await;
+        init_shard(&options, true, false, true).await.unwrap();
+        for (k, v) in [
+            ("replid", "primary-history"),
+            ("applied_lsn", "8"),
+            ("caught_up_lsn", "9"),
+            ("watermark_ms", "1234"),
+            ("synced", "1"),
+        ] {
+            set_state(&mut conn, k, v).await.unwrap();
+        }
+
+        init_shard(&options, false, false, true).await.unwrap();
+        init_shard(&options, true, false, true).await.unwrap();
+        for k in ["replid", "applied_lsn", "caught_up_lsn", "watermark_ms"] {
+            assert_eq!(state(&mut conn, k).await, None, "{k}");
+        }
+        assert_eq!(state(&mut conn, "synced").await.unwrap(), "0");
+        assert_eq!(state(&mut conn, "role").await.unwrap(), "replica");
     }
 
     #[test]
@@ -1558,7 +1695,7 @@ mod tests {
         let (options, mut conn) = shard(&dir).await;
 
         // A new replica generates no replid, and isn't synced.
-        init_shard(&options, true, true).await.unwrap();
+        init_shard(&options, true, true, true).await.unwrap();
         assert_eq!(state(&mut conn, "replid").await, None);
         assert_eq!(state(&mut conn, "role").await.unwrap(), "replica");
         assert_eq!(state(&mut conn, "synced").await.unwrap(), "0");
@@ -1568,7 +1705,7 @@ mod tests {
             .await
             .unwrap();
         set_state(&mut conn, "synced", "1").await.unwrap();
-        init_shard(&options, true, true).await.unwrap();
+        init_shard(&options, true, true, true).await.unwrap();
         assert_eq!(state(&mut conn, "replid").await.unwrap(), "primary-history");
         assert_eq!(state(&mut conn, "synced").await.unwrap(), "1");
 
@@ -1576,21 +1713,21 @@ mod tests {
         set_state(&mut conn, "synced", "0").await.unwrap();
         let options_list = std::slice::from_ref(&options);
         assert!(ensure_promotable(options_list).await.is_err());
-        assert!(init_shard(&options, false, false).await.is_err());
+        assert!(init_shard(&options, true, false, false).await.is_err());
         assert_eq!(state(&mut conn, "role").await.unwrap(), "replica");
 
         // Synced: promoted with a new replid, and a primary from then on.
         set_state(&mut conn, "synced", "1").await.unwrap();
         ensure_promotable(options_list).await.unwrap();
-        init_shard(&options, false, false).await.unwrap();
+        init_shard(&options, true, false, false).await.unwrap();
         assert_eq!(state(&mut conn, "role").await.unwrap(), "primary");
         let promoted = state(&mut conn, "replid").await.unwrap();
         assert_ne!(promoted, "primary-history");
-        init_shard(&options, false, false).await.unwrap();
+        init_shard(&options, true, false, false).await.unwrap();
         assert_eq!(state(&mut conn, "replid").await.unwrap(), promoted);
 
         // Demoting makes it a replica that has to sync again.
-        init_shard(&options, false, true).await.unwrap();
+        init_shard(&options, true, false, true).await.unwrap();
         assert_eq!(state(&mut conn, "role").await.unwrap(), "replica");
         assert_eq!(state(&mut conn, "replid").await.unwrap(), promoted);
         assert_eq!(state(&mut conn, "synced").await.unwrap(), "0");
@@ -1640,6 +1777,7 @@ mod tests {
             inflight_hcache: state.inflight_hcache.clone(),
             metrics: Metrics::new(),
             commit_watch: state.commit_watch[0].clone(),
+            replication: true,
             shutdown: shutdown.clone(),
         }));
         sqlx::query(

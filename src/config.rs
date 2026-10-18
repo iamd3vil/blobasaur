@@ -285,6 +285,12 @@ impl Cfg {
         self.cleanup_interval_secs.unwrap_or(60)
     }
 
+    /// Whether the change index is maintained: the config has a `[replication]`
+    /// section. Without it, writes pay nothing for replication.
+    pub fn replication_enabled(&self) -> bool {
+        self.replication.is_some()
+    }
+
     /// Node id of the primary this node replicates, if it is a replica.
     pub fn replica_of(&self) -> Option<&str> {
         self.replication.as_ref()?.replica_of.as_deref()

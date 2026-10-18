@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use blobasaur::config::{Cfg, SqliteConfig};
+use blobasaur::config::{Cfg, ReplicationConfig, SqliteConfig};
 use blobasaur::server;
 use sqlx::{Connection, SqliteConnection};
 use tempfile::TempDir;
@@ -29,7 +29,7 @@ struct Server {
 }
 
 async fn start(async_write: bool, batch_size: usize, batch_timeout_ms: u64) -> Server {
-    start_with_timeout(async_write, batch_size, batch_timeout_ms, 20).await
+    start_with_timeout(async_write, batch_size, batch_timeout_ms, 20, true).await
 }
 
 async fn start_with_timeout(
@@ -37,6 +37,7 @@ async fn start_with_timeout(
     batch_size: usize,
     batch_timeout_ms: u64,
     shutdown_timeout_secs: u64,
+    replication: bool,
 ) -> Server {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     let dir = TempDir::new().unwrap();
@@ -48,7 +49,10 @@ async fn start_with_timeout(
         batch_size: Some(batch_size),
         batch_timeout_ms: Some(batch_timeout_ms),
         addr: None,
-        replication: None,
+        replication: replication.then_some(ReplicationConfig {
+            replica_of: None,
+            tombstone_retention_secs: None,
+        }),
         cluster: None,
         metrics: None,
         sqlite: Some(SqliteConfig {
@@ -354,8 +358,37 @@ async fn shutdown_marks_every_shard_clean() {
 }
 
 #[tokio::test]
+async fn shutdown_without_replication_writes_no_replication_state() {
+    let server = start_with_timeout(false, 16, 5, 20, false).await;
+    let mut client = Client::connect(server.addr).await;
+    for i in 0..20 {
+        let key = format!("key-{i}");
+        let reply = client.call(&["SET", &key, "v"]).await;
+        assert_eq!(reply.as_deref(), Some("+OK"));
+    }
+    // The commands that need replication say so.
+    let reply = client.call(&["BLOBASAUR.WATERMARK"]).await;
+    assert_eq!(reply.as_deref(), Some("-ERR replication is not enabled"));
+    let sync = ["BLOBASAUR.SYNC", "0", "", "0", "2", "none"];
+    let reply = Client::connect(server.addr).await.call(&sync).await;
+    assert_eq!(
+        reply.as_deref(),
+        Some("-ERR replication is not enabled on this node")
+    );
+
+    let dir = server.stop().await;
+    for shard in 0..NUM_SHARDS {
+        for k in ["clean_shutdown", "replid", "boot_id", "indexed"] {
+            assert_eq!(repl_state(dir.path(), shard, k).await, None, "{k}");
+        }
+    }
+    assert!(keys(dir.path(), "repl_log").await.is_empty());
+    assert_eq!(keys(dir.path(), "blobs").await.len(), 20);
+}
+
+#[tokio::test]
 async fn failed_drain_leaves_shards_marked_unclean() {
-    let server = start_with_timeout(true, 1000, 600_000, 1).await;
+    let server = start_with_timeout(true, 1000, 600_000, 1, true).await;
     let mut locks = wedge_writers(&server).await;
     let mut client = Client::connect(server.addr).await;
     for i in 0..10 {

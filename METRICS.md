@@ -121,7 +121,7 @@ Blocking-pool size, worker-local queue depth, poll counts, and work-steal counts
 
 ### Replication Metrics
 
-Every node reports its `role`; the other series appear on the side they describe. LSNs are per shard and per node, so compare them only between a primary and a replica of the same shard (see the lag query below).
+Only nodes with a `[replication]` section report these metrics. Each of them reports its `role`; the other series appear on the side they describe. LSNs are per shard and per node, so compare them only between a primary and a replica of the same shard (see the lag query below).
 
 - `blobasaur_replication_role{shard,role}` - `1` for the node's role, `primary` or `replica`. Sampled on each scrape
 - `blobasaur_replication_info{shard,replid}` - `1` for the shard's current replication history (`replid`), on primaries and replicas. When the `replid` changes, the old series is set to `0`. Join LSN gauges to it to compare them only within one history (see the lag query below)
