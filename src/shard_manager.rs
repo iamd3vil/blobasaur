@@ -102,6 +102,8 @@ pub enum ShardWriteOperation {
         replid: String,
         responder: oneshot::Sender<Result<(), String>>,
     },
+    /// Answered once everything queued ahead of it has committed.
+    Barrier { responder: oneshot::Sender<()> },
 }
 
 impl ShardWriteOperation {
@@ -109,7 +111,7 @@ impl ShardWriteOperation {
     fn is_maintenance(&self) -> bool {
         matches!(
             self,
-            Self::Vacuum { .. } | Self::Apply { .. } | Self::Reset { .. }
+            Self::Vacuum { .. } | Self::Apply { .. } | Self::Reset { .. } | Self::Barrier { .. }
         )
     }
 }
@@ -347,6 +349,10 @@ pub async fn shard_writer_task(writer: ShardWriter) {
                 }
                 Some(ShardWriteOperation::Reset { replid, responder }) => {
                     let _ = responder.send(replication::reset(&pool, &replid).await);
+                    continue;
+                }
+                Some(ShardWriteOperation::Barrier { responder }) => {
+                    let _ = responder.send(());
                     continue;
                 }
                 Some(operation) => {
@@ -621,6 +627,8 @@ async fn process_batch(
                     shard_metrics.async_write_failures_total.increment(1);
                     shard_metrics.async_writes_pending.decrement(1.0);
                 }
+                // Never batched; dropping the responder reports it as cancelled.
+                ShardWriteOperation::Barrier { .. } => {}
             }
         }
         return None;
@@ -986,7 +994,8 @@ async fn process_batch(
             }
             ShardWriteOperation::Vacuum { .. }
             | ShardWriteOperation::Apply { .. }
-            | ShardWriteOperation::Reset { .. } => {
+            | ShardWriteOperation::Reset { .. }
+            | ShardWriteOperation::Barrier { .. } => {
                 Err("Maintenance operation reached transactional batch unexpectedly".to_string())
             }
         };
@@ -1119,6 +1128,8 @@ async fn process_batch(
                     errors,
                 });
             }
+            // Never batched; dropping the responder reports it as cancelled.
+            ShardWriteOperation::Barrier { .. } => {}
         }
     }
 
@@ -2395,6 +2406,59 @@ mod tests {
             sender.is_closed(),
             "writer should reject sends after shutdown"
         );
+    }
+
+    #[tokio::test]
+    async fn barrier_is_answered_after_earlier_async_writes_commit() {
+        let (_temp_dir, pool) = create_test_pool().await;
+        let (sender, receiver) = mpsc::channel(64);
+        let writer = tokio::spawn(shard_writer_task(ShardWriter {
+            shard_id: 0,
+            pool: pool.clone(),
+            receiver,
+            batch_size: 64,
+            // Without the barrier these would sit in the batch for a minute.
+            batch_timeout_ms: 60_000,
+            inflight_cache: Cache::new(128),
+            inflight_hcache: Cache::new(128),
+            metrics: Metrics::new(),
+            commit_watch: Arc::new(watch::channel(0).0),
+            shutdown: CancellationToken::new(),
+        }));
+        for i in 0..5 {
+            sender
+                .send(ShardWriteOperation::SetAsync {
+                    key: format!("key-{i}"),
+                    data: Bytes::from_static(b"v"),
+                    expires_at: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        let (responder, done) = oneshot::channel();
+        sender
+            .send(ShardWriteOperation::Barrier { responder })
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(5), done)
+            .await
+            .expect("barrier was not answered")
+            .unwrap();
+
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM blobs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let lsn: i64 =
+            sqlx::query_scalar("SELECT seq FROM sqlite_sequence WHERE name = 'repl_log'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!((rows, lsn), (5, 5));
+
+        drop(sender);
+        writer.await.unwrap();
     }
 
     #[tokio::test]

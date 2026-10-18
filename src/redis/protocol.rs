@@ -137,6 +137,8 @@ pub enum RedisCommand {
         budget_mb: u64,
         dry_run: bool,
     },
+    /// Per shard `[shard, replid, lsn]`; see `replication::shard_watermark`.
+    BlobasaurWatermark,
     /// A replica opening the replication stream of one shard; see
     /// `replication::serve_sync`. `replid` is empty if the replica has none.
     BlobasaurSync {
@@ -183,6 +185,7 @@ impl RedisCommand {
             RedisCommand::Ttl { .. } => "TTL".to_string(),
             RedisCommand::Expire { .. } => "EXPIRE".to_string(),
             RedisCommand::BlobasaurVacuum { .. } => "BLOBASAUR.VACUUM".to_string(),
+            RedisCommand::BlobasaurWatermark => "BLOBASAUR.WATERMARK".to_string(),
             RedisCommand::BlobasaurSync { .. } => "BLOBASAUR.SYNC".to_string(),
             RedisCommand::Hello { .. } => "HELLO".to_string(),
             RedisCommand::Client { .. } => "CLIENT".to_string(),
@@ -902,6 +905,14 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
         }
         "BLOBASAUR.VACUUM" => parse_blobasaur_vacuum_command(&elements),
         "BLOBASAUR.SYNC" => parse_blobasaur_sync_command(&elements),
+        "BLOBASAUR.WATERMARK" => {
+            if elements.len() != 1 {
+                return Err(ParseError::Invalid(
+                    "BLOBASAUR.WATERMARK takes no arguments".to_string(),
+                ));
+            }
+            Ok(RedisCommand::BlobasaurWatermark)
+        }
         "HELLO" => {
             let protover = if elements.len() > 1 {
                 let ver_str = extract_string(&elements[1])?;
@@ -1542,6 +1553,15 @@ mod tests {
                 dry_run: true,
             }
         );
+    }
+
+    #[test]
+    fn test_parse_blobasaur_watermark_command() {
+        assert_eq!(
+            parse_command(command_frame(&["blobasaur.watermark"])).unwrap(),
+            RedisCommand::BlobasaurWatermark
+        );
+        assert!(parse_command(command_frame(&["BLOBASAUR.WATERMARK", "0"])).is_err());
     }
 
     #[test]

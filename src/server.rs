@@ -587,6 +587,9 @@ async fn handle_redis_command_inner(
         } => {
             handle_blobasaur_vacuum(stream, state, target, mode, budget_mb, dry_run).await?;
         }
+        RedisCommand::BlobasaurWatermark => {
+            handle_blobasaur_watermark(stream, state).await?;
+        }
         RedisCommand::BlobasaurSync { .. } => {
             unreachable!("handle_connection hands BLOBASAUR.SYNC to the replication stream")
         }
@@ -1064,6 +1067,7 @@ const COMMANDS: &[CommandInfo] = &[
     ("client", -2, &[], 0, 0, 0),
     ("quit", -1, &["fast"], 0, 0, 0),
     ("blobasaur.vacuum", -7, &["admin"], 0, 0, 0),
+    ("blobasaur.watermark", 1, &["admin"], 0, 0, 0),
 ];
 
 fn command_info_frame(info: &CommandInfo) -> BytesFrame {
@@ -2437,6 +2441,34 @@ fn client_disconnected(stream: &TcpStream) -> bool {
         Some(Ok(0)) | Some(Err(_)) => true,
         Some(Ok(_)) | None => false,
     }
+}
+
+async fn handle_blobasaur_watermark(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let shards = futures::future::try_join_all(
+        (0..state.shard_senders.len()).map(|shard| replication::shard_watermark(state, shard)),
+    )
+    .await;
+    let response = match shards {
+        Ok(shards) => BytesFrame::Array(
+            shards
+                .into_iter()
+                .enumerate()
+                .map(|(shard, (replid, lsn))| {
+                    BytesFrame::Array(vec![
+                        BytesFrame::Integer(shard as i64),
+                        BytesFrame::BulkString(replid.into()),
+                        BytesFrame::BulkString(lsn.into()),
+                    ])
+                })
+                .collect(),
+        ),
+        Err(e) => BytesFrame::Error(format!("ERR {}", e).into()),
+    };
+    stream.write_all(&serialize_frame(&response)).await?;
+    Ok(())
 }
 
 async fn handle_blobasaur_vacuum(
