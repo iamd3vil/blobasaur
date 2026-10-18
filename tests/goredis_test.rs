@@ -30,6 +30,7 @@ async fn run_go_suite(async_write: bool) {
         batch_timeout_ms: Some(if async_write { 5 } else { 0 }),
         write_queue_capacity: None,
         addr: None,
+        replication: None,
         cluster: None,
         metrics: None,
         sqlite: None,

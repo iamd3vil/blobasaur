@@ -32,6 +32,7 @@ async fn start(max_request_size_mb: Option<u64>) -> Server {
         batch_timeout_ms: None,
         write_queue_capacity: None,
         addr: None,
+        replication: None,
         cluster: None,
         metrics: None,
         sqlite: None,

@@ -459,7 +459,54 @@ impl ShardMetrics {
         .record(duration);
     }
 
-    /// Record a cleanup failure at `stage`: discover or delete.
+    /// A replication stream of this shard, served to a replica, opened or closed.
+    pub fn record_replication_stream(&self, opened: bool) {
+        metrics::gauge!("blobasaur_replication_active_streams", "shard" => self.shard.clone())
+            .increment(if opened { 1.0 } else { -1.0 });
+    }
+
+    /// Replica: an Apply committed `rows` rows (`bytes` of stored values), leaving the
+    /// shard at `applied_lsn`, and at `caught_up_lsn` if it carried a watermark.
+    pub fn record_replica_applied(
+        &self,
+        rows: u64,
+        bytes: u64,
+        applied_lsn: Option<u64>,
+        caught_up_lsn: Option<u64>,
+    ) {
+        let shard = &self.shard;
+        metrics::counter!("blobasaur_replication_rows_applied_total", "shard" => shard.clone())
+            .increment(rows);
+        metrics::counter!("blobasaur_replication_bytes_applied_total", "shard" => shard.clone())
+            .increment(bytes);
+        self.set_replica_lsns(applied_lsn, caught_up_lsn);
+    }
+
+    /// Replica: sets the applied and caught-up LSN gauges that are known.
+    pub fn set_replica_lsns(&self, applied_lsn: Option<u64>, caught_up_lsn: Option<u64>) {
+        for (name, lsn) in [
+            ("blobasaur_replication_applied_lsn", applied_lsn),
+            ("blobasaur_replication_caught_up_lsn", caught_up_lsn),
+        ] {
+            if let Some(lsn) = lsn {
+                metrics::gauge!(name, "shard" => self.shard.clone()).set(lsn as f64);
+            }
+        }
+    }
+
+    /// Replica: the shard was reset for a full resync.
+    pub fn record_replica_resync(&self) {
+        metrics::counter!("blobasaur_replication_resyncs_total", "shard" => self.shard.clone())
+            .increment(1);
+    }
+
+    /// Replica: seconds since the last applied watermark.
+    pub fn set_replication_staleness(&self, seconds: f64) {
+        metrics::gauge!("blobasaur_replication_staleness_seconds", "shard" => self.shard.clone())
+            .set(seconds);
+    }
+
+    /// Record a cleanup failure at `stage`: discover, delete or trim.
     pub fn record_cleanup_error(&self, stage: &'static str) {
         metrics::counter!(
             "blobasaur_cleanup_errors_total",

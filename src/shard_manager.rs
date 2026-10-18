@@ -1,6 +1,6 @@
 use crate::metrics::{Metrics, ShardMetrics};
 use crate::redis::protocol::HExpireCondition;
-use crate::replication;
+use crate::replication::{self, Frame};
 use bytes::Bytes;
 use chrono::Utc;
 use metrics::Counter;
@@ -121,6 +121,27 @@ pub enum ShardWriteOperation {
         dry_run: bool,
         responder: oneshot::Sender<VacuumResult>,
     },
+    /// Replica only: applies a page of the primary's stream in one transaction.
+    Apply {
+        frames: Vec<Frame>,
+        responder: oneshot::Sender<Result<(), String>>,
+    },
+    /// Replica only: empties the shard to take a full copy of the primary
+    /// whose replication history is `replid`.
+    Reset {
+        replid: String,
+        responder: oneshot::Sender<Result<(), String>>,
+    },
+}
+
+impl ShardWriteOperation {
+    /// Runs alone, never inside a client batch, so it acts as an ordering barrier.
+    fn is_maintenance(&self) -> bool {
+        matches!(
+            self,
+            Self::Vacuum { .. } | Self::Apply { .. } | Self::Reset { .. }
+        )
+    }
 }
 
 /// A shard's write queue. Every enqueue goes through [`ShardSender::reserve`],
@@ -1020,7 +1041,7 @@ pub async fn shard_writer_task(writer: ShardWriter) {
     let mut deferred_operation: Option<ShardWriteOperation> = None;
 
     loop {
-        // The next op starts a batch, unless it's a vacuum, which runs alone.
+        // The next op starts a batch, unless it's a maintenance op, which runs alone.
         let next_operation = match deferred_operation.take() {
             Some(operation) => Some(operation),
             None => tokio::select! {
@@ -1042,6 +1063,19 @@ pub async fn shard_writer_task(writer: ShardWriter) {
                 let _ = responder.send(result);
                 continue;
             }
+            Some(ShardWriteOperation::Apply { frames, responder }) => {
+                let result = replication::apply(&pool, &mut known_tables, &frames).await;
+                let _ = responder.send(result.map(|lsn| {
+                    if let Some(lsn) = lsn {
+                        replication::publish(&commit_watch, lsn);
+                    }
+                }));
+                continue;
+            }
+            Some(ShardWriteOperation::Reset { replid, responder }) => {
+                let _ = responder.send(replication::reset(&pool, &replid).await);
+                continue;
+            }
             Some(operation) => {
                 batch.push_back(operation);
             }
@@ -1049,8 +1083,8 @@ pub async fn shard_writer_task(writer: ShardWriter) {
         }
 
         // Fill the batch until it's full or batch_timeout has passed since its
-        // first op: take what's queued, then wait for more. A vacuum is an
-        // ordering barrier, so it ends the batch and runs next. Expire and
+        // first op: take what's queued, then wait for more. Maintenance ops are
+        // ordering barriers, so they end the batch and run next. Expire and
         // HExpire don't update the inflight caches, so when the batch already
         // holds an async op for the same key/field they start the next batch:
         // that way the prior async op commits and clears its cache entry before
@@ -1075,9 +1109,7 @@ pub async fn shard_writer_task(writer: ShardWriter) {
                 }
             };
 
-            if matches!(operation, ShardWriteOperation::Vacuum { .. })
-                || conflicts_with_async_in_batch(&batch, &operation)
-            {
+            if operation.is_maintenance() || conflicts_with_async_in_batch(&batch, &operation) {
                 deferred_operation = Some(operation);
                 break;
             }
@@ -1113,14 +1145,14 @@ pub async fn shard_writer_task(writer: ShardWriter) {
     let mut drained = 0;
     loop {
         if let Some(operation) = deferred_operation.take()
-            && !matches!(operation, ShardWriteOperation::Vacuum { .. })
+            && !operation.is_maintenance()
         {
             batch.push_back(operation);
         }
         while batch.len() < batch_size {
             match receiver.recv().await {
-                // Dropping the responder reports the vacuum as cancelled.
-                Some(ShardWriteOperation::Vacuum { .. }) => {}
+                // Dropping the responder reports it as cancelled.
+                Some(op) if op.is_maintenance() => {}
                 Some(operation) if conflicts_with_async_in_batch(&batch, &operation) => {
                     deferred_operation = Some(operation);
                     break;
@@ -1297,7 +1329,9 @@ async fn process_batch(
                 | ShardWriteOperation::Delete { responder, .. }
                 | ShardWriteOperation::HSet { responder, .. }
                 | ShardWriteOperation::HSetEx { responder, .. }
-                | ShardWriteOperation::HDelete { responder, .. } => {
+                | ShardWriteOperation::HDelete { responder, .. }
+                | ShardWriteOperation::Apply { responder, .. }
+                | ShardWriteOperation::Reset { responder, .. } => {
                     let _ = responder.send(Err(error_message.clone()));
                 }
                 ShardWriteOperation::Expire { responder, .. } => {
@@ -1461,7 +1495,7 @@ async fn process_batch(
                 let table_name = namespace_table(namespace);
 
                 // Ensure table exists
-                if let Err(e) = ensure_namespaced_table_exists(
+                if let Err(e) = ensure_namespaced_table_exists_for_namespace(
                     &mut tx,
                     namespace,
                     known_tables,
@@ -1563,7 +1597,7 @@ async fn process_batch(
                 let table_name = namespace_table(namespace);
 
                 // Ensure table exists
-                if let Err(e) = ensure_namespaced_table_exists(
+                if let Err(e) = ensure_namespaced_table_exists_for_namespace(
                     &mut tx,
                     namespace,
                     known_tables,
@@ -1737,8 +1771,10 @@ async fn process_batch(
                     }
                 })
             }
-            ShardWriteOperation::Vacuum { .. } => {
-                Err("Vacuum operation reached transactional batch unexpectedly".to_string())
+            ShardWriteOperation::Vacuum { .. }
+            | ShardWriteOperation::Apply { .. }
+            | ShardWriteOperation::Reset { .. } => {
+                Err("Maintenance operation reached transactional batch unexpectedly".to_string())
             }
         };
 
@@ -1847,7 +1883,9 @@ async fn process_batch(
             | ShardWriteOperation::Delete { responder, .. }
             | ShardWriteOperation::HSet { responder, .. }
             | ShardWriteOperation::HSetEx { responder, .. }
-            | ShardWriteOperation::HDelete { responder, .. } => {
+            | ShardWriteOperation::HDelete { responder, .. }
+            | ShardWriteOperation::Apply { responder, .. }
+            | ShardWriteOperation::Reset { responder, .. } => {
                 let _ = responder.send(op_result(operation_idx));
             }
             ShardWriteOperation::Expire { responder, .. } => {
@@ -1949,7 +1987,7 @@ async fn finish_op(
 
 /// Records that `key` of `table` changed (or was deleted) and returns the new
 /// LSN. INSERT OR REPLACE, not an upsert: the row must get a new LSN.
-async fn log_change(
+pub(crate) async fn log_change(
     tx: &mut sqlx::Transaction<'_, Sqlite>,
     table: &str,
     key: &str,
@@ -2394,14 +2432,36 @@ async fn load_existing_tables(pool: &SqlitePool, shard_id: usize) -> HashSet<Str
 /// Ensures `namespace`'s table exists, creating it if necessary. A table it
 /// creates is added to `known_tables` and to `created`, so the caller can
 /// forget it again if the transaction or savepoint doesn't commit.
-async fn ensure_namespaced_table_exists(
+async fn ensure_namespaced_table_exists_for_namespace(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     namespace: &str,
     known_tables: &mut HashSet<String>,
     created: &mut Vec<String>,
 ) -> Result<(), String> {
     let table_name = namespace_table(namespace);
-    let table_name = table_name.as_str();
+    ensure_namespaced_table_inner(tx, &table_name, Some(namespace), known_tables, created).await
+}
+
+/// Ensures a namespaced table already identified by its SQLite `table_name`
+/// exists (used by replication apply). A table it creates is added to
+/// `known_tables` and `created` so the caller can forget it if the transaction
+/// doesn't commit.
+pub(crate) async fn ensure_namespaced_table_exists(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_name: &str,
+    known_tables: &mut HashSet<String>,
+    created: &mut Vec<String>,
+) -> Result<(), String> {
+    ensure_namespaced_table_inner(tx, table_name, None, known_tables, created).await
+}
+
+async fn ensure_namespaced_table_inner(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_name: &str,
+    namespace: Option<&str>,
+    known_tables: &mut HashSet<String>,
+    created: &mut Vec<String>,
+) -> Result<(), String> {
     if known_tables.contains(table_name) {
         return Ok(());
     }
@@ -2446,29 +2506,31 @@ async fn ensure_namespaced_table_exists(
             return Err(format!("Failed to create index: {}", e));
         }
 
-        if let Err(e) = sqlx::query(CREATE_BLOB_NAMESPACES_TABLE)
+        if let Some(namespace) = namespace {
+            if let Err(e) = sqlx::query(CREATE_BLOB_NAMESPACES_TABLE)
+                .execute(&mut *sp)
+                .await
+            {
+                tracing::error!("Failed to ensure blob_namespaces table: {}", e);
+                return Err(format!("Failed to create blob_namespaces table: {}", e));
+            }
+
+            if let Err(e) = sqlx::query(
+                "INSERT OR IGNORE INTO blob_namespaces (namespace, table_name) VALUES (?, ?)",
+            )
+            .bind(namespace)
+            .bind(table_name)
             .execute(&mut *sp)
             .await
-        {
-            tracing::error!("Failed to ensure blob_namespaces table: {}", e);
-            return Err(format!("Failed to create blob_namespaces table: {}", e));
-        }
-
-        if let Err(e) = sqlx::query(
-            "INSERT OR IGNORE INTO blob_namespaces (namespace, table_name) VALUES (?, ?)",
-        )
-        .bind(namespace)
-        .bind(table_name)
-        .execute(&mut *sp)
-        .await
-        {
-            tracing::error!(
-                "Failed to record namespace {} -> {} in blob_namespaces: {}",
-                namespace,
-                table_name,
-                e
-            );
-            return Err(format!("Failed to record namespace metadata: {}", e));
+            {
+                tracing::error!(
+                    "Failed to record namespace {} -> {} in blob_namespaces: {}",
+                    namespace,
+                    table_name,
+                    e
+                );
+                return Err(format!("Failed to record namespace metadata: {}", e));
+            }
         }
 
         Ok(())
@@ -2488,7 +2550,7 @@ async fn ensure_namespaced_table_exists(
             known_tables.insert(table_name.to_string());
             created.push(table_name.to_string());
             tracing::info!(
-                "Created namespaced table and expires_at index: {} (namespace: {})",
+                "Created namespaced table and expires_at index: {} (namespace: {:?})",
                 table_name,
                 namespace
             );
@@ -2596,7 +2658,8 @@ async fn delete_expired(
     Ok(total)
 }
 
-/// Background task to clean up expired keys from a shard
+/// Background task to clean up expired keys from a shard, and to trim old
+/// tombstones from its change index.
 #[allow(clippy::too_many_arguments)]
 pub async fn shard_cleanup_task(
     shard_id: usize,
@@ -2607,6 +2670,8 @@ pub async fn shard_cleanup_task(
     inflight_hcache: Cache<String, Pending>,
     key_count: Arc<AtomicI64>,
     commit_watch: Arc<watch::Sender<u64>>,
+    pins: Arc<replication::ShardPins>,
+    tombstone_retention_secs: u64,
     cancel: CancellationToken,
 ) {
     let mut interval = interval(Duration::from_secs(cleanup_interval_secs));
@@ -2707,6 +2772,11 @@ pub async fn shard_cleanup_task(
                     ok = false;
                 }
             }
+        }
+        if let Err(e) = replication::trim_tombstones(&pool, &pins, tombstone_retention_secs).await {
+            tracing::error!("[Shard {}] Error trimming tombstones: {}", shard_id, e);
+            shard_metrics.record_cleanup_error("trim");
+            ok = false;
         }
         shard_metrics.record_cleanup(ok, started.elapsed());
     }
@@ -6024,6 +6094,8 @@ mod tests {
                 hcache,
                 key_count,
                 commit_watch,
+                Arc::default(),
+                86400,
                 cancel,
             ),
         )

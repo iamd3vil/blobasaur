@@ -84,6 +84,9 @@ pub struct AppState {
     /// Per shard, the highest committed `repl_log` LSN. Published by whoever
     /// commits, so subscribers can wake on new changes.
     pub commit_watch: Vec<Arc<watch::Sender<u64>>>,
+    /// Per shard, the cursors of the replication streams being served; see
+    /// [`replication::ShardPins`].
+    pub repl_pins: Vec<Arc<replication::ShardPins>>,
 
     ring: HashRing<ShardNode>,
 }
@@ -156,6 +159,16 @@ impl AppState {
         cfg: Cfg,
         shard_receivers_out: &mut Vec<mpsc::Receiver<ShardWriteOperation>>,
     ) -> Result<Self> {
+        if let Some(primary) = cfg.replica_of() {
+            let cluster = cfg.cluster.as_ref().filter(|c| c.enabled);
+            let Some(cluster) = cluster else {
+                return Err(miette!("replication requires [cluster] to be enabled"));
+            };
+            if cluster.node_id == primary {
+                return Err(miette!("replica_of must be another node, not {}", primary));
+            }
+        }
+
         let mut shard_senders_vec = Vec::new();
         // Clear the output vector first to ensure it's empty
         shard_receivers_out.clear();
@@ -224,14 +237,19 @@ impl AppState {
         }
 
         // Index pre-existing rows and settle the replid before any writer runs.
+        let replica = cfg.replica_of().is_some();
+        if !replica {
+            let options: Vec<_> = (0..cfg.num_shards)
+                .map(|i| build_sqlite_connect_options(&cfg, i))
+                .collect();
+            replication::ensure_promotable(&options).await?;
+        }
         let mut commit_watch = Vec::with_capacity(cfg.num_shards);
         for i in 0..cfg.num_shards {
-            let lsn =
-                replication::init_shard(&build_sqlite_connect_options(&cfg, i), cfg.new_replid)
-                    .await
-                    .map_err(|e| {
-                        miette!("failed to initialize change index of shard {}: {}", i, e)
-                    })?;
+            let options = build_sqlite_connect_options(&cfg, i);
+            let lsn = replication::init_shard(&options, cfg.new_replid, replica)
+                .await
+                .map_err(|e| miette!("failed to initialize change index of shard {}: {}", i, e))?;
             commit_watch.push(Arc::new(watch::channel(lsn).0));
         }
 
@@ -357,6 +375,9 @@ impl AppState {
                         tracing::info!("Cluster manager initialized successfully");
                         Some(manager)
                     }
+                    Err(e) if cfg.replication.is_some() => {
+                        return Err(miette!("failed to initialize cluster manager: {}", e));
+                    }
                     Err(e) => {
                         tracing::error!("Failed to initialize cluster manager: {}", e);
                         None
@@ -379,6 +400,7 @@ impl AppState {
             ring.add(ShardNode(i as u64));
         }
 
+        let repl_pins = (0..cfg.num_shards).map(|_| Arc::default()).collect();
         Ok(AppState {
             cfg,
             shard_senders: shard_senders_vec,
@@ -393,6 +415,7 @@ impl AppState {
             metrics,
             key_locks: KeyLocks::default(),
             commit_watch,
+            repl_pins,
             ring,
         })
     }
@@ -428,6 +451,15 @@ impl AppState {
                 .set(self.shard_key_count(i) as f64);
             metrics::gauge!("blobasaur_write_queue_depth", "shard" => shard.clone())
                 .set(sender.queue_depth() as f64);
+            let role = if self.cfg.replica_of().is_some() {
+                "replica"
+            } else {
+                metrics::gauge!("blobasaur_replication_latest_lsn", "shard" => shard.clone())
+                    .set(*self.commit_watch[i].borrow() as f64);
+                "primary"
+            };
+            metrics::gauge!("blobasaur_replication_role", "shard" => shard.clone(), "role" => role)
+                .set(1.0);
             for (name, pool) in [
                 ("read", &self.db_pools[i]),
                 ("write", &self.write_db_pools[i]),
@@ -802,6 +834,7 @@ mod tests {
             batch_timeout_ms: Some(0),
             write_queue_capacity: None,
             addr: None,
+            replication: None,
             cluster: None,
             metrics: None,
             shutdown_timeout_secs: None,

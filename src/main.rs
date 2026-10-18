@@ -874,6 +874,7 @@ mod tests {
             batch_timeout_ms: None,
             write_queue_capacity: None,
             addr: Some("10.0.0.9:6379".to_string()),
+            replication: None,
             cluster: None,
             metrics: None,
             shutdown_timeout_secs: None,
@@ -903,6 +904,7 @@ mod tests {
             batch_timeout_ms: None,
             write_queue_capacity: None,
             addr: Some("0.0.0.0:6379".to_string()),
+            replication: None,
             cluster: None,
             metrics: None,
             shutdown_timeout_secs: None,
@@ -931,6 +933,7 @@ mod tests {
             batch_timeout_ms: None,
             write_queue_capacity: None,
             addr: Some("0.0.0.0:6379".to_string()),
+            replication: None,
             cluster: Some(config::ClusterConfig {
                 enabled: true,
                 node_id: "node1".to_string(),

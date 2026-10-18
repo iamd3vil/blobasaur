@@ -6,6 +6,7 @@ use crate::redis::{
     HExpireCondition, ParseError, RedisCommand, VacuumCommandMode, VacuumShardTarget,
     decode_request, parse_command, serialize_frame,
 };
+use crate::replication;
 use crate::shard_manager::{
     self, Pending, ShardWriteOperation, ShardWriter, VacuumMode, VacuumResult, VacuumStats,
 };
@@ -98,9 +99,27 @@ pub async fn run(
             state.inflight_hcache.clone(),
             state.shard_key_counts[i].clone(),
             state.commit_watch[i].clone(),
+            state.repl_pins[i].clone(),
+            cfg.tombstone_retention_secs(),
             writers_shutdown.clone(),
         )));
     }
+
+    // A replica keeps one stream per shard open to its primary. They stop with
+    // the connections, before the writers drain.
+    let replicas: Vec<_> = if cfg.replica_of().is_some() {
+        (0..cfg.num_shards)
+            .map(|i| {
+                tokio::spawn(crate::replication::replica_sync_task(
+                    state.clone(),
+                    i,
+                    shutdown.clone(),
+                ))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     // Start HTTP metrics server if enabled
     if let Some(handle) = prometheus_handle {
@@ -146,6 +165,10 @@ pub async fn run(
             "{} connections still running a command at the drain deadline; their writes will be rejected",
             connections.len()
         );
+    }
+
+    for replica in replicas {
+        let _ = replica.await;
     }
 
     // Cleanup stops between chunks on the same token. It commits too, so the
@@ -319,6 +342,24 @@ async fn handle_connection(
             release_large_buffer(&mut buffer, &mut grown_to);
 
             match parse_command(request) {
+                // A replica's stream takes over the connection.
+                Ok(RedisCommand::BlobasaurSync {
+                    shard,
+                    replid,
+                    lsn,
+                    num_shards,
+                    compression,
+                }) => {
+                    let request = replication::SyncRequest {
+                        shard,
+                        replid,
+                        lsn,
+                        num_shards,
+                        compression,
+                    };
+                    replication::serve_sync(stream, &state, &shutdown, request).await?;
+                    return Ok(());
+                }
                 Ok(command) => {
                     let quit = matches!(command, RedisCommand::Quit);
                     if let Err(e) =
@@ -585,6 +626,9 @@ async fn handle_redis_command_inner(
             dry_run,
         } => {
             handle_blobasaur_vacuum(stream, state, target, mode, budget_mb, dry_run).await?;
+        }
+        RedisCommand::BlobasaurSync { .. } => {
+            unreachable!("handle_connection hands BLOBASAUR.SYNC to the replication stream")
         }
         RedisCommand::Hello { protover } => {
             handle_hello(stream, protover).await?;
@@ -1223,6 +1267,12 @@ async fn validate_hash_namespace(
     );
     stream.write_all(&serialize_frame(&response)).await?;
     Ok(false)
+}
+
+/// Namespace tables are created per shard on the first HSET routed there, so a
+/// read can hit a shard without the table. That's a miss, not an error.
+pub(crate) fn is_missing_table(error: &sqlx::Error) -> bool {
+    matches!(error, sqlx::Error::Database(db) if db.message().starts_with("no such table"))
 }
 
 /// Whether a live hash field exists, for the commands that check before
@@ -2750,6 +2800,7 @@ mod tests {
                 batch_timeout_ms: Some(0),
                 write_queue_capacity: None,
                 addr: None,
+                replication: None,
                 cluster: None,
                 metrics: None,
                 shutdown_timeout_secs: None,
@@ -2835,6 +2886,7 @@ mod tests {
             batch_timeout_ms: Some(0),
             write_queue_capacity: None,
             addr: None,
+            replication: None,
             cluster: None,
             metrics: None,
             shutdown_timeout_secs: None,
