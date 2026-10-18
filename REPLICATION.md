@@ -1,6 +1,6 @@
 # Replication Design
 
-Status: proposed, not implemented.
+Status: implemented.
 
 ## Goals
 
@@ -260,9 +260,10 @@ Stream frames, primary → replica:
   wake-up, and at least every 10 s when idle. A scan reads pages of `repl_log`
   entries and their current rows, each page in one read transaction, capped by
   bytes as well as row count.
-- When a page comes back empty, the streamer sends `[watermark]`: the shard's
-  highest assigned LSN (`sqlite_sequence`), read in the same read transaction
-  as that empty page. Every entry up to it has therefore been sent, so it is
+- When a page reaches the head of the log (including an empty page), the
+  streamer sends `[watermark]`: the shard's highest assigned LSN
+  (`sqlite_sequence`), read in the same read transaction as that page. Every
+  entry up to it has therefore been sent, so it is
   never below the cursor. `primary_unix_ms` is the primary's clock at that
   read. This is how an empty or idle shard reports that it is caught up, and
   the idle rescan makes it a heartbeat.
@@ -359,6 +360,9 @@ fails. Today it logs the error and runs without a cluster manager.
 
 - `role`: `primary` | `replica-syncing` | `replica`
 - `primary`: `Option<String>`, the node id being replicated
+- `slot_ranges`: the node's slots as `[start, end]` ranges. One UDP datagram
+  can't carry a list of all 16384 slots, so ranges are the primary form; the
+  legacy `slots` list is still emitted when the node has at most 8192 slots.
 
 Replicas gossip no slots, so slot ownership logic is unaffected. The replica's
 sync task resolves the primary's address from gossip and reconnects when it
@@ -521,7 +525,12 @@ Each step is one PR.
    for a changed boot id with an unclean stop.
 3. **Sync stream**: `BLOBASAUR.SYNC` streamer, replica sync task, Apply and
    Reset ops, watermark and heartbeat frames, trimming with stream pins, socket
-   write timeouts, handshake checks, metrics. Integration tests: primary plus
+   write timeouts, handshake checks, metrics, and the roles and promotion
+   state (persisted role, promotion on startup). The streamer sends a
+   watermark whenever a page reaches the head of the log, not only on an empty
+   page. Phase 3 also found the gossip slot-list size limit (a node with all
+   16384 slots overflows one datagram); step 4 fixes it with slot ranges in
+   gossip. Integration tests: primary plus
    replica converge, including namespaced tables and an empty shard; replica
    restart resumes from `applied_lsn`; a replica behind `trimmed_through`
    resyncs and then completes a full copy; a key expired and cleaned up while
@@ -529,9 +538,9 @@ Each step is one PR.
 4. **Cluster roles**: gossip fields, `CLUSTER NODES` / `SLOTS` with replicas,
    `READONLY` / `READWRITE`, `route()`, read gating during `replica-syncing`.
    Test: go-redis with `ReadOnly: true` reads from the replica.
-5. **Failover**: persisted role and promotion on startup, `BLOBASAUR.WATERMARK`
-   with the writer barrier op, startup slot-conflict guard, failover runbook in
-   `CLUSTERING.md`.
+5. **Failover**: `BLOBASAUR.WATERMARK` with the writer barrier op, startup
+   slot-conflict guard, failover runbook in `CLUSTERING.md`. (Persisted role and
+   promotion on startup landed in step 3.)
 
 ## Alternatives considered
 

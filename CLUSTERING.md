@@ -18,8 +18,9 @@ Blobasaur implements Redis cluster protocol compatibility, allowing Redis cluste
 - Cross-node key operations with automatic redirects
 - Cluster state management and health monitoring
 
+- Asynchronous replication with manual failover (see [Replication](#replication))
+
 🚧 **Not Yet Implemented:**
-- Replication support (master-slave)
 - Online slot migration/resharding
 - Automatic failover
 
@@ -236,6 +237,83 @@ await cluster.set('mykey', 'myvalue');
 const value = await cluster.get('mykey');
 ```
 
+## Replication
+
+A node can replicate another node's slots. Replication is asynchronous: it gives you a live copy for disaster recovery and replicas that cluster clients can read from. It is not a backup (deletes replicate too), and a failover loses writes the primary acknowledged but had not yet replicated. Promotion is manual. Design and protocol details are in [REPLICATION.md](REPLICATION.md).
+
+### Configuration
+
+A replica is a cluster member that owns no slots and names the primary's `node_id`:
+
+```toml
+# config.node1b.toml: replica of node-1
+data_dir = "data"
+num_shards = 4                                              # same as node-1
+storage_compression = { enabled = true, algorithm = "zstd", level = 3 }  # same as node-1
+addr = "0.0.0.0:6384"
+
+[cluster]
+enabled = true
+node_id = "node-1b"
+seeds = ["127.0.0.1:7001"]
+advertise_addr = "127.0.0.1:6384"
+port = 7004
+# no slot_ranges: a replica owns no slots
+
+[replication]
+replica_of = "node-1"            # node id; its address is found through gossip
+tombstone_retention_secs = 86400 # on the primary; see below
+```
+
+- `num_shards` and the storage compression algorithm must match the primary. The primary rejects a replica that differs.
+- A new replica copies everything from the primary on first start; nothing else to do.
+- `tombstone_retention_secs` (default 86400) is how long a primary remembers deletes for disconnected replicas. A replica away for longer does a full resync.
+- A replica cannot replicate another replica.
+
+### Reading from replicas
+
+Send `READONLY` on a connection, and a replica serves reads (`GET`, `EXISTS`, `TTL`, `HGET`, `HEXISTS`) for its primary's slots. With go-redis set `ReadOnly: true` (add `RouteByLatency` or `RouteRandomly` to pick among replicas). Writes still go to the primary. Replica reads are eventually consistent, with no read-your-writes guarantee. A replica serves reads only once every shard has finished its first copy.
+
+### Monitoring
+
+The replication metrics are listed in [METRICS.md](METRICS.md). The one to alert on is `blobasaur_replication_staleness_seconds` on replicas (for example `> 60`): it keeps rising if the stream, the primary or the replica's writer stalls. Watch `blobasaur_replication_resyncs_total` for unexpected full copies, and compare `blobasaur_replication_latest_lsn` on the primary with `blobasaur_replication_caught_up_lsn` on the replica for LSN lag.
+
+### Failover
+
+Failover is manual and the operator fences the old primary. Nothing in the cluster stops two nodes from claiming the same slots; a node that starts with slots refuses to if it sees a live node already claiming them, but that check is best effort only.
+
+`BLOBASAUR.WATERMARK` helps decide when a replica is caught up. It returns one `[shard, replid, lsn]` entry per shard:
+- On a primary it first waits until every write acknowledged before the call (including `async_write` ones still queued) is committed, then returns the shard's highest LSN.
+- On a replica it returns the `caught_up_lsn`, or `not-synced` for a shard without a complete copy.
+
+#### Unplanned (the primary is lost)
+
+1. **Fence the old primary.** Make sure `node-1` is stopped and cannot restart with its old config: stop the unit, block its ports, or take the host down.
+2. **Wait for the cluster to see it as dead.** Run `valkey-cli -p 6384 CLUSTER NODES` (any live node) until `node-1` is no longer listed as live. Restarting the replica earlier fails: the startup guard refuses to start while a live node still claims the slots.
+3. **Promote the replica.** Edit `config.node1b.toml`: remove `[replication]`'s `replica_of` and add `node-1`'s slots, then restart it:
+   ```toml
+   [replication]
+   tombstone_retention_secs = 86400
+
+   [[cluster.slot_ranges]]
+   start = 0
+   end = 5460
+   ```
+   On start it promotes (refusing if any shard never finished its first copy) and generates a new `replid`. Check `valkey-cli -p 6384 CLUSTER NODES` shows it as `master` with the slots.
+4. **Repoint other replicas.** For every other replica of `node-1`, set `replica_of = "node-1b"` and restart it. It gets a resync and copies everything again.
+5. **Bring `node-1` back (optional).** Give it `replica_of = "node-1b"`, remove its `slot_ranges`, and start it. It resyncs from `node-1b`; writes it never replicated are discarded.
+
+#### Planned (maintenance)
+
+1. Stop client writes to the primary's slots in your application.
+2. On the primary, run `valkey-cli -p 6381 BLOBASAUR.WATERMARK` and note each shard's `replid` and `lsn`.
+3. On the replica, run `valkey-cli -p 6384 BLOBASAUR.WATERMARK` until every shard shows the same `replid` and an `lsn` at least the primary's. The primary stays up meanwhile, and its idle heartbeats deliver the watermark within about 10 seconds. `not-synced` means the shard is not ready.
+4. Stop and fence `node-1`, then continue from step 2 of the unplanned procedure. No acknowledged writes are lost.
+
+#### Restoring a primary from backup
+
+Replication cannot tell that a data directory was restored from an older backup or disk snapshot: it looks like a clean restart, and replicas would keep newer data. Start a restored primary once with `blobasaur serve --new-replid`, which makes its replicas resync.
+
 ## Hash Slot Calculation
 
 Blobasaur uses the same hash slot calculation as Redis:
@@ -408,9 +486,9 @@ docker-compose logs | grep -i gossip
 
 ## Current Limitations
 
-1. **No Replication:** Each slot is only stored on one node (no master-slave)
+1. **Asynchronous Replication:** Replicas can lag, and a failover loses unreplicated writes (see [Replication](#replication))
 2. **No Online Resharding:** Slot assignments are configured statically
-3. **No Automatic Failover:** Manual intervention required for node failures
+3. **No Automatic Failover:** Promotion is manual (see [Failover](#failover))
 4. **Basic Failure Detection:** Uses gossip protocol timeouts for node failure detection
 
 ## Architecture Details
