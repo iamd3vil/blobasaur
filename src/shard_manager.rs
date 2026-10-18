@@ -581,56 +581,14 @@ async fn process_batch(
         drop(conn);
         tracing::error!("[Shard {}] Failed to start transaction: {}", shard_id, e);
         let error_message = format!("Transaction start failed: {}", e);
-        clear_pending_entries(batch, inflight_cache, inflight_hcache).await;
-
-        // Send errors to all synchronous operations and clear batch
-        for operation in batch.drain(..) {
-            match operation {
-                ShardWriteOperation::Set { responder, .. }
-                | ShardWriteOperation::Delete { responder, .. }
-                | ShardWriteOperation::HSet { responder, .. }
-                | ShardWriteOperation::HSetEx { responder, .. }
-                | ShardWriteOperation::HDelete { responder, .. }
-                | ShardWriteOperation::Apply { responder, .. }
-                | ShardWriteOperation::Reset { responder, .. } => {
-                    let _ = responder.send(Err(error_message.clone()));
-                }
-                ShardWriteOperation::Expire { responder, .. } => {
-                    let _ = responder.send(Err(error_message.clone()));
-                }
-                ShardWriteOperation::HExpire { responder, .. } => {
-                    let _ = responder.send(Err(error_message.clone()));
-                }
-                ShardWriteOperation::Vacuum {
-                    mode,
-                    budget_bytes,
-                    dry_run,
-                    responder,
-                } => {
-                    let _ = responder.send(VacuumResult {
-                        mode,
-                        budget_bytes,
-                        dry_run,
-                        before: None,
-                        after: None,
-                        duration: Duration::ZERO,
-                        incremental_pages_requested: None,
-                        estimated_reclaimed_pages: None,
-                        errors: vec![error_message.clone()],
-                    });
-                }
-                ShardWriteOperation::SetAsync { .. }
-                | ShardWriteOperation::DeleteAsync { .. }
-                | ShardWriteOperation::HSetAsync { .. }
-                | ShardWriteOperation::HSetExAsync { .. }
-                | ShardWriteOperation::HDeleteAsync { .. } => {
-                    shard_metrics.async_write_failures_total.increment(1);
-                    shard_metrics.async_writes_pending.decrement(1.0);
-                }
-                // Never batched; dropping the responder reports it as cancelled.
-                ShardWriteOperation::Barrier { .. } => {}
-            }
-        }
+        fail_batch(
+            batch,
+            inflight_cache,
+            inflight_hcache,
+            shard_metrics,
+            error_message,
+        )
+        .await;
         return None;
     };
 
@@ -642,6 +600,9 @@ async fn process_batch(
     // Namespace tables created by this batch, which `known_tables` already lists.
     let mut added_tables: Vec<String> = Vec::new();
     let mut last_lsn: Option<i64> = None;
+    // Set when the transaction can't be trusted any more: SQLite rolled it back
+    // itself, so savepoint statements fail and later ops would run outside it.
+    let mut abort: Option<String> = None;
 
     // Execute all operations in the transaction
     for (idx, operation) in batch.iter_mut().enumerate() {
@@ -649,8 +610,8 @@ async fn process_batch(
         let operation = &*operation;
         if let Err(e) = sqlx::query("SAVEPOINT op").execute(&mut *tx).await {
             tracing::error!("[Shard {}] SAVEPOINT error: {}", shard_id, e);
-            results.push(Err(e.to_string()));
-            continue;
+            abort = Some(e.to_string());
+            break;
         }
         let added_before = added_tables.len();
         let result: Result<Option<LogEntry>, String> = match operation {
@@ -1007,10 +968,10 @@ async fn process_batch(
                 results.push(Ok(()));
             }
             Err(e) => {
-                for statement in ["ROLLBACK TO op", "RELEASE op"] {
-                    if let Err(e) = sqlx::query(statement).execute(&mut *tx).await {
-                        tracing::error!("[Shard {}] {} error: {}", shard_id, statement, e);
-                    }
+                if let Err(e) = rollback_op(&mut tx).await {
+                    tracing::error!("[Shard {}] savepoint recovery error: {}", shard_id, e);
+                    abort = Some(e.to_string());
+                    break;
                 }
                 for table in added_tables.drain(added_before..) {
                     known_tables.remove(&table);
@@ -1018,6 +979,31 @@ async fn process_batch(
                 results.push(Err(e));
             }
         }
+    }
+
+    if let Some(e) = abort {
+        // Nothing of this batch is safe: the ops that ran before the failure
+        // were rolled back with it. SQLite may have ended the transaction
+        // already, so a failing ROLLBACK is expected. Don't pool the connection.
+        let _ = tx.rollback().await;
+        if let Ok(conn) = conn {
+            let _ = conn.close().await;
+        }
+        for table in &added_tables {
+            known_tables.remove(table);
+        }
+        shard_metrics.record_sqlite_error("execute", &e);
+        shard_metrics.record_transaction(false, tx_start.elapsed());
+        let error_message = format!("Transaction aborted: {}", e);
+        fail_batch(
+            batch,
+            inflight_cache,
+            inflight_hcache,
+            shard_metrics,
+            error_message,
+        )
+        .await;
+        return None;
     }
 
     // Commit transaction
@@ -1134,6 +1120,73 @@ async fn process_batch(
     }
 
     commit_result.ok().and(last_lsn).map(|lsn| lsn as u64)
+}
+
+/// Fails every op of `batch` with `error_message`, and clears it.
+async fn fail_batch(
+    batch: &mut VecDeque<ShardWriteOperation>,
+    inflight_cache: &Cache<String, Pending>,
+    inflight_hcache: &Cache<String, Pending>,
+    shard_metrics: &ShardMetrics,
+    error_message: String,
+) {
+    clear_pending_entries(batch, inflight_cache, inflight_hcache).await;
+
+    // Send errors to all synchronous operations and clear batch
+    for operation in batch.drain(..) {
+        match operation {
+            ShardWriteOperation::Set { responder, .. }
+            | ShardWriteOperation::Delete { responder, .. }
+            | ShardWriteOperation::HSet { responder, .. }
+            | ShardWriteOperation::HSetEx { responder, .. }
+            | ShardWriteOperation::HDelete { responder, .. }
+            | ShardWriteOperation::Apply { responder, .. }
+            | ShardWriteOperation::Reset { responder, .. } => {
+                let _ = responder.send(Err(error_message.clone()));
+            }
+            ShardWriteOperation::Expire { responder, .. } => {
+                let _ = responder.send(Err(error_message.clone()));
+            }
+            ShardWriteOperation::HExpire { responder, .. } => {
+                let _ = responder.send(Err(error_message.clone()));
+            }
+            ShardWriteOperation::Vacuum {
+                mode,
+                budget_bytes,
+                dry_run,
+                responder,
+            } => {
+                let _ = responder.send(VacuumResult {
+                    mode,
+                    budget_bytes,
+                    dry_run,
+                    before: None,
+                    after: None,
+                    duration: Duration::ZERO,
+                    incremental_pages_requested: None,
+                    estimated_reclaimed_pages: None,
+                    errors: vec![error_message.clone()],
+                });
+            }
+            ShardWriteOperation::SetAsync { .. }
+            | ShardWriteOperation::DeleteAsync { .. }
+            | ShardWriteOperation::HSetAsync { .. }
+            | ShardWriteOperation::HSetExAsync { .. }
+            | ShardWriteOperation::HDeleteAsync { .. } => {
+                shard_metrics.async_write_failures_total.increment(1);
+                shard_metrics.async_writes_pending.decrement(1.0);
+            }
+            // Never batched; dropping the responder reports it as cancelled.
+            ShardWriteOperation::Barrier { .. } => {}
+        }
+    }
+}
+
+/// Undoes the current op and pops its savepoint.
+async fn rollback_op(tx: &mut sqlx::Transaction<'_, Sqlite>) -> Result<(), sqlx::Error> {
+    sqlx::query("ROLLBACK TO op").execute(&mut **tx).await?;
+    sqlx::query("RELEASE op").execute(&mut **tx).await?;
+    Ok(())
 }
 
 /// Writes the op's `repl_log` entry, if its data change needs one, and releases
@@ -2967,6 +3020,54 @@ mod tests {
             lsn_of(&pool, "blobs_ns1", "next").await.unwrap()
         );
         assert!(known.contains("blobs_ns1"));
+    }
+
+    #[tokio::test]
+    async fn a_failure_that_rolls_back_the_transaction_fails_the_whole_batch() {
+        let (_dir, pool) = create_test_pool().await;
+        // Unlike ABORT, ROLLBACK ends the whole transaction, so the savepoint
+        // recovery fails and later ops would otherwise commit on their own.
+        sqlx::query(
+            "CREATE TRIGGER rollback_bad BEFORE INSERT ON repl_log WHEN NEW.key = 'bad'
+             BEGIN SELECT RAISE(ROLLBACK, 'forced rollback'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let known = &mut blobs_only();
+
+        let mut receivers = Vec::new();
+        let mut ops = Vec::new();
+        for (op, rx) in [
+            hset("ns1", "early"),
+            set("good"),
+            set("bad"),
+            set("late"),
+            hset("ns2", "late"),
+        ] {
+            ops.push(op);
+            receivers.push(rx);
+        }
+        assert_eq!(run_batch(&pool, known, ops).await, None);
+
+        for rx in receivers {
+            assert!(rx.await.unwrap().is_err());
+        }
+        assert!(keys(&pool, "blobs").await.is_empty());
+        assert!(repl_log(&pool).await.is_empty());
+        assert_eq!(*known, blobs_only());
+
+        // The writer recovers: the next batch commits, tables included.
+        let (next, next_rx) = hset("ns1", "next");
+        assert!(
+            run_batch(&pool, known, vec![set("good").0, next])
+                .await
+                .is_some()
+        );
+        assert_eq!(next_rx.await.unwrap(), Ok(()));
+        assert_eq!(keys(&pool, "blobs").await, vec!["good"]);
+        assert_eq!(keys(&pool, "blobs_ns1").await, vec!["next"]);
+        assert_eq!(repl_log(&pool).await.len(), 2);
     }
 
     #[tokio::test]
