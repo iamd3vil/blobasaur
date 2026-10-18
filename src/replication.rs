@@ -241,7 +241,7 @@ pub async fn ensure_promotable(options: &[SqliteConnectOptions]) -> Result<()> {
         let replica = get_state(&mut conn, "role").await?.as_deref() == Some("replica");
         if replica && get_state(&mut conn, "synced").await?.as_deref() != Some("1") {
             return Err(miette!(
-                "cannot promote: shard {} never finished syncing from its primary",
+                "cannot start as a primary: shard {} holds an incomplete copy from its primary; start it as a replica to finish syncing, or remove its data",
                 shard
             ));
         }
