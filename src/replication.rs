@@ -601,6 +601,41 @@ async fn primary_state(pool: &SqlitePool) -> Result<(String, u64, u64), sqlx::Er
     Ok((replid.unwrap_or_default(), trimmed, watermark as u64))
 }
 
+/// One shard's `(replid, lsn)` for `BLOBASAUR.WATERMARK`. A primary first
+/// waits for its writer to commit everything queued, so every acknowledged
+/// write has an LSN, and reports the highest one. A replica reports its
+/// `caught_up_lsn`, or `not-synced` for a shard that holds no complete copy.
+pub async fn shard_watermark(state: &AppState, shard: usize) -> Result<(String, String)> {
+    let replica = state.cfg.replica_of().is_some();
+    if !replica {
+        let (responder, done) = oneshot::channel();
+        state.shard_senders[shard]
+            .send(ShardWriteOperation::Barrier { responder })
+            .await
+            .map_err(|_| miette!("shard {} writer is gone", shard))?;
+        done.await
+            .map_err(|_| miette!("shard {} writer is gone", shard))?;
+    }
+    let mut tx = state.db_pools[shard]
+        .begin()
+        .await
+        .map_err(|e| miette!("shard {} read failed: {}", shard, e))?;
+    let replid = get_state(&mut tx, "replid").await?.unwrap_or_default();
+    let lsn = if !replica {
+        watermark(&mut tx)
+            .await
+            .map_err(|e| miette!("shard {} read failed: {}", shard, e))?
+            .to_string()
+    } else {
+        let synced = get_state(&mut tx, "synced").await?.as_deref() == Some("1");
+        match get_state(&mut tx, "caught_up_lsn").await? {
+            Some(lsn) if synced => lsn,
+            _ => "not-synced".to_string(),
+        }
+    };
+    Ok((replid, lsn))
+}
+
 /// Serves one replica's `BLOBASAUR.SYNC`. Takes over the connection: after the
 /// handshake reply it only streams, until the replica hangs up, a write fails
 /// or times out, or `shutdown` is cancelled.

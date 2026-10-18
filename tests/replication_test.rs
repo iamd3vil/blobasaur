@@ -46,6 +46,7 @@ struct Opts<'a> {
     shards: usize,
     retention_secs: u64,
     zstd: bool,
+    async_write: bool,
 }
 
 impl<'a> Opts<'a> {
@@ -58,6 +59,7 @@ impl<'a> Opts<'a> {
             shards,
             retention_secs: 86400,
             zstd: false,
+            async_write: false,
         }
     }
 
@@ -94,7 +96,7 @@ fn cfg(dir: &Path, o: &Opts, addr: SocketAddr, gossip_port: u16) -> Cfg {
             algorithm: CompressionType::Zstd,
             level: Some(3),
         }),
-        async_write: Some(false),
+        async_write: Some(o.async_write),
         batch_size: None,
         batch_timeout_ms: None,
         addr: Some(addr.to_string()),
@@ -665,4 +667,193 @@ async fn a_failed_cluster_start_stops_a_replicated_node() {
         "wrong error"
     );
     drop(taken);
+}
+
+/// `BLOBASAUR.WATERMARK`: per shard `(replid, lsn)`, the LSN as the reply's text.
+async fn watermark(client: &mut Client) -> Result<Vec<(String, String)>, String> {
+    client
+        .0
+        .get_mut()
+        .write_all(b"*1\r\n$19\r\nBLOBASAUR.WATERMARK\r\n")
+        .await
+        .unwrap();
+    let header = client.line().await;
+    let Some(n) = header.strip_prefix('*') else {
+        return Err(header);
+    };
+    let mut shards = Vec::new();
+    for shard in 0..n.parse::<usize>().unwrap() {
+        assert_eq!(client.line().await, "*3");
+        assert_eq!(client.line().await, format!(":{shard}"));
+        client.line().await;
+        let replid = client.line().await;
+        client.line().await;
+        shards.push((replid, client.line().await));
+    }
+    Ok(shards)
+}
+
+/// A shard's highest assigned LSN, from the DB.
+async fn latest_lsn(dir: &Path, shard: usize) -> u64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COALESCE(MAX(seq), 0) FROM sqlite_sequence WHERE name = 'repl_log'",
+    )
+    .fetch_one(&mut connect_db(dir, shard).await)
+    .await
+    .unwrap() as u64
+}
+
+/// Whether every shard of `marks` is under the primary's replid and at or past
+/// the primary's LSN in `target`.
+fn reached(marks: &[(String, String)], target: &[(String, String)]) -> bool {
+    marks.iter().zip(target).all(|((rid, rl), (pid, pl))| {
+        rid == pid && rl.parse::<u64>().is_ok_and(|l| l >= pl.parse().unwrap())
+    })
+}
+
+async fn reached_by(addr: SocketAddr, target: &[(String, String)]) -> bool {
+    reached(
+        &watermark(&mut Client::connect(addr).await).await.unwrap(),
+        target,
+    )
+}
+
+#[tokio::test]
+async fn watermark_on_a_primary_covers_acknowledged_async_writes() {
+    const SHARDS: usize = 2;
+    let pdir = TempDir::new().unwrap();
+    let primary = start(
+        pdir.path(),
+        &Opts {
+            async_write: true,
+            ..Opts::primary("p", SHARDS)
+        },
+    )
+    .await;
+    let mut client = Client::connect(primary.addr).await;
+    for i in 0..20 {
+        ok(&mut client, &["SET", &k(&format!("k{i}_")), "v"]).await;
+    }
+
+    let marks = watermark(&mut client).await.unwrap();
+    assert_eq!(marks.len(), SHARDS);
+    // Each key is one log entry, so the LSNs add up to the writes, and they
+    // are already committed rather than still queued.
+    let mut total = 0;
+    for (shard, (replid, lsn)) in marks.iter().enumerate() {
+        assert_eq!(*replid, state(pdir.path(), shard, "replid").await.unwrap());
+        let lsn: u64 = lsn.parse().unwrap();
+        assert_eq!(lsn, latest_lsn(pdir.path(), shard).await);
+        total += lsn;
+    }
+    assert_eq!(total, 20);
+    assert_eq!(snapshot(pdir.path(), SHARDS).await.len(), 20);
+
+    primary.stop().await;
+}
+
+#[tokio::test]
+async fn watermark_on_a_replica_reports_caught_up_lsn_or_not_synced() {
+    const SHARDS: usize = 2;
+    let (pdir, rdir, odir) = (
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    );
+
+    // A replica of a node that never shows up has no copy.
+    let orphan = start(
+        odir.path(),
+        &Opts::replica("o", "ghost", Vec::new(), SHARDS),
+    )
+    .await;
+    let mut client = Client::connect(orphan.addr).await;
+    let marks = watermark(&mut client).await.unwrap();
+    assert_eq!(marks.len(), SHARDS);
+    assert!(
+        marks.iter().all(|(_, lsn)| lsn == "not-synced"),
+        "{marks:?}"
+    );
+    orphan.stop().await;
+
+    let primary = start(
+        pdir.path(),
+        &Opts {
+            async_write: true,
+            ..Opts::primary("p", SHARDS)
+        },
+    )
+    .await;
+    let replica = start(
+        rdir.path(),
+        &Opts::replica("r", "p", vec![primary.gossip.clone()], SHARDS),
+    )
+    .await;
+    let mut pclient = Client::connect(primary.addr).await;
+    for i in 0..20 {
+        ok(&mut pclient, &["SET", &k(&format!("k{i}_")), "v"]).await;
+    }
+    let target = watermark(&mut pclient).await.unwrap();
+
+    let raddr = replica.addr;
+    wait_for("the replica's watermark to reach the primary's", || {
+        reached_by(raddr, &target)
+    })
+    .await;
+    assert!(converged(pdir.path(), rdir.path(), SHARDS).await);
+
+    replica.stop().await;
+    primary.stop().await;
+}
+
+#[tokio::test]
+async fn planned_failover_promotes_the_replica_without_losing_writes() {
+    const SHARDS: usize = 2;
+    let (pdir, rdir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let primary = start(
+        pdir.path(),
+        &Opts {
+            async_write: true,
+            ..Opts::primary("p", SHARDS)
+        },
+    )
+    .await;
+    let replica = start(
+        rdir.path(),
+        &Opts::replica("r", "p", vec![primary.gossip.clone()], SHARDS),
+    )
+    .await;
+    let mut client = Client::connect(primary.addr).await;
+    for i in 0..20 {
+        let (key, value) = (k(&format!("k{i}_")), format!("v{i}"));
+        ok(&mut client, &["SET", &key, &value]).await;
+    }
+
+    // Steps 2 and 3 of the planned procedure.
+    let target = watermark(&mut client).await.unwrap();
+    let raddr = replica.addr;
+    wait_for("the replica to reach the primary's watermark", || {
+        reached_by(raddr, &target)
+    })
+    .await;
+    drop(client);
+
+    // Step 4: stop the primary, restart the replica as primary with its slots.
+    primary.stop().await;
+    replica.stop().await;
+    let promoted = start(rdir.path(), &Opts::primary("r", SHARDS)).await;
+    let mut client = Client::connect(promoted.addr).await;
+    for i in 0..20 {
+        let (key, value) = (k(&format!("k{i}_")), format!("v{i}"));
+        assert_eq!(
+            client.call(&["GET", &key]).await,
+            [format!("${}", value.len())]
+        );
+        assert_eq!(client.line().await, value);
+    }
+    let marks = watermark(&mut client).await.unwrap();
+    assert!(marks.iter().all(|(replid, _)| *replid != target[0].0));
+    ok(&mut client, &["SET", &k("after"), "promoted"]).await;
+
+    promoted.stop().await;
 }
