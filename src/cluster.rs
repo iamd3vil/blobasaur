@@ -161,9 +161,10 @@ const GOSSIP_VALUE_MAX: usize = 56_000;
 struct NodeGossipData {
     pub addr: String,
     /// Every owned slot. Only for old nodes, which read nothing else; empty when
-    /// the whole value would exceed `GOSSIP_VALUE_MAX`. Can be dropped in a later release.
+    /// only the ranges fit `GOSSIP_VALUE_MAX`. Can be dropped in a later release.
     pub slots: Vec<u16>,
-    /// Owned slots as inclusive `(start, end)` runs. Read in preference to `slots`.
+    /// Owned slots as inclusive `(start, end)` runs. Read in preference to `slots`;
+    /// empty when the list alone fits but not both.
     #[serde(default)]
     pub slot_ranges: Vec<(u16, u16)>,
     pub state: String,
@@ -174,10 +175,18 @@ struct NodeGossipData {
 }
 
 impl NodeGossipData {
-    fn new(addr: String, slots: &HashSet<u16>, role: NodeRole, primary: Option<String>) -> Self {
+    /// Encodes `slots` as both a list and ranges if that fits `GOSSIP_VALUE_MAX`,
+    /// else as whichever one alone fits, preferring the list old nodes can read.
+    /// Errors if neither fits: peers would never receive the value.
+    fn new(
+        addr: String,
+        slots: &HashSet<u16>,
+        role: NodeRole,
+        primary: Option<String>,
+    ) -> Result<Self, String> {
         let mut list: Vec<u16> = slots.iter().copied().collect();
         list.sort_unstable();
-        let mut data = Self {
+        let both = Self {
             addr,
             slots: list,
             slot_ranges: ClusterManager::slot_runs(slots),
@@ -185,18 +194,38 @@ impl NodeGossipData {
             role,
             primary,
         };
-        let size = serde_json::to_string(&data).map_or(0, |json| json.len());
-        if size > GOSSIP_VALUE_MAX {
-            static WARNED: Once = Once::new();
-            WARNED.call_once(|| {
-                warn!(
-                    "This node's slots are too many to gossip as a list ({} bytes): peers older than this version can't see them. Upgrade every peer before giving a node this many slots",
-                    size
-                )
-            });
-            data.slots = Vec::new();
+        let size = |data: &Self| serde_json::to_string(data).map_or(usize::MAX, |json| json.len());
+        if size(&both) <= GOSSIP_VALUE_MAX {
+            return Ok(both);
         }
-        data
+        // Scattered slots: the ranges can be longer than the list.
+        let list_only = Self {
+            slot_ranges: Vec::new(),
+            ..both.clone()
+        };
+        if size(&list_only) <= GOSSIP_VALUE_MAX {
+            return Ok(list_only);
+        }
+        let ranges_only = Self {
+            slots: Vec::new(),
+            ..both
+        };
+        let ranges_size = size(&ranges_only);
+        if ranges_size > GOSSIP_VALUE_MAX {
+            return Err(format!(
+                "this node's {} slots are too scattered to gossip ({} bytes as ranges, limit {})",
+                slots.len(),
+                ranges_size,
+                GOSSIP_VALUE_MAX
+            ));
+        }
+        static WARNED: Once = Once::new();
+        WARNED.call_once(|| {
+            warn!(
+                "This node's slots are too many to gossip as a list: peers older than this version can't see them. Upgrade every peer before giving a node this many slots"
+            )
+        });
+        Ok(ranges_only)
     }
 
     fn owned_slots(&self) -> HashSet<u16> {
@@ -310,7 +339,7 @@ impl ClusterManager {
             &HashSet::new(),
             replica_of.map_or(NodeRole::Primary, |_| NodeRole::ReplicaSyncing),
             replica_of.map(str::to_string),
-        );
+        )?;
 
         let gossip_data_json = serde_json::to_string(&initial_gossip_data)
             .map_err(|e| format!("Failed to serialize gossip data: {}", e))?;
@@ -525,8 +554,8 @@ impl ClusterManager {
             replica.synced[shard] = synced;
             before != replica.role()
         };
-        if changed {
-            self.update_gossip_data().await;
+        if changed && let Err(e) = self.update_gossip_data().await {
+            error!("Failed to gossip the new role: {}", e);
         }
     }
 
@@ -575,7 +604,7 @@ impl ClusterManager {
 
         let count = slots.len();
         *self.local_slots.write().await = slots;
-        self.update_gossip_data().await;
+        self.update_gossip_data().await?;
         info!("Cluster node {} claimed {} slots", self.node_id, count);
         Ok(())
     }
@@ -819,13 +848,20 @@ impl ClusterManager {
             return Err("ERR this node is a replica".into());
         }
         let mut local_slots = self.local_slots.write().await;
-        for slot in &slots {
-            local_slots.insert(*slot);
-        }
+        let added: Vec<u16> = slots
+            .iter()
+            .copied()
+            .filter(|slot| local_slots.insert(*slot))
+            .collect();
         drop(local_slots);
 
-        // Update gossip data
-        self.update_gossip_data().await;
+        if let Err(e) = self.update_gossip_data().await {
+            let mut local_slots = self.local_slots.write().await;
+            for slot in &added {
+                local_slots.remove(slot);
+            }
+            return Err(format!("ERR {}", e).into());
+        }
 
         info!("Added slots {:?} to local node", slots);
         Ok(())
@@ -840,20 +876,25 @@ impl ClusterManager {
             return Err("ERR this node is a replica".into());
         }
         let mut local_slots = self.local_slots.write().await;
-        for slot in &slots {
-            local_slots.remove(slot);
-        }
+        let removed: Vec<u16> = slots
+            .iter()
+            .copied()
+            .filter(|slot| local_slots.remove(slot))
+            .collect();
         drop(local_slots);
 
-        // Update gossip data
-        self.update_gossip_data().await;
+        if let Err(e) = self.update_gossip_data().await {
+            self.local_slots.write().await.extend(removed);
+            return Err(format!("ERR {}", e).into());
+        }
 
         info!("Removed slots {:?} from local node", slots);
         Ok(())
     }
 
-    /// Update gossip data with the current slots and role
-    async fn update_gossip_data(&self) {
+    /// Update gossip data with the current slots and role. Errors, leaving the
+    /// gossiped value as it was, if the slots can't be encoded within a datagram.
+    async fn update_gossip_data(&self) -> Result<(), String> {
         if let Some(handle) = self.chitchat_handle.as_ref() {
             let (local_ip, local_port) = local_endpoint(&self.config, self.local_addr);
             let chitchat_arc = handle.chitchat();
@@ -865,7 +906,7 @@ impl ClusterManager {
                 &*self.local_slots.read().await,
                 self.role(),
                 self.replica_primary(),
-            );
+            )?;
 
             if let Ok(gossip_data_json) = serde_json::to_string(&gossip_data) {
                 debug!("Updating gossip data: {}", gossip_data_json);
@@ -881,6 +922,7 @@ impl ClusterManager {
                 error!("Failed to serialize gossip data");
             }
         }
+        Ok(())
     }
 
     /// Get slots owned by this node
@@ -1186,7 +1228,8 @@ mod tests {
     #[test]
     fn test_gossip_encodes_ranges_and_legacy_slots() {
         let slots: HashSet<u16> = [0, 1, 2, 9].into_iter().collect();
-        let data = NodeGossipData::new("10.0.0.1:6379".into(), &slots, NodeRole::Primary, None);
+        let data =
+            NodeGossipData::new("10.0.0.1:6379".into(), &slots, NodeRole::Primary, None).unwrap();
         assert_eq!(data.slots, vec![0, 1, 2, 9]);
         assert_eq!(data.slot_ranges, vec![(0, 2), (9, 9)]);
         let json = serde_json::to_string(&data).unwrap();
@@ -1204,7 +1247,8 @@ mod tests {
             slots: Vec<u16>,
         }
         let all = |n: u16| (0..n).collect::<HashSet<u16>>();
-        let at_limit = NodeGossipData::new("a:1".into(), &all(9000), NodeRole::Primary, None);
+        let at_limit =
+            NodeGossipData::new("a:1".into(), &all(9000), NodeRole::Primary, None).unwrap();
         assert_eq!(at_limit.slots.len(), 9000);
         let json = serde_json::to_string(&at_limit).unwrap();
         assert!(json.len() <= GOSSIP_VALUE_MAX, "{} bytes", json.len());
@@ -1214,9 +1258,9 @@ mod tests {
         );
         // The worst case for 9000 slots: all five digits.
         let high: HashSet<u16> = (7384..16384).collect();
-        let high = NodeGossipData::new("a:1".into(), &high, NodeRole::Primary, None);
+        let high = NodeGossipData::new("a:1".into(), &high, NodeRole::Primary, None).unwrap();
         assert_eq!(high.slots.len(), 9000);
-        let full = NodeGossipData::new("a:1".into(), &all(16384), NodeRole::Primary, None);
+        let full = NodeGossipData::new("a:1".into(), &all(16384), NodeRole::Primary, None).unwrap();
         assert!(full.slots.is_empty());
         assert_eq!(full.slot_ranges, vec![(0, 16383)]);
         let json = serde_json::to_string(&full).unwrap();
@@ -1227,6 +1271,24 @@ mod tests {
                 .owned_slots()
                 .len(),
             16384
+        );
+    }
+
+    #[test]
+    fn test_gossip_falls_back_to_whichever_encoding_fits() {
+        // Every other slot: the ranges are longer than the list, so the list
+        // alone is sent (and old nodes can still read it).
+        let alternating: HashSet<u16> = (0..16384).step_by(2).collect();
+        let data =
+            NodeGossipData::new("a:1".into(), &alternating, NodeRole::Primary, None).unwrap();
+        assert!(data.slot_ranges.is_empty());
+        let json = serde_json::to_string(&data).unwrap();
+        assert!(json.len() <= GOSSIP_VALUE_MAX, "{} bytes", json.len());
+        assert_eq!(
+            serde_json::from_str::<NodeGossipData>(&json)
+                .unwrap()
+                .owned_slots(),
+            alternating
         );
     }
 
@@ -1248,7 +1310,8 @@ mod tests {
             &HashSet::new(),
             NodeRole::ReplicaSyncing,
             Some("node-a".into()),
-        );
+        )
+        .unwrap();
         let json = serde_json::to_string(&replica).unwrap();
         assert!(json.contains(r#""role":"replica-syncing""#), "{json}");
         assert!(json.contains(r#""primary":"node-a""#), "{json}");
