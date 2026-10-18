@@ -16,6 +16,7 @@ pub mod http_server;
 pub mod metrics;
 pub mod migration;
 pub mod redis;
+pub mod replication;
 pub mod server;
 pub mod shard_manager;
 

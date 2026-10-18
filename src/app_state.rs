@@ -8,7 +8,7 @@ use std::fs;
 use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
-use tokio::sync::{Mutex, MutexGuard, Semaphore, mpsc};
+use tokio::sync::{Mutex, MutexGuard, Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
 
 use crate::compression::{self, Compressor};
@@ -17,18 +17,36 @@ use crate::{
     cluster::ClusterManager,
     config::Cfg,
     metrics::{Metrics, ShardMetrics},
+    replication,
     shard_manager::{
         ALL_KEY_TABLES_QUERY, Pending, ShardSender, ShardWriteOperation, wal_checkpoint_truncate,
     },
 };
 
-const CREATE_BLOBS_TABLE: &str = "CREATE TABLE IF NOT EXISTS blobs (
+pub(crate) const CREATE_BLOBS_TABLE: &str = "CREATE TABLE IF NOT EXISTS blobs (
     key TEXT PRIMARY KEY,
     data BLOB,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     expires_at INTEGER,
     version INTEGER NOT NULL DEFAULT 0
+)";
+
+/// The change index: one row per key, holding the LSN of its last change.
+/// AUTOINCREMENT keeps LSNs from being reused after a row is deleted, and
+/// writers use INSERT OR REPLACE so a rewritten key gets a new LSN.
+pub(crate) const CREATE_REPL_LOG: &str = "CREATE TABLE IF NOT EXISTS repl_log (
+    lsn INTEGER PRIMARY KEY AUTOINCREMENT,
+    tbl TEXT NOT NULL,
+    key TEXT NOT NULL,
+    deleted INTEGER NOT NULL,
+    at INTEGER NOT NULL,
+    UNIQUE (tbl, key)
+)";
+
+pub(crate) const CREATE_REPL_STATE: &str = "CREATE TABLE IF NOT EXISTS repl_state (
+    k TEXT PRIMARY KEY,
+    v
 )";
 
 #[derive(Hash)]
@@ -63,6 +81,9 @@ pub struct AppState {
     pub metrics: Metrics,
     /// Held by commands that check a key before writing it; see [`KeyLocks`].
     pub key_locks: KeyLocks,
+    /// Per shard, the highest committed `repl_log` LSN. Published by whoever
+    /// commits, so subscribers can wake on new changes.
+    pub commit_watch: Vec<Arc<watch::Sender<u64>>>,
 
     ring: HashRing<ShardNode>,
 }
@@ -192,9 +213,26 @@ impl AppState {
             crate::shard_manager::migrate_shard_schema(&mut conn, i)
                 .await
                 .map_err(|e| miette!("failed to migrate schema in shard {} DB: {}", i, e))?;
+            for ddl in [CREATE_REPL_LOG, CREATE_REPL_STATE] {
+                sqlx::query(ddl).execute(&mut conn).await.map_err(|e| {
+                    miette!("failed to create change index in shard {} DB: {}", i, e)
+                })?;
+            }
             conn.close()
                 .await
                 .map_err(|e| miette!("failed to close shard {} DB: {}", i, e))?;
+        }
+
+        // Index pre-existing rows and settle the replid before any writer runs.
+        let mut commit_watch = Vec::with_capacity(cfg.num_shards);
+        for i in 0..cfg.num_shards {
+            let lsn =
+                replication::init_shard(&build_sqlite_connect_options(&cfg, i), cfg.new_replid)
+                    .await
+                    .map_err(|e| {
+                        miette!("failed to initialize change index of shard {}: {}", i, e)
+                    })?;
+            commit_watch.push(Arc::new(watch::channel(lsn).0));
         }
 
         let mut db_pools_futures = vec![];
@@ -354,6 +392,7 @@ impl AppState {
             compressor,
             metrics,
             key_locks: KeyLocks::default(),
+            commit_watch,
             ring,
         })
     }
@@ -371,6 +410,12 @@ impl AppState {
             .iter()
             .map(|c| c.load(Ordering::Relaxed).max(0) as u64)
             .sum()
+    }
+
+    /// Records that shard `shard_id` stopped cleanly; see
+    /// [`replication::mark_clean_shutdown`]. Its pools must be closed first.
+    pub async fn mark_clean_shutdown(&self, shard_id: usize) -> Result<()> {
+        replication::mark_clean_shutdown(&build_sqlite_connect_options(&self.cfg, shard_id)).await
     }
 
     /// Set the gauges that are sampled rather than updated in place: queue
@@ -763,6 +808,7 @@ mod tests {
             max_request_size_mb: None,
             cleanup_chunk_size: None,
             cleanup_interval_secs: None,
+            new_replid: false,
             sqlite: None,
         }
     }
