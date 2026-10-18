@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chitchat::{ChitchatConfig, ChitchatHandle, ChitchatId, FailureDetectorConfig, spawn_chitchat};
 use serde::{Deserialize, Serialize};
@@ -30,28 +30,6 @@ pub const REDIS_CLUSTER_SLOTS: u16 = 16384;
 /// Redis Cluster error reply for a hash slot with no known owner.
 pub const CLUSTERDOWN_HASH_SLOT_NOT_SERVED: &str = "CLUSTERDOWN Hash slot not served";
 
-/// Routing decision for a hash slot on this cluster node.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SlotRoute {
-    /// This node owns the slot and should execute the command locally.
-    Local,
-    /// Another known node owns the slot (`MOVED <slot> <addr>`).
-    Moved(String),
-    /// Neither this node nor any known peer owns the slot.
-    Unserved,
-}
-
-impl SlotRoute {
-    /// Returns the Redis error reply when the command must not execute locally.
-    pub fn into_error(self) -> Option<String> {
-        match self {
-            SlotRoute::Local => None,
-            SlotRoute::Moved(redirect) => Some(redirect),
-            SlotRoute::Unserved => Some(CLUSTERDOWN_HASH_SLOT_NOT_SERVED.to_string()),
-        }
-    }
-}
-
 /// Represents the state of a cluster node
 #[derive(Debug, Clone)]
 pub struct ClusterNode {
@@ -59,6 +37,64 @@ pub struct ClusterNode {
     pub addr: SocketAddr,
     pub slots: HashSet<u16>,
     pub _state: String,
+}
+
+/// Where a request for a slot should run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Route {
+    /// This node owns the slot.
+    Local,
+    /// A live peer owns the slot; holds the full `MOVED <slot> <ip>:<port>` reply.
+    Moved(String),
+    /// No live node owns the slot.
+    ClusterDown,
+}
+
+impl Route {
+    /// Returns the Redis error reply when the command must not execute locally.
+    pub fn into_error(self) -> Option<String> {
+        match self {
+            Route::Local => None,
+            Route::Moved(redirect) => Some(redirect),
+            Route::ClusterDown => Some(CLUSTERDOWN_HASH_SLOT_NOT_SERVED.to_string()),
+        }
+    }
+}
+
+/// A contiguous slot range and the node serving it, as reported by CLUSTER SLOTS.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SlotRange {
+    pub start: u16,
+    pub end: u16,
+    pub node_id: String,
+    pub ip: String,
+    pub port: u16,
+}
+
+/// The Redis ip and port this node advertises to clients and peers.
+fn local_endpoint(config: &ClusterConfig, redis_addr: SocketAddr) -> (String, u16) {
+    if let Some(ref advertise_addr) = config.advertise_addr {
+        match advertise_addr.rsplit_once(':') {
+            Some((ip, port)) => (ip.to_string(), port.parse().unwrap_or(redis_addr.port())),
+            None => (advertise_addr.clone(), redis_addr.port()),
+        }
+    } else if redis_addr.ip().is_unspecified() {
+        ("127.0.0.1".to_string(), redis_addr.port())
+    } else {
+        (redis_addr.ip().to_string(), redis_addr.port())
+    }
+}
+
+/// Keeps only the newest generation of each node id.
+fn newest_generations<'a>(ids: impl Iterator<Item = &'a ChitchatId>) -> Vec<&'a ChitchatId> {
+    let mut newest: HashMap<&str, &ChitchatId> = HashMap::new();
+    for id in ids {
+        let entry = newest.entry(&id.node_id).or_insert(id);
+        if id.generation_id > entry.generation_id {
+            *entry = id;
+        }
+    }
+    newest.into_values().collect()
 }
 
 /// Gossip data structure for sharing node information
@@ -111,12 +147,20 @@ impl ClusterManager {
         // Set up chitchat for gossip protocol
         let gossip_addr = SocketAddr::new(gossip_bind_addr.ip(), config.port);
 
+        // Peers gossip over UDP on `cluster.port` at the advertised host. Falls back to
+        // the bind address when no (or a non-IP) advertise_addr is configured.
+        let (local_ip, local_port) = local_endpoint(config, redis_addr);
         let advertise_gossip_addr =
             gossip_advertise_addr(config.advertise_addr.as_deref(), gossip_addr);
 
+        // The startup time is the generation, so peers drop the state of a previous run.
+        let generation_id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+
         let chitchat_id = ChitchatId {
             node_id: config.node_id.clone(),
-            generation_id: 0,
+            generation_id,
             gossip_advertise_addr: advertise_gossip_addr,
         };
 
@@ -142,13 +186,7 @@ impl ClusterManager {
 
         // Create initial gossip data for this node
         let initial_gossip_data = NodeGossipData {
-            addr: if let Some(ref advertise_addr) = config.advertise_addr {
-                advertise_addr.clone()
-            } else if redis_addr.ip().is_unspecified() {
-                format!("127.0.0.1:{}", redis_addr.port())
-            } else {
-                format!("{}:{}", redis_addr.ip(), redis_addr.port())
-            },
+            addr: format!("{}:{}", local_ip, local_port),
             slots: {
                 let mut slots = Vec::new();
                 // Add slots from slots array if present
@@ -261,11 +299,14 @@ impl ClusterManager {
                     dead_nodes
                 );
 
-                // Iterate through all nodes in the cluster
-                for (chitchat_id, node_state) in chitchat_guard.node_states() {
+                // Only live nodes own slots, and only their newest generation counts
+                for chitchat_id in newest_generations(chitchat_guard.live_nodes()) {
                     if chitchat_id.node_id == self.node_id {
                         continue; // Skip self
                     }
+                    let Some(node_state) = chitchat_guard.node_state(chitchat_id) else {
+                        continue;
+                    };
 
                     debug!("Processing node: {}", chitchat_id.node_id);
 
@@ -371,31 +412,21 @@ impl ClusterManager {
         }
     }
 
-    /// Determine how this node should route a command for `slot`.
-    pub async fn route_slot(&self, slot: u16) -> SlotRoute {
+    /// Decide where a request for `slot` should run.
+    pub async fn route(&self, slot: u16) -> Route {
         if self.local_slots.read().await.contains(&slot) {
-            return SlotRoute::Local;
+            return Route::Local;
         }
-
-        let nodes = self.nodes.read().await;
-        for node in nodes.values() {
-            if node.slots.contains(&slot) {
-                return SlotRoute::Moved(format!("MOVED {} {}", slot, node.addr));
-            }
-        }
-
-        SlotRoute::Unserved
-    }
-
-    /// Determine how this node should route a key command.
-    pub async fn route_key(&self, key: &str) -> SlotRoute {
-        self.route_slot(Self::calculate_slot(key)).await
-    }
-
-    /// Determine how this node should route a hash operation.
-    pub async fn route_hash(&self, namespace: &str, key: &str) -> SlotRoute {
-        self.route_slot(self.calculate_slot_for_hash(namespace, key))
+        match self
+            .nodes
+            .read()
             .await
+            .values()
+            .find(|node| node.slots.contains(&slot))
+        {
+            Some(node) => Route::Moved(format!("MOVED {} {}", slot, node.addr)),
+            None => Route::ClusterDown,
+        }
     }
 
     /// Calculate Redis hash slot for a key
@@ -456,22 +487,7 @@ impl ClusterManager {
 
         // Add local node
         let local_slots_ranges = Self::slots_to_ranges(&local_slots);
-        let (local_ip, local_port) = if let Some(ref advertise_addr) = self.config.advertise_addr {
-            // Parse advertise_addr which is in "ip:port" format
-            if let Some((ip, port)) = advertise_addr.split_once(':') {
-                (
-                    ip.to_string(),
-                    port.parse().unwrap_or(self.local_addr.port()),
-                )
-            } else {
-                // If no port in advertise_addr, use the IP with local port
-                (advertise_addr.clone(), self.local_addr.port())
-            }
-        } else if self.local_addr.ip().is_unspecified() {
-            ("127.0.0.1".to_string(), self.local_addr.port())
-        } else {
-            (self.local_addr.ip().to_string(), self.local_addr.port())
-        };
+        let (local_ip, local_port) = local_endpoint(&self.config, self.local_addr);
 
         let local_info = format!(
             "{} {}:{} myself,master - 0 0 0 connected {}",
@@ -495,41 +511,66 @@ impl ClusterManager {
         format!("{}\n", result.join("\n"))
     }
 
-    /// Convert slots set to Redis slot ranges format
-    fn slots_to_ranges(slots: &HashSet<u16>) -> String {
-        if slots.is_empty() {
-            return String::new();
-        }
+    /// Collapse a slot set into sorted, inclusive `(start, end)` runs
+    fn slot_runs(slots: &HashSet<u16>) -> Vec<(u16, u16)> {
+        let mut sorted: Vec<u16> = slots.iter().copied().collect();
+        sorted.sort_unstable();
 
-        let mut sorted_slots: Vec<u16> = slots.iter().copied().collect();
-        sorted_slots.sort();
-
-        let mut ranges = Vec::new();
-        let mut start = sorted_slots[0];
-        let mut end = sorted_slots[0];
-
-        for &slot in &sorted_slots[1..] {
-            if slot == end + 1 {
-                end = slot;
-            } else {
-                if start == end {
-                    ranges.push(start.to_string());
-                } else {
-                    ranges.push(format!("{}-{}", start, end));
-                }
-                start = slot;
-                end = slot;
+        let mut runs: Vec<(u16, u16)> = Vec::new();
+        for slot in sorted {
+            match runs.last_mut() {
+                Some((_, end)) if slot - *end == 1 => *end = slot,
+                _ => runs.push((slot, slot)),
             }
         }
+        runs
+    }
 
-        // Add the last range
-        if start == end {
-            ranges.push(start.to_string());
-        } else {
-            ranges.push(format!("{}-{}", start, end));
+    /// Convert slots set to Redis slot ranges format
+    fn slots_to_ranges(slots: &HashSet<u16>) -> String {
+        Self::slot_runs(slots)
+            .into_iter()
+            .map(|(start, end)| {
+                if start == end {
+                    start.to_string()
+                } else {
+                    format!("{}-{}", start, end)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Get the slot ranges of every live node (local and remote) for CLUSTER SLOTS
+    pub async fn get_cluster_slots(&self) -> Vec<SlotRange> {
+        let (local_ip, local_port) = local_endpoint(&self.config, self.local_addr);
+        let mut ranges: Vec<SlotRange> = Self::slot_runs(&*self.local_slots.read().await)
+            .into_iter()
+            .map(|(start, end)| SlotRange {
+                start,
+                end,
+                node_id: self.node_id.clone(),
+                ip: local_ip.clone(),
+                port: local_port,
+            })
+            .collect();
+
+        for node in self.nodes.read().await.values() {
+            ranges.extend(
+                Self::slot_runs(&node.slots)
+                    .into_iter()
+                    .map(|(start, end)| SlotRange {
+                        start,
+                        end,
+                        node_id: node.id.clone(),
+                        ip: node.addr.ip().to_string(),
+                        port: node.addr.port(),
+                    }),
+            );
         }
 
-        ranges.join(" ")
+        ranges.sort_by_key(|range| range.start);
+        ranges
     }
 
     /// Get cluster info for CLUSTER INFO command
@@ -607,14 +648,9 @@ impl ClusterManager {
     async fn update_gossip_data(&self, local_slots: &HashSet<u16>) {
         if let Some(handle) = self.chitchat_handle.as_ref() {
             let updated_slots: Vec<u16> = local_slots.iter().copied().collect();
+            let (local_ip, local_port) = local_endpoint(&self.config, self.local_addr);
             let gossip_data = NodeGossipData {
-                addr: if let Some(ref advertise_addr) = self.config.advertise_addr {
-                    advertise_addr.clone()
-                } else if self.local_addr.ip().is_unspecified() {
-                    format!("127.0.0.1:{}", self.local_addr.port())
-                } else {
-                    format!("{}:{}", self.local_addr.ip(), self.local_addr.port())
-                },
+                addr: format!("{}:{}", local_ip, local_port),
                 slots: updated_slots,
                 state: "master".to_string(),
             };
@@ -634,6 +670,7 @@ impl ClusterManager {
     }
 
     /// Get slots owned by this node
+    #[cfg(test)]
     pub async fn get_local_slots(&self) -> HashSet<u16> {
         self.local_slots.read().await.clone()
     }
@@ -659,10 +696,13 @@ impl ClusterManager {
 /// `ip:port`.
 fn gossip_advertise_addr(advertise_addr: Option<&str>, gossip_addr: SocketAddr) -> SocketAddr {
     advertise_addr
-        .and_then(|addr| addr.parse::<SocketAddr>().ok())
-        .map_or(gossip_addr, |addr| {
-            SocketAddr::new(addr.ip(), gossip_addr.port())
+        .and_then(|addr| {
+            addr.parse::<SocketAddr>()
+                .map(|sock| sock.ip())
+                .or_else(|_| addr.parse::<IpAddr>())
+                .ok()
         })
+        .map_or(gossip_addr, |ip| SocketAddr::new(ip, gossip_addr.port()))
 }
 
 // Implement Clone for ClusterManager to allow sharing between tasks
@@ -824,41 +864,109 @@ mod tests {
         // Note: Additional namespace distribution tests are in tests/namespace_distribution_test.rs
     }
 
-    #[tokio::test]
-    async fn test_should_handle_locally() {
+    /// A manager without gossip, with `remote` nodes already known as live
+    fn manager_with(local: &[u16], remote: &[(&str, &str, &[u16])]) -> ClusterManager {
         let config = ClusterConfig {
             enabled: true,
-            node_id: "test-node".to_string(),
+            node_id: "node-a".to_string(),
             seeds: vec![],
             port: 7000,
-            slots: Some(vec![0, 1, 2]),
+            slots: None,
             slot_ranges: None,
             gossip_interval_ms: Some(1000),
-            advertise_addr: Some("127.0.0.1:7000".to_string()),
+            advertise_addr: Some("10.0.0.1:6379".to_string()),
         };
-
-        let gossip_bind_addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
-        let redis_addr: SocketAddr = "127.0.0.1:6379".parse().unwrap();
-
-        // This test might fail in CI due to UDP binding, so we'll handle the error gracefully
-        if let Ok(manager) = ClusterManager::new(&config, gossip_bind_addr, redis_addr).await {
-            // Test keys that should be handled locally
-            for slot in [0, 1, 2] {
-                // Find a key that maps to this slot
-                for i in 0..1000 {
-                    let test_key = format!("testkey{}", i);
-                    if ClusterManager::calculate_slot(&test_key) == slot {
-                        assert_eq!(manager.route_key(&test_key).await, SlotRoute::Local);
-                        break;
-                    }
-                }
-            }
-
-            // Test a key that definitely won't be in slots 0, 1, 2
-            // We'll use a key that we know maps to a different slot
-            let remote_key = "key"; // This maps to slot 12539
-            assert_eq!(manager.route_key(remote_key).await, SlotRoute::Unserved);
+        let nodes = remote
+            .iter()
+            .map(|(id, addr, slots)| {
+                (
+                    id.to_string(),
+                    ClusterNode {
+                        id: id.to_string(),
+                        addr: addr.parse().unwrap(),
+                        slots: slots.iter().copied().collect(),
+                        _state: "master".to_string(),
+                    },
+                )
+            })
+            .collect();
+        ClusterManager {
+            node_id: config.node_id.clone(),
+            nodes: Arc::new(RwLock::new(nodes)),
+            local_slots: Arc::new(RwLock::new(local.iter().copied().collect())),
+            config,
+            chitchat_handle: Arc::new(None),
+            local_addr: "0.0.0.0:6379".parse().unwrap(),
+            namespace_strategy: NamespaceDistributionStrategy::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn test_route() {
+        let manager = manager_with(&[0, 1], &[("node-b", "10.0.0.2:6379", &[10])]);
+
+        assert_eq!(manager.route(1).await, Route::Local);
+        assert_eq!(
+            manager.route(10).await,
+            Route::Moved("MOVED 10 10.0.0.2:6379".to_string())
+        );
+        // Nobody owns slot 5: must not fall through to local execution
+        assert_eq!(manager.route(5).await, Route::ClusterDown);
+    }
+
+    #[tokio::test]
+    async fn test_get_cluster_slots_lists_local_and_remote_ranges() {
+        let manager = manager_with(&[0, 1, 2, 9], &[("node-b", "10.0.0.2:6380", &[5, 6])]);
+
+        let range = |start, end, id: &str, ip: &str, port| SlotRange {
+            start,
+            end,
+            node_id: id.to_string(),
+            ip: ip.to_string(),
+            port,
+        };
+        assert_eq!(
+            manager.get_cluster_slots().await,
+            vec![
+                range(0, 2, "node-a", "10.0.0.1", 6379),
+                range(5, 6, "node-b", "10.0.0.2", 6380),
+                range(9, 9, "node-a", "10.0.0.1", 6379),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_newest_generations() {
+        let addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+        let ids = [
+            ChitchatId::new("a".to_string(), 5, addr),
+            ChitchatId::new("a".to_string(), 9, addr),
+            ChitchatId::new("a".to_string(), 7, addr),
+            ChitchatId::new("b".to_string(), 1, addr),
+        ];
+
+        let mut newest: Vec<_> = newest_generations(ids.iter())
+            .into_iter()
+            .map(|id| (id.node_id.as_str(), id.generation_id))
+            .collect();
+        newest.sort();
+        assert_eq!(newest, vec![("a", 9), ("b", 1)]);
+    }
+
+    #[test]
+    fn test_local_endpoint() {
+        let redis_addr: SocketAddr = "0.0.0.0:6379".parse().unwrap();
+        let mut config = manager_with(&[], &[]).config;
+
+        assert_eq!(
+            local_endpoint(&config, redis_addr),
+            ("10.0.0.1".to_string(), 6379)
+        );
+        config.advertise_addr = None;
+        assert_eq!(
+            local_endpoint(&config, redis_addr),
+            ("127.0.0.1".to_string(), 6379)
+        );
     }
 
     #[tokio::test]
@@ -933,10 +1041,10 @@ mod tests {
         let peer_addr: SocketAddr = "127.0.0.1:6402".parse().unwrap();
 
         // Before gossip converges: non-local slots have no known owner.
-        assert_eq!(manager.route_slot(5061).await, SlotRoute::Local);
-        assert_eq!(manager.route_slot(9706).await, SlotRoute::Unserved);
+        assert_eq!(manager.route(5061).await, Route::Local);
+        assert_eq!(manager.route(9706).await, Route::ClusterDown);
         assert_eq!(
-            manager.route_slot(9706).await.into_error().as_deref(),
+            manager.route(9706).await.into_error().as_deref(),
             Some(CLUSTERDOWN_HASH_SLOT_NOT_SERVED)
         );
 
@@ -951,23 +1059,23 @@ mod tests {
             },
         );
         assert_eq!(
-            manager.route_slot(9706).await,
-            SlotRoute::Moved(format!("MOVED 9706 {}", peer_addr))
+            manager.route(9706).await,
+            Route::Moved(format!("MOVED 9706 {}", peer_addr))
         );
         assert_eq!(
-            manager.route_slot(9706).await.into_error().as_deref(),
+            manager.route(9706).await.into_error().as_deref(),
             Some("MOVED 9706 127.0.0.1:6402")
         );
 
         // When the peer leaves gossip (e.g. after dead_node_grace_period),
-        // its slots must become Unserved rather than falling through locally.
+        // its slots must become ClusterDown rather than falling through locally.
         manager.nodes.write().await.remove("node-b");
-        assert_eq!(manager.route_slot(9706).await, SlotRoute::Unserved);
+        assert_eq!(manager.route(9706).await, Route::ClusterDown);
         assert_eq!(
-            manager.route_slot(9706).await.into_error().as_deref(),
+            manager.route(9706).await.into_error().as_deref(),
             Some(CLUSTERDOWN_HASH_SLOT_NOT_SERVED)
         );
-        assert_eq!(manager.route_slot(5061).await, SlotRoute::Local);
+        assert_eq!(manager.route(5061).await, Route::Local);
     }
 
     #[tokio::test]
@@ -978,15 +1086,27 @@ mod tests {
         assert_eq!(ClusterManager::calculate_slot("bar"), 5061);
         assert_eq!(ClusterManager::calculate_slot("layout:user42"), 9706);
 
-        assert_eq!(manager.route_key("bar").await, SlotRoute::Local);
         assert_eq!(
-            manager.route_key("layout:user42").await,
-            SlotRoute::Unserved
+            manager.route(ClusterManager::calculate_slot("bar")).await,
+            Route::Local
         );
-        assert_eq!(manager.route_hash("ns", "bar").await, SlotRoute::Local);
         assert_eq!(
-            manager.route_hash("ns", "layout:user42").await,
-            SlotRoute::Unserved
+            manager
+                .route(ClusterManager::calculate_slot("layout:user42"))
+                .await,
+            Route::ClusterDown
+        );
+        assert_eq!(
+            manager
+                .route(manager.calculate_slot_for_hash("ns", "bar"))
+                .await,
+            Route::Local
+        );
+        assert_eq!(
+            manager
+                .route(manager.calculate_slot_for_hash("ns", "layout:user42"))
+                .await,
+            Route::ClusterDown
         );
     }
 
