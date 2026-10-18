@@ -2139,7 +2139,7 @@ async fn handle_cluster_addslots(
             }
             Err(e) => {
                 tracing::error!("Failed to add slots: {}", e);
-                let response = BytesFrame::Error("ERR failed to add slots ".into());
+                let response = BytesFrame::Error(e.to_string().into());
                 stream.write_all(&serialize_frame(&response)).await?;
             }
         }
@@ -2163,7 +2163,7 @@ async fn handle_cluster_delslots(
             }
             Err(e) => {
                 tracing::error!("Failed to remove slots: {}", e);
-                let response = BytesFrame::Error("ERR failed to remove slots ".into());
+                let response = BytesFrame::Error(e.to_string().into());
                 stream.write_all(&serialize_frame(&response)).await?;
             }
         }
