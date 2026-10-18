@@ -24,9 +24,11 @@ use tokio_util::task::TaskTracker;
 /// without losing acknowledged writes:
 /// 1. stop accepting connections,
 /// 2. stop reading new commands and let in-flight ones reply,
-/// 3. drain every shard writer (commit all queued ops) and await it,
+/// 3. drain every shard writer (commit all queued ops) and await it, and stop
+///    and await the expiry cleanup tasks,
 /// 4. stop background tasks and the cluster manager,
-/// 5. checkpoint the WAL and close the pools.
+/// 5. checkpoint the WAL and close the pools,
+/// 6. mark each shard as cleanly stopped (see [`crate::replication`]).
 ///
 /// Returns an error if shard writers could not drain within
 /// `shutdown_timeout_secs`; acknowledged writes may have been lost then.
@@ -72,12 +74,14 @@ pub async fn run(
                 inflight_cache: state.inflight_cache.clone(),
                 inflight_hcache: state.inflight_hcache.clone(),
                 metrics: state.metrics.clone(),
+                commit_watch: state.commit_watch[i].clone(),
                 shutdown: writers_shutdown.clone(),
             },
         )));
     }
 
     let mut background = Vec::new();
+    let mut cleanups = Vec::with_capacity(cfg.num_shards);
 
     // Spawn cleanup tasks for each shard
     for i in 0..cfg.num_shards {
@@ -85,11 +89,13 @@ pub async fn run(
         // connection: taking turns with the writer instead of holding the SQLite
         // write lock from another connection, which made writer batches fail
         // with SQLITE_BUSY.
-        background.push(tokio::spawn(shard_manager::shard_cleanup_task(
+        cleanups.push(tokio::spawn(shard_manager::shard_cleanup_task(
             i,
             state.write_db_pools[i].clone(),
             cfg.cleanup_interval_secs(),
             cfg.cleanup_chunk_size(),
+            state.commit_watch[i].clone(),
+            writers_shutdown.clone(),
         )));
     }
 
@@ -139,6 +145,8 @@ pub async fn run(
         );
     }
 
+    // Cleanup stops between chunks on the same token. It commits too, so the
+    // shards are only quiet once it has exited as well.
     writers_shutdown.cancel();
     let mut drain_failed = false;
     for (shard_id, writer) in writers.iter_mut().enumerate() {
@@ -165,7 +173,14 @@ pub async fn run(
         }
     }
 
-    for task in &background {
+    for (shard_id, task) in cleanups.iter_mut().enumerate() {
+        if !matches!(tokio::time::timeout_at(deadline, task).await, Ok(Ok(()))) {
+            tracing::error!("Shard {} cleanup task did not stop cleanly", shard_id);
+            drain_failed = true;
+        }
+    }
+
+    for task in background.iter().chain(&cleanups) {
         task.abort();
     }
     if let Some(cluster_manager) = &state.cluster_manager {
@@ -178,17 +193,30 @@ pub async fn run(
         ));
     }
 
+    let mut checkpointed = Vec::with_capacity(cfg.num_shards);
     for (shard_id, pool) in state.write_db_pools.iter().enumerate() {
-        if let Err(e) = shard_manager::wal_checkpoint_truncate(pool).await {
-            tracing::warn!(
+        match shard_manager::wal_checkpoint_truncate(pool).await {
+            Ok(()) => checkpointed.push(shard_id),
+            Err(e) => tracing::warn!(
                 "Shard {} WAL checkpoint on shutdown failed: {}",
                 shard_id,
                 e
-            );
+            ),
         }
     }
     for pool in state.db_pools.iter().chain(&state.write_db_pools) {
         pool.close().await;
+    }
+    // Nothing can commit anymore. A shard whose checkpoint failed may not be
+    // fully on disk, so it stays marked as not stopped cleanly.
+    for shard_id in checkpointed {
+        if let Err(e) = state.mark_clean_shutdown(shard_id).await {
+            tracing::error!(
+                "Shard {} clean shutdown marker not written: {}",
+                shard_id,
+                e
+            );
+        }
     }
 
     server_result.map_err(|e| miette!("Failed to run Redis server: {}", e))?;
@@ -2533,6 +2561,7 @@ mod tests {
                 max_request_size_mb: None,
                 cleanup_chunk_size: None,
                 cleanup_interval_secs: None,
+                new_replid: false,
                 sqlite: None,
             };
 
@@ -2580,6 +2609,7 @@ mod tests {
                             inflight_cache: state.inflight_cache.clone(),
                             inflight_hcache: state.inflight_hcache.clone(),
                             metrics: state.metrics.clone(),
+                            commit_watch: state.commit_watch[i].clone(),
                             shutdown: CancellationToken::new(),
                         },
                     )));
@@ -2614,6 +2644,7 @@ mod tests {
             max_request_size_mb: None,
             cleanup_chunk_size: None,
             cleanup_interval_secs: None,
+            new_replid: false,
             sqlite: Some(SqliteConfig {
                 cache_size_mb: None,
                 busy_timeout_ms: Some(250),
