@@ -310,6 +310,8 @@ async fn handle_connection(
     let max_request_size = state.cfg.max_request_size();
     let mut buffer = BytesMut::with_capacity(READ_CHUNK);
     let mut grown_to = READ_CHUNK;
+    // Set by READONLY: a replica may serve this connection's reads.
+    let mut conn_readonly = false;
 
     loop {
         // Run every complete request already buffered before reading more.
@@ -354,7 +356,9 @@ async fn handle_connection(
                 }
                 Ok(command) => {
                     let quit = matches!(command, RedisCommand::Quit);
-                    if let Err(e) = handle_redis_command(&mut stream, &state, command).await {
+                    if let Err(e) =
+                        handle_redis_command(&mut stream, &state, command, &mut conn_readonly).await
+                    {
                         tracing::error!("Error handling command: {}", e);
                         return Err(e);
                     }
@@ -428,17 +432,32 @@ struct ShardVacuumDispatchResult {
     vacuum_result: Option<VacuumResult>,
 }
 
-/// Checks that this node serves the slot `slot` computes. Otherwise replies MOVED or
-/// CLUSTERDOWN and returns false.
+/// Checks that this node serves the slot `slot` computes for a write. Otherwise
+/// replies MOVED or CLUSTERDOWN and returns false.
 async fn route_or_reply(
     stream: &mut TcpStream,
     state: &AppState,
     slot: impl FnOnce(&ClusterManager) -> u16,
 ) -> std::io::Result<bool> {
+    route_read_or_reply(stream, state, false, false, slot).await
+}
+
+/// Like [`route_or_reply`], with `is_read` set for a read command, which a replica
+/// serves if the connection sent `READONLY` (`conn_readonly`).
+async fn route_read_or_reply(
+    stream: &mut TcpStream,
+    state: &AppState,
+    is_read: bool,
+    conn_readonly: bool,
+    slot: impl FnOnce(&ClusterManager) -> u16,
+) -> std::io::Result<bool> {
     let Some(ref cluster_manager) = state.cluster_manager else {
         return Ok(true);
     };
-    let error = match cluster_manager.route(slot(cluster_manager)).await {
+    let route = cluster_manager
+        .route(slot(cluster_manager), is_read, conn_readonly)
+        .await;
+    let error = match route {
         Route::Local => return Ok(true),
         Route::Moved(redirect) => redirect,
         Route::ClusterDown => "CLUSTERDOWN Hash slot not served".to_string(),
@@ -452,11 +471,12 @@ async fn handle_redis_command(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
     command: RedisCommand,
+    conn_readonly: &mut bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let timer = Timer::start();
     let cmd_name = command.name();
 
-    let result = handle_redis_command_inner(stream, state, command).await;
+    let result = handle_redis_command_inner(stream, state, command, conn_readonly).await;
 
     // Record command metrics
     state.metrics.record_command(&cmd_name, timer.start);
@@ -472,10 +492,16 @@ async fn handle_redis_command_inner(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
     command: RedisCommand,
+    conn_readonly: &mut bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let readonly = *conn_readonly;
     match command {
         RedisCommand::Get { key } => {
-            if !route_or_reply(stream, state, |_| ClusterManager::calculate_slot(&key)).await? {
+            if !route_read_or_reply(stream, state, true, readonly, |_| {
+                ClusterManager::calculate_slot(&key)
+            })
+            .await?
+            {
                 return Ok(());
             }
             handle_get(stream, state, key).await?;
@@ -494,7 +520,11 @@ async fn handle_redis_command_inner(
             handle_del_multiple(stream, state, keys).await?;
         }
         RedisCommand::Exists { key } => {
-            if !route_or_reply(stream, state, |_| ClusterManager::calculate_slot(&key)).await? {
+            if !route_read_or_reply(stream, state, true, readonly, |_| {
+                ClusterManager::calculate_slot(&key)
+            })
+            .await?
+            {
                 return Ok(());
             }
             handle_exists(stream, state, key).await?;
@@ -509,7 +539,7 @@ async fn handle_redis_command_inner(
             handle_command(stream, &args).await?;
         }
         RedisCommand::HGet { namespace, key } => {
-            handle_hget(stream, state, namespace, key).await?;
+            handle_hget(stream, state, readonly, namespace, key).await?;
         }
         RedisCommand::HSet {
             namespace,
@@ -531,7 +561,7 @@ async fn handle_redis_command_inner(
             handle_hdel(stream, state, namespace, key).await?;
         }
         RedisCommand::HExists { namespace, key } => {
-            handle_hexists(stream, state, namespace, key).await?;
+            handle_hexists(stream, state, readonly, namespace, key).await?;
         }
         RedisCommand::HExpire {
             key,
@@ -568,7 +598,11 @@ async fn handle_redis_command_inner(
             handle_cluster_keyslot(stream, key).await?;
         }
         RedisCommand::Ttl { key } => {
-            if !route_or_reply(stream, state, |_| ClusterManager::calculate_slot(&key)).await? {
+            if !route_read_or_reply(stream, state, true, readonly, |_| {
+                ClusterManager::calculate_slot(&key)
+            })
+            .await?
+            {
                 return Ok(());
             }
             handle_ttl(stream, state, key).await?;
@@ -598,6 +632,11 @@ async fn handle_redis_command_inner(
         }
         RedisCommand::Quit => {
             // handle_connection closes the connection after this reply.
+            let response = BytesFrame::SimpleString("OK".into());
+            stream.write_all(&serialize_frame(&response)).await?;
+        }
+        RedisCommand::ReadOnly | RedisCommand::ReadWrite => {
+            *conn_readonly = matches!(command, RedisCommand::ReadOnly);
             let response = BytesFrame::SimpleString("OK".into());
             stream.write_all(&serialize_frame(&response)).await?;
         }
@@ -1063,6 +1102,8 @@ const COMMANDS: &[CommandInfo] = &[
     ("hello", -1, &["fast"], 0, 0, 0),
     ("client", -2, &[], 0, 0, 0),
     ("quit", -1, &["fast"], 0, 0, 0),
+    ("readonly", 1, &["fast"], 0, 0, 0),
+    ("readwrite", 1, &["fast"], 0, 0, 0),
     ("blobasaur.vacuum", -7, &["admin"], 0, 0, 0),
 ];
 
@@ -1218,6 +1259,7 @@ async fn hash_field_exists(
 async fn handle_hget(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
+    conn_readonly: bool,
     namespace: String,
     key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1226,7 +1268,7 @@ async fn handle_hget(
     }
 
     // Check if we should handle this hash operation locally in a cluster
-    if !route_or_reply(stream, state, |cm| {
+    if !route_read_or_reply(stream, state, true, conn_readonly, |cm| {
         cm.calculate_slot_for_hash(&namespace, &key)
     })
     .await?
@@ -1824,6 +1866,7 @@ async fn handle_hdel(
 async fn handle_hexists(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
+    conn_readonly: bool,
     namespace: String,
     key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1832,7 +1875,7 @@ async fn handle_hexists(
     }
 
     // Check if we should handle this hash operation locally in a cluster
-    if !route_or_reply(stream, state, |cm| {
+    if !route_read_or_reply(stream, state, true, conn_readonly, |cm| {
         cm.calculate_slot_for_hash(&namespace, &key)
     })
     .await?
@@ -2041,16 +2084,26 @@ fn cluster_slots_frame(ranges: &[SlotRange]) -> BytesFrame {
         ranges
             .iter()
             .map(|range| {
-                // Replica entries, if any, are appended after the primary's.
-                BytesFrame::Array(vec![
+                let node = |ip: &str, port: u16, id: &str| {
+                    BytesFrame::Array(vec![
+                        BytesFrame::BulkString(ip.to_string().into()),
+                        BytesFrame::Integer(port as i64),
+                        BytesFrame::BulkString(id.to_string().into()),
+                    ])
+                };
+                // The primary, then its replicas.
+                let mut entry = vec![
                     BytesFrame::Integer(range.start as i64),
                     BytesFrame::Integer(range.end as i64),
-                    BytesFrame::Array(vec![
-                        BytesFrame::BulkString(range.ip.clone().into()),
-                        BytesFrame::Integer(range.port as i64),
-                        BytesFrame::BulkString(range.node_id.clone().into()),
-                    ]),
-                ])
+                    node(&range.ip, range.port, &range.node_id),
+                ];
+                entry.extend(
+                    range
+                        .replicas
+                        .iter()
+                        .map(|(ip, port, id)| node(ip, *port, id)),
+                );
+                BytesFrame::Array(entry)
             })
             .collect(),
     )
@@ -2861,6 +2914,7 @@ mod tests {
             node_id: "node-1".to_string(),
             ip: "10.0.0.1".to_string(),
             port: 6379,
+            replicas: vec![("10.0.0.2".to_string(), 6380, "node-1b".to_string())],
         }];
 
         let frame = cluster_slots_frame(&ranges);
@@ -2873,7 +2927,12 @@ mod tests {
         assert_eq!(text(&node[0]), "10.0.0.1");
         assert_eq!(int(&node[1]), 6379);
         assert_eq!(text(&node[2]), "node-1");
-        assert_eq!(range.len(), 3);
+        // The replica follows the primary.
+        assert_eq!(range.len(), 4);
+        let replica = items(&range[3]);
+        assert_eq!(text(&replica[0]), "10.0.0.2");
+        assert_eq!(int(&replica[1]), 6380);
+        assert_eq!(text(&replica[2]), "node-1b");
     }
 
     #[test]
@@ -3057,6 +3116,7 @@ mod tests {
                 handle_hget(
                     &mut stream,
                     &state,
+                    false,
                     "has-dash".to_string(),
                     "field".to_string(),
                 )
@@ -3087,6 +3147,7 @@ mod tests {
                 handle_hexists(
                     &mut stream,
                     &state,
+                    false,
                     "has-dash".to_string(),
                     "field".to_string(),
                 )
@@ -3432,6 +3493,7 @@ mod tests {
                 handle_hget(
                     &mut stream,
                     &state,
+                    false,
                     "never_written".to_string(),
                     "f".to_string(),
                 )
@@ -3446,6 +3508,7 @@ mod tests {
                 handle_hexists(
                     &mut stream,
                     &state,
+                    false,
                     "never_written".to_string(),
                     "f".to_string(),
                 )
@@ -3484,7 +3547,14 @@ mod tests {
 
         let frame = respond_with(&ctx, |state, mut stream| {
             Box::pin(async move {
-                handle_hexists(&mut stream, &state, "ns".to_string(), "field".to_string()).await
+                handle_hexists(
+                    &mut stream,
+                    &state,
+                    false,
+                    "ns".to_string(),
+                    "field".to_string(),
+                )
+                .await
             })
         })
         .await;
@@ -3599,14 +3669,28 @@ mod tests {
         assert_integer_response(frame, 1);
         let frame = respond_with(&ctx, |state, mut stream| {
             Box::pin(async move {
-                handle_hget(&mut stream, &state, "ns".to_string(), "f".to_string()).await
+                handle_hget(
+                    &mut stream,
+                    &state,
+                    false,
+                    "ns".to_string(),
+                    "f".to_string(),
+                )
+                .await
             })
         })
         .await;
         assert_null(frame);
         let frame = respond_with(&ctx, |state, mut stream| {
             Box::pin(async move {
-                handle_hexists(&mut stream, &state, "ns".to_string(), "f".to_string()).await
+                handle_hexists(
+                    &mut stream,
+                    &state,
+                    false,
+                    "ns".to_string(),
+                    "f".to_string(),
+                )
+                .await
             })
         })
         .await;
@@ -3668,7 +3752,14 @@ mod tests {
         assert_null(frame);
         let frame = respond_with(&ctx, |state, mut stream| {
             Box::pin(async move {
-                handle_hget(&mut stream, &state, "ns".to_string(), "f".to_string()).await
+                handle_hget(
+                    &mut stream,
+                    &state,
+                    false,
+                    "ns".to_string(),
+                    "f".to_string(),
+                )
+                .await
             })
         })
         .await;
@@ -3680,7 +3771,14 @@ mod tests {
     async fn hget_frame(ctx: &TestContext, field: &'static str) -> BytesFrame {
         respond_with(ctx, move |state, mut stream| {
             Box::pin(async move {
-                handle_hget(&mut stream, &state, "ns".to_string(), field.to_string()).await
+                handle_hget(
+                    &mut stream,
+                    &state,
+                    false,
+                    "ns".to_string(),
+                    field.to_string(),
+                )
+                .await
             })
         })
         .await
@@ -3851,7 +3949,14 @@ mod tests {
         let frame = respond_with(&ctx, |state, stream| {
             Box::pin(async move {
                 let mut stream = stream;
-                handle_hget(&mut stream, &state, "ns".to_string(), "field1".to_string()).await
+                handle_hget(
+                    &mut stream,
+                    &state,
+                    false,
+                    "ns".to_string(),
+                    "field1".to_string(),
+                )
+                .await
             })
         })
         .await;
@@ -3860,7 +3965,14 @@ mod tests {
         let frame = respond_with(&ctx, |state, stream| {
             Box::pin(async move {
                 let mut stream = stream;
-                handle_hexists(&mut stream, &state, "ns".to_string(), "field1".to_string()).await
+                handle_hexists(
+                    &mut stream,
+                    &state,
+                    false,
+                    "ns".to_string(),
+                    "field1".to_string(),
+                )
+                .await
             })
         })
         .await;
@@ -3887,7 +3999,14 @@ mod tests {
         let frame = respond_with(&ctx, |state, stream| {
             Box::pin(async move {
                 let mut stream = stream;
-                handle_hexists(&mut stream, &state, "ns".to_string(), "field1".to_string()).await
+                handle_hexists(
+                    &mut stream,
+                    &state,
+                    false,
+                    "ns".to_string(),
+                    "field1".to_string(),
+                )
+                .await
             })
         })
         .await;
@@ -3896,7 +4015,14 @@ mod tests {
         let frame = respond_with(&ctx, |state, stream| {
             Box::pin(async move {
                 let mut stream = stream;
-                handle_hget(&mut stream, &state, "ns".to_string(), "field1".to_string()).await
+                handle_hget(
+                    &mut stream,
+                    &state,
+                    false,
+                    "ns".to_string(),
+                    "field1".to_string(),
+                )
+                .await
             })
         })
         .await;
@@ -4030,7 +4156,9 @@ mod tests {
         let frame = respond_with(&ctx, |state, stream| {
             Box::pin(async move {
                 let mut stream = stream;
-                let _ = handle_redis_command_inner(&mut stream, &state, RedisCommand::Quit).await;
+                let _ =
+                    handle_redis_command_inner(&mut stream, &state, RedisCommand::Quit, &mut false)
+                        .await;
                 Ok(())
             })
         });
@@ -4055,6 +4183,7 @@ mod tests {
                         budget_mb: 16,
                         dry_run: true,
                     },
+                    &mut false,
                 )
                 .await
             })
@@ -4103,6 +4232,7 @@ mod tests {
                         budget_mb: 8,
                         dry_run: true,
                     },
+                    &mut false,
                 )
                 .await
             })
@@ -4347,7 +4477,14 @@ mod tests {
         let frame = respond_with(&ctx, |state, stream| {
             Box::pin(async move {
                 let mut stream = stream;
-                handle_hget(&mut stream, &state, "ns".to_string(), "field1".to_string()).await
+                handle_hget(
+                    &mut stream,
+                    &state,
+                    false,
+                    "ns".to_string(),
+                    "field1".to_string(),
+                )
+                .await
             })
         })
         .await;
@@ -4414,7 +4551,14 @@ mod tests {
         let frame = respond_with(&ctx, |state, stream| {
             Box::pin(async move {
                 let mut stream = stream;
-                handle_hget(&mut stream, &state, "ns".to_string(), "field1".to_string()).await
+                handle_hget(
+                    &mut stream,
+                    &state,
+                    false,
+                    "ns".to_string(),
+                    "field1".to_string(),
+                )
+                .await
             })
         })
         .await;
@@ -4576,7 +4720,14 @@ mod tests {
         let frame = respond_with(&ctx, |state, stream| {
             Box::pin(async move {
                 let mut stream = stream;
-                handle_hget(&mut stream, &state, "ns".to_string(), "field1".to_string()).await
+                handle_hget(
+                    &mut stream,
+                    &state,
+                    false,
+                    "ns".to_string(),
+                    "field1".to_string(),
+                )
+                .await
             })
         })
         .await;
