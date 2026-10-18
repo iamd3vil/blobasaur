@@ -591,7 +591,7 @@ async fn reply(stream: &mut TcpStream, frame: BytesFrame) -> io::Result<()> {
 }
 
 /// The shard's replid, `trimmed_through` and watermark, as of one read.
-async fn primary_state(pool: &SqlitePool) -> Result<(String, u64, u64), sqlx::Error> {
+pub(crate) async fn primary_state(pool: &SqlitePool) -> Result<(String, u64, u64), sqlx::Error> {
     let mut tx = pool.begin().await?;
     let replid: Option<String> = sqlx::query_scalar("SELECT v FROM repl_state WHERE k = 'replid'")
         .fetch_optional(&mut *tx)
@@ -1105,9 +1105,12 @@ impl Replica {
         let _gate = state.replica_reset_gate(self.shard).await;
         self.set_synced(false).await;
         let (responder, committed) = oneshot::channel();
-        let replid = replid.to_string();
-        self.writer(ShardWriteOperation::Reset { replid, responder }, committed)
-            .await?;
+        let op = ShardWriteOperation::Reset {
+            replid: replid.to_string(),
+            responder,
+        };
+        self.writer(op, committed).await?;
+        self.state.set_replid(self.shard, replid);
         self.metrics.record_replica_resync();
         self.metrics.set_replica_lsns(Some(0), Some(0));
         self.last_watermark_ms = Some(Utc::now().timestamp_millis());
