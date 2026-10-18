@@ -1145,7 +1145,8 @@ async fn a_slot_nobody_serves_is_clusterdown() {
 #[tokio::test]
 async fn a_client_that_stops_reading_redirects_does_not_block_a_resync() {
     let (pdir, rdir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
-    let primary = start(pdir.path(), &Opts::primary("p", 1)).await;
+    let popts = Opts::primary("p", 1);
+    let primary = start(pdir.path(), &popts).await;
     let replica = start(
         rdir.path(),
         &Opts::replica("r", "p", vec![primary.gossip.clone()], 1),
@@ -1181,14 +1182,12 @@ async fn a_client_that_stops_reading_redirects_does_not_block_a_resync() {
         "the server never blocked on the client"
     );
     // A new replid on the primary makes the replica reset, which needs the gate.
-    // In-process, the stopped node's gossip keeps its port: restart on another.
     primary.stop().await;
     let primary = start(
         pdir.path(),
         &Opts {
             new_replid: true,
-            seeds: vec![replica.gossip.clone()],
-            ..Opts::primary("p", 1)
+            ..popts
         },
     )
     .await;
