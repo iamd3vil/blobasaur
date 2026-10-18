@@ -249,8 +249,21 @@ impl AppState {
                     .parse()
                     .expect("Invalid Redis server address");
 
-                match ClusterManager::new(cluster_config, gossip_bind_addr, redis_addr).await {
+                let manager = ClusterManager::new(
+                    cluster_config,
+                    gossip_bind_addr,
+                    redis_addr,
+                    cfg.replica_of(),
+                    cfg.num_shards,
+                )
+                .await;
+                match manager {
                     Ok(manager) => {
+                        // A slot conflict stops startup, replication or not.
+                        manager
+                            .claim_slots()
+                            .await
+                            .map_err(|e| miette!("slot conflict: {}", e))?;
                         tracing::info!("Cluster manager initialized successfully");
                         Some(manager)
                     }

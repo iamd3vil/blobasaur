@@ -1061,6 +1061,13 @@ impl Replica {
         }
     }
 
+    /// Tells the cluster whether the shard holds a full copy, for the gossiped role.
+    async fn set_synced(&self, synced: bool) {
+        if let Some(cluster) = &self.state.cluster_manager {
+            cluster.set_shard_synced(self.shard, synced).await;
+        }
+    }
+
     /// Hands `frames` to the shard's writer and waits for the commit.
     async fn apply(&mut self, frames: Vec<Frame>) -> Result<(), String> {
         let rows = frames.iter().filter(|f| f.lsn().is_some()).count() as u64;
@@ -1082,6 +1089,7 @@ impl Replica {
         if let Some((_, unix_ms)) = caught_up {
             self.last_watermark_ms = Some(unix_ms);
             self.publish_staleness();
+            self.set_synced(true).await;
         }
         Ok(())
     }
@@ -1092,6 +1100,8 @@ impl Replica {
             self.shard,
             self.primary
         );
+        // Stop serving reads from the shard before the reset is queued.
+        self.set_synced(false).await;
         let (responder, committed) = oneshot::channel();
         let replid = replid.to_string();
         self.writer(ShardWriteOperation::Reset { replid, responder }, committed)

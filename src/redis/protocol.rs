@@ -155,6 +155,9 @@ pub enum RedisCommand {
         subcommand: String,
     },
     Quit,
+    /// Lets a replica serve this connection's reads.
+    ReadOnly,
+    ReadWrite,
     Unknown(String),
 }
 
@@ -190,6 +193,8 @@ impl RedisCommand {
             RedisCommand::Hello { .. } => "HELLO".to_string(),
             RedisCommand::Client { .. } => "CLIENT".to_string(),
             RedisCommand::Quit => "QUIT".to_string(),
+            RedisCommand::ReadOnly => "READONLY".to_string(),
+            RedisCommand::ReadWrite => "READWRITE".to_string(),
             RedisCommand::Unknown(cmd) => cmd.clone(),
         }
     }
@@ -934,6 +939,8 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
             Ok(RedisCommand::Client { subcommand })
         }
         "QUIT" => Ok(RedisCommand::Quit),
+        "READONLY" => Ok(RedisCommand::ReadOnly),
+        "READWRITE" => Ok(RedisCommand::ReadWrite),
         _ => Ok(RedisCommand::Unknown(command_name)),
     }
 }
@@ -1783,6 +1790,12 @@ mod tests {
         let (resp, _) = parse_resp_with_remaining(input).unwrap();
         let command = parse_command(resp).unwrap();
         assert_eq!(command, RedisCommand::Quit);
+    }
+
+    #[test]
+    fn test_parse_readonly_readwrite() {
+        assert_eq!(parse(&["READONLY"]).unwrap(), RedisCommand::ReadOnly);
+        assert_eq!(parse(&["readwrite"]).unwrap(), RedisCommand::ReadWrite);
     }
 
     #[test]

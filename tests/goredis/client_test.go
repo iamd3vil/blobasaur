@@ -288,3 +288,19 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// A ReadOnly cluster client reads from the replica listed in CLUSTER SLOTS.
+// Run by tests/replication_test.rs, which sets BLOBASAUR_ADDR to the primary and
+// BLOBASAUR_REPLICA_KEY to a key whose value only the replica's DB holds.
+func TestClusterReadOnlyReadsFromReplica(t *testing.T) {
+	primary, key := os.Getenv("BLOBASAUR_ADDR"), os.Getenv("BLOBASAUR_REPLICA_KEY")
+	if primary == "" || key == "" {
+		t.Skip("needs a primary with a replica; run via tests/replication_test.rs")
+	}
+	rdb := redis.NewClusterClient(&redis.ClusterOptions{Addrs: []string{primary}, ReadOnly: true})
+	t.Cleanup(func() { rdb.Close() })
+
+	expect(t, "GET from the replica", rdb.Get(ctx, key), "from-replica")
+	// Writes still go to the primary.
+	expect(t, "SET", rdb.Set(ctx, "written", "v", 0), "OK")
+}
