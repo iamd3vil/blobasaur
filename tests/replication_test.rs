@@ -1083,6 +1083,16 @@ async fn a_replica_serves_reads_only_on_readonly_connections() {
     ok(&mut ro, &["READWRITE"]).await;
     assert_eq!(ro.tree(&["GET", key]).await, moved(key));
 
+    // A replica owns no slots: ADDSLOTS/DELSLOTS are refused and a write still moves.
+    let slot = ClusterManager::calculate_slot(key).to_string();
+    for sub in ["ADDSLOTS", "DELSLOTS"] {
+        assert_eq!(
+            ro.tree(&["CLUSTER", sub, &slot]).await,
+            text("-ERR this node is a replica")
+        );
+    }
+    assert_eq!(ro.tree(&["SET", key, "other"]).await, moved(key));
+
     // A replica that is still copying serves nothing, READONLY or not.
     wait_for("the stuck replica to know its primary", || async {
         let mut c = readonly_client(&stuck).await;

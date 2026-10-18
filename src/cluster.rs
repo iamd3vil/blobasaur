@@ -483,7 +483,8 @@ impl ClusterManager {
     /// Decide where a request for `slot` should run. A synced replica serves reads
     /// of its primary's slots on connections that sent `READONLY`.
     pub async fn route(&self, slot: u16, is_read: bool, conn_readonly: bool) -> Route {
-        if self.local_slots.read().await.contains(&slot) {
+        // A replica owns no slots, so never runs a write itself.
+        if self.replica.is_none() && self.local_slots.read().await.contains(&slot) {
             return Route::Local;
         }
         let nodes = self.nodes.read().await;
@@ -815,7 +816,9 @@ impl ClusterManager {
         &self,
         slots: Vec<u16>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Hold the write lock across gossip publication so concurrent
+        if self.replica.is_some() {
+            return Err("ERR this node is a replica".into());
+        }
         {
             let mut local_slots = self.local_slots.write().await;
             for slot in &slots {
@@ -833,6 +836,9 @@ impl ClusterManager {
         &self,
         slots: Vec<u16>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.replica.is_some() {
+            return Err("ERR this node is a replica".into());
+        }
         {
             let mut local_slots = self.local_slots.write().await;
             for slot in &slots {
@@ -1179,6 +1185,10 @@ mod tests {
         // Still copying: nothing is served.
         let syncing = into_replica(manager_with(&[], remote), "node-b", false);
         assert_eq!(syncing.route(10, true, true).await, moved);
+
+        // Even with a local slot set, a replica never runs a write itself.
+        let rogue = into_replica(manager_with(&[20], remote), "node-b", true);
+        assert_ne!(rogue.route(20, false, false).await, Route::Local);
 
         // The primary left the cluster.
         let orphan = into_replica(manager_with(&[], &remote[1..]), "node-b", true);
