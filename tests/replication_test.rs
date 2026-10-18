@@ -52,6 +52,7 @@ struct Opts<'a> {
     async_write: bool,
     /// The slots a primary owns; 0 to `OWNED_SLOTS` if unset.
     range: Option<(u16, u16)>,
+    new_replid: bool,
 }
 
 impl<'a> Opts<'a> {
@@ -66,6 +67,7 @@ impl<'a> Opts<'a> {
             zstd: false,
             async_write: false,
             range: None,
+            new_replid: false,
         }
     }
 
@@ -131,7 +133,7 @@ fn cfg(dir: &Path, o: &Opts, addr: SocketAddr, gossip_port: u16) -> Cfg {
         max_request_size_mb: None,
         cleanup_chunk_size: None,
         cleanup_interval_secs: Some(1),
-        new_replid: false,
+        new_replid: o.new_replid,
     }
 }
 
@@ -1136,6 +1138,71 @@ async fn a_slot_nobody_serves_is_clusterdown() {
         assert_eq!(client.tree(&["SET", &key, "v"]).await, down);
     }
 
+    replica.stop().await;
+    primary.stop().await;
+}
+
+#[tokio::test]
+async fn a_client_that_stops_reading_redirects_does_not_block_a_resync() {
+    let (pdir, rdir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let primary = start(pdir.path(), &Opts::primary("p", 1)).await;
+    let replica = start(
+        rdir.path(),
+        &Opts::replica("r", "p", vec![primary.gossip.clone()], 1),
+    )
+    .await;
+    wait_for("synced", || all_synced(rdir.path(), 1)).await;
+    let old = state(rdir.path(), 0, "replid").await.unwrap();
+
+    // READONLY reads on a replica take the shard's gate. Pipeline redirected
+    // reads without reading the replies, until the server blocks writing them.
+    let key = (0..)
+        .map(|i| format!("down{i}"))
+        .find(|k| ClusterManager::calculate_slot(k) > OWNED_SLOTS)
+        .unwrap();
+    // A small receive buffer, so the server's reply writes block quickly.
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(4096).unwrap();
+    let mut blocked = socket.connect(replica.addr).await.unwrap();
+    let mut pipeline = b"*1\r\n$8\r\nREADONLY\r\n".to_vec();
+    let get = format!("*2\r\n$3\r\nGET\r\n${}\r\n{key}\r\n", key.len());
+    for _ in 0..200_000 {
+        pipeline.extend_from_slice(get.as_bytes());
+    }
+    let writer = tokio::spawn(async move {
+        let _ = blocked.write_all(&pipeline).await;
+        blocked
+    });
+
+    // Give the server time to fill the socket and block on a reply.
+    sleep(Duration::from_secs(1)).await;
+    assert!(
+        !writer.is_finished(),
+        "the server never blocked on the client"
+    );
+    // A new replid on the primary makes the replica reset, which needs the gate.
+    // In-process, the stopped node's gossip keeps its port: restart on another.
+    primary.stop().await;
+    let primary = start(
+        pdir.path(),
+        &Opts {
+            new_replid: true,
+            seeds: vec![replica.gossip.clone()],
+            ..Opts::primary("p", 1)
+        },
+    )
+    .await;
+    wait_for("the replica to resync onto the new replid", || async {
+        let replid = state(rdir.path(), 0, "replid").await;
+        replid.is_some_and(|r| r != old) && all_synced(rdir.path(), 1).await
+    })
+    .await;
+    assert_eq!(
+        state(rdir.path(), 0, "replid").await,
+        state(pdir.path(), 0, "replid").await
+    );
+
+    writer.abort();
     replica.stop().await;
     primary.stop().await;
 }
