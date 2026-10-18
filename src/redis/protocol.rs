@@ -137,6 +137,15 @@ pub enum RedisCommand {
         budget_mb: u64,
         dry_run: bool,
     },
+    /// A replica opening the replication stream of one shard; see
+    /// `replication::serve_sync`. `replid` is empty if the replica has none.
+    BlobasaurSync {
+        shard: usize,
+        replid: String,
+        lsn: u64,
+        num_shards: usize,
+        compression: String,
+    },
     Hello {
         protover: Option<u64>,
     },
@@ -174,6 +183,7 @@ impl RedisCommand {
             RedisCommand::Ttl { .. } => "TTL".to_string(),
             RedisCommand::Expire { .. } => "EXPIRE".to_string(),
             RedisCommand::BlobasaurVacuum { .. } => "BLOBASAUR.VACUUM".to_string(),
+            RedisCommand::BlobasaurSync { .. } => "BLOBASAUR.SYNC".to_string(),
             RedisCommand::Hello { .. } => "HELLO".to_string(),
             RedisCommand::Client { .. } => "CLIENT".to_string(),
             RedisCommand::Quit => "QUIT".to_string(),
@@ -891,6 +901,7 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
             Ok(RedisCommand::Expire { key, seconds })
         }
         "BLOBASAUR.VACUUM" => parse_blobasaur_vacuum_command(&elements),
+        "BLOBASAUR.SYNC" => parse_blobasaur_sync_command(&elements),
         "HELLO" => {
             let protover = if elements.len() > 1 {
                 let ver_str = extract_string(&elements[1])?;
@@ -914,6 +925,27 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
         "QUIT" => Ok(RedisCommand::Quit),
         _ => Ok(RedisCommand::Unknown(command_name)),
     }
+}
+
+fn parse_blobasaur_sync_command(elements: &[BytesFrame]) -> Result<RedisCommand, ParseError> {
+    if elements.len() != 6 {
+        return Err(ParseError::Invalid(
+            "BLOBASAUR.SYNC syntax: BLOBASAUR.SYNC <shard> <replid> <lsn> <num_shards> <compression>"
+                .to_string(),
+        ));
+    }
+    fn number<T: std::str::FromStr>(value: &BytesFrame, what: &str) -> Result<T, ParseError> {
+        let text = extract_string(value)?;
+        text.parse()
+            .map_err(|_| ParseError::Invalid(format!("Invalid {what} '{text}'")))
+    }
+    Ok(RedisCommand::BlobasaurSync {
+        shard: number(&elements[1], "shard")?,
+        replid: extract_string(&elements[2])?,
+        lsn: number(&elements[3], "lsn")?,
+        num_shards: number(&elements[4], "num_shards")?,
+        compression: extract_string(&elements[5])?,
+    })
 }
 
 fn parse_blobasaur_vacuum_command(elements: &[BytesFrame]) -> Result<RedisCommand, ParseError> {
@@ -1510,6 +1542,36 @@ mod tests {
                 dry_run: true,
             }
         );
+    }
+
+    #[test]
+    fn test_parse_blobasaur_sync_command() {
+        let command = parse_command(command_frame(&[
+            "blobasaur.sync",
+            "2",
+            "",
+            "17",
+            "4",
+            "zstd",
+        ]))
+        .unwrap();
+        assert_eq!(
+            command,
+            RedisCommand::BlobasaurSync {
+                shard: 2,
+                replid: String::new(),
+                lsn: 17,
+                num_shards: 4,
+                compression: "zstd".to_string(),
+            }
+        );
+        for bad in [
+            &["BLOBASAUR.SYNC", "0", "id", "0", "1"][..],
+            &["BLOBASAUR.SYNC", "x", "id", "0", "1", "none"][..],
+            &["BLOBASAUR.SYNC", "0", "id", "-1", "1", "none"][..],
+        ] {
+            assert!(parse_command(command_frame(bad)).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

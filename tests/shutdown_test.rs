@@ -48,6 +48,7 @@ async fn start_with_timeout(
         batch_size: Some(batch_size),
         batch_timeout_ms: Some(batch_timeout_ms),
         addr: None,
+        replication: None,
         cluster: None,
         metrics: None,
         sqlite: Some(SqliteConfig {

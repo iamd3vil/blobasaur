@@ -90,6 +90,7 @@ async fn cleanup_deletes_expired_rows_in_chunks_and_keeps_live_ones() {
         batch_size: None,
         batch_timeout_ms: None,
         addr: None,
+        replication: None,
         cluster: None,
         metrics: None,
         sqlite: None,

@@ -1,6 +1,6 @@
 use crate::metrics::{Metrics, ShardMetrics};
 use crate::redis::protocol::HExpireCondition;
-use crate::replication;
+use crate::replication::{self, Frame};
 use bytes::Bytes;
 use chrono::Utc;
 use metrics::Counter;
@@ -91,6 +91,27 @@ pub enum ShardWriteOperation {
         dry_run: bool,
         responder: oneshot::Sender<VacuumResult>,
     },
+    /// Replica only: applies a page of the primary's stream in one transaction.
+    Apply {
+        frames: Vec<Frame>,
+        responder: oneshot::Sender<Result<(), String>>,
+    },
+    /// Replica only: empties the shard to take a full copy of the primary
+    /// whose replication history is `replid`.
+    Reset {
+        replid: String,
+        responder: oneshot::Sender<Result<(), String>>,
+    },
+}
+
+impl ShardWriteOperation {
+    /// Runs alone, never inside a client batch, so it acts as an ordering barrier.
+    fn is_maintenance(&self) -> bool {
+        matches!(
+            self,
+            Self::Vacuum { .. } | Self::Apply { .. } | Self::Reset { .. }
+        )
+    }
 }
 
 /// A shard's write queue. Every enqueue goes through [`ShardSender::reserve`],
@@ -315,6 +336,19 @@ pub async fn shard_writer_task(writer: ShardWriter) {
                     let _ = responder.send(result);
                     continue;
                 }
+                Some(ShardWriteOperation::Apply { frames, responder }) => {
+                    let result = replication::apply(&pool, &mut known_tables, &frames).await;
+                    let _ = responder.send(result.map(|lsn| {
+                        if let Some(lsn) = lsn {
+                            replication::publish(&commit_watch, lsn);
+                        }
+                    }));
+                    continue;
+                }
+                Some(ShardWriteOperation::Reset { replid, responder }) => {
+                    let _ = responder.send(replication::reset(&pool, &replid).await);
+                    continue;
+                }
                 Some(operation) => {
                     batch.push_back(operation);
                 }
@@ -329,7 +363,7 @@ pub async fn shard_writer_task(writer: ShardWriter) {
             };
             match next_operation {
                 Ok(Some(operation)) => {
-                    if matches!(operation, ShardWriteOperation::Vacuum { .. }) {
+                    if operation.is_maintenance() {
                         pending_maintenance_operation = Some(operation);
                     } else {
                         batch.push_back(operation);
@@ -341,12 +375,12 @@ pub async fn shard_writer_task(writer: ShardWriter) {
         }
 
         // Continue collecting until batch is full or no more immediate operations.
-        // Vacuum operations are ordering barriers, so stop collecting when one is observed.
+        // Maintenance operations are ordering barriers, so stop collecting when one is observed.
         if pending_maintenance_operation.is_none() {
             while batch.len() < batch_size {
                 match receiver.try_recv() {
                     Ok(operation) => {
-                        if matches!(operation, ShardWriteOperation::Vacuum { .. }) {
+                        if operation.is_maintenance() {
                             pending_maintenance_operation = Some(operation);
                             break;
                         }
@@ -388,8 +422,8 @@ pub async fn shard_writer_task(writer: ShardWriter) {
     loop {
         while batch.len() < batch_size {
             match receiver.recv().await {
-                // Dropping the responder reports the vacuum as cancelled.
-                Some(ShardWriteOperation::Vacuum { .. }) => {}
+                // Dropping the responder reports it as cancelled.
+                Some(op) if op.is_maintenance() => {}
                 Some(operation) => batch.push_back(operation),
                 None => break,
             }
@@ -550,7 +584,9 @@ async fn process_batch(
                 | ShardWriteOperation::Delete { responder, .. }
                 | ShardWriteOperation::HSet { responder, .. }
                 | ShardWriteOperation::HSetEx { responder, .. }
-                | ShardWriteOperation::HDelete { responder, .. } => {
+                | ShardWriteOperation::HDelete { responder, .. }
+                | ShardWriteOperation::Apply { responder, .. }
+                | ShardWriteOperation::Reset { responder, .. } => {
                     let _ = responder.send(Err(error_message.clone()));
                 }
                 ShardWriteOperation::Expire { responder, .. } => {
@@ -948,8 +984,10 @@ async fn process_batch(
                     }
                 })
             }
-            ShardWriteOperation::Vacuum { .. } => {
-                Err("Vacuum operation reached transactional batch unexpectedly".to_string())
+            ShardWriteOperation::Vacuum { .. }
+            | ShardWriteOperation::Apply { .. }
+            | ShardWriteOperation::Reset { .. } => {
+                Err("Maintenance operation reached transactional batch unexpectedly".to_string())
             }
         };
 
@@ -1007,7 +1045,9 @@ async fn process_batch(
             | ShardWriteOperation::Delete { responder, .. }
             | ShardWriteOperation::HSet { responder, .. }
             | ShardWriteOperation::HSetEx { responder, .. }
-            | ShardWriteOperation::HDelete { responder, .. } => {
+            | ShardWriteOperation::HDelete { responder, .. }
+            | ShardWriteOperation::Apply { responder, .. }
+            | ShardWriteOperation::Reset { responder, .. } => {
                 let _ = responder.send(op_result(operation_idx));
             }
             ShardWriteOperation::Expire { responder, .. } => {
@@ -1116,7 +1156,7 @@ async fn finish_op(
 
 /// Records that `key` of `table` changed (or was deleted) and returns the new
 /// LSN. INSERT OR REPLACE, not an upsert: the row must get a new LSN.
-async fn log_change(
+pub(crate) async fn log_change(
     tx: &mut sqlx::Transaction<'_, Sqlite>,
     table: &str,
     key: &str,
@@ -1534,7 +1574,7 @@ async fn load_existing_tables(pool: &SqlitePool, shard_id: usize) -> HashSet<Str
 // Ensure a namespaced table exists, creating it if necessary. A table this
 // creates is added to `known_tables` at once, and to `added_tables` so the
 // caller can take it back out if the transaction doesn't keep it.
-async fn ensure_namespaced_table_exists(
+pub(crate) async fn ensure_namespaced_table_exists(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     table_name: &str,
     known_tables: &mut HashSet<String>,
@@ -1640,13 +1680,17 @@ async fn delete_expired(
     Ok(total)
 }
 
-/// Background task to clean up expired keys from a shard
+/// Background task to clean up expired keys from a shard, and to trim old
+/// tombstones from its change index.
+#[allow(clippy::too_many_arguments)]
 pub async fn shard_cleanup_task(
     shard_id: usize,
     pool: SqlitePool,
     cleanup_interval_secs: u64,
     chunk_size: u32,
     commit_watch: Arc<watch::Sender<u64>>,
+    pins: Arc<replication::ShardPins>,
+    tombstone_retention_secs: u64,
     cancel: CancellationToken,
 ) {
     let mut interval = interval(Duration::from_secs(cleanup_interval_secs));
@@ -1723,6 +1767,11 @@ pub async fn shard_cleanup_task(
                     ok = false;
                 }
             }
+        }
+        if let Err(e) = replication::trim_tombstones(&pool, &pins, tombstone_retention_secs).await {
+            tracing::error!("[Shard {}] Error trimming tombstones: {}", shard_id, e);
+            shard_metrics.record_cleanup_error("trim");
+            ok = false;
         }
         shard_metrics.record_cleanup(ok, started.elapsed());
     }
@@ -3054,7 +3103,16 @@ mod tests {
         // The task itself exits instead of waiting for its next sweep.
         timeout(
             Duration::from_secs(5),
-            shard_cleanup_task(0, pool.clone(), 3600, 1, commit_watch, cancel),
+            shard_cleanup_task(
+                0,
+                pool.clone(),
+                3600,
+                1,
+                commit_watch,
+                Arc::default(),
+                86400,
+                cancel,
+            ),
         )
         .await
         .expect("cleanup task did not stop");

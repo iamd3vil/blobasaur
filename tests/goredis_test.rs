@@ -27,6 +27,7 @@ async fn run_go_suite(async_write: bool) {
         batch_size: Some(50),
         batch_timeout_ms: Some(5),
         addr: None,
+        replication: None,
         cluster: None,
         metrics: None,
         sqlite: None,

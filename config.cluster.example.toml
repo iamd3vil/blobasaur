@@ -54,6 +54,17 @@ end = 5460
 gossip_interval_ms = 1000
 
 # ============================================================================
+# Replication (optional, see REPLICATION.md)
+# ============================================================================
+# A replica is a cluster node with no slots that copies one primary. It finds
+# the primary's address through gossip. num_shards and storage_compression must
+# match the primary's. Replicas serve no client traffic yet.
+#
+# [replication]
+# replica_of = "node1"             # node id of the primary; unset on a primary
+# tombstone_retention_secs = 86400 # a replica away for longer gets a full resync
+
+# ============================================================================
 # Example 3-node cluster setup:
 # ============================================================================
 #

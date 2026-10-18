@@ -418,6 +418,11 @@ impl ClusterManager {
         }
     }
 
+    /// The Redis address of a live peer, as last gossiped.
+    pub async fn node_addr(&self, node_id: &str) -> Option<SocketAddr> {
+        self.nodes.read().await.get(node_id).map(|node| node.addr)
+    }
+
     /// Calculate Redis hash slot for a key
     pub fn calculate_slot(key: &str) -> u16 {
         Self::calculate_slot_with_strategy(key, NamespaceDistributionStrategy::HashTagAware)
