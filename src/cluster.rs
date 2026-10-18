@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chitchat::{
@@ -150,16 +150,18 @@ fn live_peers(chitchat: &Chitchat, self_id: &str) -> HashMap<String, ClusterNode
     nodes_map
 }
 
-/// Slot lists longer than this are left out of the legacy `slots` field, since
-/// they would overflow one UDP datagram and never be delivered.
-const LEGACY_SLOTS_MAX: usize = 8192;
+/// The largest `node_info` value we gossip with the legacy `slots` list. chitchat
+/// drops a value that doesn't fit one 65507-byte datagram, shared with the digest
+/// (about 60 bytes per node) and the node record, and asserts one item is at most
+/// `u16::MAX` bytes. This leaves about 9.5 KB for those. 9000 slots take under 55 KB.
+const GOSSIP_VALUE_MAX: usize = 56_000;
 
 /// Gossip data structure for sharing node information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct NodeGossipData {
     pub addr: String,
-    /// Every owned slot. Only for old nodes, which read nothing else; empty above
-    /// `LEGACY_SLOTS_MAX` slots. Can be dropped in a later release.
+    /// Every owned slot. Only for old nodes, which read nothing else; empty when
+    /// the whole value would exceed `GOSSIP_VALUE_MAX`. Can be dropped in a later release.
     pub slots: Vec<u16>,
     /// Owned slots as inclusive `(start, end)` runs. Read in preference to `slots`.
     #[serde(default)]
@@ -175,18 +177,26 @@ impl NodeGossipData {
     fn new(addr: String, slots: &HashSet<u16>, role: NodeRole, primary: Option<String>) -> Self {
         let mut list: Vec<u16> = slots.iter().copied().collect();
         list.sort_unstable();
-        Self {
+        let mut data = Self {
             addr,
-            slots: if list.len() <= LEGACY_SLOTS_MAX {
-                list
-            } else {
-                Vec::new()
-            },
+            slots: list,
             slot_ranges: ClusterManager::slot_runs(slots),
             state: "master".to_string(),
             role,
             primary,
+        };
+        let size = serde_json::to_string(&data).map_or(0, |json| json.len());
+        if size > GOSSIP_VALUE_MAX {
+            static WARNED: Once = Once::new();
+            WARNED.call_once(|| {
+                warn!(
+                    "This node's slots are too many to gossip as a list ({} bytes): peers older than this version can't see them. Upgrade every peer before giving a node this many slots",
+                    size
+                )
+            });
+            data.slots = Vec::new();
         }
+        data
     }
 
     fn owned_slots(&self) -> HashSet<u16> {
@@ -1187,12 +1197,25 @@ mod tests {
             slots
         );
 
-        // At the legacy limit both are sent; above it only the ranges.
+        // While the value fits a datagram the legacy list is sent too, and an old
+        // node reads it; above that only the ranges.
+        #[derive(Deserialize)]
+        struct Legacy {
+            slots: Vec<u16>,
+        }
         let all = |n: u16| (0..n).collect::<HashSet<u16>>();
-        let at_limit = NodeGossipData::new("a:1".into(), &all(8192), NodeRole::Primary, None);
-        assert_eq!(at_limit.slots.len(), 8192);
+        let at_limit = NodeGossipData::new("a:1".into(), &all(9000), NodeRole::Primary, None);
+        assert_eq!(at_limit.slots.len(), 9000);
         let json = serde_json::to_string(&at_limit).unwrap();
-        assert!(json.len() < 65_000, "{} bytes", json.len());
+        assert!(json.len() <= GOSSIP_VALUE_MAX, "{} bytes", json.len());
+        assert_eq!(
+            serde_json::from_str::<Legacy>(&json).unwrap().slots.len(),
+            9000
+        );
+        // The worst case for 9000 slots: all five digits.
+        let high: HashSet<u16> = (7384..16384).collect();
+        let high = NodeGossipData::new("a:1".into(), &high, NodeRole::Primary, None);
+        assert_eq!(high.slots.len(), 9000);
         let full = NodeGossipData::new("a:1".into(), &all(16384), NodeRole::Primary, None);
         assert!(full.slots.is_empty());
         assert_eq!(full.slot_ranges, vec![(0, 16383)]);

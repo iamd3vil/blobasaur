@@ -484,6 +484,19 @@ docker-compose logs | grep -i gossip
 # "Discovered cluster node: node-2 at 127.0.0.1:6382 with 5462 slots"
 ```
 
+## Upgrade Notes
+
+Nodes gossip their slots as ranges. Nodes from before this encoding read only a
+full list of slots, so a node also gossips that list for them as long as its
+whole gossip entry stays under 56000 bytes. That fits about 9000 slots, and fewer
+when scattered, since the ranges grow too. Past that
+(for example a node owning all 16384 slots) only the ranges fit in one gossip
+datagram, and the node logs a warning once. An older peer then sees that node as
+owning no slots, and runs requests for them locally instead of redirecting.
+
+Upgrade every peer before giving one node an assignment too large for the list.
+Rolling upgrades with smaller assignments need no care.
+
 ## Current Limitations
 
 1. **Asynchronous Replication:** Replicas can lag, and a failover loses unreplicated writes (see [Replication](#replication))
