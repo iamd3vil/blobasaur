@@ -8,7 +8,9 @@ use std::fs;
 use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
-use tokio::sync::{Mutex, MutexGuard, Semaphore, mpsc, watch};
+use tokio::sync::{
+    Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, Semaphore, mpsc, watch,
+};
 use tokio::task::JoinSet;
 
 use crate::compression::{self, Compressor};
@@ -87,6 +89,10 @@ pub struct AppState {
     /// Per shard, the cursors of the replication streams being served; see
     /// [`replication::ShardPins`].
     pub repl_pins: Vec<Arc<replication::ShardPins>>,
+    /// Per shard, on a replica: READONLY reads hold it shared from before their
+    /// readiness check until their data is read, and a resync holds it exclusive
+    /// while it unsyncs and wipes the shard, so no admitted read sees the wipe.
+    replica_gates: Vec<RwLock<()>>,
 
     ring: HashRing<ShardNode>,
 }
@@ -414,6 +420,7 @@ impl AppState {
         }
 
         let repl_pins = (0..cfg.num_shards).map(|_| Arc::default()).collect();
+        let replica_gates = (0..cfg.num_shards).map(|_| RwLock::new(())).collect();
         Ok(AppState {
             cfg,
             shard_senders: shard_senders_vec,
@@ -429,6 +436,7 @@ impl AppState {
             key_locks: KeyLocks::default(),
             commit_watch,
             repl_pins,
+            replica_gates,
             ring,
         })
     }
@@ -491,6 +499,25 @@ impl AppState {
                 }
             }
         }
+    }
+
+    /// A replica's READONLY read takes this before it is routed, and holds it
+    /// until its DB read is done. Primaries and other connections take nothing.
+    pub async fn replica_read_gate(
+        &self,
+        shard: usize,
+        conn_readonly: bool,
+    ) -> Option<RwLockReadGuard<'_, ()>> {
+        if conn_readonly && self.cfg.replica_of().is_some() {
+            Some(self.replica_gates[shard].read().await)
+        } else {
+            None
+        }
+    }
+
+    /// Held by a resync of `shard` from unsyncing it until the wipe has committed.
+    pub async fn replica_reset_gate(&self, shard: usize) -> RwLockWriteGuard<'_, ()> {
+        self.replica_gates[shard].write().await
     }
 
     pub fn get_shard(&self, key: &str) -> usize {
