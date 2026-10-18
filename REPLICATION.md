@@ -304,7 +304,11 @@ so it is ordered after any queued Apply. In one transaction it deletes all rows
 from `blobs` and every `blobs_*` table, clears `repl_log`, sets `applied_lsn = 0`,
 deletes `caught_up_lsn` and the last watermark time, stores the new `replid`,
 and sets `synced = 0`. The shard stops serving replica
-reads before the reset is queued.
+reads before the reset is queued. A per-shard gate orders this against reads:
+a replica's READONLY read holds it shared from before its route check until its
+DB read is done, and the sync task holds it exclusive from clearing the synced
+flag until the reset has committed. A read admitted while synced finishes
+before the wipe; a later one is redirected.
 
 ## Roles and promotion state
 

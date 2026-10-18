@@ -1100,7 +1100,9 @@ impl Replica {
             self.shard,
             self.primary
         );
-        // Stop serving reads from the shard before the reset is queued.
+        // Reads admitted while synced finish first; later ones are redirected.
+        let state = self.state.clone();
+        let _gate = state.replica_reset_gate(self.shard).await;
         self.set_synced(false).await;
         let (responder, committed) = oneshot::channel();
         let replid = replid.to_string();
@@ -1589,5 +1591,97 @@ mod tests {
         assert_eq!(state(&mut conn, "role").await.unwrap(), "replica");
         assert_eq!(state(&mut conn, "replid").await.unwrap(), promoted);
         assert_eq!(state(&mut conn, "synced").await.unwrap(), "0");
+    }
+
+    #[tokio::test]
+    async fn a_resync_waits_for_replica_reads_admitted_before_it() {
+        use crate::config::{Cfg, ReplicationConfig};
+        use crate::metrics::Metrics;
+        use crate::shard_manager::{ShardWriter, shard_writer_task};
+
+        let dir = TempDir::new().unwrap();
+        let cfg = Cfg {
+            data_dir: dir.path().to_string_lossy().into_owned(),
+            num_shards: 1,
+            storage_compression: None,
+            async_write: None,
+            batch_size: Some(1),
+            batch_timeout_ms: Some(0),
+            addr: None,
+            replication: None,
+            cluster: None,
+            metrics: None,
+            shutdown_timeout_secs: None,
+            max_request_size_mb: None,
+            cleanup_chunk_size: None,
+            cleanup_interval_secs: None,
+            new_replid: false,
+            sqlite: None,
+        };
+        let mut receivers = Vec::new();
+        let mut state = AppState::new(cfg, &mut receivers).await.unwrap();
+        // AppState::new wants a cluster for a replica; the gate only needs the role.
+        state.cfg.replication = Some(ReplicationConfig {
+            replica_of: Some("p".to_string()),
+            tombstone_retention_secs: None,
+        });
+        let state = Arc::new(state);
+        let shutdown = CancellationToken::new();
+        let writer = tokio::spawn(shard_writer_task(ShardWriter {
+            shard_id: 0,
+            pool: state.write_db_pools[0].clone(),
+            receiver: receivers.remove(0),
+            batch_size: 1,
+            batch_timeout_ms: 0,
+            inflight_cache: state.inflight_cache.clone(),
+            inflight_hcache: state.inflight_hcache.clone(),
+            metrics: Metrics::new(),
+            commit_watch: state.commit_watch[0].clone(),
+            shutdown: shutdown.clone(),
+        }));
+        sqlx::query(
+            "INSERT INTO blobs (key, data, created_at, updated_at) VALUES ('k', x'00', 0, 0)",
+        )
+        .execute(&state.write_db_pools[0])
+        .await
+        .unwrap();
+        let rows = || async {
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM blobs")
+                .fetch_one(&state.db_pools[0])
+                .await
+                .unwrap()
+        };
+
+        // Only a READONLY read on a replica takes the gate.
+        assert!(state.replica_read_gate(0, false).await.is_none());
+        let admitted = state.replica_read_gate(0, true).await.unwrap();
+
+        let mut replica = Replica {
+            state: state.clone(),
+            shard: 0,
+            primary: "p".to_string(),
+            metrics: ShardMetrics::new(0),
+            tick: interval(Duration::from_secs(1)),
+            last_watermark_ms: None,
+            backoff: BACKOFF_MIN,
+        };
+        let mut reset = tokio::spawn(async move { replica.reset("new-replid").await });
+        // The reset can't start, so the admitted read still sees the copy. (A
+        // reset that didn't wait would finish well within this.)
+        assert!(
+            timeout(Duration::from_millis(200), &mut reset)
+                .await
+                .is_err()
+        );
+        assert_eq!(rows().await, 1);
+
+        drop(admitted);
+        reset.await.unwrap().unwrap();
+        assert_eq!(rows().await, 0);
+        // And a read arriving afterwards is not blocked.
+        assert!(state.replica_read_gate(0, true).await.is_some());
+
+        shutdown.cancel();
+        writer.await.unwrap();
     }
 }
