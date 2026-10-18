@@ -6,7 +6,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Connection, SqliteConnection, SqlitePool};
 use std::fs;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard, Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
 
@@ -79,6 +79,8 @@ pub struct AppState {
     /// readiness check until their data is read, and a resync holds it exclusive
     /// while it unsyncs and wipes the shard, so no admitted read sees the wipe.
     replica_gates: Vec<RwLock<()>>,
+    /// Per shard, the replid that `blobasaur_replication_info` last reported.
+    replids: Vec<Mutex<Option<String>>>,
 
     ring: HashRing<ShardNode>,
 }
@@ -298,7 +300,8 @@ impl AppState {
 
         let repl_pins = (0..cfg.num_shards).map(|_| Arc::default()).collect();
         let replica_gates = (0..cfg.num_shards).map(|_| RwLock::new(())).collect();
-        Ok(AppState {
+        let replids = (0..cfg.num_shards).map(|_| Mutex::new(None)).collect();
+        let state = AppState {
             cfg,
             shard_senders: shard_senders_vec,
             db_pools,
@@ -311,8 +314,36 @@ impl AppState {
             commit_watch,
             repl_pins,
             replica_gates,
+            replids,
             ring,
-        })
+        };
+        // A new replica has none until its first sync.
+        for (i, pool) in state.db_pools.iter().enumerate() {
+            if let Ok((replid, ..)) = replication::primary_state(pool).await
+                && !replid.is_empty()
+            {
+                state.set_replid(i, &replid);
+            }
+        }
+        Ok(state)
+    }
+
+    /// Reports `replid` as the shard's current one in `blobasaur_replication_info`,
+    /// and zeroes the series of the one it replaces.
+    pub fn set_replid(&self, shard: usize, replid: &str) {
+        let mut current = self.replids[shard].lock().unwrap();
+        let info = |replid: &str| {
+            metrics::gauge!(
+                "blobasaur_replication_info",
+                "shard" => shard.to_string(),
+                "replid" => replid.to_string()
+            )
+        };
+        if let Some(old) = current.as_deref().filter(|old| *old != replid) {
+            info(old).set(0.0);
+        }
+        info(replid).set(1.0);
+        *current = Some(replid.to_string());
     }
 
     /// Records that shard `shard_id` stopped cleanly; see
@@ -805,6 +836,34 @@ mod tests {
             .execute(&mut writer)
             .await
             .expect("failed to release write lock");
+    }
+
+    #[tokio::test]
+    async fn replication_info_follows_the_replid() {
+        use crate::metrics::rendered_value;
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let cfg = test_cfg(temp_dir.path().to_string_lossy().into_owned(), 1);
+        let mut receivers = Vec::new();
+        let state = AppState::new(cfg, &mut receivers).await.unwrap();
+        let series =
+            |replid: &str| format!(r#"blobasaur_replication_info{{shard="0",replid="{replid}"}}"#);
+
+        // A primary reports the replid it started with.
+        let stored: String = sqlx::query_scalar("SELECT v FROM repl_state WHERE k = 'replid'")
+            .fetch_one(&state.db_pools[0])
+            .await
+            .unwrap();
+        let output = recorder.handle().render();
+        assert_eq!(rendered_value(&output, &series(&stored)), 1.0);
+
+        // A new one replaces it, which is zeroed, not removed.
+        state.set_replid(0, "next");
+        state.set_replid(0, "next");
+        let output = recorder.handle().render();
+        assert_eq!(rendered_value(&output, &series(&stored)), 0.0);
+        assert_eq!(rendered_value(&output, &series("next")), 1.0);
     }
 
     #[tokio::test]

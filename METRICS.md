@@ -124,6 +124,7 @@ Blocking-pool size, worker-local queue depth, poll counts, and work-steal counts
 Every node reports its `role`; the other series appear on the side they describe. LSNs are per shard and per node, so compare them only between a primary and a replica of the same shard (see the lag query below).
 
 - `blobasaur_replication_role{shard,role}` - `1` for the node's role, `primary` or `replica`. Sampled on each scrape
+- `blobasaur_replication_info{shard,replid}` - `1` for the shard's current replication history (`replid`), on primaries and replicas. When the `replid` changes, the old series is set to `0`. Join LSN gauges to it to compare them only within one history (see the lag query below)
 - `blobasaur_replication_latest_lsn{shard}` - Primary: highest committed change LSN of the shard. Sampled on each scrape
 - `blobasaur_replication_active_streams{shard}` - Primary: replication streams currently open to replicas
 - `blobasaur_replication_staleness_seconds{shard}` - Replica: seconds since the primary's clock at the last applied watermark, by the replica's clock. Watermarks arrive at least every 10 s, and the gauge is refreshed every second, so it keeps rising if the stream, the primary or the replica's writer stalls. Counted from startup (or from a resync) until the first watermark. Assumes synchronized clocks; alert on this
@@ -181,11 +182,18 @@ Open `http://localhost:9090` in your browser to access the Prometheus UI.
 ### Replication lag (LSNs behind the primary)
 
 ```promql
-blobasaur_replication_latest_lsn{instance="primary:9090"}
-  - on(shard) blobasaur_replication_caught_up_lsn{instance="replica:9090"}
+(
+  blobasaur_replication_latest_lsn{instance="primary:9090"}
+    * on(shard) group_left(replid) (blobasaur_replication_info{instance="primary:9090"} == 1)
+)
+- on(shard, replid)
+(
+  blobasaur_replication_caught_up_lsn{instance="replica:9090"}
+    * on(shard) group_left(replid) (blobasaur_replication_info{instance="replica:9090"} == 1)
+)
 ```
 
-Only meaningful while the replica's `replid` matches the primary's; right after a resync `caught_up_lsn` restarts from 0.
+Each side takes its `replid` from `blobasaur_replication_info`, and only shards whose primary and replica share one `replid` are subtracted. Right after a resync the replica reports the new `replid` and `caught_up_lsn` restarts from 0. Keep the parentheses around `== 1`: without them the comparison applies to the product.
 
 ### Replica staleness
 
