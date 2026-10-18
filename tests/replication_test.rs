@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 use std::future::Future;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::Path;
+use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use blobasaur::cluster::ClusterManager;
@@ -14,15 +15,17 @@ use blobasaur::config::{
 use blobasaur::server;
 use sqlx::{Connection, SqliteConnection};
 use tempfile::TempDir;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
-/// The primary owns this many slots: gossip carries them as a JSON list in one
-/// UDP datagram, which all 16384 would overflow.
+/// A primary owns slots up to this one, unless a test gives it a `range`.
 const OWNED_SLOTS: u16 = 8000;
+
+/// Every slot, whose old JSON list would overflow a gossip datagram.
+const ALL_SLOTS: (u16, u16) = (0, 16383);
 
 /// A key (or hash field) that name hashes into the primary's slots.
 fn k(name: &str) -> String {
@@ -46,6 +49,8 @@ struct Opts<'a> {
     shards: usize,
     retention_secs: u64,
     zstd: bool,
+    /// The slots a primary owns; 0 to `OWNED_SLOTS` if unset.
+    range: Option<(u16, u16)>,
 }
 
 impl<'a> Opts<'a> {
@@ -58,6 +63,7 @@ impl<'a> Opts<'a> {
             shards,
             retention_secs: 86400,
             zstd: false,
+            range: None,
         }
     }
 
@@ -106,10 +112,8 @@ fn cfg(dir: &Path, o: &Opts, addr: SocketAddr, gossip_port: u16) -> Cfg {
             slots: None,
             // A replica owns no slots.
             slot_ranges: o.replica_of.is_none().then(|| {
-                vec![SlotRange {
-                    start: 0,
-                    end: OWNED_SLOTS,
-                }]
+                let (start, end) = o.range.unwrap_or((0, OWNED_SLOTS));
+                vec![SlotRange { start, end }]
             }),
             gossip_interval_ms: Some(100),
             // Peers gossip to the advertised host, so it can't be left at 0.0.0.0.
@@ -176,6 +180,13 @@ where
 
 struct Client(BufReader<TcpStream>);
 
+#[derive(Debug, PartialEq)]
+enum Reply {
+    Int(i64),
+    Text(String),
+    Array(Vec<Reply>),
+}
+
 impl Client {
     async fn connect(addr: SocketAddr) -> Self {
         // The server may still be starting.
@@ -192,11 +203,7 @@ impl Client {
     /// Sends a command and returns its reply lines (an array reply's elements
     /// follow its header).
     async fn call(&mut self, args: &[&str]) -> Vec<String> {
-        let mut req = format!("*{}\r\n", args.len());
-        for arg in args {
-            req.push_str(&format!("${}\r\n{}\r\n", arg.len(), arg));
-        }
-        self.0.get_mut().write_all(req.as_bytes()).await.unwrap();
+        self.send(args).await;
         let mut lines = vec![self.line().await];
         if let Some(n) = lines[0].strip_prefix('*') {
             for _ in 0..n.parse::<usize>().unwrap() {
@@ -204,6 +211,79 @@ impl Client {
             }
         }
         lines
+    }
+
+    async fn send(&mut self, args: &[&str]) {
+        let mut req = format!("*{}\r\n", args.len());
+        for arg in args {
+            req.push_str(&format!("${}\r\n{}\r\n", arg.len(), arg));
+        }
+        self.0.get_mut().write_all(req.as_bytes()).await.unwrap();
+    }
+
+    /// Sends a command and parses the reply, nested arrays included.
+    async fn tree(&mut self, args: &[&str]) -> Reply {
+        self.send(args).await;
+        self.reply().await
+    }
+
+    async fn cluster_nodes(&mut self) -> String {
+        self.send(&["CLUSTER", "NODES"]).await;
+        let header = self.line().await;
+        let mut text = vec![0; header[1..].parse::<usize>().unwrap() + 2];
+        self.0.read_exact(&mut text).await.unwrap();
+        String::from_utf8(text).unwrap()
+    }
+
+    fn reply(&mut self) -> Pin<Box<dyn Future<Output = Reply> + '_>> {
+        Box::pin(async move {
+            let line = self.line().await;
+            let (kind, rest) = line.split_at(1);
+            match kind {
+                ":" => Reply::Int(rest.parse().unwrap()),
+                "*" => {
+                    let mut items = Vec::new();
+                    for _ in 0..rest.parse::<usize>().unwrap() {
+                        items.push(self.reply().await);
+                    }
+                    Reply::Array(items)
+                }
+                "$" if rest != "-1" => Reply::Text(self.line().await),
+                _ => Reply::Text(line),
+            }
+        })
+    }
+
+    /// CLUSTER SLOTS as `(start, end, [(port, node id)])`, the primary first.
+    async fn cluster_slots(&mut self) -> Vec<(i64, i64, Vec<(i64, String)>)> {
+        let Reply::Array(ranges) = self.tree(&["CLUSTER", "SLOTS"]).await else {
+            panic!("CLUSTER SLOTS is not an array");
+        };
+        ranges
+            .into_iter()
+            .map(|range| {
+                let Reply::Array(items) = range else {
+                    panic!("range is not an array")
+                };
+                let (Reply::Int(start), Reply::Int(end)) = (&items[0], &items[1]) else {
+                    panic!("range has no bounds")
+                };
+                let nodes = items[2..]
+                    .iter()
+                    .map(|node| match node {
+                        Reply::Array(n) => match (&n[0], &n[1], &n[2]) {
+                            (Reply::Text(ip), Reply::Int(port), Reply::Text(id)) => {
+                                assert_eq!(ip, "127.0.0.1");
+                                (*port, id.clone())
+                            }
+                            _ => panic!("bad node {n:?}"),
+                        },
+                        _ => panic!("node is not an array"),
+                    })
+                    .collect();
+                (*start, *end, nodes)
+            })
+            .collect()
     }
 
     async fn line(&mut self) -> String {
@@ -311,7 +391,15 @@ async fn converged(primary: &Path, replica: &Path, shards: usize) -> bool {
 async fn replica_converges_with_primary() {
     const SHARDS: usize = 4;
     let (pdir, rdir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
-    let primary = start(pdir.path(), &Opts::primary("p", SHARDS)).await;
+    // All slots: the replica only finds this primary if gossip delivers them.
+    let primary = start(
+        pdir.path(),
+        &Opts {
+            range: Some(ALL_SLOTS),
+            ..Opts::primary("p", SHARDS)
+        },
+    )
+    .await;
     let replica = start(
         rdir.path(),
         &Opts::replica("r", "p", vec![primary.gossip.clone()], SHARDS),
@@ -665,4 +753,348 @@ async fn a_failed_cluster_start_stops_a_replicated_node() {
         "wrong error"
     );
     drop(taken);
+}
+
+fn text(s: impl Into<String>) -> Reply {
+    Reply::Text(s.into())
+}
+
+type Slots = Vec<(i64, i64, Vec<(i64, String)>)>;
+
+/// CLUSTER SLOTS for a primary `p` owning every slot, then its listed replicas.
+fn listing(primary: &Node, replicas: &[(&Node, &str)]) -> Slots {
+    let mut nodes = vec![(primary.addr.port() as i64, "p".to_string())];
+    nodes.extend(
+        replicas
+            .iter()
+            .map(|(n, id)| (n.addr.port() as i64, id.to_string())),
+    );
+    vec![(0, 16383, nodes)]
+}
+
+async fn slots_of(node: &Node) -> Slots {
+    Client::connect(node.addr).await.cluster_slots().await
+}
+
+async fn readonly_client(node: &Node) -> Client {
+    let mut client = Client::connect(node.addr).await;
+    ok(&mut client, &["READONLY"]).await;
+    client
+}
+
+/// A replica that never finishes syncing: the primary refuses its shard count.
+fn stuck_replica<'a>(primary: &Node) -> Opts<'a> {
+    Opts::replica("stuck", "p", vec![primary.gossip.clone()], 3)
+}
+
+fn all_slots(o: Opts<'_>) -> Opts<'_> {
+    Opts {
+        range: Some(ALL_SLOTS),
+        ..o
+    }
+}
+
+#[tokio::test]
+async fn topology_lists_a_replica_once_it_is_synced() {
+    const SHARDS: usize = 2;
+    let (pdir, rdir, sdir) = (
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    );
+    let primary = start(pdir.path(), &all_slots(Opts::primary("p", SHARDS))).await;
+    let stuck = start(sdir.path(), &stuck_replica(&primary)).await;
+    let replica = start(
+        rdir.path(),
+        &Opts::replica("r", "p", vec![primary.gossip.clone()], SHARDS),
+    )
+    .await;
+
+    // The replica appears after the primary, and only once it has synced. The
+    // listing is read first and the database second: listed implies synced.
+    let (mut before, deadline) = (0, Instant::now() + Duration::from_secs(30));
+    loop {
+        let slots = slots_of(&primary).await;
+        if slots == listing(&primary, &[(&replica, "r")]) {
+            assert!(
+                all_synced(rdir.path(), SHARDS).await,
+                "listed before synced"
+            );
+            break;
+        }
+        assert_eq!(slots, listing(&primary, &[]));
+        before += 1;
+        assert!(Instant::now() < deadline, "the replica was never listed");
+        sleep(Duration::from_millis(20)).await;
+    }
+    eprintln!("replica absent from CLUSTER SLOTS for {before} polls");
+
+    // The replica sees the same, and the primary's slots reached it as ranges.
+    wait_for("the replica's own view", || async {
+        slots_of(&replica).await == listing(&primary, &[(&replica, "r")])
+    })
+    .await;
+
+    // Both are slaves in CLUSTER NODES, the stuck one too.
+    let slave = |n: &Node, id: &str| {
+        format!(
+            "{id} {}:{} slave p 0 0 0 connected\n",
+            n.addr.ip(),
+            n.addr.port()
+        )
+    };
+    wait_for("the stuck replica to be known", || async {
+        let nodes = Client::connect(primary.addr).await.cluster_nodes().await;
+        nodes.contains(&slave(&stuck, "stuck")) && nodes.contains(&slave(&replica, "r"))
+    })
+    .await;
+    let nodes = Client::connect(replica.addr).await.cluster_nodes().await;
+    let myself = format!(
+        "r {}:{} myself,slave p 0 0 0 connected\n",
+        replica.addr.ip(),
+        replica.addr.port()
+    );
+    assert!(nodes.contains(&myself), "{nodes}");
+    let master = format!(
+        "p {}:{} master - 0 0 0 connected 0-16383\n",
+        primary.addr.ip(),
+        primary.addr.port()
+    );
+    assert!(nodes.contains(&master), "{nodes}");
+    // Still syncing, so still not listed.
+    assert_eq!(
+        slots_of(&primary).await,
+        listing(&primary, &[(&replica, "r")])
+    );
+
+    stuck.stop().await;
+    replica.stop().await;
+    primary.stop().await;
+}
+
+#[tokio::test]
+async fn a_replica_serves_reads_only_on_readonly_connections() {
+    const SHARDS: usize = 2;
+    let (pdir, rdir, sdir) = (
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    );
+    let primary = start(pdir.path(), &all_slots(Opts::primary("p", SHARDS))).await;
+    let stuck = start(sdir.path(), &stuck_replica(&primary)).await;
+    let replica = start(
+        rdir.path(),
+        &Opts::replica("r", "p", vec![primary.gossip.clone()], SHARDS),
+    )
+    .await;
+    wait_for("the replica to be listed", || async {
+        slots_of(&primary).await == listing(&primary, &[(&replica, "r")])
+    })
+    .await;
+
+    let mut writer = Client::connect(primary.addr).await;
+    let (key, field) = ("key", "field");
+    ok(&mut writer, &["SET", key, "value"]).await;
+    ok(&mut writer, &["SET", "ttl", "v", "EX", "3600"]).await;
+    assert_eq!(writer.call(&["HSET", "ns", field, "hv"]).await, [":1"]);
+    let moved = |key: &str| {
+        text(format!(
+            "-MOVED {} {}",
+            ClusterManager::calculate_slot(key),
+            primary.addr
+        ))
+    };
+
+    // Without READONLY every command goes to the primary, though this one is synced.
+    let mut plain = Client::connect(replica.addr).await;
+    assert_eq!(plain.tree(&["GET", key]).await, moved(key));
+    assert_eq!(plain.tree(&["HGET", "ns", field]).await, moved(field));
+
+    // With it, reads are served here once they have replicated.
+    wait_for("the replica to hold the data", || async {
+        let mut c = readonly_client(&replica).await;
+        c.tree(&["GET", key]).await == text("value")
+            && c.tree(&["HGET", "ns", field]).await == text("hv")
+            && matches!(c.tree(&["TTL", "ttl"]).await, Reply::Int(n) if n > 3000)
+    })
+    .await;
+    let mut ro = readonly_client(&replica).await;
+    assert_eq!(ro.tree(&["GET", "nope"]).await, text("$-1"));
+    assert_eq!(ro.tree(&["EXISTS", key]).await, Reply::Int(1));
+    assert_eq!(ro.tree(&["HEXISTS", "ns", field]).await, Reply::Int(1));
+
+    // Writes never are.
+    for command in [
+        vec!["SET", key, "other"],
+        vec!["DEL", key],
+        vec!["EXPIRE", key, "10"],
+        vec!["HSET", "ns", field, "other"],
+        vec!["HDEL", "ns", field],
+    ] {
+        let slot_key = if command[0].starts_with('H') {
+            field
+        } else {
+            key
+        };
+        assert_eq!(ro.tree(&command).await, moved(slot_key), "{command:?}");
+    }
+    assert_eq!(ro.tree(&["GET", key]).await, text("value"));
+
+    // READWRITE undoes READONLY.
+    ok(&mut ro, &["READWRITE"]).await;
+    assert_eq!(ro.tree(&["GET", key]).await, moved(key));
+
+    // A replica that is still copying serves nothing, READONLY or not.
+    wait_for("the stuck replica to know its primary", || async {
+        let mut c = readonly_client(&stuck).await;
+        c.tree(&["GET", key]).await == moved(key)
+    })
+    .await;
+
+    stuck.stop().await;
+    replica.stop().await;
+    primary.stop().await;
+}
+
+#[tokio::test]
+async fn a_slot_nobody_serves_is_clusterdown() {
+    let (pdir, rdir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    // The primary owns 0 to OWNED_SLOTS only.
+    let primary = start(pdir.path(), &Opts::primary("p", 1)).await;
+    let replica = start(
+        rdir.path(),
+        &Opts::replica("r", "p", vec![primary.gossip.clone()], 1),
+    )
+    .await;
+    // A slot the primary does own is served here once the replica knows it.
+    let known = k("known");
+    wait_for("the replica to serve", || async {
+        readonly_client(&replica).await.tree(&["GET", &known]).await == text("$-1")
+    })
+    .await;
+
+    let key = (0..)
+        .map(|i| format!("down{i}"))
+        .find(|k| ClusterManager::calculate_slot(k) > OWNED_SLOTS)
+        .unwrap();
+    let down = text("-CLUSTERDOWN Hash slot not served");
+    for (node, readonly) in [(&primary, false), (&replica, false), (&replica, true)] {
+        let mut client = Client::connect(node.addr).await;
+        if readonly {
+            ok(&mut client, &["READONLY"]).await;
+        }
+        assert_eq!(client.tree(&["GET", &key]).await, down);
+        assert_eq!(client.tree(&["SET", &key, "v"]).await, down);
+    }
+
+    replica.stop().await;
+    primary.stop().await;
+}
+
+#[tokio::test]
+async fn a_node_claiming_slots_a_live_node_owns_refuses_to_start() {
+    let (pdir, qdir, odir) = (
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    );
+    let primary = start(pdir.path(), &Opts::primary("p", 1)).await;
+
+    // 4000-9000 overlaps p's 0-8000. A slow gossip interval gives the guard a
+    // long wait, so it hears about p even on a busy machine.
+    let o = Opts {
+        seeds: vec![primary.gossip.clone()],
+        range: Some((4000, 9000)),
+        ..Opts::primary("q", 1)
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut config = cfg(qdir.path(), &o, addr, o.gossip_port);
+    config.cluster.as_mut().unwrap().gossip_interval_ms = Some(300);
+    let result = timeout(
+        Duration::from_secs(30),
+        server::run(config, listener, CancellationToken::new()),
+    )
+    .await
+    .expect("startup hung");
+    let error = format!("{:?}", result.unwrap_err());
+    assert!(
+        error.contains("slot conflict") && error.contains("node p ") && error.contains("4000-8000"),
+        "{error}"
+    );
+
+    // Slots nobody claims start fine, and are advertised once claimed.
+    let other = start(
+        odir.path(),
+        &Opts {
+            seeds: vec![primary.gossip.clone()],
+            range: Some((OWNED_SLOTS + 1, 16383)),
+            ..Opts::primary("o", 1)
+        },
+    )
+    .await;
+    let owner = |node: &Node, id: &str| vec![(node.addr.port() as i64, id.to_string())];
+    wait_for("both ranges to be listed", || async {
+        slots_of(&primary).await
+            == vec![
+                (0, OWNED_SLOTS as i64, owner(&primary, "p")),
+                (OWNED_SLOTS as i64 + 1, 16383, owner(&other, "o")),
+            ]
+    })
+    .await;
+
+    other.stop().await;
+    primary.stop().await;
+}
+
+/// A go-redis `ReadOnly` cluster client reads from the replica listed in
+/// CLUSTER SLOTS: the value it gets exists only in the replica's database.
+#[tokio::test(flavor = "multi_thread")]
+async fn go_redis_read_only_client_reads_from_the_replica() {
+    if std::env::var_os("BLOBASAUR_SKIP_GO_TESTS").is_some() {
+        eprintln!("BLOBASAUR_SKIP_GO_TESTS is set; skipping go-redis client tests");
+        return;
+    }
+    let (pdir, rdir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let primary = start(pdir.path(), &all_slots(Opts::primary("p", 1))).await;
+    let replica = start(
+        rdir.path(),
+        &Opts::replica("r", "p", vec![primary.gossip.clone()], 1),
+    )
+    .await;
+    wait_for("the replica to be listed", || async {
+        slots_of(&primary).await == listing(&primary, &[(&replica, "r")])
+    })
+    .await;
+    sqlx::query("INSERT INTO blobs (key, data, created_at, updated_at) VALUES ('go-key', ?, 0, 0)")
+        .bind(&b"from-replica"[..])
+        .execute(&mut connect_db(rdir.path(), 0).await)
+        .await
+        .unwrap();
+
+    let output = tokio::process::Command::new("go")
+        .args([
+            "test",
+            "-count=1",
+            "-run",
+            "TestClusterReadOnlyReadsFromReplica",
+            "./...",
+        ])
+        .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/goredis"))
+        .env("BLOBASAUR_ADDR", primary.addr.to_string())
+        .env("BLOBASAUR_REPLICA_KEY", "go-key")
+        .output()
+        .await
+        .unwrap_or_else(|e| {
+            panic!("failed to run `go test` ({e}); set BLOBASAUR_SKIP_GO_TESTS=1 to skip")
+        });
+    assert!(
+        output.status.success(),
+        "go-redis failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    replica.stop().await;
+    primary.stop().await;
 }
