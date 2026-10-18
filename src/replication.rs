@@ -693,13 +693,17 @@ async fn stream_pages(
                 .await
                 .map_err(io::Error::other)?;
             write_all(stream, &page.bytes).await?;
-            let Some(last) = page.last_lsn else { break };
-            cursor = last;
-            state.repl_pins[shard]
-                .lock()
-                .await
-                .cursors
-                .insert(pin, cursor);
+            if let Some(last) = page.last_lsn {
+                cursor = last;
+                state.repl_pins[shard]
+                    .lock()
+                    .await
+                    .cursors
+                    .insert(pin, cursor);
+            }
+            if page.caught_up {
+                break;
+            }
         }
         // A replica sends nothing after the handshake, so a read means it hung up.
         let mut hangup = [0u8; 1];
@@ -713,9 +717,12 @@ async fn stream_pages(
 
 struct Page {
     /// Encoded frames: the entries after the cursor with their current rows,
-    /// or, if there are none, a watermark.
+    /// followed by a watermark if they reach the head.
     bytes: BytesMut,
     last_lsn: Option<u64>,
+    /// Whether the page holds every entry after the cursor, so it ends with a
+    /// watermark.
+    caught_up: bool,
 }
 
 /// One page of the stream, read in one read transaction.
@@ -733,16 +740,10 @@ async fn read_page(pool: &SqlitePool, cursor: u64) -> Result<Page, sqlx::Error> 
         extend_encode(&mut bytes, &frame.to_resp(), false).expect("Failed to encode frame");
         bytes.len()
     };
-    if entries.is_empty() {
-        encode(Frame::Watermark {
-            watermark: watermark(&mut tx).await?,
-            unix_ms: Utc::now().timestamp_millis(),
-        });
-        return Ok(Page {
-            bytes,
-            last_lsn: None,
-        });
-    }
+    // Fewer rows than the limit, none cut off by the byte cap: this read saw
+    // every entry after the cursor. A watermark only after an empty page
+    // would never come while writes keep arriving between pages.
+    let mut caught_up = entries.len() < PAGE_ROWS;
     let mut last_lsn = None;
     for (lsn, tbl, key, deleted) in entries {
         let row = if deleted {
@@ -767,10 +768,23 @@ async fn read_page(pool: &SqlitePool, cursor: u64) -> Result<Page, sqlx::Error> 
         });
         last_lsn = Some(lsn as u64);
         if len >= PAGE_BYTES {
+            caught_up = false;
             break;
         }
     }
-    Ok(Page { bytes, last_lsn })
+    if caught_up {
+        // Read in the same transaction as the entries, so every entry up to
+        // it is in this page or an earlier one.
+        encode(Frame::Watermark {
+            watermark: watermark(&mut tx).await?,
+            unix_ms: Utc::now().timestamp_millis(),
+        });
+    }
+    Ok(Page {
+        bytes,
+        last_lsn,
+        caught_up,
+    })
 }
 
 type RowImage = (i64, i64, Option<i64>, i64, Option<Vec<u8>>);
@@ -1261,6 +1275,55 @@ mod tests {
             assert_eq!(Frame::from_resp(decoded).unwrap(), frame);
         }
         assert!(buf.is_empty());
+    }
+
+    fn decode_page(mut bytes: BytesMut) -> Vec<Frame> {
+        let mut frames = Vec::new();
+        while let Some((frame, _, _)) = decode_bytes_mut(&mut bytes).unwrap() {
+            frames.push(Frame::from_resp(frame).unwrap());
+        }
+        frames
+    }
+
+    #[tokio::test]
+    async fn a_page_that_reaches_the_head_ends_with_a_watermark() {
+        let dir = TempDir::new().unwrap();
+        let pool = replica_pool(&dir).await;
+        let log = |n: usize| {
+            let pool = pool.clone();
+            async move {
+                for i in 0..n {
+                    sqlx::query(
+                        "INSERT INTO repl_log (tbl, key, deleted, at) VALUES ('blobs', ?, 1, 0)",
+                    )
+                    .bind(format!(
+                        "k{i}-{}",
+                        Utc::now().timestamp_nanos_opt().unwrap()
+                    ))
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                }
+            }
+        };
+
+        // Not empty, but every entry after the cursor: rows then a watermark,
+        // so a replica that keeps up gets one even while writes continue.
+        log(3).await;
+        let page = read_page(&pool, 1).await.unwrap();
+        assert!(page.caught_up);
+        assert_eq!(page.last_lsn, Some(3));
+        let frames = decode_page(page.bytes);
+        assert_eq!(frames.len(), 3);
+        assert!(matches!(frames[2], Frame::Watermark { watermark: 3, .. }));
+
+        // A full page may have more behind it: no watermark.
+        log(PAGE_ROWS).await;
+        let page = read_page(&pool, 0).await.unwrap();
+        assert!(!page.caught_up);
+        let frames = decode_page(page.bytes);
+        assert_eq!(frames.len(), PAGE_ROWS);
+        assert!(!frames.iter().any(|f| matches!(f, Frame::Watermark { .. })));
     }
 
     async fn replica_pool(dir: &TempDir) -> SqlitePool {
