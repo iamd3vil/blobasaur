@@ -36,6 +36,12 @@
 //! 4. Convergence: after the sequence, a handshake and then pages and applies
 //!    until a watermark is applied leave the replica with the primary's live rows
 //!    and replid.
+//! 5. Async writes (`SetAsync`, `DeleteAsync`, `HSetAsync`, `HSetExAsync`,
+//!    `HDeleteAsync`) are queued with `queue_pending`, as the server does, and
+//!    batched with the sync ones. The real inflight caches go to `process_batch`.
+//!    While an op is queued, each key's cache entry is the last queued op's; once
+//!    the batch is processed, whether the op committed or not, no entry is left
+//!    (the caches only hold ops still queued, which is none).
 //!
 //! # Clocks
 //!
@@ -49,7 +55,10 @@
 
 use super::*;
 use crate::app_state::{CREATE_BLOBS_TABLE, CREATE_REPL_LOG, CREATE_REPL_STATE};
-use crate::shard_manager::{Pending, delete_expired, load_existing_tables, process_batch};
+use crate::shard_manager::{
+    Pending, ShardSender, delete_expired, load_existing_tables, next_delete_token, process_batch,
+    queue_pending,
+};
 use metrics::Counter;
 use moka::future::Cache;
 use proptest::prelude::*;
@@ -57,6 +66,7 @@ use sqlx::sqlite::{SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
 use tempfile::TempDir;
+use tokio::sync::mpsc;
 
 const PAST: i64 = 1_000_000_000;
 const REPLICA_NOW: i64 = 2_000_000_000;
@@ -96,6 +106,13 @@ enum Write {
     Expire(u8, Ttl),
     /// `Past` expires the field at once, which deletes it.
     HExpire(u8, u8, Ttl),
+    // The async variants, acked when queued: they leave a pending entry until
+    // their batch is processed.
+    SetAsync(u8, Option<Ttl>),
+    DelAsync(u8),
+    HSetAsync(u8, u8),
+    HSetExAsync(u8, u8, Ttl),
+    HDelAsync(u8, u8),
 }
 
 #[derive(Clone, Debug)]
@@ -132,8 +149,14 @@ fn write() -> impl Strategy<Value = Write> {
         2 => key.clone().prop_map(Write::Del),
         3 => (ns.clone(), field.clone()).prop_map(|(n, f)| Write::HSet(n, f)),
         2 => (ns.clone(), field.clone()).prop_map(|(n, f)| Write::HDel(n, f)),
-        2 => (key, ttl()).prop_map(|(k, t)| Write::Expire(k, t)),
-        2 => (ns, field, ttl()).prop_map(|(n, f, t)| Write::HExpire(n, f, t)),
+        2 => (key.clone(), ttl()).prop_map(|(k, t)| Write::Expire(k, t)),
+        2 => (ns.clone(), field.clone(), ttl()).prop_map(|(n, f, t)| Write::HExpire(n, f, t)),
+        4 => (key.clone(), prop::option::weighted(0.4, ttl()))
+            .prop_map(|(k, t)| Write::SetAsync(k, t)),
+        2 => key.prop_map(Write::DelAsync),
+        3 => (ns.clone(), field.clone()).prop_map(|(n, f)| Write::HSetAsync(n, f)),
+        2 => (ns.clone(), field.clone(), ttl()).prop_map(|(n, f, t)| Write::HSetExAsync(n, f, t)),
+        2 => (ns, field).prop_map(|(n, f)| Write::HDelAsync(n, f)),
     ]
 }
 
@@ -166,6 +189,17 @@ macro_rules! ensure {
     };
 }
 
+/// An async op's inflight cache entry: the hash cache or not, the key, the entry.
+type Queued = (bool, String, Pending);
+
+fn same(a: &Pending, b: &Pending) -> bool {
+    match (a, b) {
+        (Pending::Value(a), Pending::Value(b)) => a == b,
+        (Pending::Deleted(a), Pending::Deleted(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// The stream the primary is serving the replica, if connected.
 struct Stream {
     pin: u64,
@@ -182,6 +216,11 @@ struct Sim {
     replica_known: HashSet<String>,
     primary_commits: watch::Sender<u64>,
     replica_commits: watch::Sender<u64>,
+    /// The primary's inflight caches and write queue, which async writes go through.
+    inflight_cache: Cache<String, Pending>,
+    inflight_hcache: Cache<String, Pending>,
+    queue: ShardSender,
+    queue_rx: mpsc::Receiver<ShardWriteOperation>,
     pins: ShardPins,
     stream: Option<Stream>,
     /// The network: decoded frames not applied yet. A watermark carries the
@@ -267,6 +306,7 @@ impl Sim {
         let dir = TempDir::new().unwrap();
         let (primary_opts, primary) = open(&dir, "primary.db").await;
         let (replica_opts, replica) = open(&dir, "replica.db").await;
+        let (queue_tx, queue_rx) = mpsc::channel(16);
         init_shard(&primary_opts, true, false, false).await.unwrap();
         init_shard(&replica_opts, true, false, true).await.unwrap();
         Sim {
@@ -279,6 +319,11 @@ impl Sim {
             replica_known: HashSet::from(["blobs".to_string()]),
             primary_commits: watch::channel(0).0,
             replica_commits: watch::channel(0).0,
+            // Big enough that nothing is evicted: the checks need every entry.
+            inflight_cache: Cache::new(1024),
+            inflight_hcache: Cache::new(1024),
+            queue: ShardSender::new(queue_tx, ShardMetrics::new(0)),
+            queue_rx,
             pins: ShardPins::default(),
             stream: None,
             inflight: VecDeque::new(),
@@ -334,8 +379,39 @@ impl Sim {
         self.check().await
     }
 
+    /// Queues an async op the way the server does and takes it off the queue
+    /// into the batch, which the writer would collect next.
+    async fn queue_async(
+        &mut self,
+        hash: bool,
+        key: String,
+        pending: Pending,
+        op: ShardWriteOperation,
+        queued: &mut Vec<Queued>,
+    ) -> ShardWriteOperation {
+        let cache = if hash {
+            &self.inflight_hcache
+        } else {
+            &self.inflight_cache
+        };
+        queue_pending(cache, &self.queue, key.clone(), pending.clone(), op)
+            .await
+            .unwrap();
+        queued.push((hash, key, pending));
+        self.queue_rx.try_recv().unwrap()
+    }
+
+    fn cache(&self, hash: bool) -> &Cache<String, Pending> {
+        if hash {
+            &self.inflight_hcache
+        } else {
+            &self.inflight_cache
+        }
+    }
+
     async fn write(&mut self, writes: &[Write]) -> Result<(), String> {
         let mut batch = VecDeque::new();
+        let mut queued: Vec<Queued> = Vec::new();
         for write in writes {
             self.writes += 1;
             let data = Bytes::from(format!("v{}", self.writes));
@@ -376,7 +452,79 @@ impl Sim {
                     condition: None,
                     responder: ack,
                 },
+                Write::SetAsync(k, ttl) => {
+                    let key = name("k", *k);
+                    let op = ShardWriteOperation::SetAsync {
+                        key: key.clone(),
+                        data: data.clone(),
+                        expires_at: ttl.map(Ttl::at),
+                    };
+                    let pending = Pending::Value(data);
+                    self.queue_async(false, key, pending, op, &mut queued).await
+                }
+                Write::DelAsync(k) => {
+                    let key = name("k", *k);
+                    let token = next_delete_token();
+                    let op = ShardWriteOperation::DeleteAsync {
+                        key: key.clone(),
+                        token,
+                    };
+                    let pending = Pending::Deleted(token);
+                    self.queue_async(false, key, pending, op, &mut queued).await
+                }
+                Write::HSetAsync(n, f) => {
+                    let (namespace, key) = (name("n", *n), name("f", *f));
+                    let cache_key = format!("{namespace}:{key}");
+                    let op = ShardWriteOperation::HSetAsync {
+                        namespace,
+                        key,
+                        data: data.clone(),
+                    };
+                    let pending = Pending::Value(data);
+                    self.queue_async(true, cache_key, pending, op, &mut queued)
+                        .await
+                }
+                Write::HSetExAsync(n, f, ttl) => {
+                    let (namespace, key) = (name("n", *n), name("f", *f));
+                    let cache_key = format!("{namespace}:{key}");
+                    let op = ShardWriteOperation::HSetExAsync {
+                        namespace,
+                        key,
+                        data: data.clone(),
+                        expires_at: ttl.at(),
+                    };
+                    let pending = Pending::Value(data);
+                    self.queue_async(true, cache_key, pending, op, &mut queued)
+                        .await
+                }
+                Write::HDelAsync(n, f) => {
+                    let (namespace, key) = (name("n", *n), name("f", *f));
+                    let cache_key = format!("{namespace}:{key}");
+                    let token = next_delete_token();
+                    let op = ShardWriteOperation::HDeleteAsync {
+                        namespace,
+                        key,
+                        token,
+                    };
+                    let pending = Pending::Deleted(token);
+                    self.queue_async(true, cache_key, pending, op, &mut queued)
+                        .await
+                }
             });
+        }
+        // Queued: reads see each key as its last queued op left it.
+        for (hash, key, _) in &queued {
+            let last = &queued
+                .iter()
+                .rev()
+                .find(|(h, k, _)| h == hash && k == key)
+                .unwrap()
+                .2;
+            let found = self.cache(*hash).get(key).await;
+            ensure!(
+                found.as_ref().is_some_and(|found| same(found, last)),
+                "queued async ops left {found:?} for {key:?} in the inflight cache, expected {last:?}"
+            );
         }
         let before = lsn(&self.primary).await;
         let committed = process_batch(
@@ -384,13 +532,29 @@ impl Sim {
             &self.primary,
             &mut batch,
             &mut self.primary_known,
-            &Cache::<String, Pending>::new(16),
-            &Cache::<String, Pending>::new(16),
+            &self.inflight_cache,
+            &self.inflight_hcache,
             &ShardMetrics::new(0),
             true,
         )
         .await;
         let after = lsn(&self.primary).await;
+        // Processed: nothing of the batch is queued, so no entry may be left.
+        for (hash, key, _) in &queued {
+            let found = self.cache(*hash).get(key).await;
+            ensure!(
+                found.is_none(),
+                "the batch is processed but the inflight cache still holds {found:?} for {key:?}"
+            );
+        }
+        for cache in [&self.inflight_cache, &self.inflight_hcache] {
+            cache.run_pending_tasks().await;
+            ensure!(
+                cache.entry_count() == 0,
+                "the batch is processed but an inflight cache holds {} entries",
+                cache.entry_count()
+            );
+        }
         if let Some(committed) = committed {
             ensure!(
                 after > before && committed == after,
