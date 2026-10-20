@@ -1842,3 +1842,6 @@ mod tests {
         writer.await.unwrap();
     }
 }
+
+#[cfg(test)]
+mod model_tests;
