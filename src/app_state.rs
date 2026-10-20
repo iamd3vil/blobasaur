@@ -6,8 +6,8 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Connection, SqliteConnection, SqlitePool};
 use std::fs;
 use std::str::FromStr;
-use std::sync::Arc;
-use tokio::sync::{Semaphore, mpsc};
+use std::sync::{Arc, Mutex};
+use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard, Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
 
 use crate::compression::{self, Compressor};
@@ -16,16 +16,34 @@ use crate::{
     cluster::ClusterManager,
     config::Cfg,
     metrics::{Metrics, ShardMetrics},
+    replication,
     shard_manager::{Pending, ShardSender, ShardWriteOperation, wal_checkpoint_truncate},
 };
 
-const CREATE_BLOBS_TABLE: &str = "CREATE TABLE IF NOT EXISTS blobs (
+pub(crate) const CREATE_BLOBS_TABLE: &str = "CREATE TABLE IF NOT EXISTS blobs (
     key TEXT PRIMARY KEY,
     data BLOB,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     expires_at INTEGER,
     version INTEGER NOT NULL DEFAULT 0
+)";
+
+/// The change index: one row per key, holding the LSN of its last change.
+/// AUTOINCREMENT keeps LSNs from being reused after a row is deleted, and
+/// writers use INSERT OR REPLACE so a rewritten key gets a new LSN.
+pub(crate) const CREATE_REPL_LOG: &str = "CREATE TABLE IF NOT EXISTS repl_log (
+    lsn INTEGER PRIMARY KEY AUTOINCREMENT,
+    tbl TEXT NOT NULL,
+    key TEXT NOT NULL,
+    deleted INTEGER NOT NULL,
+    at INTEGER NOT NULL,
+    UNIQUE (tbl, key)
+)";
+
+pub(crate) const CREATE_REPL_STATE: &str = "CREATE TABLE IF NOT EXISTS repl_state (
+    k TEXT PRIMARY KEY,
+    v
 )";
 
 #[derive(Hash)]
@@ -51,6 +69,18 @@ pub struct AppState {
     pub compressor: Option<Box<dyn Compressor>>,
     /// Metrics collector
     pub metrics: Metrics,
+    /// Per shard, the highest committed `repl_log` LSN. Published by whoever
+    /// commits, so subscribers can wake on new changes.
+    pub commit_watch: Vec<Arc<watch::Sender<u64>>>,
+    /// Per shard, the cursors of the replication streams being served; see
+    /// [`replication::ShardPins`].
+    pub repl_pins: Vec<Arc<replication::ShardPins>>,
+    /// Per shard, on a replica: READONLY reads hold it shared from before their
+    /// readiness check until their data is read, and a resync holds it exclusive
+    /// while it unsyncs and wipes the shard, so no admitted read sees the wipe.
+    replica_gates: Vec<RwLock<()>>,
+    /// Per shard, the replid that `blobasaur_replication_info` last reported.
+    replids: Vec<Mutex<Option<String>>>,
 
     ring: HashRing<ShardNode>,
 }
@@ -60,6 +90,16 @@ impl AppState {
         cfg: Cfg,
         shard_receivers_out: &mut Vec<mpsc::Receiver<ShardWriteOperation>>,
     ) -> Result<Self> {
+        if let Some(primary) = cfg.replica_of() {
+            let cluster = cfg.cluster.as_ref().filter(|c| c.enabled);
+            let Some(cluster) = cluster else {
+                return Err(miette!("replication requires [cluster] to be enabled"));
+            };
+            if cluster.node_id == primary {
+                return Err(miette!("replica_of must be another node, not {}", primary));
+            }
+        }
+
         let mut shard_senders_vec = Vec::new();
         // Clear the output vector first to ensure it's empty
         shard_receivers_out.clear();
@@ -100,9 +140,34 @@ impl AppState {
                 .execute(&mut conn)
                 .await
                 .map_err(|e| miette!("failed to create table in shard {} DB: {}", i, e))?;
+            for ddl in [CREATE_REPL_LOG, CREATE_REPL_STATE] {
+                sqlx::query(ddl).execute(&mut conn).await.map_err(|e| {
+                    miette!("failed to create change index in shard {} DB: {}", i, e)
+                })?;
+            }
             conn.close()
                 .await
                 .map_err(|e| miette!("failed to close shard {} DB: {}", i, e))?;
+        }
+
+        // Index pre-existing rows and settle the replid before any writer runs.
+        // Without replication this only marks the index as stale.
+        let enabled = cfg.replication_enabled();
+        let replica = cfg.replica_of().is_some();
+        // Also without replication: a half-copied replica must not serve as a primary.
+        if !replica {
+            let options: Vec<_> = (0..cfg.num_shards)
+                .map(|i| build_sqlite_connect_options(&cfg, i))
+                .collect();
+            replication::ensure_promotable(&options).await?;
+        }
+        let mut commit_watch = Vec::with_capacity(cfg.num_shards);
+        for i in 0..cfg.num_shards {
+            let options = build_sqlite_connect_options(&cfg, i);
+            let lsn = replication::init_shard(&options, enabled, cfg.new_replid, replica)
+                .await
+                .map_err(|e| miette!("failed to initialize change index of shard {}: {}", i, e))?;
+            commit_watch.push(Arc::new(watch::channel(lsn).0));
         }
 
         let mut db_pools_futures = vec![];
@@ -193,10 +258,26 @@ impl AppState {
                     .parse()
                     .expect("Invalid Redis server address");
 
-                match ClusterManager::new(cluster_config, gossip_bind_addr, redis_addr).await {
+                let manager = ClusterManager::new(
+                    cluster_config,
+                    gossip_bind_addr,
+                    redis_addr,
+                    cfg.replica_of(),
+                    cfg.num_shards,
+                )
+                .await;
+                match manager {
                     Ok(manager) => {
+                        // A slot conflict stops startup, replication or not.
+                        if let Err(e) = manager.claim_slots().await {
+                            manager.shutdown().await;
+                            return Err(miette!("slot conflict: {}", e));
+                        }
                         tracing::info!("Cluster manager initialized successfully");
                         Some(manager)
+                    }
+                    Err(e) if cfg.replication.is_some() => {
+                        return Err(miette!("failed to initialize cluster manager: {}", e));
                     }
                     Err(e) => {
                         tracing::error!("Failed to initialize cluster manager: {}", e);
@@ -220,7 +301,10 @@ impl AppState {
             ring.add(ShardNode(i as u64));
         }
 
-        Ok(AppState {
+        let repl_pins = (0..cfg.num_shards).map(|_| Arc::default()).collect();
+        let replica_gates = (0..cfg.num_shards).map(|_| RwLock::new(())).collect();
+        let replids = (0..cfg.num_shards).map(|_| Mutex::new(None)).collect();
+        let state = AppState {
             cfg,
             shard_senders: shard_senders_vec,
             db_pools,
@@ -230,8 +314,48 @@ impl AppState {
             cluster_manager,
             compressor,
             metrics,
+            commit_watch,
+            repl_pins,
+            replica_gates,
+            replids,
             ring,
-        })
+        };
+        // A new replica has none until its first sync.
+        for (i, pool) in state.db_pools.iter().enumerate().filter(|_| enabled) {
+            if let Ok((replid, ..)) = replication::primary_state(pool).await
+                && !replid.is_empty()
+            {
+                state.set_replid(i, &replid);
+            }
+        }
+        Ok(state)
+    }
+
+    /// Reports `replid` as the shard's current one in `blobasaur_replication_info`,
+    /// and zeroes the series of the one it replaces.
+    pub fn set_replid(&self, shard: usize, replid: &str) {
+        let mut current = self.replids[shard].lock().unwrap();
+        let info = |replid: &str| {
+            metrics::gauge!(
+                "blobasaur_replication_info",
+                "shard" => shard.to_string(),
+                "replid" => replid.to_string()
+            )
+        };
+        if let Some(old) = current.as_deref().filter(|old| *old != replid) {
+            info(old).set(0.0);
+        }
+        info(replid).set(1.0);
+        *current = Some(replid.to_string());
+    }
+
+    /// Records that shard `shard_id` stopped cleanly; see
+    /// [`replication::mark_clean_shutdown`]. Its pools must be closed first.
+    pub async fn mark_clean_shutdown(&self, shard_id: usize) -> Result<()> {
+        if !self.cfg.replication_enabled() {
+            return Ok(());
+        }
+        replication::mark_clean_shutdown(&build_sqlite_connect_options(&self.cfg, shard_id)).await
     }
 
     /// Set the gauges that are sampled rather than updated in place: queue
@@ -241,6 +365,21 @@ impl AppState {
             let shard = i.to_string();
             metrics::gauge!("blobasaur_write_queue_depth", "shard" => shard.clone())
                 .set(sender.queue_depth() as f64);
+            if self.cfg.replication_enabled() {
+                let role = if self.cfg.replica_of().is_some() {
+                    "replica"
+                } else {
+                    metrics::gauge!("blobasaur_replication_latest_lsn", "shard" => shard.clone())
+                        .set(*self.commit_watch[i].borrow() as f64);
+                    "primary"
+                };
+                metrics::gauge!(
+                    "blobasaur_replication_role",
+                    "shard" => shard.clone(),
+                    "role" => role
+                )
+                .set(1.0);
+            }
             for (name, pool) in [
                 ("read", &self.db_pools[i]),
                 ("write", &self.write_db_pools[i]),
@@ -258,6 +397,25 @@ impl AppState {
                 }
             }
         }
+    }
+
+    /// A replica's READONLY read takes this before it is routed, and holds it
+    /// until its DB read is done. Primaries and other connections take nothing.
+    pub async fn replica_read_gate(
+        &self,
+        shard: usize,
+        conn_readonly: bool,
+    ) -> Option<RwLockReadGuard<'_, ()>> {
+        if conn_readonly && self.cfg.replica_of().is_some() {
+            Some(self.replica_gates[shard].read().await)
+        } else {
+            None
+        }
+    }
+
+    /// Held by a resync of `shard` from unsyncing it until the wipe has committed.
+    pub async fn replica_reset_gate(&self, shard: usize) -> RwLockWriteGuard<'_, ()> {
+        self.replica_gates[shard].write().await
     }
 
     pub fn get_shard(&self, key: &str) -> usize {
@@ -574,12 +732,14 @@ mod tests {
             batch_size: Some(1),
             batch_timeout_ms: Some(0),
             addr: None,
+            replication: None,
             cluster: None,
             metrics: None,
             shutdown_timeout_secs: None,
             max_request_size_mb: None,
             cleanup_chunk_size: None,
             cleanup_interval_secs: None,
+            new_replid: false,
             sqlite: None,
         }
     }
@@ -688,6 +848,38 @@ mod tests {
             .execute(&mut writer)
             .await
             .expect("failed to release write lock");
+    }
+
+    #[tokio::test]
+    async fn replication_info_follows_the_replid() {
+        use crate::metrics::rendered_value;
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let mut cfg = test_cfg(temp_dir.path().to_string_lossy().into_owned(), 1);
+        cfg.replication = Some(crate::config::ReplicationConfig {
+            replica_of: None,
+            tombstone_retention_secs: None,
+        });
+        let mut receivers = Vec::new();
+        let state = AppState::new(cfg, &mut receivers).await.unwrap();
+        let series =
+            |replid: &str| format!(r#"blobasaur_replication_info{{shard="0",replid="{replid}"}}"#);
+
+        // A primary reports the replid it started with.
+        let stored: String = sqlx::query_scalar("SELECT v FROM repl_state WHERE k = 'replid'")
+            .fetch_one(&state.db_pools[0])
+            .await
+            .unwrap();
+        let output = recorder.handle().render();
+        assert_eq!(rendered_value(&output, &series(&stored)), 1.0);
+
+        // A new one replaces it, which is zeroed, not removed.
+        state.set_replid(0, "next");
+        state.set_replid(0, "next");
+        let output = recorder.handle().render();
+        assert_eq!(rendered_value(&output, &series(&stored)), 0.0);
+        assert_eq!(rendered_value(&output, &series("next")), 1.0);
     }
 
     #[tokio::test]

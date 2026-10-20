@@ -13,6 +13,7 @@ pub struct Cfg {
     pub batch_timeout_ms: Option<u64>,
     pub addr: Option<String>,
     pub cluster: Option<ClusterConfig>,
+    pub replication: Option<ReplicationConfig>,
     pub metrics: Option<MetricsConfig>,
     pub sqlite: Option<SqliteConfig>,
     /// Max seconds to drain in-flight commands and queued writes on SIGINT/SIGTERM.
@@ -28,6 +29,10 @@ pub struct Cfg {
     /// Seconds between background expiry cleanup sweeps of each shard.
     /// Default: 60
     pub cleanup_interval_secs: Option<u64>,
+    /// Set by `serve --new-replid`, never from the config file: start a new
+    /// replication history even if the stored one looks intact.
+    #[serde(skip)]
+    pub new_replid: bool,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -94,6 +99,16 @@ pub struct ClusterConfig {
     #[allow(dead_code)]
     pub gossip_interval_ms: Option<u64>,
     pub advertise_addr: Option<String>,
+}
+
+/// Replication needs `[cluster]`: replicas find their primary through gossip.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ReplicationConfig {
+    /// Node id of the primary this node replicates. Unset: this node is a primary.
+    pub replica_of: Option<String>,
+    /// Seconds a delete is remembered for replicas that were disconnected.
+    /// A replica away for longer gets a full resync. Default: 86400
+    pub tombstone_retention_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, serde::Deserialize, PartialEq)]
@@ -268,6 +283,34 @@ impl Cfg {
     /// Seconds between expiry cleanup sweeps; see `cleanup_interval_secs`.
     pub fn cleanup_interval_secs(&self) -> u64 {
         self.cleanup_interval_secs.unwrap_or(60)
+    }
+
+    /// Whether the change index is maintained: the config has a `[replication]`
+    /// section. Without it, writes pay nothing for replication.
+    pub fn replication_enabled(&self) -> bool {
+        self.replication.is_some()
+    }
+
+    /// Node id of the primary this node replicates, if it is a replica.
+    pub fn replica_of(&self) -> Option<&str> {
+        self.replication.as_ref()?.replica_of.as_deref()
+    }
+
+    /// Seconds deletes are remembered for replicas; see `tombstone_retention_secs`.
+    pub fn tombstone_retention_secs(&self) -> u64 {
+        self.replication
+            .as_ref()
+            .and_then(|r| r.tombstone_retention_secs)
+            .unwrap_or(86400)
+    }
+
+    /// What `data` is stored as, which a replica must match: the compression
+    /// algorithm (the level doesn't change how values are read back).
+    pub fn compression_id(&self) -> String {
+        match &self.storage_compression {
+            Some(c) if c.enabled => format!("{:?}", c.algorithm).to_lowercase(),
+            _ => "none".to_string(),
+        }
     }
 
     pub fn is_compression(&self) -> bool {

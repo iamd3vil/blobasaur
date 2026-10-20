@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use blobasaur::config::{Cfg, SqliteConfig};
+use blobasaur::config::{Cfg, ReplicationConfig, SqliteConfig};
 use blobasaur::server;
 use sqlx::{Connection, SqliteConnection};
 use tempfile::TempDir;
@@ -29,6 +29,16 @@ struct Server {
 }
 
 async fn start(async_write: bool, batch_size: usize, batch_timeout_ms: u64) -> Server {
+    start_with_timeout(async_write, batch_size, batch_timeout_ms, 20, true).await
+}
+
+async fn start_with_timeout(
+    async_write: bool,
+    batch_size: usize,
+    batch_timeout_ms: u64,
+    shutdown_timeout_secs: u64,
+    replication: bool,
+) -> Server {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     let dir = TempDir::new().unwrap();
     let cfg = Cfg {
@@ -39,6 +49,10 @@ async fn start(async_write: bool, batch_size: usize, batch_timeout_ms: u64) -> S
         batch_size: Some(batch_size),
         batch_timeout_ms: Some(batch_timeout_ms),
         addr: None,
+        replication: replication.then_some(ReplicationConfig {
+            replica_of: None,
+            tombstone_retention_secs: None,
+        }),
         cluster: None,
         metrics: None,
         sqlite: Some(SqliteConfig {
@@ -51,10 +65,11 @@ async fn start(async_write: bool, batch_size: usize, batch_timeout_ms: u64) -> S
             auto_upgrade_legacy_auto_vacuum: None,
             auto_upgrade_legacy_auto_vacuum_concurrency: None,
         }),
-        shutdown_timeout_secs: Some(20),
+        shutdown_timeout_secs: Some(shutdown_timeout_secs),
         max_request_size_mb: None,
         cleanup_chunk_size: None,
         cleanup_interval_secs: None,
+        new_replid: false,
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -109,6 +124,18 @@ async fn keys(dir: &Path, table: &str) -> HashSet<String> {
         keys.extend(rows.into_iter().map(|(k,)| k));
     }
     keys
+}
+
+/// A shard's `repl_state` value.
+async fn repl_state(dir: &Path, shard: usize, k: &str) -> Option<String> {
+    let mut conn = SqliteConnection::connect(&shard_url(dir, shard))
+        .await
+        .unwrap();
+    sqlx::query_scalar("SELECT v FROM repl_state WHERE k = ?")
+        .bind(k)
+        .fetch_optional(&mut conn)
+        .await
+        .unwrap()
 }
 
 struct Client(BufReader<TcpStream>);
@@ -299,4 +326,89 @@ async fn writes_during_async_shutdown_are_rejected_or_persisted() {
 #[tokio::test]
 async fn writes_during_sync_shutdown_are_rejected_or_persisted() {
     assert_writes_during_shutdown_not_lost(false).await;
+}
+
+#[tokio::test]
+async fn shutdown_marks_every_shard_clean() {
+    let server = start(false, 16, 5).await;
+    let mut client = Client::connect(server.addr).await;
+    for i in 0..20 {
+        let key = format!("key-{i}");
+        let reply = client.call(&["SET", &key, "v"]).await;
+        assert_eq!(reply.as_deref(), Some("+OK"));
+    }
+
+    // While running, a crash would leave the marker like this.
+    let mut replids = Vec::new();
+    for shard in 0..NUM_SHARDS {
+        let dir = server.dir.path();
+        let marker = repl_state(dir, shard, "clean_shutdown").await;
+        assert_eq!(marker.as_deref(), Some("0"));
+        replids.push(repl_state(dir, shard, "replid").await.unwrap());
+    }
+
+    let dir = server.stop().await;
+    for (shard, replid) in replids.into_iter().enumerate() {
+        let dir = dir.path();
+        let marker = repl_state(dir, shard, "clean_shutdown").await;
+        assert_eq!(marker.as_deref(), Some("1"));
+        assert_eq!(repl_state(dir, shard, "replid").await, Some(replid));
+    }
+    assert_eq!(keys(dir.path(), "repl_log").await.len(), 20);
+}
+
+#[tokio::test]
+async fn shutdown_without_replication_writes_no_replication_state() {
+    let server = start_with_timeout(false, 16, 5, 20, false).await;
+    let mut client = Client::connect(server.addr).await;
+    for i in 0..20 {
+        let key = format!("key-{i}");
+        let reply = client.call(&["SET", &key, "v"]).await;
+        assert_eq!(reply.as_deref(), Some("+OK"));
+    }
+    // The commands that need replication say so.
+    let reply = client.call(&["BLOBASAUR.WATERMARK"]).await;
+    assert_eq!(reply.as_deref(), Some("-ERR replication is not enabled"));
+    let sync = ["BLOBASAUR.SYNC", "0", "", "0", "2", "none"];
+    let reply = Client::connect(server.addr).await.call(&sync).await;
+    assert_eq!(
+        reply.as_deref(),
+        Some("-ERR replication is not enabled on this node")
+    );
+
+    let dir = server.stop().await;
+    for shard in 0..NUM_SHARDS {
+        for k in ["clean_shutdown", "replid", "boot_id", "indexed"] {
+            assert_eq!(repl_state(dir.path(), shard, k).await, None, "{k}");
+        }
+    }
+    assert!(keys(dir.path(), "repl_log").await.is_empty());
+    assert_eq!(keys(dir.path(), "blobs").await.len(), 20);
+}
+
+#[tokio::test]
+async fn failed_drain_leaves_shards_marked_unclean() {
+    let server = start_with_timeout(true, 1000, 600_000, 1, true).await;
+    let mut locks = wedge_writers(&server).await;
+    let mut client = Client::connect(server.addr).await;
+    for i in 0..10 {
+        let key = format!("key-{i}");
+        let reply = client.call(&["SET", &key, "v"]).await;
+        assert_eq!(reply.as_deref(), Some("+OK"));
+    }
+
+    // The writers can't drain within the timeout.
+    server.shutdown.cancel();
+    let result = timeout(Duration::from_secs(30), server.handle)
+        .await
+        .expect("shutdown hung")
+        .unwrap();
+    assert!(result.is_err());
+    for lock in &mut locks {
+        sqlx::query("ROLLBACK").execute(&mut *lock).await.unwrap();
+    }
+    for shard in 0..NUM_SHARDS {
+        let marker = repl_state(server.dir.path(), shard, "clean_shutdown").await;
+        assert_eq!(marker.as_deref(), Some("0"));
+    }
 }

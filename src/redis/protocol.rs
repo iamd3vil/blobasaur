@@ -108,7 +108,9 @@ pub enum RedisCommand {
     Info {
         section: Option<String>,
     },
-    Command,
+    Command {
+        args: Vec<String>,
+    },
     // Cluster commands
     ClusterNodes,
     ClusterInfo,
@@ -135,6 +137,17 @@ pub enum RedisCommand {
         budget_mb: u64,
         dry_run: bool,
     },
+    /// Per shard `[shard, replid, lsn]`; see `replication::shard_watermark`.
+    BlobasaurWatermark,
+    /// A replica opening the replication stream of one shard; see
+    /// `replication::serve_sync`. `replid` is empty if the replica has none.
+    BlobasaurSync {
+        shard: usize,
+        replid: String,
+        lsn: u64,
+        num_shards: usize,
+        compression: String,
+    },
     Hello {
         protover: Option<u64>,
     },
@@ -142,6 +155,9 @@ pub enum RedisCommand {
         subcommand: String,
     },
     Quit,
+    /// Lets a replica serve this connection's reads.
+    ReadOnly,
+    ReadWrite,
     Unknown(String),
 }
 
@@ -162,7 +178,7 @@ impl RedisCommand {
             RedisCommand::HExpireAt { .. } => "HEXPIREAT".to_string(),
             RedisCommand::Ping { .. } => "PING".to_string(),
             RedisCommand::Info { .. } => "INFO".to_string(),
-            RedisCommand::Command => "COMMAND".to_string(),
+            RedisCommand::Command { .. } => "COMMAND".to_string(),
             RedisCommand::ClusterNodes => "CLUSTER NODES".to_string(),
             RedisCommand::ClusterInfo => "CLUSTER INFO".to_string(),
             RedisCommand::ClusterSlots => "CLUSTER SLOTS".to_string(),
@@ -172,9 +188,13 @@ impl RedisCommand {
             RedisCommand::Ttl { .. } => "TTL".to_string(),
             RedisCommand::Expire { .. } => "EXPIRE".to_string(),
             RedisCommand::BlobasaurVacuum { .. } => "BLOBASAUR.VACUUM".to_string(),
+            RedisCommand::BlobasaurWatermark => "BLOBASAUR.WATERMARK".to_string(),
+            RedisCommand::BlobasaurSync { .. } => "BLOBASAUR.SYNC".to_string(),
             RedisCommand::Hello { .. } => "HELLO".to_string(),
             RedisCommand::Client { .. } => "CLIENT".to_string(),
             RedisCommand::Quit => "QUIT".to_string(),
+            RedisCommand::ReadOnly => "READONLY".to_string(),
+            RedisCommand::ReadWrite => "READWRITE".to_string(),
             RedisCommand::Unknown(cmd) => cmd.clone(),
         }
     }
@@ -418,7 +438,13 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
             };
             Ok(RedisCommand::Info { section })
         }
-        "COMMAND" => Ok(RedisCommand::Command),
+        "COMMAND" => {
+            let args = elements[1..]
+                .iter()
+                .map(extract_string)
+                .collect::<Result<_, _>>()?;
+            Ok(RedisCommand::Command { args })
+        }
         "HGET" => {
             if elements.len() != 3 {
                 return Err(ParseError::Invalid(
@@ -883,6 +909,15 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
             Ok(RedisCommand::Expire { key, seconds })
         }
         "BLOBASAUR.VACUUM" => parse_blobasaur_vacuum_command(&elements),
+        "BLOBASAUR.SYNC" => parse_blobasaur_sync_command(&elements),
+        "BLOBASAUR.WATERMARK" => {
+            if elements.len() != 1 {
+                return Err(ParseError::Invalid(
+                    "BLOBASAUR.WATERMARK takes no arguments".to_string(),
+                ));
+            }
+            Ok(RedisCommand::BlobasaurWatermark)
+        }
         "HELLO" => {
             let protover = if elements.len() > 1 {
                 let ver_str = extract_string(&elements[1])?;
@@ -904,8 +939,31 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
             Ok(RedisCommand::Client { subcommand })
         }
         "QUIT" => Ok(RedisCommand::Quit),
+        "READONLY" => Ok(RedisCommand::ReadOnly),
+        "READWRITE" => Ok(RedisCommand::ReadWrite),
         _ => Ok(RedisCommand::Unknown(command_name)),
     }
+}
+
+fn parse_blobasaur_sync_command(elements: &[BytesFrame]) -> Result<RedisCommand, ParseError> {
+    if elements.len() != 6 {
+        return Err(ParseError::Invalid(
+            "BLOBASAUR.SYNC syntax: BLOBASAUR.SYNC <shard> <replid> <lsn> <num_shards> <compression>"
+                .to_string(),
+        ));
+    }
+    fn number<T: std::str::FromStr>(value: &BytesFrame, what: &str) -> Result<T, ParseError> {
+        let text = extract_string(value)?;
+        text.parse()
+            .map_err(|_| ParseError::Invalid(format!("Invalid {what} '{text}'")))
+    }
+    Ok(RedisCommand::BlobasaurSync {
+        shard: number(&elements[1], "shard")?,
+        replid: extract_string(&elements[2])?,
+        lsn: number(&elements[3], "lsn")?,
+        num_shards: number(&elements[4], "num_shards")?,
+        compression: extract_string(&elements[5])?,
+    })
 }
 
 fn parse_blobasaur_vacuum_command(elements: &[BytesFrame]) -> Result<RedisCommand, ParseError> {
@@ -1505,6 +1563,45 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_blobasaur_watermark_command() {
+        assert_eq!(
+            parse_command(command_frame(&["blobasaur.watermark"])).unwrap(),
+            RedisCommand::BlobasaurWatermark
+        );
+        assert!(parse_command(command_frame(&["BLOBASAUR.WATERMARK", "0"])).is_err());
+    }
+
+    #[test]
+    fn test_parse_blobasaur_sync_command() {
+        let command = parse_command(command_frame(&[
+            "blobasaur.sync",
+            "2",
+            "",
+            "17",
+            "4",
+            "zstd",
+        ]))
+        .unwrap();
+        assert_eq!(
+            command,
+            RedisCommand::BlobasaurSync {
+                shard: 2,
+                replid: String::new(),
+                lsn: 17,
+                num_shards: 4,
+                compression: "zstd".to_string(),
+            }
+        );
+        for bad in [
+            &["BLOBASAUR.SYNC", "0", "id", "0", "1"][..],
+            &["BLOBASAUR.SYNC", "x", "id", "0", "1", "none"][..],
+            &["BLOBASAUR.SYNC", "0", "id", "-1", "1", "none"][..],
+        ] {
+            assert!(parse_command(command_frame(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn test_parse_blobasaur_vacuum_command_all_full() {
         let command = parse_command(command_frame(&[
             "blobasaur.vacuum",
@@ -1696,11 +1793,24 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_readonly_readwrite() {
+        assert_eq!(parse(&["READONLY"]).unwrap(), RedisCommand::ReadOnly);
+        assert_eq!(parse(&["readwrite"]).unwrap(), RedisCommand::ReadWrite);
+    }
+
+    #[test]
     fn test_parse_command_command() {
         let input = b"*1\r\n$7\r\nCOMMAND\r\n";
         let (resp, _) = parse_resp_with_remaining(input).unwrap();
         let command = parse_command(resp).unwrap();
-        assert_eq!(command, RedisCommand::Command);
+        assert_eq!(command, RedisCommand::Command { args: vec![] });
+
+        assert_eq!(
+            parse(&["COMMAND", "INFO", "get"]).unwrap(),
+            RedisCommand::Command {
+                args: vec!["INFO".to_string(), "get".to_string()]
+            }
+        );
     }
 
     #[test]

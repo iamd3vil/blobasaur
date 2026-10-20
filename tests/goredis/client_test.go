@@ -183,6 +183,26 @@ func TestCommandErrorsKeepConnection(t *testing.T) {
 	})
 }
 
+// Cluster clients read COMMAND to route by key position and to send only
+// readonly commands to replicas.
+func TestCommandMetadata(t *testing.T) {
+	forEachProtocol(t, func(t *testing.T, rdb *redis.Client, p string) {
+		cmds, err := rdb.Command(ctx).Result()
+		if err != nil {
+			t.Fatalf("COMMAND: %v", err)
+		}
+		for name, readOnly := range map[string]bool{"get": true, "hget": true, "set": false, "hset": false} {
+			info := cmds[name]
+			if info == nil || info.ReadOnly != readOnly {
+				t.Fatalf("%s: got %+v, want readonly=%v", name, info, readOnly)
+			}
+		}
+		if cmds["hget"].FirstKeyPos != 2 || cmds["hsetex"].FirstKeyPos != 1 {
+			t.Fatalf("hash key positions: hget=%d hsetex=%d", cmds["hget"].FirstKeyPos, cmds["hsetex"].FirstKeyPos)
+		}
+	})
+}
+
 func TestPipeline(t *testing.T) {
 	forEachProtocol(t, func(t *testing.T, rdb *redis.Client, p string) {
 		pipe := rdb.Pipeline()
@@ -267,4 +287,20 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// A ReadOnly cluster client reads from the replica listed in CLUSTER SLOTS.
+// Run by tests/replication_test.rs, which sets BLOBASAUR_ADDR to the primary and
+// BLOBASAUR_REPLICA_KEY to a key whose value only the replica's DB holds.
+func TestClusterReadOnlyReadsFromReplica(t *testing.T) {
+	primary, key := os.Getenv("BLOBASAUR_ADDR"), os.Getenv("BLOBASAUR_REPLICA_KEY")
+	if primary == "" || key == "" {
+		t.Skip("needs a primary with a replica; run via tests/replication_test.rs")
+	}
+	rdb := redis.NewClusterClient(&redis.ClusterOptions{Addrs: []string{primary}, ReadOnly: true})
+	t.Cleanup(func() { rdb.Close() })
+
+	expect(t, "GET from the replica", rdb.Get(ctx, key), "from-replica")
+	// Writes still go to the primary.
+	expect(t, "SET", rdb.Set(ctx, "written", "v", 0), "OK")
 }

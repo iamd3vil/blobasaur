@@ -31,6 +31,7 @@ async fn start(max_request_size_mb: Option<u64>) -> Server {
         batch_size: None,
         batch_timeout_ms: None,
         addr: None,
+        replication: None,
         cluster: None,
         metrics: None,
         sqlite: None,
@@ -38,6 +39,7 @@ async fn start(max_request_size_mb: Option<u64>) -> Server {
         max_request_size_mb,
         cleanup_chunk_size: None,
         cleanup_interval_secs: None,
+        new_replid: false,
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

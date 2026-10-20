@@ -27,6 +27,7 @@ async fn run_go_suite(async_write: bool) {
         batch_size: Some(50),
         batch_timeout_ms: Some(5),
         addr: None,
+        replication: None,
         cluster: None,
         metrics: None,
         sqlite: None,
@@ -34,6 +35,7 @@ async fn run_go_suite(async_write: bool) {
         max_request_size_mb: None,
         cleanup_chunk_size: None,
         cleanup_interval_secs: None,
+        new_replid: false,
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
