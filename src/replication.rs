@@ -250,7 +250,9 @@ pub async fn ensure_promotable(options: &[SqliteConnectOptions]) -> Result<()> {
 }
 
 /// Rows per stream page and frames per Apply.
-const PAGE_ROWS: usize = 1000;
+///
+/// Tests use a tiny page so a handful of writes spans several of them.
+const PAGE_ROWS: usize = if cfg!(test) { 3 } else { 1000 };
 /// A page or Apply ends once it holds this many bytes.
 const PAGE_BYTES: usize = 8 * 1024 * 1024;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -409,6 +411,21 @@ impl Pins {
     fn min(&self) -> Option<u64> {
         self.cursors.values().copied().min()
     }
+}
+
+/// The handshake decision: whether a primary whose shard has `replid`,
+/// `trimmed_through` and `watermark` can stream from the replica's `lsn`
+/// (`CONTINUE`), or the replica has to reset first (`RESYNC`). Cursor 0 is a
+/// full copy into a freshly reset shard, which holds nothing an old tombstone
+/// could apply to.
+fn can_continue(
+    replid: &str,
+    trimmed_through: u64,
+    watermark: u64,
+    req_replid: &str,
+    req_lsn: u64,
+) -> bool {
+    replid == req_replid && (req_lsn == 0 || (trimmed_through <= req_lsn && req_lsn <= watermark))
 }
 
 /// Deletes tombstones older than `retention_secs` that every active stream has
@@ -722,8 +739,7 @@ pub async fn serve_sync(
             return reply(&mut stream, error).await;
         }
     };
-    let can_continue = replid == req.replid
-        && (req.lsn == 0 || (trimmed_through <= req.lsn && req.lsn <= watermark));
+    let can_continue = can_continue(&replid, trimmed_through, watermark, &req.replid, req.lsn);
     let pin = can_continue.then(|| pins.add(req.lsn));
     drop(pins);
 

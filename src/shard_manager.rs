@@ -557,7 +557,7 @@ type LogEntry<'a> = (Cow<'a, str>, &'a str, bool);
 /// with its `repl_log` entry, unless `replication` is off. Returns the highest
 /// LSN it committed, if any.
 #[allow(clippy::too_many_arguments)]
-async fn process_batch(
+pub(crate) async fn process_batch(
     shard_id: usize,
     pool: &SqlitePool,
     batch: &mut VecDeque<ShardWriteOperation>,
@@ -1615,7 +1615,7 @@ async fn execute_vacuum(
 }
 
 // Load existing namespaced tables from the database
-async fn load_existing_tables(pool: &SqlitePool, shard_id: usize) -> HashSet<String> {
+pub(crate) async fn load_existing_tables(pool: &SqlitePool, shard_id: usize) -> HashSet<String> {
     let mut tables = HashSet::new();
 
     // Add the default blobs table
@@ -1714,7 +1714,7 @@ pub(crate) async fn ensure_namespaced_table_exists(
 /// row it deletes and publishes its LSN once committed. Each chunk's rows are
 /// added to `deleted` as they go, so a later failing chunk doesn't lose the
 /// count. Stops between chunks once `cancel` is cancelled.
-async fn delete_expired(
+pub(crate) async fn delete_expired(
     pool: &SqlitePool,
     table: &str,
     now: i64,
