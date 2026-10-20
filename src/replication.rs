@@ -28,6 +28,11 @@ use tokio_util::sync::CancellationToken;
 
 const BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
 
+/// TEST ONLY: when set, `init_shard` reads the boot id from this file instead of
+/// `BOOT_ID_PATH`. It lets a test process simulate a reboot (a changed boot id)
+/// without rebooting. Never set it in production.
+const BOOT_ID_FILE_ENV: &str = "BLOBASAUR_BOOT_ID_FILE";
+
 /// Raises the shard's published committed LSN to `lsn`; never lowers it.
 pub fn publish(commit_watch: &watch::Sender<u64>, lsn: u64) {
     commit_watch.send_if_modified(|current| {
@@ -163,7 +168,8 @@ pub async fn init_shard(
 
     let stored_boot_id = get_state(&mut tx, "boot_id").await?;
     let clean_shutdown = get_state(&mut tx, "clean_shutdown").await?.as_deref() == Some("1");
-    let boot_id = std::fs::read_to_string(BOOT_ID_PATH)
+    let boot_id_path = std::env::var(BOOT_ID_FILE_ENV).unwrap_or_else(|_| BOOT_ID_PATH.to_string());
+    let boot_id = std::fs::read_to_string(boot_id_path)
         .ok()
         .map(|id| id.trim().to_string());
     if replica {
