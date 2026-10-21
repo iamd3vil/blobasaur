@@ -36,6 +36,10 @@ pub struct AppState {
     pub shard_senders: Vec<ShardSender>,
     pub db_pools: Vec<SqlitePool>,
     pub write_db_pools: Vec<SqlitePool>,
+    /// Existence checks HSET, HDEL and DEL make before queueing a write. Kept
+    /// off the writer pool, whose one connection the writer holds for a whole
+    /// batch, and off the read pool, so reads can't stall writes either.
+    pub check_db_pools: Vec<SqlitePool>,
     /// Cache for inflight write operations to prevent race conditions in async mode.
     /// When async_write=true, SET and DEL return immediately but the actual
     /// database write happens asynchronously. This cache stores the pending
@@ -107,8 +111,10 @@ impl AppState {
 
         let mut db_pools_futures = vec![];
         let mut write_db_pools_futures = vec![];
+        let mut check_db_pools_futures = vec![];
         let pool_max_connections = cfg.sqlite_pool_max_connections();
         let write_pool_max_connections = cfg.sqlite_write_pool_max_connections();
+        let check_pool_max_connections = cfg.sqlite_check_pool_max_connections();
         for i in 0..cfg.num_shards {
             db_pools_futures.push(
                 SqlitePoolOptions::new()
@@ -119,6 +125,12 @@ impl AppState {
             write_db_pools_futures.push(
                 SqlitePoolOptions::new()
                     .max_connections(write_pool_max_connections)
+                    .connect_with(build_sqlite_connect_options(&cfg, i)),
+            );
+
+            check_db_pools_futures.push(
+                SqlitePoolOptions::new()
+                    .max_connections(check_pool_max_connections)
                     .connect_with(build_sqlite_connect_options(&cfg, i)),
             );
         }
@@ -144,6 +156,14 @@ impl AppState {
                         i, e
                     )
                 })
+            })
+            .collect();
+        let check_db_pools: Vec<SqlitePool> = join_all(check_db_pools_futures)
+            .await
+            .into_iter()
+            .enumerate()
+            .map(|(i, res)| {
+                res.unwrap_or_else(|e| panic!("Failed to connect to shard {} check DB: {}", i, e))
             })
             .collect();
 
@@ -225,6 +245,7 @@ impl AppState {
             shard_senders: shard_senders_vec,
             db_pools,
             write_db_pools,
+            check_db_pools,
             inflight_cache,
             inflight_hcache,
             cluster_manager,
@@ -244,6 +265,7 @@ impl AppState {
             for (name, pool) in [
                 ("read", &self.db_pools[i]),
                 ("write", &self.write_db_pools[i]),
+                ("check", &self.check_db_pools[i]),
             ] {
                 let idle = pool.num_idle();
                 let in_use = (pool.size() as usize).saturating_sub(idle);
