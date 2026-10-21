@@ -215,6 +215,7 @@ impl Cfg {
         let mmap_per_connection_mb = cfg.sqlite_mmap_per_connection_mb();
         let pool_max_connections = cfg.sqlite_pool_max_connections();
         let write_pool_max_connections = cfg.sqlite_write_pool_max_connections();
+        let check_pool_max_connections = cfg.sqlite_check_pool_max_connections();
         let auto_upgrade_legacy_auto_vacuum = cfg.sqlite_auto_upgrade_legacy_auto_vacuum();
         let auto_upgrade_legacy_auto_vacuum_concurrency =
             cfg.sqlite_auto_upgrade_legacy_auto_vacuum_concurrency();
@@ -235,8 +236,8 @@ impl Cfg {
             println!("  mmap_size: disabled");
         }
         println!(
-            "  pool_max_connections: {} read + {} dedicated writer",
-            pool_max_connections, write_pool_max_connections
+            "  pool_max_connections: {} read + {} dedicated writer + {} write check",
+            pool_max_connections, write_pool_max_connections, check_pool_max_connections
         );
         println!(
             "  auto_upgrade_legacy_auto_vacuum: {}",
@@ -398,10 +399,17 @@ impl Cfg {
         1
     }
 
-    /// Total SQLite connections per shard across read and dedicated writer pools.
+    /// Pool size per shard for the existence checks HSET, HDEL and DEL make
+    /// before queueing a write. Point lookups, so one connection keeps up.
+    pub fn sqlite_check_pool_max_connections(&self) -> u32 {
+        1
+    }
+
+    /// Total SQLite connections per shard across read, writer and check pools.
     pub fn sqlite_total_pool_connections_per_shard(&self) -> u32 {
         self.sqlite_pool_max_connections()
             .saturating_add(self.sqlite_write_pool_max_connections())
+            .saturating_add(self.sqlite_check_pool_max_connections())
             .max(1)
     }
 

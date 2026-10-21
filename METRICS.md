@@ -110,7 +110,7 @@ Blocking-pool size, worker-local queue depth, poll counts, and work-steal counts
 
 - `blobasaur_sqlite_transaction_duration_seconds{shard,result}` - Histogram of writer batch transactions, from BEGIN through commit. `result` is `ok`, or `error` if BEGIN or COMMIT failed. A transaction with some failed statements still commits, so it counts as `ok`
 - `blobasaur_sqlite_errors_total{shard,stage,kind}` - SQLite and pool failures. `stage` is `acquire` (getting a connection), `begin`, `execute` (one per failed writer statement), or `commit`. `kind` is `busy`, `locked`, `constraint`, `io`, `pool_timeout`, or `other`. Read query errors are not included; see `blobasaur_reads_total{result="error"}`
-- `blobasaur_sqlite_pool_connections{shard,pool,state}` - Open connections in the shard's `read` or `write` pool, by `state` `idle` or `in_use`. Sampled on each scrape
+- `blobasaur_sqlite_pool_connections{shard,pool,state}` - Open connections in the shard's `read`, `write` or `check` pool (`check` serves the existence checks HSET, HDEL and DEL make before queueing), by `state` `idle` or `in_use`. Sampled on each scrape
 - `blobasaur_sqlite_pool_acquire_seconds{shard,pool,result}` - Histogram of time waiting for a pool connection, separate from the query. Measured for GET/HGET reads (`read`) and writer batches (`write`); `result` is `ok` or `error`
 
 ### Expiry Cleanup Metrics

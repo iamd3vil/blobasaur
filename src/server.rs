@@ -187,7 +187,12 @@ pub async fn run(
             );
         }
     }
-    for pool in state.db_pools.iter().chain(&state.write_db_pools) {
+    for pool in state
+        .db_pools
+        .iter()
+        .chain(&state.write_db_pools)
+        .chain(&state.check_db_pools)
+    {
         pool.close().await;
     }
 
@@ -754,13 +759,13 @@ async fn handle_del_multiple(
         }
 
         let shard_index = state.get_shard(&key);
-        let pool = &state.write_db_pools[shard_index];
+        let pool = &state.check_db_pools[shard_index];
 
         // A queued async SET is in the inflight cache but not the DB yet. It
         // counts as existing: skipping the delete would let that SET commit
         // afterwards and bring the key back. A queued DEL means it's gone.
-        // Otherwise check the DB. A failed check (e.g. the writer connection is
-        // held by a long VACUUM) must not be reported as "key not found".
+        // Otherwise check the DB. A failed check (e.g. the shard file is
+        // locked or unreadable) must not be reported as "key not found".
         let exists = match shard_manager::pending_exists(&state.inflight_cache, &key).await {
             Some(exists) => exists,
             None => match sqlx::query("SELECT 1 FROM blobs WHERE key = ?")
@@ -1212,7 +1217,7 @@ async fn handle_hset(
     let value_len = value.len() as f64;
 
     let shard_index = state.get_shard(&key);
-    let pool = &state.write_db_pools[shard_index];
+    let pool = &state.check_db_pools[shard_index];
     let table_name = format!("blobs_{}", namespace);
 
     let table_exists = match hash_table_exists(pool, &table_name).await {
@@ -1393,7 +1398,7 @@ async fn handle_hsetex(
         }
 
         let shard_index = state.get_shard(&field_key);
-        let pool = &state.write_db_pools[shard_index];
+        let pool = &state.check_db_pools[shard_index];
         let table_name = format!("blobs_{}", namespace);
 
         let table_exists = match hash_table_exists(pool, &table_name).await {
@@ -1587,7 +1592,7 @@ async fn handle_hdel(
     }
 
     let shard_index = state.get_shard(&key);
-    let pool = &state.write_db_pools[shard_index];
+    let pool = &state.check_db_pools[shard_index];
     let table_name = format!("blobs_{}", namespace);
 
     // A queued async HSET is in the inflight cache but not the DB yet. It counts
@@ -3087,6 +3092,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn async_writes_ack_while_writer_connection_is_occupied() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let mut cfg = single_read_connection_cfg(&temp_dir, true);
+        // The queue holds batch_size ops: room for the three queued below.
+        cfg.batch_size = Some(8);
+        let ctx = TestContext::from_cfg(temp_dir, cfg).await;
+
+        for field in ["alice", "bob"] {
+            let frame = respond_with(&ctx, |state, stream| {
+                Box::pin(async move {
+                    let mut stream = stream;
+                    handle_hset(
+                        &mut stream,
+                        &state,
+                        "users".to_string(),
+                        field.to_string(),
+                        Bytes::from_static(b"first"),
+                    )
+                    .await
+                })
+            })
+            .await;
+            assert_integer_response(frame, 1);
+        }
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_set(
+                    &mut stream,
+                    &state,
+                    "k".to_string(),
+                    Bytes::from_static(b"v"),
+                    None,
+                )
+                .await
+            })
+        })
+        .await;
+        assert_simple_string(frame, "OK");
+
+        // Wait for the seeds to commit, so the checks below go to the DB.
+        timeout(Duration::from_secs(5), async {
+            while ctx.state.inflight_hcache.get("users:alice").await.is_some()
+                || ctx.state.inflight_hcache.get("users:bob").await.is_some()
+                || ctx.state.inflight_cache.get("k").await.is_some()
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("seed writes did not commit");
+
+        // As if the writer were mid-commit: it holds its only connection.
+        let writer_conn = ctx.state.write_db_pools[0]
+            .acquire()
+            .await
+            .expect("occupy writer connection");
+
+        let frame = timeout(
+            Duration::from_secs(1),
+            respond_with(&ctx, |state, stream| {
+                Box::pin(async move {
+                    let mut stream = stream;
+                    handle_hset(
+                        &mut stream,
+                        &state,
+                        "users".to_string(),
+                        "alice".to_string(),
+                        Bytes::from_static(b"second"),
+                    )
+                    .await
+                })
+            }),
+        )
+        .await
+        .expect("async HSET should not wait for the writer connection");
+        assert_integer_response(frame, 0);
+
+        let frame = timeout(
+            Duration::from_secs(1),
+            respond_with(&ctx, |state, stream| {
+                Box::pin(async move {
+                    let mut stream = stream;
+                    handle_hdel(&mut stream, &state, "users".to_string(), "bob".to_string()).await
+                })
+            }),
+        )
+        .await
+        .expect("async HDEL should not wait for the writer connection");
+        assert_integer_response(frame, 1);
+
+        let frame = timeout(
+            Duration::from_secs(1),
+            respond_with(&ctx, |state, stream| {
+                Box::pin(async move {
+                    let mut stream = stream;
+                    handle_del_multiple(&mut stream, &state, vec!["k".to_string()]).await
+                })
+            }),
+        )
+        .await
+        .expect("async DEL should not wait for the writer connection");
+        assert_integer_response(frame, 1);
+
+        drop(writer_conn);
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn hdel_completes_while_read_pool_connection_is_occupied() {
         let temp_dir = TempDir::new().expect("temp dir");
         let cfg = single_read_connection_cfg(&temp_dir, false);
@@ -3220,8 +3334,8 @@ mod tests {
     #[tokio::test]
     async fn del_and_hdel_return_error_when_existence_check_fails() {
         let ctx = TestContext::new(false).await;
-        // Simulates the writer connection being unavailable (e.g. held by a long VACUUM).
-        ctx.state.write_db_pools[0].close().await;
+        // Simulates the existence check failing.
+        ctx.state.check_db_pools[0].close().await;
 
         let frame = respond_with(&ctx, |state, stream| {
             Box::pin(async move {
