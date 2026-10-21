@@ -38,6 +38,7 @@ async fn start(async_write: bool, batch_size: usize, batch_timeout_ms: u64) -> S
         async_write: Some(async_write),
         batch_size: Some(batch_size),
         batch_timeout_ms: Some(batch_timeout_ms),
+        write_queue_capacity: None,
         addr: None,
         cluster: None,
         metrics: None,

@@ -9,7 +9,7 @@ use sqlx::{Connection, Sqlite, SqlitePool, pool::PoolConnection};
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::{Duration, interval, timeout};
+use tokio::time::{Duration, interval, timeout_at};
 use tokio_util::sync::CancellationToken;
 
 // Message type for writer consumers
@@ -285,72 +285,62 @@ pub async fn shard_writer_task(writer: ShardWriter) {
     let mut pending_maintenance_operation: Option<ShardWriteOperation> = None;
 
     loop {
-        // Collect operations for batching
-        if batch.is_empty() {
-            let next_operation = match pending_maintenance_operation.take() {
-                Some(operation) => Some(operation),
-                None => tokio::select! {
-                    biased;
-                    _ = shutdown.cancelled() => break,
-                    operation = receiver.recv() => operation,
-                },
-            };
-
-            match next_operation {
-                Some(ShardWriteOperation::Vacuum {
-                    mode,
-                    budget_bytes,
-                    dry_run,
-                    responder,
-                }) => {
-                    let result =
-                        execute_vacuum(shard_id, &pool, mode, budget_bytes, dry_run, &metrics)
-                            .await;
-                    let _ = responder.send(result);
-                    continue;
-                }
-                Some(operation) => {
-                    batch.push_back(operation);
-                }
-                None => break, // Channel closed
-            }
-        } else {
-            // If batch has items, wait with timeout for more operations
-            let next_operation = tokio::select! {
+        // The next op starts a batch, unless it's a vacuum, which runs alone.
+        let next_operation = match pending_maintenance_operation.take() {
+            Some(operation) => Some(operation),
+            None => tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => break,
-                result = timeout(batch_timeout, receiver.recv()) => result,
-            };
-            match next_operation {
-                Ok(Some(operation)) => {
-                    if matches!(operation, ShardWriteOperation::Vacuum { .. }) {
-                        pending_maintenance_operation = Some(operation);
-                    } else {
-                        batch.push_back(operation);
-                    }
-                }
-                Ok(None) => break, // Channel closed
-                Err(_) => {}       // Timeout - process current batch
+                operation = receiver.recv() => operation,
+            },
+        };
+
+        match next_operation {
+            Some(ShardWriteOperation::Vacuum {
+                mode,
+                budget_bytes,
+                dry_run,
+                responder,
+            }) => {
+                let result =
+                    execute_vacuum(shard_id, &pool, mode, budget_bytes, dry_run, &metrics).await;
+                let _ = responder.send(result);
+                continue;
             }
+            Some(operation) => {
+                batch.push_back(operation);
+            }
+            None => break, // Channel closed
         }
 
-        // Continue collecting until batch is full or no more immediate operations.
-        // Vacuum operations are ordering barriers, so stop collecting when one is observed.
-        if pending_maintenance_operation.is_none() {
-            while batch.len() < batch_size {
-                match receiver.try_recv() {
-                    Ok(operation) => {
-                        if matches!(operation, ShardWriteOperation::Vacuum { .. }) {
-                            pending_maintenance_operation = Some(operation);
-                            break;
-                        }
-
-                        batch.push_back(operation);
+        // Fill the batch until it's full or batch_timeout has passed since its
+        // first op: take what's queued, then wait for more. A vacuum is an
+        // ordering barrier, so it ends the batch and runs next. Shutdown ends
+        // the wait: this batch commits, then the drain below takes the rest.
+        let deadline = tokio::time::Instant::now() + batch_timeout;
+        while batch.len() < batch_size {
+            let operation = match receiver.try_recv() {
+                Ok(operation) => operation,
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+                Err(mpsc::error::TryRecvError::Empty) if batch_timeout.is_zero() => break,
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    let next_operation = tokio::select! {
+                        biased;
+                        _ = shutdown.cancelled() => None,
+                        result = timeout_at(deadline, receiver.recv()) => result.ok().flatten(),
+                    };
+                    match next_operation {
+                        Some(operation) => operation,
+                        None => break, // Timed out, shutting down, or channel closed
                     }
-                    Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) => break,
                 }
+            };
+
+            if matches!(operation, ShardWriteOperation::Vacuum { .. }) {
+                pending_maintenance_operation = Some(operation);
+                break;
             }
+            batch.push_back(operation);
         }
 
         if !batch.is_empty() {
@@ -1578,6 +1568,7 @@ mod tests {
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
     use std::str::FromStr;
     use tempfile::TempDir;
+    use tokio::time::timeout;
 
     #[test]
     fn take_value_reuses_a_sync_values_request_buffer() {
@@ -2157,6 +2148,107 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(keys, vec![("k".to_string(),)]);
+    }
+
+    fn spawn_writer(
+        pool: &SqlitePool,
+        batch_size: usize,
+        batch_timeout_ms: u64,
+        shutdown: CancellationToken,
+    ) -> (
+        mpsc::Sender<ShardWriteOperation>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (sender, receiver) = mpsc::channel(64);
+        let writer = tokio::spawn(shard_writer_task(ShardWriter {
+            shard_id: 0,
+            pool: pool.clone(),
+            receiver,
+            batch_size,
+            batch_timeout_ms,
+            inflight_cache: Cache::new(16),
+            inflight_hcache: Cache::new(16),
+            metrics: Metrics::new(),
+            shutdown,
+        }));
+        (sender, writer)
+    }
+
+    fn sync_set(key: &str) -> (ShardWriteOperation, oneshot::Receiver<Result<(), String>>) {
+        let (responder, rx) = oneshot::channel();
+        let op = ShardWriteOperation::Set {
+            key: key.to_string(),
+            data: Bytes::from_static(b"v"),
+            expires_at: None,
+            responder,
+        };
+        (op, rx)
+    }
+
+    #[tokio::test]
+    async fn writer_waits_batch_timeout_for_more_ops_until_the_batch_is_full() {
+        let (_temp_dir, pool) = create_test_pool().await;
+        let (sender, writer) = spawn_writer(&pool, 2, 60_000, CancellationToken::new());
+
+        let (op, mut first) = sync_set("a");
+        sender.send(op).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            first.try_recv().is_err(),
+            "the writer should wait for more ops"
+        );
+
+        // The batch is full: it commits without waiting out the timeout.
+        let (op, second) = sync_set("b");
+        sender.send(op).await.unwrap();
+        let results = timeout(Duration::from_secs(5), async {
+            (first.await.unwrap(), second.await.unwrap())
+        })
+        .await
+        .expect("a full batch should commit right away");
+        assert_eq!(results, (Ok(()), Ok(())));
+
+        drop(sender);
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn writer_commits_when_batch_timeout_passes() {
+        let (_temp_dir, pool) = create_test_pool().await;
+        let (sender, writer) = spawn_writer(&pool, 8, 200, CancellationToken::new());
+
+        let start = std::time::Instant::now();
+        let (op, rx) = sync_set("a");
+        sender.send(op).await.unwrap();
+        assert_eq!(rx.await.unwrap(), Ok(()));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(200) && elapsed < Duration::from_secs(5),
+            "the batch should commit once the timeout passes: {elapsed:?}"
+        );
+
+        drop(sender);
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_ends_the_batch_timeout_wait() {
+        let (_temp_dir, pool) = create_test_pool().await;
+        let shutdown = CancellationToken::new();
+        let (sender, writer) = spawn_writer(&pool, 8, 60_000, shutdown.clone());
+
+        let (op, rx) = sync_set("a");
+        sender.send(op).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown.cancel();
+        let result = timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("shutdown should not wait out the batch timeout");
+        assert_eq!(result.unwrap(), Ok(()));
+        timeout(Duration::from_secs(5), writer)
+            .await
+            .expect("writer did not stop")
+            .unwrap();
     }
 
     #[tokio::test]

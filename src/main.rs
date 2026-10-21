@@ -863,6 +863,7 @@ mod tests {
             async_write: None,
             batch_size: None,
             batch_timeout_ms: None,
+            write_queue_capacity: None,
             addr: Some("10.0.0.9:6379".to_string()),
             cluster: None,
             metrics: None,
@@ -890,6 +891,7 @@ mod tests {
             async_write: None,
             batch_size: None,
             batch_timeout_ms: None,
+            write_queue_capacity: None,
             addr: Some("0.0.0.0:6379".to_string()),
             cluster: None,
             metrics: None,
@@ -916,6 +918,7 @@ mod tests {
             async_write: None,
             batch_size: None,
             batch_timeout_ms: None,
+            write_queue_capacity: None,
             addr: Some("0.0.0.0:6379".to_string()),
             cluster: Some(config::ClusterConfig {
                 enabled: true,

@@ -68,7 +68,7 @@ impl AppState {
         // Clear the output vector first to ensure it's empty
         shard_receivers_out.clear();
 
-        let queue_capacity = cfg.batch_size.unwrap_or(100);
+        let queue_capacity = cfg.write_queue_capacity();
         for i in 0..cfg.num_shards {
             let (sender, receiver) = mpsc::channel(queue_capacity);
             shard_senders_vec.push(ShardSender::new(sender, ShardMetrics::new(i)));
@@ -595,6 +595,7 @@ mod tests {
             async_write: Some(false),
             batch_size: Some(1),
             batch_timeout_ms: Some(0),
+            write_queue_capacity: None,
             addr: None,
             cluster: None,
             metrics: None,
