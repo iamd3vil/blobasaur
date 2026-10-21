@@ -1006,13 +1006,19 @@ async fn process_batch(
 
 /// Begins the batch transaction on the writer connection, if there is one.
 /// A failed acquire was already recorded by [`ShardMetrics::acquire`].
+///
+/// IMMEDIATE takes the write lock up front, waiting up to busy_timeout if
+/// another connection holds it. A deferred BEGIN would take it at the first
+/// write, after the existence check's read, and SQLite fails that upgrade at
+/// once without waiting: the batch's writes, async ones already acked, would
+/// be lost.
 async fn begin<'c>(
     conn: &'c mut Result<PoolConnection<Sqlite>, sqlx::Error>,
     shard_metrics: &ShardMetrics,
     tx_start: std::time::Instant,
 ) -> Result<sqlx::Transaction<'c, Sqlite>, String> {
     let conn = conn.as_mut().map_err(|e| e.to_string())?;
-    conn.begin().await.map_err(|e| {
+    conn.begin_with("BEGIN IMMEDIATE").await.map_err(|e| {
         shard_metrics.record_sqlite_error("begin", &e.to_string());
         shard_metrics.record_transaction(false, tx_start.elapsed());
         e.to_string()
@@ -2054,13 +2060,14 @@ mod tests {
     #[tokio::test]
     async fn sync_write_reports_its_own_statement_failure() {
         let (_temp_dir, pool) = create_test_pool().await;
-        // Another connection holds the write lock: the writer's INSERT fails
-        // with SQLITE_BUSY, but its (now read-only) transaction still commits.
-        let mut lock = pool.acquire().await.unwrap();
-        sqlx::query("BEGIN IMMEDIATE")
-            .execute(&mut *lock)
-            .await
-            .unwrap();
+        // The INSERT of "blocked" fails, but its transaction still commits.
+        sqlx::query(
+            "CREATE TRIGGER reject_blocked BEFORE INSERT ON blobs WHEN NEW.key = 'blocked' \
+             BEGIN SELECT RAISE(ABORT, 'rejected'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let (sender, receiver) = mpsc::channel(8);
         let writer = tokio::spawn(shard_writer_task(ShardWriter {
@@ -2090,12 +2097,10 @@ mod tests {
         sender.send(op).await.unwrap();
         let result = rx.await.unwrap();
         assert!(
-            result.as_ref().is_err_and(|e| e.contains("locked")),
+            result.as_ref().is_err_and(|e| e.contains("rejected")),
             "a write that wasn't persisted must not be acknowledged: {result:?}"
         );
 
-        sqlx::query("ROLLBACK").execute(&mut *lock).await.unwrap();
-        drop(lock);
         let (op, rx) = set("after");
         sender.send(op).await.unwrap();
         assert_eq!(rx.await.unwrap(), Ok(()));
@@ -2107,6 +2112,51 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(keys, vec![("after".to_string(),)]);
+    }
+
+    #[tokio::test]
+    async fn async_write_waits_out_an_outside_write_lock() {
+        let (_temp_dir, pool) = create_test_pool().await;
+        // Another connection, e.g. a sqlite3 session, holds the write lock.
+        let mut lock = pool.acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *lock)
+            .await
+            .unwrap();
+
+        let (sender, receiver) = mpsc::channel(8);
+        let writer = tokio::spawn(shard_writer_task(ShardWriter {
+            shard_id: 0,
+            pool: pool.clone(),
+            receiver,
+            batch_size: 8,
+            batch_timeout_ms: 0,
+            inflight_cache: Cache::new(16),
+            inflight_hcache: Cache::new(16),
+            metrics: Metrics::new(),
+            shutdown: CancellationToken::new(),
+        }));
+
+        // Already acked to the client, so it must commit once the lock is gone.
+        sender
+            .send(ShardWriteOperation::SetAsync {
+                key: "k".to_string(),
+                data: Bytes::from_static(b"v"),
+                expires_at: None,
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        sqlx::query("ROLLBACK").execute(&mut *lock).await.unwrap();
+        drop(lock);
+
+        drop(sender);
+        writer.await.unwrap();
+        let keys: Vec<(String,)> = sqlx::query_as("SELECT key FROM blobs")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(keys, vec![("k".to_string(),)]);
     }
 
     #[tokio::test]
