@@ -11,6 +11,8 @@ pub struct Cfg {
     pub async_write: Option<bool>,
     pub batch_size: Option<usize>,
     pub batch_timeout_ms: Option<u64>,
+    /// Write ops each shard can queue before writes wait for room. Default: 1024
+    pub write_queue_capacity: Option<usize>,
     pub addr: Option<String>,
     pub cluster: Option<ClusterConfig>,
     pub metrics: Option<MetricsConfig>,
@@ -176,6 +178,12 @@ impl Cfg {
             return Err(miette::miette!("batch_size must be greater than 0"));
         }
 
+        if cfg.write_queue_capacity == Some(0) {
+            return Err(miette::miette!(
+                "write_queue_capacity must be greater than 0"
+            ));
+        }
+
         if cfg.max_request_size_mb == Some(0) {
             return Err(miette::miette!(
                 "max_request_size_mb must be greater than 0"
@@ -194,6 +202,10 @@ impl Cfg {
 
         println!("Data directory: {}", cfg.data_dir);
         println!("Number of shards: {}", cfg.num_shards);
+        println!(
+            "Write queue capacity: {} per shard",
+            cfg.write_queue_capacity()
+        );
 
         if let Some(ref metrics) = cfg.metrics
             && metrics.enabled
@@ -317,6 +329,11 @@ impl Cfg {
         per_connection
             .clamp(i32::MIN as i64, i32::MAX as i64)
             .max(0) as i32
+    }
+
+    /// Write ops each shard can queue (default: 1024)
+    pub fn write_queue_capacity(&self) -> usize {
+        self.write_queue_capacity.unwrap_or(1024)
     }
 
     /// Get SQLite busy timeout in milliseconds (default: 5000 ms = 5 seconds)

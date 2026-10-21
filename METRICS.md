@@ -101,7 +101,7 @@ Blocking-pool size, worker-local queue depth, poll counts, and work-steal counts
 
 ### Write Queue Metrics
 
-- `blobasaur_write_queue_depth{shard}` - Ops waiting in the shard's write queue, not counting the batch being written. Sampled on each scrape. The queue holds `batch_size` ops (default 100); a value at that limit means writers are blocked on it
+- `blobasaur_write_queue_depth{shard}` - Ops waiting in the shard's write queue, not counting the batch being written. Sampled on each scrape. The queue holds `write_queue_capacity` ops (default 1024); a value at that limit means writers are blocked on it
 - `blobasaur_write_enqueue_wait_seconds{shard}` - Histogram of time a SET/DEL/HSET/HSETEX/HDEL/EXPIRE/HEXPIRE/vacuum request waited for queue space, excluding SQLite execution
 - `blobasaur_async_writes_pending{shard}` - `async_write` ops acknowledged to clients but not yet committed or failed, whether queued or in the batch being written
 - `blobasaur_async_write_failures_total{shard}` - `async_write` ops that were acknowledged and then failed to persist, because their statement or their transaction failed. Each op counts once
@@ -183,10 +183,10 @@ sum(rate(blobasaur_reads_total{result="hit"}[5m])) / sum(rate(blobasaur_reads_to
 
 ### Write backpressure
 
-Queue saturation per shard, as a fraction of the queue capacity (here the default 100):
+Queue saturation per shard, as a fraction of `write_queue_capacity` (here the default 1024):
 
 ```promql
-max by (shard) (blobasaur_write_queue_depth) / 100
+max by (shard) (blobasaur_write_queue_depth) / 1024
 ```
 
 95th percentile wait for queue space:

@@ -25,7 +25,10 @@ async fn run_go_suite(async_write: bool) {
         storage_compression: None,
         async_write: Some(async_write),
         batch_size: Some(50),
-        batch_timeout_ms: Some(5),
+        // A sync write waits out the timeout when nothing else is queued, so
+        // 1000 pipelined sync SETs would take 5 s and trip the client's timeout.
+        batch_timeout_ms: Some(if async_write { 5 } else { 0 }),
+        write_queue_capacity: None,
         addr: None,
         cluster: None,
         metrics: None,

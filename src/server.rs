@@ -934,13 +934,15 @@ async fn handle_info(
                  data_dir:{}\r\n\
                  async_write:{}\r\n\
                  batch_size:{}\r\n\
-                 batch_timeout_ms:{}\r\n",
+                 batch_timeout_ms:{}\r\n\
+                 write_queue_capacity:{}\r\n",
                 std::process::id(),
                 state.cfg.num_shards,
                 state.cfg.data_dir,
                 state.cfg.async_write.unwrap_or(false),
                 state.cfg.batch_size.unwrap_or(1),
-                state.cfg.batch_timeout_ms.unwrap_or(0)
+                state.cfg.batch_timeout_ms.unwrap_or(0),
+                state.cfg.write_queue_capacity()
             )
         }
         Some("stats") => "# Stats\r\n\
@@ -2531,6 +2533,7 @@ mod tests {
                 async_write: Some(async_write),
                 batch_size: Some(1),
                 batch_timeout_ms: Some(0),
+                write_queue_capacity: None,
                 addr: None,
                 cluster: None,
                 metrics: None,
@@ -2612,6 +2615,7 @@ mod tests {
             async_write: Some(async_write),
             batch_size: Some(1),
             batch_timeout_ms: Some(0),
+            write_queue_capacity: None,
             addr: None,
             cluster: None,
             metrics: None,
@@ -3094,9 +3098,7 @@ mod tests {
     #[tokio::test]
     async fn async_writes_ack_while_writer_connection_is_occupied() {
         let temp_dir = TempDir::new().expect("temp dir");
-        let mut cfg = single_read_connection_cfg(&temp_dir, true);
-        // The queue holds batch_size ops: room for the three queued below.
-        cfg.batch_size = Some(8);
+        let cfg = single_read_connection_cfg(&temp_dir, true);
         let ctx = TestContext::from_cfg(temp_dir, cfg).await;
 
         for field in ["alice", "bob"] {
