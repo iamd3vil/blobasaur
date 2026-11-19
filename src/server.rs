@@ -587,7 +587,7 @@ async fn handle_get(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // First check inflight cache for pending writes
     match state.inflight_cache.get(&key).await {
-        Some(Pending::Value(data)) => {
+        Some(Pending::Value { data, .. }) => {
             state.metrics.record_read("get", "inflight", "hit");
             // Decompress if needed
             let data = decompress_if_enabled(state, data).await?;
@@ -668,12 +668,14 @@ async fn handle_set(
 
         // Async mode: respond immediately after queueing. The inflight cache
         // serves the value until it commits.
+        let token = shard_manager::next_pending_token();
         let operation = ShardWriteOperation::SetAsync {
             key: key.clone(),
             data: value.clone(),
             expires_at,
+            token,
         };
-        let pending = Pending::Value(value);
+        let pending = Pending::Value { data: value, token };
 
         if shard_manager::queue_pending(&state.inflight_cache, sender, key, pending, operation)
             .await
@@ -793,7 +795,7 @@ async fn handle_del_multiple(
         if state.cfg.async_write.unwrap_or(false) {
             // Async mode: respond immediately after queueing. Reads see the
             // key as gone until the delete commits.
-            let token = shard_manager::next_delete_token();
+            let token = shard_manager::next_pending_token();
             let operation = ShardWriteOperation::DeleteAsync {
                 key: key.clone(),
                 token,
@@ -1116,7 +1118,7 @@ async fn handle_hget(
     // First check inflight cache for pending writes
     let namespaced_key = state.namespaced_key(&namespace, &key);
     match state.inflight_hcache.get(&namespaced_key).await {
-        Some(Pending::Value(data)) => {
+        Some(Pending::Value { data, .. }) => {
             state.metrics.record_read("hget", "inflight", "hit");
             // Decompress if needed
             let data = decompress_if_enabled(state, data).await?;
@@ -1271,12 +1273,14 @@ async fn handle_hset(
         // Async mode: respond immediately after queueing. The inflight cache
         // serves the value until it commits.
         let namespaced_key = state.namespaced_key(&namespace, &key);
+        let token = shard_manager::next_pending_token();
         let operation = ShardWriteOperation::HSetAsync {
             namespace,
             key,
             data: value.clone(),
+            token,
         };
-        let pending = Pending::Value(value);
+        let pending = Pending::Value { data: value, token };
 
         if shard_manager::queue_pending(
             &state.inflight_hcache,
@@ -1466,19 +1470,25 @@ async fn handle_hsetex(
         if state.cfg.async_write.unwrap_or(false) {
             // The inflight cache serves the value until it commits.
             let namespaced_key = state.namespaced_key(&namespace, &field_key);
-            let pending = Pending::Value(compressed_value.clone());
+            let token = shard_manager::next_pending_token();
+            let pending = Pending::Value {
+                data: compressed_value.clone(),
+                token,
+            };
             let operation = if let Some(exp) = expires_at {
                 ShardWriteOperation::HSetExAsync {
                     namespace: namespace.clone(),
                     key: field_key,
                     data: compressed_value,
                     expires_at: exp,
+                    token,
                 }
             } else {
                 ShardWriteOperation::HSetAsync {
                     namespace: namespace.clone(),
                     key: field_key,
                     data: compressed_value,
+                    token,
                 }
             };
 
@@ -1649,7 +1659,7 @@ async fn handle_hdel(
     if state.cfg.async_write.unwrap_or(false) {
         // Async mode: respond immediately after queueing. Reads see the field
         // as gone until the delete commits.
-        let token = shard_manager::next_delete_token();
+        let token = shard_manager::next_pending_token();
         let operation = ShardWriteOperation::HDeleteAsync {
             namespace,
             key,
@@ -3418,13 +3428,22 @@ mod tests {
         let value = Bytes::from_static(b"v");
         ctx.state
             .inflight_cache
-            .insert("queued".to_string(), Pending::Value(value.clone()))
+            .insert(
+                "queued".to_string(),
+                Pending::Value {
+                    data: value.clone(),
+                    token: shard_manager::next_pending_token(),
+                },
+            )
             .await;
         ctx.state
             .inflight_hcache
             .insert(
                 ctx.state.namespaced_key("ns", "field"),
-                Pending::Value(value),
+                Pending::Value {
+                    data: value,
+                    token: shard_manager::next_pending_token(),
+                },
             )
             .await;
 
@@ -3626,6 +3645,186 @@ mod tests {
         .await;
         assert_bulk_string(frame, b"v2");
 
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pipelined_async_empty_writes_never_serve_stale_reads() {
+        let ctx = TestContext::new(true).await;
+        // Pre-create the namespace table (leaving f and f2 absent) so the
+        // second pipelined HSET cannot see a stale table-absent check if the
+        // first HSET commits before pending_exists runs.
+        sqlx::query(
+            "CREATE TABLE blobs_ns (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)",
+        )
+        .execute(&ctx.state.write_db_pools[0])
+        .await
+        .unwrap();
+        let (server_stream, mut client_stream) = tcp_pair().await;
+        let shutdown = CancellationToken::new();
+        let state_clone = ctx.state.clone();
+        let shutdown_clone = shutdown.clone();
+        let conn_task = tokio::spawn(async move {
+            let _ = handle_connection(server_stream, state_clone, shutdown_clone).await;
+        });
+
+        let encode_cmd = |parts: &[&[u8]]| {
+            let mut out = format!("*{}\r\n", parts.len()).into_bytes();
+            for part in parts {
+                out.extend_from_slice(format!("${}\r\n", part.len()).as_bytes());
+                out.extend_from_slice(part);
+                out.extend_from_slice(b"\r\n");
+            }
+            out
+        };
+
+        async fn read_replies(
+            stream: &mut TcpStream,
+            buf: &mut Vec<u8>,
+            count: usize,
+        ) -> Vec<BytesFrame> {
+            let mut replies = Vec::with_capacity(count);
+            let mut tmp = [0u8; 4096];
+            while replies.len() < count {
+                let mut consumed = 0;
+                while replies.len() < count {
+                    match parse_resp_with_remaining(&buf[consumed..]) {
+                        Ok((frame, remaining)) => {
+                            consumed = buf.len() - remaining.len();
+                            replies.push(frame);
+                        }
+                        Err(crate::redis::ParseError::Incomplete) => break,
+                        Err(e) => panic!("unexpected parse error: {e}"),
+                    }
+                }
+                if consumed > 0 {
+                    buf.drain(..consumed);
+                }
+                if replies.len() < count {
+                    let n = timeout(Duration::from_secs(5), stream.read(&mut tmp))
+                        .await
+                        .expect("timed out waiting for reply")
+                        .expect("read failed");
+                    assert!(n > 0, "connection closed before all replies arrived");
+                    buf.extend_from_slice(&tmp[..n]);
+                }
+            }
+            replies
+        }
+
+        let mut read_buf = Vec::new();
+
+        // Repro from #26: pipeline SET k "", SET k "x{i}", SET k "" 50 times,
+        // then GET k immediately after the last ack.
+        let mut payload = Vec::new();
+        for i in 0..50 {
+            let val = format!("x{i}");
+            payload.extend_from_slice(&encode_cmd(&[b"SET", b"k", b""]));
+            payload.extend_from_slice(&encode_cmd(&[b"SET", b"k", val.as_bytes()]));
+            payload.extend_from_slice(&encode_cmd(&[b"SET", b"k", b""]));
+        }
+        client_stream.write_all(&payload).await.unwrap();
+        let replies = read_replies(&mut client_stream, &mut read_buf, 150).await;
+        for reply in replies {
+            assert_simple_string(reply, "OK");
+        }
+        client_stream
+            .write_all(&encode_cmd(&[b"GET", b"k"]))
+            .await
+            .unwrap();
+        let reply = read_replies(&mut client_stream, &mut read_buf, 1)
+            .await
+            .pop()
+            .unwrap();
+        assert_bulk_string(reply, b"");
+
+        // Same pattern with HSET/HGET on inflight_hcache.
+        payload.clear();
+        for i in 0..50 {
+            let val = format!("x{i}");
+            payload.extend_from_slice(&encode_cmd(&[b"HSET", b"ns", b"f", b""]));
+            payload.extend_from_slice(&encode_cmd(&[b"HSET", b"ns", b"f", val.as_bytes()]));
+            payload.extend_from_slice(&encode_cmd(&[b"HSET", b"ns", b"f", b""]));
+        }
+        client_stream.write_all(&payload).await.unwrap();
+        let replies = read_replies(&mut client_stream, &mut read_buf, 150).await;
+        for (idx, reply) in replies.into_iter().enumerate() {
+            assert_integer_response(reply, if idx == 0 { 1 } else { 0 });
+        }
+        client_stream
+            .write_all(&encode_cmd(&[b"HGET", b"ns", b"f"]))
+            .await
+            .unwrap();
+        let reply = read_replies(&mut client_stream, &mut read_buf, 1)
+            .await
+            .pop()
+            .unwrap();
+        assert_bulk_string(reply, b"");
+
+        // Same pattern with HSETEX/HGET on inflight_hcache.
+        payload.clear();
+        for i in 0..50 {
+            let val = format!("x{i}");
+            payload.extend_from_slice(&encode_cmd(&[
+                b"HSETEX", b"ns", b"EX", b"60", b"FIELDS", b"1", b"f2", b"",
+            ]));
+            payload.extend_from_slice(&encode_cmd(&[
+                b"HSETEX",
+                b"ns",
+                b"EX",
+                b"60",
+                b"FIELDS",
+                b"1",
+                b"f2",
+                val.as_bytes(),
+            ]));
+            payload.extend_from_slice(&encode_cmd(&[
+                b"HSETEX", b"ns", b"EX", b"60", b"FIELDS", b"1", b"f2", b"",
+            ]));
+        }
+        client_stream.write_all(&payload).await.unwrap();
+        let replies = read_replies(&mut client_stream, &mut read_buf, 150).await;
+        for (idx, reply) in replies.into_iter().enumerate() {
+            assert_integer_response(reply, if idx == 0 { 1 } else { 0 });
+        }
+        client_stream
+            .write_all(&encode_cmd(&[b"HGET", b"ns", b"f2"]))
+            .await
+            .unwrap();
+        let reply = read_replies(&mut client_stream, &mut read_buf, 1)
+            .await
+            .pop()
+            .unwrap();
+        assert_bulk_string(reply, b"");
+
+        // Intervening DEL must not make the final empty SET read as missing.
+        payload.clear();
+        for _ in 0..50 {
+            payload.extend_from_slice(&encode_cmd(&[b"SET", b"k2", b""]));
+            payload.extend_from_slice(&encode_cmd(&[b"DEL", b"k2"]));
+            payload.extend_from_slice(&encode_cmd(&[b"SET", b"k2", b""]));
+        }
+        client_stream.write_all(&payload).await.unwrap();
+        let replies = read_replies(&mut client_stream, &mut read_buf, 150).await;
+        for chunk in replies.chunks(3) {
+            assert_simple_string(chunk[0].clone(), "OK");
+            assert_integer_response(chunk[1].clone(), 1);
+            assert_simple_string(chunk[2].clone(), "OK");
+        }
+        payload.clear();
+        payload.extend_from_slice(&encode_cmd(&[b"GET", b"k2"]));
+        payload.extend_from_slice(&encode_cmd(&[b"EXISTS", b"k2"]));
+        client_stream.write_all(&payload).await.unwrap();
+        let mut replies = read_replies(&mut client_stream, &mut read_buf, 2)
+            .await
+            .into_iter();
+        assert_bulk_string(replies.next().unwrap(), b"");
+        assert_integer_response(replies.next().unwrap(), 1);
+
+        drop(client_stream);
+        shutdown.cancel();
+        let _ = conn_task.await;
         ctx.shutdown().await;
     }
 

@@ -205,6 +205,75 @@ func TestPipeline(t *testing.T) {
 	})
 }
 
+// Regression test for #26: pipelined empty values must not let an older empty
+// write clear a newer queued empty write from the inflight cache and expose a
+// stale intermediate value from SQLite.
+func TestPipelinedEmptyValues(t *testing.T) {
+	forEachProtocol(t, func(t *testing.T, rdb *redis.Client, p string) {
+		conn := rdb.Conn()
+		defer conn.Close()
+
+		// 20 triples = 60 ops: with batch_size=50, batch 0 commits ops 0..49
+		// (ending on the non-empty value at index 49) while ops 50..59 wait in
+		// the next batch.
+		for round := 0; round < 5; round++ {
+			k := fmt.Sprintf("%sempty-set:%d", p, round)
+			pipe := conn.Pipeline()
+			for i := 0; i < 20; i++ {
+				pipe.Set(ctx, k, "", 0)
+				pipe.Set(ctx, k, fmt.Sprintf("x%d", i), 0)
+				pipe.Set(ctx, k, "", 0)
+			}
+			if _, err := pipe.Exec(ctx); err != nil {
+				t.Fatalf("pipelined empty SETs: %v", err)
+			}
+			expect(t, "GET after pipelined empty SETs", conn.Get(ctx, k), "")
+
+			ns := namespace(p)
+			f := fmt.Sprintf("f:%d", round)
+			pipe = conn.Pipeline()
+			for i := 0; i < 20; i++ {
+				pipe.HSet(ctx, ns, f, "")
+				pipe.HSet(ctx, ns, f, fmt.Sprintf("x%d", i))
+				pipe.HSet(ctx, ns, f, "")
+			}
+			if _, err := pipe.Exec(ctx); err != nil {
+				t.Fatalf("pipelined empty HSETs: %v", err)
+			}
+			expect(t, "HGET after pipelined empty HSETs", conn.HGet(ctx, ns, f), "")
+
+			f2 := fmt.Sprintf("f2:%d", round)
+			pipe = conn.Pipeline()
+			for i := 0; i < 20; i++ {
+				pipe.Do(ctx, "HSETEX", ns, "EX", 60, "FIELDS", 1, f2, "")
+				pipe.Do(ctx, "HSETEX", ns, "EX", 60, "FIELDS", 1, f2, fmt.Sprintf("x%d", i))
+				pipe.Do(ctx, "HSETEX", ns, "EX", 60, "FIELDS", 1, f2, "")
+			}
+			if _, err := pipe.Exec(ctx); err != nil {
+				t.Fatalf("pipelined empty HSETEXs: %v", err)
+			}
+			expect(t, "HGET after pipelined empty HSETEXs", conn.HGet(ctx, ns, f2), "")
+
+			k2 := fmt.Sprintf("%sempty-del:%d", p, round)
+			pipe = conn.Pipeline()
+			dels := make([]*redis.IntCmd, 20)
+			for i := 0; i < 20; i++ {
+				pipe.Set(ctx, k2, "", 0)
+				dels[i] = pipe.Del(ctx, k2)
+				pipe.Set(ctx, k2, "", 0)
+			}
+			if _, err := pipe.Exec(ctx); err != nil {
+				t.Fatalf("pipelined empty SET/DEL/SET: %v", err)
+			}
+			for _, d := range dels {
+				expect(t, "pipelined DEL", d, int64(1))
+			}
+			expect(t, "GET after pipelined empty SET/DEL/SET", conn.Get(ctx, k2), "")
+			expect(t, "EXISTS after pipelined empty SET/DEL/SET", conn.Exists(ctx, k2), int64(1))
+		}
+	})
+}
+
 // Concurrent clients: every acknowledged write must be readable. This caught
 // sync writes acked as OK but lost under SQLite lock contention.
 func TestConcurrentClients(t *testing.T) {

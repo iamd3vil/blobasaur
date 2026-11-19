@@ -24,6 +24,8 @@ pub enum ShardWriteOperation {
         key: String,
         data: Bytes,
         expires_at: Option<i64>,
+        /// Matches the [`Pending::Value`] entry SET left in the cache.
+        token: u64,
     },
     Delete {
         key: String,
@@ -44,6 +46,8 @@ pub enum ShardWriteOperation {
         namespace: String,
         key: String,
         data: Bytes,
+        /// Matches the [`Pending::Value`] entry HSET left in the cache.
+        token: u64,
     },
     HSetEx {
         namespace: String,
@@ -57,6 +61,8 @@ pub enum ShardWriteOperation {
         key: String,
         data: Bytes,
         expires_at: i64,
+        /// Matches the [`Pending::Value`] entry HSETEX left in the cache.
+        token: u64,
     },
     HDelete {
         namespace: String,
@@ -177,24 +183,21 @@ pub struct ShardWriter {
 
 /// An async write that is acknowledged but not committed yet. Reads check
 /// the inflight cache first, so they see it before the DB does.
+///
+/// Every entry carries a unique token from [`next_pending_token`] matching its
+/// queued op, so clearing after commit only removes the entry that op recorded.
 #[derive(Clone, Debug)]
 pub enum Pending {
-    Value(Bytes),
-    /// A queued DEL/HDEL: the key reads as absent. The token is unique per
-    /// delete, so its op clears only its own marker.
+    /// A queued SET/HSET/HSETEX.
+    Value { data: Bytes, token: u64 },
+    /// A queued DEL/HDEL: the key reads as absent.
     Deleted(u64),
 }
 
 impl Pending {
-    /// Whether this is the very entry `other` recorded, not just equal data.
-    /// Values compare by allocation, so this is cheap even for large values.
-    fn is(&self, other: &Pending) -> bool {
-        match (self, other) {
-            (Pending::Value(a), Pending::Value(b)) => {
-                a.as_ptr() == b.as_ptr() && a.len() == b.len()
-            }
-            (Pending::Deleted(a), Pending::Deleted(b)) => a == b,
-            _ => false,
+    fn token(&self) -> u64 {
+        match self {
+            Pending::Value { token, .. } | Pending::Deleted(token) => *token,
         }
     }
 }
@@ -211,6 +214,22 @@ pub async fn queue_pending(
     pending: Pending,
     op: ShardWriteOperation,
 ) -> Result<(), mpsc::error::SendError<()>> {
+    debug_assert!(
+        matches!(
+            (&pending, &op),
+            (
+                Pending::Value { token: pt, .. },
+                ShardWriteOperation::SetAsync { token: ot, .. }
+                    | ShardWriteOperation::HSetAsync { token: ot, .. }
+                    | ShardWriteOperation::HSetExAsync { token: ot, .. }
+            ) | (
+                Pending::Deleted(pt),
+                ShardWriteOperation::DeleteAsync { token: ot, .. }
+                    | ShardWriteOperation::HDeleteAsync { token: ot, .. }
+            ) if pt == ot
+        ),
+        "queue_pending op must match pending entry kind and token"
+    );
     let permit = sender.reserve().await?;
     let pending_writes = &sender.metrics.async_writes_pending;
     cache
@@ -226,8 +245,8 @@ pub async fn queue_pending(
     Ok(())
 }
 
-/// A fresh token for a [`Pending::Deleted`] marker and its delete op.
-pub fn next_delete_token() -> u64 {
+/// A fresh token for a [`Pending`] entry and its queued async op.
+pub fn next_pending_token() -> u64 {
     static NEXT_TOKEN: AtomicU64 = AtomicU64::new(0);
     NEXT_TOKEN.fetch_add(1, Ordering::Relaxed)
 }
@@ -238,17 +257,17 @@ pub async fn pending_exists(cache: &Cache<String, Pending>, key: &str) -> Option
     cache
         .get(key)
         .await
-        .map(|pending| matches!(pending, Pending::Value(_)))
+        .map(|pending| matches!(pending, Pending::Value { .. }))
 }
 
-/// Removes `key`'s entry if it is still the one `written` recorded: a newer
-/// op on the same key, still queued, must stay visible.
-async fn clear_pending_write(cache: &Cache<String, Pending>, key: &str, written: &Pending) {
+/// Removes `key`'s entry if it still carries `token`: a newer op on the same
+/// key, still queued, must stay visible.
+async fn clear_pending_write(cache: &Cache<String, Pending>, key: &str, token: u64) {
     cache
         .entry_by_ref(key)
         .and_compute_with(|entry| async move {
             match entry {
-                Some(entry) if entry.value().is(written) => Op::Remove,
+                Some(entry) if entry.value().token() == token => Op::Remove,
                 _ => Op::Nop,
             }
         })
@@ -406,7 +425,8 @@ pub async fn shard_writer_task(writer: ShardWriter) {
 /// The op's value as an owned `Vec` to bind (empty if it has none): sqlx
 /// copies a borrowed blob but takes an owned one as is. Sync ops give theirs
 /// up, which costs no copy when the value is the last user of its request
-/// buffer. Async ops still need theirs to clear the inflight cache, so copy.
+/// buffer. Async ops share theirs with the inflight cache and still need
+/// `data.len()` in [`clear_pending_entries`], so copy.
 fn take_value(operation: &mut ShardWriteOperation) -> Vec<u8> {
     match operation {
         ShardWriteOperation::Set { data, .. }
@@ -438,32 +458,31 @@ async fn clear_pending_entries(
     let mut value_bytes = 0;
     for operation in batch.iter() {
         match operation {
-            ShardWriteOperation::SetAsync { key, data, .. } => {
+            ShardWriteOperation::SetAsync {
+                key, data, token, ..
+            } => {
                 value_bytes += data.len();
-                clear_pending_write(inflight_cache, key, &Pending::Value(data.clone())).await;
+                clear_pending_write(inflight_cache, key, *token).await;
             }
             ShardWriteOperation::DeleteAsync { key, token } => {
-                clear_pending_write(inflight_cache, key, &Pending::Deleted(*token)).await;
+                clear_pending_write(inflight_cache, key, *token).await;
             }
             ShardWriteOperation::HSetAsync {
                 namespace,
                 key,
                 data,
+                token,
             }
             | ShardWriteOperation::HSetExAsync {
                 namespace,
                 key,
                 data,
+                token,
                 ..
             } => {
                 value_bytes += data.len();
                 let namespaced_key = format!("{}:{}", namespace, key);
-                clear_pending_write(
-                    inflight_hcache,
-                    &namespaced_key,
-                    &Pending::Value(data.clone()),
-                )
-                .await;
+                clear_pending_write(inflight_hcache, &namespaced_key, *token).await;
             }
             ShardWriteOperation::HDeleteAsync {
                 namespace,
@@ -471,8 +490,7 @@ async fn clear_pending_entries(
                 token,
             } => {
                 let namespaced_key = format!("{}:{}", namespace, key);
-                clear_pending_write(inflight_hcache, &namespaced_key, &Pending::Deleted(*token))
-                    .await;
+                clear_pending_write(inflight_hcache, &namespaced_key, *token).await;
             }
             _ => {}
         }
@@ -1747,19 +1765,28 @@ mod tests {
         sender: &ShardSender,
         key: &str,
         data: Bytes,
-    ) {
+    ) -> u64 {
+        let token = next_pending_token();
         let op = ShardWriteOperation::SetAsync {
             key: key.to_string(),
             data: data.clone(),
             expires_at: None,
+            token,
         };
-        queue_pending(cache, sender, key.to_string(), Pending::Value(data), op)
-            .await
-            .unwrap();
+        queue_pending(
+            cache,
+            sender,
+            key.to_string(),
+            Pending::Value { data, token },
+            op,
+        )
+        .await
+        .unwrap();
+        token
     }
 
     async fn queue_del(cache: &Cache<String, Pending>, sender: &ShardSender, key: &str) -> u64 {
-        let token = next_delete_token();
+        let token = next_pending_token();
         let op = ShardWriteOperation::DeleteAsync {
             key: key.to_string(),
             token,
@@ -1799,7 +1826,7 @@ mod tests {
         queue_set(&cache, &sender, "d", Bytes::from_static(b"new")).await;
         queue_del(&cache, &sender, "x").await;
         let second = queue_del(&cache, &sender, "x").await;
-        let token = next_delete_token();
+        let token = next_pending_token();
         let op = ShardWriteOperation::HDeleteAsync {
             namespace: "ns".to_string(),
             key: "f".to_string(),
@@ -1831,11 +1858,11 @@ mod tests {
         // Each key's first op is processed while a newer op on it is queued.
         clear_pending_entries(&first_batch, &cache, &hcache).await;
         assert!(
-            matches!(cache.get("k").await, Some(Pending::Value(v)) if v == v2),
+            matches!(cache.get("k").await, Some(Pending::Value { data: v, .. }) if v == v2),
             "newer SET must stay visible"
         );
         assert!(
-            matches!(cache.get("d").await, Some(Pending::Value(_))),
+            matches!(cache.get("d").await, Some(Pending::Value { .. })),
             "SET after DEL must stay visible"
         );
         assert!(
@@ -1860,6 +1887,167 @@ mod tests {
         let result = queue_pending(&cache, &sender, "gone".to_string(), Pending::Deleted(0), op);
         assert!(result.await.is_err());
         assert!(!cache.contains_key("gone"));
+    }
+
+    #[tokio::test]
+    async fn empty_and_aliased_async_values_only_clear_their_own_cache_entry() {
+        let (_temp_dir, pool) = create_test_pool().await;
+        let cache: Cache<String, Pending> = Cache::new(16);
+        let hcache: Cache<String, Pending> = Cache::new(16);
+        let (sender, mut receiver) = test_channel(16);
+        let shard_metrics = ShardMetrics::new(0);
+        let mut tables = HashSet::new();
+
+        // SET k "", SET k "a", SET k "" using empty Bytes (shared static pointer).
+        queue_set(&cache, &sender, "k", Bytes::new()).await;
+        queue_set(&cache, &sender, "k", Bytes::from_static(b"a")).await;
+        let last_k_token = queue_set(&cache, &sender, "k", Bytes::new()).await;
+
+        // Same aliased non-empty Bytes across an intervening write.
+        let shared = Bytes::from_static(b"same");
+        queue_set(&cache, &sender, "s", shared.clone()).await;
+        queue_set(&cache, &sender, "s", Bytes::from_static(b"mid")).await;
+        let last_s_token = queue_set(&cache, &sender, "s", shared.clone()).await;
+
+        // HSET and HSETEX with empty values in inflight_hcache.
+        let h0 = next_pending_token();
+        queue_pending(
+            &hcache,
+            &sender,
+            "ns:f".to_string(),
+            Pending::Value {
+                data: Bytes::new(),
+                token: h0,
+            },
+            ShardWriteOperation::HSetAsync {
+                namespace: "ns".to_string(),
+                key: "f".to_string(),
+                data: Bytes::new(),
+                token: h0,
+            },
+        )
+        .await
+        .unwrap();
+        let h1 = next_pending_token();
+        queue_pending(
+            &hcache,
+            &sender,
+            "ns:f".to_string(),
+            Pending::Value {
+                data: Bytes::from_static(b"a"),
+                token: h1,
+            },
+            ShardWriteOperation::HSetAsync {
+                namespace: "ns".to_string(),
+                key: "f".to_string(),
+                data: Bytes::from_static(b"a"),
+                token: h1,
+            },
+        )
+        .await
+        .unwrap();
+        let last_h_token = next_pending_token();
+        queue_pending(
+            &hcache,
+            &sender,
+            "ns:f".to_string(),
+            Pending::Value {
+                data: Bytes::new(),
+                token: last_h_token,
+            },
+            ShardWriteOperation::HSetExAsync {
+                namespace: "ns".to_string(),
+                key: "f".to_string(),
+                data: Bytes::new(),
+                expires_at: Utc::now().timestamp() + 60,
+                token: last_h_token,
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut ops = Vec::new();
+        while let Ok(op) = receiver.try_recv() {
+            ops.push(op);
+        }
+        // First batch commits the first two ops for each key (leaving the DB
+        // at "a" / "mid"), while the third op for each key stays queued.
+        let mut first_batch = VecDeque::from([
+            ops.remove(0),
+            ops.remove(0),
+            ops.remove(1),
+            ops.remove(1),
+            ops.remove(2),
+            ops.remove(2),
+        ]);
+        let mut second_batch = VecDeque::from(ops);
+
+        process_batch(
+            0,
+            &pool,
+            &mut first_batch,
+            &mut tables,
+            &cache,
+            &hcache,
+            &shard_metrics,
+        )
+        .await;
+
+        // Newer entries must remain in the inflight caches so reads don't fall
+        // through to the stale "a" / "mid" values in SQLite.
+        assert!(
+            matches!(
+                cache.get("k").await,
+                Some(Pending::Value { data, token }) if data.is_empty() && token == last_k_token
+            ),
+            "newer empty SET was cleared by older empty SET"
+        );
+        assert!(
+            matches!(
+                cache.get("s").await,
+                Some(Pending::Value { data, token }) if data == shared && token == last_s_token
+            ),
+            "newer aliased SET was cleared by older aliased SET"
+        );
+        assert!(
+            matches!(
+                hcache.get("ns:f").await,
+                Some(Pending::Value { data, token }) if data.is_empty() && token == last_h_token
+            ),
+            "newer empty HSETEX was cleared by older empty HSET"
+        );
+
+        // Once the second batch commits, the caches are cleared and SQLite has
+        // the final values.
+        process_batch(
+            0,
+            &pool,
+            &mut second_batch,
+            &mut tables,
+            &cache,
+            &hcache,
+            &shard_metrics,
+        )
+        .await;
+        assert!(!cache.contains_key("k"));
+        assert!(!cache.contains_key("s"));
+        assert!(!hcache.contains_key("ns:f"));
+
+        let (k_val,): (Vec<u8>,) = sqlx::query_as("SELECT data FROM blobs WHERE key = 'k'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(k_val.is_empty());
+        let (s_val,): (Vec<u8>,) = sqlx::query_as("SELECT data FROM blobs WHERE key = 's'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(s_val, b"same");
+        let (h_val,): (Vec<u8>,) = sqlx::query_as("SELECT data FROM blobs_ns WHERE key = 'f'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(h_val.is_empty());
     }
 
     #[tokio::test]
@@ -1908,12 +2096,17 @@ mod tests {
         // fails: a namespace that isn't a valid table name.
         queue_set(&cache, &sender, "k", Bytes::from_static(b"1")).await;
         queue_set(&cache, &sender, "k", Bytes::from_static(b"2")).await;
+        let token = next_pending_token();
         let op = ShardWriteOperation::HSetAsync {
             namespace: "bad name".to_string(),
             key: "f".to_string(),
             data: Bytes::from_static(b"v"),
+            token,
         };
-        let pending = Pending::Value(Bytes::from_static(b"v"));
+        let pending = Pending::Value {
+            data: Bytes::from_static(b"v"),
+            token,
+        };
         queue_pending(&hcache, &sender, "bad name:f".to_string(), pending, op)
             .await
             .unwrap();
@@ -2134,6 +2327,7 @@ mod tests {
                 key: "k".to_string(),
                 data: Bytes::from_static(b"v"),
                 expires_at: None,
+                token: next_pending_token(),
             })
             .await
             .unwrap();
@@ -2261,6 +2455,7 @@ mod tests {
                     key: format!("key-{i}"),
                     data: Bytes::from_static(b"v"),
                     expires_at: None,
+                    token: next_pending_token(),
                 })
                 .await
                 .unwrap();
