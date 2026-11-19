@@ -228,12 +228,10 @@ impl MigrationManager {
     }
 
     async fn get_all_tables(&self, pool: &SqlitePool) -> Result<Vec<String>> {
-        let rows = sqlx::query(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'blobs%' ORDER BY name"
-        )
-        .fetch_all(pool)
-        .await
-        .map_err(|e| sqlx_to_miette(e, "Failed to query table names"))?;
+        let rows = sqlx::query(crate::shard_manager::ALL_KEY_TABLES_QUERY)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| sqlx_to_miette(e, "Failed to query table names"))?;
 
         let tables: Vec<String> = rows
             .iter()
@@ -320,7 +318,7 @@ impl MigrationManager {
                 .wrap_err(format!("Failed to connect to new shard {}", new_shard_id))?;
 
             // Ensure the table exists in the new shard
-            if table_name != "blobs" {
+            if !table_name.eq_ignore_ascii_case("blobs") {
                 let create_query = format!(
                     "CREATE TABLE IF NOT EXISTS {} (
                         key TEXT PRIMARY KEY,

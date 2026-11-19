@@ -13,6 +13,20 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, interval, timeout_at};
 use tokio_util::sync::CancellationToken;
 
+/// Lists the default `blobs` table (case-insensitively) plus every namespaced
+/// `blobs_*` table with a literal underscore, excluding unrelated tables such
+/// as `blobsXaudit`.
+pub const ALL_KEY_TABLES_QUERY: &str = "SELECT name FROM sqlite_master \
+    WHERE type = 'table' \
+      AND (LOWER(name) = 'blobs' OR LOWER(name) LIKE 'blobs\\_%' ESCAPE '\\') \
+    ORDER BY name";
+
+/// Lists only namespaced `blobs_*` tables with a literal underscore.
+const NAMESPACED_TABLES_QUERY: &str = "SELECT name FROM sqlite_master \
+    WHERE type = 'table' \
+      AND LOWER(name) LIKE 'blobs\\_%' ESCAPE '\\' \
+    ORDER BY name";
+
 // Message type for writer consumers
 pub enum ShardWriteOperation {
     Set {
@@ -576,7 +590,9 @@ async fn process_batch(
     let mut expire_results: Vec<(usize, bool)> = Vec::new();
     let mut hexpire_results: Vec<(usize, i64)> = Vec::new();
     let mut sync_operations: Vec<usize> = Vec::new();
+    let mut created_tables: Vec<String> = Vec::new();
     let mut batch_delta: i64 = 0;
+    let mut rolled_back_error: Option<String> = None;
 
     // Execute all operations in the transaction
     for (idx, operation) in batch.iter_mut().enumerate() {
@@ -663,8 +679,13 @@ async fn process_batch(
                 let table_name = format!("blobs_{}", namespace);
 
                 // Ensure table exists
-                if let Err(e) =
-                    ensure_namespaced_table_exists(&mut tx, &table_name, known_tables).await
+                if let Err(e) = ensure_namespaced_table_exists(
+                    &mut tx,
+                    &table_name,
+                    known_tables,
+                    &mut created_tables,
+                )
+                .await
                 {
                     tracing::error!("[Shard {}] Failed to ensure table exists: {}", shard_id, e);
                     Err(e)
@@ -751,8 +772,13 @@ async fn process_batch(
                 let table_name = format!("blobs_{}", namespace);
 
                 // Ensure table exists
-                if let Err(e) =
-                    ensure_namespaced_table_exists(&mut tx, &table_name, known_tables).await
+                if let Err(e) = ensure_namespaced_table_exists(
+                    &mut tx,
+                    &table_name,
+                    known_tables,
+                    &mut created_tables,
+                )
+                .await
                 {
                     tracing::error!("[Shard {}] Failed to ensure table exists: {}", shard_id, e);
                     Err(e)
@@ -906,16 +932,46 @@ async fn process_batch(
             }
         };
 
+        let stmt_err = result.as_ref().err().cloned();
         results.push(result);
+
+        if let Some(err) = stmt_err
+            && !transaction_is_still_open(&mut tx).await
+        {
+            tracing::error!(
+                "[Shard {}] SQLite ended batch transaction after statement error: {}",
+                shard_id,
+                err
+            );
+            rolled_back_error = Some(err);
+            break;
+        }
     }
 
-    // Commit transaction
-    let commit_result = tx.commit().await.map_err(|e| {
-        tracing::error!("[Shard {}] Transaction commit failed: {}", shard_id, e);
-        e.to_string()
-    });
-    if commit_result.is_ok() && batch_delta != 0 {
-        key_count.fetch_add(batch_delta, Ordering::Relaxed);
+    // Commit transaction, or clean up if SQLite already rolled it back.
+    let commit_result = if let Some(err) = rolled_back_error {
+        if let Err(rb_err) = tx.rollback().await {
+            tracing::debug!(
+                "[Shard {}] Cleanup rollback after implicit SQLite rollback: {}",
+                shard_id,
+                rb_err
+            );
+        }
+        Err(format!("Transaction rolled back: {err}"))
+    } else {
+        tx.commit().await.map_err(|e| {
+            tracing::error!("[Shard {}] Transaction commit failed: {}", shard_id, e);
+            e.to_string()
+        })
+    };
+    if commit_result.is_ok() {
+        if batch_delta != 0 {
+            key_count.fetch_add(batch_delta, Ordering::Relaxed);
+        }
+    } else {
+        for table in created_tables {
+            known_tables.remove(&table);
+        }
     }
     // Return the writer connection before the bookkeeping below.
     drop(conn);
@@ -932,7 +988,11 @@ async fn process_batch(
     // An op succeeded only if its own statement and the commit both did. A
     // failed statement doesn't abort the transaction, so the commit alone
     // can't tell a client its write was persisted.
-    let op_result = |idx: usize| commit_result.clone().and(results[idx].clone());
+    let op_result = |idx: usize| {
+        commit_result
+            .clone()
+            .and_then(|()| results.get(idx).cloned().unwrap_or(Ok(())))
+    };
 
     // Send responses to synchronous operations
     for (operation_idx, operation) in batch.drain(..).enumerate() {
@@ -947,28 +1007,25 @@ async fn process_batch(
             ShardWriteOperation::Expire { responder, .. } => {
                 // For expire operations, we need to send the actual result (bool)
                 // Find the corresponding expire result using current operation index
-                if let Some((_, success)) =
-                    expire_results.iter().find(|(idx, _)| *idx == operation_idx)
-                {
-                    let _ = responder.send(op_result(operation_idx).map(|()| *success));
-                } else {
-                    let _ = responder.send(Err(
-                        "Internal error: could not find expire result".to_string()
-                    ));
-                }
+                let reply = op_result(operation_idx).and_then(|()| {
+                    expire_results
+                        .iter()
+                        .find(|(idx, _)| *idx == operation_idx)
+                        .map(|(_, success)| *success)
+                        .ok_or_else(|| "Internal error: could not find expire result".to_string())
+                });
+                let _ = responder.send(reply);
             }
             ShardWriteOperation::HExpire { responder, .. } => {
                 // For hexpire operations, send the per-field result code
-                if let Some((_, result_code)) = hexpire_results
-                    .iter()
-                    .find(|(idx, _)| *idx == operation_idx)
-                {
-                    let _ = responder.send(op_result(operation_idx).map(|()| *result_code));
-                } else {
-                    let _ = responder.send(Err(
-                        "Internal error: could not find hexpire result".to_string()
-                    ));
-                }
+                let reply = op_result(operation_idx).and_then(|()| {
+                    hexpire_results
+                        .iter()
+                        .find(|(idx, _)| *idx == operation_idx)
+                        .map(|(_, result_code)| *result_code)
+                        .ok_or_else(|| "Internal error: could not find hexpire result".to_string())
+                });
+                let _ = responder.send(reply);
             }
             ShardWriteOperation::SetAsync { .. }
             | ShardWriteOperation::DeleteAsync { .. }
@@ -1036,6 +1093,28 @@ async fn begin<'c>(
         shard_metrics.record_transaction(false, tx_start.elapsed());
         e.to_string()
     })
+}
+
+/// Checks whether SQLite's transaction is still active after a statement error.
+///
+/// Certain SQLite errors (such as `SQLITE_FULL`, `SQLITE_IOERR`, or
+/// `RAISE(ROLLBACK, ...)`) implicitly roll back the active transaction, leaving
+/// the connection in autocommit mode. Running more statements on `tx` after
+/// that would commit them outside the batch transaction.
+///
+/// Starting a deferred `BEGIN` while a transaction is active fails with
+/// `"cannot start a transaction within a transaction"` without disturbing the
+/// open transaction. If `BEGIN` succeeds, SQLite had already rolled back our
+/// transaction; leaving that empty probe transaction open lets `tx.rollback()`
+/// close it cleanly and reset sqlx's internal transaction depth to 0.
+async fn transaction_is_still_open(tx: &mut sqlx::Transaction<'_, Sqlite>) -> bool {
+    match sqlx::query("BEGIN").execute(&mut **tx).await {
+        Ok(_) => false,
+        Err(e) => e
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("cannot start a transaction within a transaction"),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1403,11 +1482,9 @@ async fn load_existing_tables(pool: &SqlitePool, shard_id: usize) -> HashSet<Str
     // Add the default blobs table
     tables.insert("blobs".to_string());
 
-    match sqlx::query_as::<_, (String,)>(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'blobs_%'",
-    )
-    .fetch_all(pool)
-    .await
+    match sqlx::query_as::<_, (String,)>(NAMESPACED_TABLES_QUERY)
+        .fetch_all(pool)
+        .await
     {
         Ok(rows) => {
             for (table_name,) in rows {
@@ -1432,6 +1509,7 @@ async fn ensure_namespaced_table_exists(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     table_name: &str,
     known_tables: &mut HashSet<String>,
+    created_tables: &mut Vec<String>,
 ) -> Result<(), String> {
     if known_tables.contains(table_name) {
         return Ok(());
@@ -1461,6 +1539,7 @@ async fn ensure_namespaced_table_exists(
             match sqlx::query(&index_query).execute(&mut **tx).await {
                 Ok(_) => {
                     known_tables.insert(table_name.to_string());
+                    created_tables.push(table_name.to_string());
                     tracing::info!(
                         "Created namespaced table and expires_at index: {}",
                         table_name
@@ -1548,11 +1627,9 @@ pub async fn shard_cleanup_task(
 
         // The main blobs table plus every namespaced "blobs_*" table
         let mut tables = vec!["blobs".to_string()];
-        match sqlx::query_as::<_, (String,)>(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'blobs_%'",
-        )
-        .fetch_all(&pool)
-        .await
+        match sqlx::query_as::<_, (String,)>(NAMESPACED_TABLES_QUERY)
+            .fetch_all(&pool)
+            .await
         {
             Ok(names) => tables.extend(names.into_iter().map(|(name,)| name)),
             Err(e) => {
@@ -2724,5 +2801,151 @@ mod tests {
         assert_eq!(rx1.await.unwrap(), Ok(1));
         assert_eq!(rx2.await.unwrap(), Ok(2));
         assert_eq!(key_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn process_batch_stops_when_sqlite_rolls_back_transaction() {
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let db_path = temp_dir.path().join("shard_0.db");
+        let connect_options =
+            SqliteConnectOptions::from_str(&format!("sqlite:{}", db_path.display()))
+                .expect("failed to parse sqlite connection string")
+                .create_if_missing(true)
+                .journal_mode(SqliteJournalMode::Wal)
+                .busy_timeout(std::time::Duration::from_secs(5));
+        // Mirror production's single-connection writer pool so PRAGMA max_page_count
+        // applies to the connection process_batch acquires.
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(connect_options)
+            .await
+            .expect("failed to create sqlite pool");
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS blobs (
+                key TEXT PRIMARY KEY,
+                data BLOB,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                expires_at INTEGER,
+                version INTEGER NOT NULL DEFAULT 0
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let cache: Cache<String, Pending> = Cache::new(16);
+        let hcache: Cache<String, Pending> = Cache::new(16);
+        let shard_metrics = ShardMetrics::new(0);
+        let key_count = AtomicI64::new(0);
+        let mut known_tables = load_existing_tables(&pool, 0).await;
+
+        // Cap the DB size so a small insert fits, a large insert hits SQLITE_FULL
+        // and implicitly rolls back the transaction, and a third small insert would
+        // autocommit if the batch kept executing.
+        let current_pages: i64 = sqlx::query_scalar("PRAGMA page_count")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let cap_pages = current_pages + 2;
+        let applied_cap: i64 = sqlx::query_scalar(&format!("PRAGMA max_page_count = {cap_pages}"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(applied_cap, cap_pages);
+
+        let (tx1, rx1) = oneshot::channel();
+        let (tx2, rx2) = oneshot::channel();
+        let (tx3, rx3) = oneshot::channel();
+        let (tx4, rx4) = oneshot::channel();
+        let mut batch = VecDeque::from([
+            ShardWriteOperation::Set {
+                key: "small-before".into(),
+                data: Bytes::from_static(b"ok"),
+                expires_at: None,
+                responder: tx1,
+            },
+            ShardWriteOperation::Set {
+                key: "too-big".into(),
+                data: Bytes::from(vec![b'x'; 256 * 1024]),
+                expires_at: None,
+                responder: tx2,
+            },
+            ShardWriteOperation::Set {
+                key: "small-after".into(),
+                data: Bytes::from_static(b"must-not-autocommit"),
+                expires_at: None,
+                responder: tx3,
+            },
+            ShardWriteOperation::Expire {
+                key: "small-before".into(),
+                expires_at: Utc::now().timestamp() + 60,
+                responder: tx4,
+            },
+        ]);
+
+        process_batch(
+            0,
+            &pool,
+            &mut batch,
+            &mut known_tables,
+            &cache,
+            &hcache,
+            &shard_metrics,
+            &key_count,
+        )
+        .await;
+
+        // Every op in the rolled-back batch gets an error, nothing is persisted,
+        // and the cached key count stays 0.
+        let r1 = rx1.await.unwrap();
+        let r2 = rx2.await.unwrap();
+        let r3 = rx3.await.unwrap();
+        let r4 = rx4.await.unwrap();
+        assert!(
+            r1.is_err(),
+            "expected r1 err, got r1={r1:?} r2={r2:?} r3={r3:?} r4={r4:?}"
+        );
+        assert!(r2.is_err(), "expected r2 err, got {r2:?}");
+        assert!(r3.is_err(), "expected r3 err, got {r3:?}");
+        assert!(r4.is_err(), "expected r4 err, got {r4:?}");
+
+        let db_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM blobs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(db_rows, 0);
+        assert_eq!(key_count.load(Ordering::Relaxed), 0);
+
+        // Lift the cap and verify the pooled writer connection is still clean for the next batch.
+        sqlx::query("PRAGMA max_page_count = 1073741823")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (tx_next, rx_next) = oneshot::channel();
+        let mut next_batch = VecDeque::from([ShardWriteOperation::Set {
+            key: "after-recovery".into(),
+            data: Bytes::from_static(b"ok"),
+            expires_at: None,
+            responder: tx_next,
+        }]);
+        process_batch(
+            0,
+            &pool,
+            &mut next_batch,
+            &mut known_tables,
+            &cache,
+            &hcache,
+            &shard_metrics,
+            &key_count,
+        )
+        .await;
+        assert_eq!(rx_next.await.unwrap(), Ok(()));
+        let db_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM blobs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(db_rows, 1);
+        assert_eq!(key_count.load(Ordering::Relaxed), 1);
     }
 }

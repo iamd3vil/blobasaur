@@ -913,12 +913,18 @@ async fn handle_ping(
     Ok(())
 }
 
+fn format_keyspace_info(total_keys: u64) -> String {
+    format!("# Keyspace\r\ndb0:keys={total_keys},expires=0,avg_ttl=0\r\n")
+}
+
 async fn handle_info(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
     section: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let info = match section.as_deref() {
+    let normalized_section = section.as_deref().map(str::to_ascii_lowercase);
+    let keyspace = format_keyspace_info(state.total_key_count());
+    let info = match normalized_section.as_deref() {
         Some("server") | None => {
             format!(
                 "# Server\r\n\
@@ -928,8 +934,7 @@ async fn handle_info(
                  tcp_port:6379\r\n\
                  uptime_in_seconds:unknown\r\n\
                  \r\n\
-                 # Keyspace\r\n\
-                 db0:keys={},expires=0,avg_ttl=0\r\n\
+                 {keyspace}\
                  \r\n\
                  # Blobasaur\r\n\
                  shards:{}\r\n\
@@ -939,7 +944,6 @@ async fn handle_info(
                  batch_timeout_ms:{}\r\n\
                  write_queue_capacity:{}\r\n",
                 std::process::id(),
-                state.total_key_count(),
                 state.cfg.num_shards,
                 state.cfg.data_dir,
                 state.cfg.async_write.unwrap_or(false),
@@ -948,6 +952,7 @@ async fn handle_info(
                 state.cfg.write_queue_capacity()
             )
         }
+        Some("keyspace") => keyspace,
         Some("stats") => "# Stats\r\n\
              total_connections_received:unknown\r\n\
              total_commands_processed:unknown\r\n\
@@ -974,7 +979,10 @@ async fn handle_info(
              active_defrag_key_hits:0\r\n\
              active_defrag_key_misses:0\r\n"
             .to_string(),
-        Some(s) => format!("# {}\r\n(section not implemented)\r\n", s),
+        Some(_) => format!(
+            "# {}\r\n(section not implemented)\r\n",
+            section.as_deref().unwrap_or("")
+        ),
     };
 
     let response = BytesFrame::BulkString(info.into_bytes().into());
@@ -3779,20 +3787,23 @@ mod tests {
         .await;
         assert_eq!(keys_gauge(), 2.0);
 
-        // INFO reflects the same cached total.
-        let info = respond_with(&ctx, |state, mut stream| {
-            Box::pin(async move { handle_info(&mut stream, &state, None).await })
-        })
-        .await;
-        match info {
-            BytesFrame::BulkString(bytes) => {
-                let text = std::str::from_utf8(&bytes).unwrap();
-                assert!(
-                    text.contains("db0:keys=2,expires=0,avg_ttl=0\r\n"),
-                    "unexpected INFO output:\n{text}"
-                );
+        // Bare INFO and INFO keyspace (case-insensitive) reflect the same cached total.
+        for section in [None, Some("keyspace"), Some("KEYSPACE")] {
+            let section_owned = section.map(str::to_string);
+            let info = respond_with(&ctx, |state, mut stream| {
+                Box::pin(async move { handle_info(&mut stream, &state, section_owned).await })
+            })
+            .await;
+            match info {
+                BytesFrame::BulkString(bytes) => {
+                    let text = std::str::from_utf8(&bytes).unwrap();
+                    assert!(
+                        text.contains("# Keyspace\r\ndb0:keys=2,expires=0,avg_ttl=0\r\n"),
+                        "unexpected INFO ({section:?}) output:\n{text}"
+                    );
+                }
+                other => panic!("Expected bulk string from INFO ({section:?}), got {other:?}"),
             }
-            other => panic!("Expected bulk string from INFO, got {other:?}"),
         }
 
         // Delete both keys.

@@ -232,12 +232,16 @@ sum(rate(blobasaur_cleanup_deleted_keys_total[5m]))
 
 ### Total keys (per node and cluster)
 
+Per node:
+
 ```promql
 sum by (instance) (blobasaur_keys)
 ```
 
+Across one cluster (scope with your deployment's cluster/job label if Prometheus scrapes multiple clusters):
+
 ```promql
-sum(blobasaur_keys)
+sum(blobasaur_keys{cluster="prod"})
 ```
 
 ### Command Latency (95th percentile)

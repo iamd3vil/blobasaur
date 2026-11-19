@@ -17,7 +17,9 @@ use crate::{
     cluster::ClusterManager,
     config::Cfg,
     metrics::{Metrics, ShardMetrics},
-    shard_manager::{Pending, ShardSender, ShardWriteOperation, wal_checkpoint_truncate},
+    shard_manager::{
+        ALL_KEY_TABLES_QUERY, Pending, ShardSender, ShardWriteOperation, wal_checkpoint_truncate,
+    },
 };
 
 const CREATE_BLOBS_TABLE: &str = "CREATE TABLE IF NOT EXISTS blobs (
@@ -333,12 +335,10 @@ impl AppState {
 /// shard DB. Uses `SELECT COUNT(*)` which scans each table's primary-key index
 /// rather than the blob payloads.
 async fn count_shard_keys(pool: &SqlitePool, shard_id: usize) -> Result<i64> {
-    let tables: Vec<(String,)> = sqlx::query_as(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND (name = 'blobs' OR name LIKE 'blobs_%')",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(|e| miette!("failed to list tables in shard {} DB: {}", shard_id, e))?;
+    let tables: Vec<(String,)> = sqlx::query_as(ALL_KEY_TABLES_QUERY)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| miette!("failed to list tables in shard {} DB: {}", shard_id, e))?;
 
     let mut total: i64 = 0;
     for (table,) in tables {
@@ -945,6 +945,16 @@ mod tests {
         .execute(&initial.db_pools[0])
         .await
         .unwrap();
+        // An unrelated table whose name would match an unescaped `LIKE 'blobs_%'` wildcard
+        // must not be counted.
+        sqlx::query("CREATE TABLE blobsXaudit (key TEXT PRIMARY KEY)")
+            .execute(&initial.db_pools[0])
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO blobsXaudit (key) VALUES ('ignored')")
+            .execute(&initial.db_pools[0])
+            .await
+            .unwrap();
         sqlx::query(
             "INSERT INTO blobs (key, data, created_at, updated_at, expires_at, version)
              VALUES ('s1', x'04', 0, 0, NULL, 0)",
@@ -952,6 +962,15 @@ mod tests {
         .execute(&initial.db_pools[1])
         .await
         .unwrap();
+        // Recreate shard 1's default table as uppercase `BLOBS` to verify case-insensitive matching.
+        sqlx::query("ALTER TABLE blobs RENAME TO BLOBS_tmp")
+            .execute(&initial.db_pools[1])
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE BLOBS_tmp RENAME TO BLOBS")
+            .execute(&initial.db_pools[1])
+            .await
+            .unwrap();
         drop(initial);
 
         // Reboot should seed counts from disk across shards and tables.
