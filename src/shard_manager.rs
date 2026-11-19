@@ -1069,13 +1069,9 @@ async fn process_batch(
             | ShardWriteOperation::HSetAsync { .. }
             | ShardWriteOperation::HSetExAsync { .. }
             | ShardWriteOperation::HDeleteAsync { .. } => {
-                // Async operations don't need responses, but log commit errors
+                // Async operations don't need responses, but log batch/commit failures
                 if let Err(e) = &commit_result {
-                    tracing::error!(
-                        "[Shard {}] ASYNC operation failed due to commit error: {}",
-                        shard_id,
-                        e
-                    );
+                    tracing::error!("[Shard {}] ASYNC operation failed: {}", shard_id, e);
                 }
                 if op_result(operation_idx).is_err() {
                     shard_metrics.async_write_failures_total.increment(1);
@@ -3095,6 +3091,14 @@ mod tests {
         let key_count = AtomicI64::new(0);
         let mut known_tables = load_existing_tables(&pool, 0).await;
 
+        // A TEMP table lives only on this SQLite connection; verifying it is gone
+        // after the failed COMMIT proves process_batch actually closed and replaced
+        // the pooled connection rather than reusing it.
+        sqlx::query("CREATE TEMP TABLE conn_marker (id INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
         let (tx_bad, rx_bad) = oneshot::channel();
         let mut bad_batch = VecDeque::from([ShardWriteOperation::Set {
             key: "disallowed".into(),
@@ -3123,6 +3127,17 @@ mod tests {
                 r#"blobasaur_sqlite_errors_total{shard="0",stage="commit",kind="constraint"}"#
             ),
             1.0
+        );
+
+        let temp_marker: Option<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_temp_master WHERE type = 'table' AND name = 'conn_marker'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert!(
+            temp_marker.is_none(),
+            "expected failed COMMIT to close and replace the pooled writer connection"
         );
 
         // Next batch on the same 1-connection pool must succeed on a fresh
