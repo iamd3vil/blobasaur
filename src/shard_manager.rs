@@ -7,7 +7,8 @@ use moka::future::Cache;
 use moka::ops::compute::Op;
 use sqlx::{Connection, Sqlite, SqlitePool, pool::PoolConnection};
 use std::collections::{HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, interval, timeout_at};
 use tokio_util::sync::CancellationToken;
@@ -171,6 +172,8 @@ pub struct ShardWriter {
     pub inflight_cache: Cache<String, Pending>,
     pub inflight_hcache: Cache<String, Pending>,
     pub metrics: Metrics,
+    /// Cached stored-key count for this shard; updated after each committed batch.
+    pub key_count: Arc<AtomicI64>,
     /// Cancel to make the writer commit everything queued and return.
     pub shutdown: CancellationToken,
 }
@@ -266,6 +269,7 @@ pub async fn shard_writer_task(writer: ShardWriter) {
         inflight_cache,
         inflight_hcache,
         metrics,
+        key_count,
         shutdown,
     } = writer;
 
@@ -354,6 +358,7 @@ pub async fn shard_writer_task(writer: ShardWriter) {
                 &inflight_cache,
                 &inflight_hcache,
                 &shard_metrics,
+                &key_count,
             )
             .await;
             let batch_duration = batch_start.elapsed();
@@ -390,6 +395,7 @@ pub async fn shard_writer_task(writer: ShardWriter) {
             &inflight_cache,
             &inflight_hcache,
             &shard_metrics,
+            &key_count,
         )
         .await;
         let batch_duration = batch_start.elapsed();
@@ -483,6 +489,7 @@ async fn clear_pending_entries(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_batch(
     shard_id: usize,
     pool: &SqlitePool,
@@ -491,6 +498,7 @@ async fn process_batch(
     inflight_cache: &Cache<String, Pending>,
     inflight_hcache: &Cache<String, Pending>,
     shard_metrics: &ShardMetrics,
+    key_count: &AtomicI64,
 ) {
     if batch.is_empty() {
         return;
@@ -568,6 +576,7 @@ async fn process_batch(
     let mut expire_results: Vec<(usize, bool)> = Vec::new();
     let mut hexpire_results: Vec<(usize, i64)> = Vec::new();
     let mut sync_operations: Vec<usize> = Vec::new();
+    let mut batch_delta: i64 = 0;
 
     // Execute all operations in the transaction
     for (idx, operation) in batch.iter_mut().enumerate() {
@@ -618,7 +627,9 @@ async fn process_batch(
                         .bind(expires_at)
                         .execute(&mut *tx)
                         .await
-                        .map(|_| ())
+                        .map(|res| {
+                            batch_delta += res.rows_affected() as i64;
+                        })
                         .map_err(|e| {
                             tracing::error!("[Shard {}] INSERT error for key {}: {}", shard_id, key, e);
                             e.to_string()
@@ -635,7 +646,9 @@ async fn process_batch(
                     .bind(key)
                     .execute(&mut *tx)
                     .await
-                    .map(|_| ())
+                    .map(|res| {
+                        batch_delta -= res.rows_affected() as i64;
+                    })
                     .map_err(|e| {
                         tracing::error!("[Shard {}] DELETE error for key {}: {}", shard_id, key, e);
                         e.to_string()
@@ -703,7 +716,9 @@ async fn process_batch(
                             .bind(now)
                             .execute(&mut *tx)
                             .await
-                            .map(|_| ())
+                            .map(|res| {
+                                batch_delta += res.rows_affected() as i64;
+                            })
                             .map_err(|e| {
                                 tracing::error!(
                                     "[Shard {}] HSET INSERT error for namespace {} key {}: {}",
@@ -791,7 +806,9 @@ async fn process_batch(
                             .bind(*expires_at)
                             .execute(&mut *tx)
                             .await
-                            .map(|_| ())
+                            .map(|res| {
+                                batch_delta += res.rows_affected() as i64;
+                            })
                             .map_err(|e| {
                                 tracing::error!(
                                     "[Shard {}] HSETEX INSERT error for namespace {} key {}: {}",
@@ -820,7 +837,9 @@ async fn process_batch(
                         .bind(key)
                         .execute(&mut *tx)
                         .await
-                        .map(|_| ())
+                        .map(|res| {
+                            batch_delta -= res.rows_affected() as i64;
+                        })
                         .map_err(|e| {
                             tracing::error!(
                                 "[Shard {}] HDEL error for namespace {} key {}: {}",
@@ -876,6 +895,7 @@ async fn process_batch(
                     key,
                     *expires_at,
                     *condition,
+                    &mut batch_delta,
                 )
                 .await;
                 hexpire_results.push((idx, result_code));
@@ -894,6 +914,9 @@ async fn process_batch(
         tracing::error!("[Shard {}] Transaction commit failed: {}", shard_id, e);
         e.to_string()
     });
+    if commit_result.is_ok() && batch_delta != 0 {
+        key_count.fetch_add(batch_delta, Ordering::Relaxed);
+    }
     // Return the writer connection before the bookkeeping below.
     drop(conn);
     shard_metrics.record_transaction(commit_result.is_ok(), tx_start.elapsed());
@@ -1015,6 +1038,7 @@ async fn begin<'c>(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_hexpire_operation(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     shard_id: usize,
@@ -1023,6 +1047,7 @@ async fn handle_hexpire_operation(
     key: &str,
     expires_at: i64,
     condition: Option<HExpireCondition>,
+    batch_delta: &mut i64,
 ) -> (i64, Result<(), String>) {
     let table_name = format!("blobs_{}", namespace);
 
@@ -1072,7 +1097,10 @@ async fn handle_hexpire_operation(
                     .execute(&mut **tx)
                     .await
                 {
-                    Ok(_) => (2, Ok(())),
+                    Ok(res) => {
+                        *batch_delta -= res.rows_affected() as i64;
+                        (2, Ok(()))
+                    }
                     Err(e) => {
                         tracing::error!(
                             "[Shard {}] HEXPIRE DELETE error for namespace {} key {}: {}",
@@ -1468,6 +1496,7 @@ async fn delete_expired(
     now: i64,
     chunk_size: u32,
     deleted_counter: &Counter,
+    key_count: &AtomicI64,
 ) -> Result<u64, sqlx::Error> {
     let query = format!(
         "DELETE FROM {table} WHERE rowid IN (
@@ -1483,6 +1512,9 @@ async fn delete_expired(
             .await?
             .rows_affected();
         deleted_counter.increment(deleted);
+        if deleted > 0 {
+            key_count.fetch_sub(deleted as i64, Ordering::Relaxed);
+        }
         total += deleted;
         if deleted < u64::from(chunk_size) {
             return Ok(total);
@@ -1496,6 +1528,7 @@ pub async fn shard_cleanup_task(
     pool: SqlitePool,
     cleanup_interval_secs: u64,
     chunk_size: u32,
+    key_count: Arc<AtomicI64>,
 ) {
     let mut interval = interval(Duration::from_secs(cleanup_interval_secs));
     let shard_metrics = ShardMetrics::new(shard_id);
@@ -1535,7 +1568,7 @@ pub async fn shard_cleanup_task(
 
         for table_name in tables {
             let deleted = &shard_metrics.cleanup_deleted_keys_total;
-            match delete_expired(&pool, &table_name, now, chunk_size, deleted).await {
+            match delete_expired(&pool, &table_name, now, chunk_size, deleted, &key_count).await {
                 Ok(deleted_count) => {
                     if deleted_count > 0 {
                         tracing::info!(
@@ -1674,10 +1707,19 @@ mod tests {
         .await
         .unwrap();
 
-        let deleted = delete_expired(&pool, "blobs", now, chunk_size, &Counter::noop())
-            .await
-            .unwrap();
+        let key_count = AtomicI64::new(i64::from(expired) + 2);
+        let deleted = delete_expired(
+            &pool,
+            "blobs",
+            now,
+            chunk_size,
+            &Counter::noop(),
+            &key_count,
+        )
+        .await
+        .unwrap();
         assert_eq!(deleted, u64::from(expired));
+        assert_eq!(key_count.load(Ordering::Relaxed), 2);
 
         let keys: Vec<(String,)> = sqlx::query_as("SELECT key FROM blobs ORDER BY key")
             .fetch_all(&pool)
@@ -1875,6 +1917,7 @@ mod tests {
             batch.push_back(op);
         }
 
+        let key_count = AtomicI64::new(0);
         // The transaction can't start: the ops are dropped, so their entries
         // must go too, or reads would serve a write or delete that never lands.
         process_batch(
@@ -1885,8 +1928,10 @@ mod tests {
             &cache,
             &Cache::new(16),
             &ShardMetrics::new(0),
+            &key_count,
         )
         .await;
+        assert_eq!(key_count.load(Ordering::Relaxed), 0);
         assert!(!cache.contains_key("k"));
         assert!(!cache.contains_key("d"));
     }
@@ -1930,6 +1975,7 @@ mod tests {
         }
         assert_eq!(sender.queue_depth(), 0);
         let tables = &mut HashSet::new();
+        let key_count = AtomicI64::new(0);
         process_batch(
             0,
             &pool,
@@ -1938,8 +1984,10 @@ mod tests {
             &cache,
             &hcache,
             &shard_metrics,
+            &key_count,
         )
         .await;
+        assert_eq!(key_count.load(Ordering::Relaxed), 1);
 
         // The statement failed but the transaction committed.
         let output = recorder.handle().render();
@@ -1988,8 +2036,10 @@ mod tests {
             &cache,
             &hcache,
             &shard_metrics,
+            &key_count,
         )
         .await;
+        assert_eq!(key_count.load(Ordering::Relaxed), 1);
         let output = recorder.handle().render();
         assert_eq!(
             rendered_value(&output, r#"blobasaur_async_writes_pending{shard="0"}"#),
@@ -2031,15 +2081,18 @@ mod tests {
             .await
             .unwrap();
             let counter = ShardMetrics::new(0).cleanup_deleted_keys_total;
+            let key_count = AtomicI64::new(3);
             // Chunk size 1: the count accumulates per chunk.
             assert_eq!(
-                delete_expired(&pool, "blobs", 10, 1, &counter)
+                delete_expired(&pool, "blobs", 10, 1, &counter, &key_count)
                     .await
                     .unwrap(),
                 2
             );
-            let missing = delete_expired(&pool, "blobs_missing", 10, 1, &counter).await;
+            assert_eq!(key_count.load(Ordering::Relaxed), 1);
+            let missing = delete_expired(&pool, "blobs_missing", 10, 1, &counter, &key_count).await;
             assert!(missing.is_err());
+            assert_eq!(key_count.load(Ordering::Relaxed), 1);
             crate::metrics::rendered_value(
                 &recorder.handle().render(),
                 r#"blobasaur_cleanup_deleted_keys_total{shard="0"}"#,
@@ -2061,6 +2114,7 @@ mod tests {
         .unwrap();
 
         let (sender, receiver) = mpsc::channel(8);
+        let key_count = Arc::new(AtomicI64::new(0));
         let writer = tokio::spawn(shard_writer_task(ShardWriter {
             shard_id: 0,
             pool: pool.clone(),
@@ -2070,6 +2124,7 @@ mod tests {
             inflight_cache: Cache::new(16),
             inflight_hcache: Cache::new(16),
             metrics: Metrics::new(),
+            key_count: key_count.clone(),
             shutdown: CancellationToken::new(),
         }));
 
@@ -2103,6 +2158,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(keys, vec![("after".to_string(),)]);
+        assert_eq!(key_count.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -2116,6 +2172,7 @@ mod tests {
             .unwrap();
 
         let (sender, receiver) = mpsc::channel(8);
+        let key_count = Arc::new(AtomicI64::new(0));
         let writer = tokio::spawn(shard_writer_task(ShardWriter {
             shard_id: 0,
             pool: pool.clone(),
@@ -2125,6 +2182,7 @@ mod tests {
             inflight_cache: Cache::new(16),
             inflight_hcache: Cache::new(16),
             metrics: Metrics::new(),
+            key_count: key_count.clone(),
             shutdown: CancellationToken::new(),
         }));
 
@@ -2148,6 +2206,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(keys, vec![("k".to_string(),)]);
+        assert_eq!(key_count.load(Ordering::Relaxed), 1);
     }
 
     fn spawn_writer(
@@ -2169,6 +2228,7 @@ mod tests {
             inflight_cache: Cache::new(16),
             inflight_hcache: Cache::new(16),
             metrics: Metrics::new(),
+            key_count: Arc::new(AtomicI64::new(0)),
             shutdown,
         }));
         (sender, writer)
@@ -2270,6 +2330,7 @@ mod tests {
         // writer must commit the queue rather than wait for more ops.
         let shutdown = CancellationToken::new();
         shutdown.cancel();
+        let key_count = Arc::new(AtomicI64::new(0));
         timeout(
             Duration::from_secs(5),
             shard_writer_task(ShardWriter {
@@ -2281,6 +2342,7 @@ mod tests {
                 inflight_cache: Cache::new(128),
                 inflight_hcache: Cache::new(128),
                 metrics: Metrics::new(),
+                key_count: key_count.clone(),
                 shutdown,
             }),
         )
@@ -2292,6 +2354,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 50);
+        assert_eq!(key_count.load(Ordering::Relaxed), 50);
         assert!(
             sender.is_closed(),
             "writer should reject sends after shutdown"
@@ -2326,6 +2389,7 @@ mod tests {
             inflight_cache: Cache::new(128),
             inflight_hcache: Cache::new(128),
             metrics: Metrics::new(),
+            key_count: Arc::new(AtomicI64::new(1)),
             shutdown: CancellationToken::new(),
         }));
 
@@ -2534,5 +2598,131 @@ mod tests {
         wal_checkpoint_truncate(&writer)
             .await
             .expect("checkpoint should complete once the reader is gone");
+    }
+
+    #[tokio::test]
+    async fn process_batch_tracks_key_count_across_all_write_ops() {
+        let (_temp_dir, pool) = create_test_pool().await;
+        let cache: Cache<String, Pending> = Cache::new(16);
+        let hcache: Cache<String, Pending> = Cache::new(16);
+        let shard_metrics = ShardMetrics::new(0);
+        let key_count = AtomicI64::new(0);
+        let mut known_tables = load_existing_tables(&pool, 0).await;
+
+        let future = Utc::now().timestamp() + 3600;
+        let past = Utc::now().timestamp() - 10;
+
+        // Single batch: insert, overwrite, delete-existing, delete-missing,
+        // same-key insert+delete, hset, hset overwrite, hsetex, hdel, hexpire.
+        let mut batch = VecDeque::from([
+            ShardWriteOperation::SetAsync {
+                key: "a".into(),
+                data: Bytes::from_static(b"1"),
+                expires_at: None,
+            },
+            ShardWriteOperation::SetAsync {
+                key: "a".into(),
+                data: Bytes::from_static(b"2"),
+                expires_at: None,
+            },
+            ShardWriteOperation::SetAsync {
+                key: "b".into(),
+                data: Bytes::from_static(b"1"),
+                expires_at: None,
+            },
+            ShardWriteOperation::DeleteAsync {
+                key: "b".into(),
+                token: 1,
+            },
+            ShardWriteOperation::DeleteAsync {
+                key: "missing".into(),
+                token: 2,
+            },
+            ShardWriteOperation::HSetAsync {
+                namespace: "ns".into(),
+                key: "f1".into(),
+                data: Bytes::from_static(b"v1"),
+            },
+            ShardWriteOperation::HSetAsync {
+                namespace: "ns".into(),
+                key: "f1".into(),
+                data: Bytes::from_static(b"v2"),
+            },
+            ShardWriteOperation::HSetExAsync {
+                namespace: "ns".into(),
+                key: "f2".into(),
+                data: Bytes::from_static(b"v2"),
+                expires_at: future,
+            },
+            ShardWriteOperation::HSetExAsync {
+                namespace: "ns".into(),
+                key: "f3".into(),
+                data: Bytes::from_static(b"v3"),
+                expires_at: future,
+            },
+            ShardWriteOperation::HDeleteAsync {
+                namespace: "ns".into(),
+                key: "f2".into(),
+                token: 3,
+            },
+            ShardWriteOperation::HDeleteAsync {
+                namespace: "ns".into(),
+                key: "nonexistent".into(),
+                token: 4,
+            },
+            ShardWriteOperation::HDeleteAsync {
+                namespace: "unknown_ns".into(),
+                key: "f".into(),
+                token: 5,
+            },
+        ]);
+
+        process_batch(
+            0,
+            &pool,
+            &mut batch,
+            &mut known_tables,
+            &cache,
+            &hcache,
+            &shard_metrics,
+            &key_count,
+        )
+        .await;
+        // Remaining rows: blobs(a), blobs_ns(f1, f3) => 3
+        assert_eq!(key_count.load(Ordering::Relaxed), 3);
+
+        // Future HEXPIRE keeps the row (delta 0); past HEXPIRE deletes it (delta -1).
+        let (tx1, rx1) = oneshot::channel();
+        let (tx2, rx2) = oneshot::channel();
+        let mut batch = VecDeque::from([
+            ShardWriteOperation::HExpire {
+                namespace: "ns".into(),
+                key: "f1".into(),
+                expires_at: future,
+                condition: None,
+                responder: tx1,
+            },
+            ShardWriteOperation::HExpire {
+                namespace: "ns".into(),
+                key: "f3".into(),
+                expires_at: past,
+                condition: None,
+                responder: tx2,
+            },
+        ]);
+        process_batch(
+            0,
+            &pool,
+            &mut batch,
+            &mut known_tables,
+            &cache,
+            &hcache,
+            &shard_metrics,
+            &key_count,
+        )
+        .await;
+        assert_eq!(rx1.await.unwrap(), Ok(1));
+        assert_eq!(rx2.await.unwrap(), Ok(2));
+        assert_eq!(key_count.load(Ordering::Relaxed), 2);
     }
 }

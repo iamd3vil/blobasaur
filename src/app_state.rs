@@ -7,6 +7,7 @@ use sqlx::{Connection, SqliteConnection, SqlitePool};
 use std::fs;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
 
@@ -40,6 +41,9 @@ pub struct AppState {
     /// off the writer pool, whose one connection the writer holds for a whole
     /// batch, and off the read pool, so reads can't stall writes either.
     pub check_db_pools: Vec<SqlitePool>,
+    /// Cached stored-row count per shard (across `blobs` and `blobs_*` tables),
+    /// seeded once at startup and updated by each shard's writer and cleanup tasks.
+    pub shard_key_counts: Vec<Arc<AtomicI64>>,
     /// Cache for inflight write operations to prevent race conditions in async mode.
     /// When async_write=true, SET and DEL return immediately but the actual
     /// database write happens asynchronously. This cache stores the pending
@@ -190,6 +194,19 @@ impl AppState {
             .unwrap_or_else(|e| panic!("Failed to create expires_at index in shard {} DB: {}", i, e));
         }
 
+        // Seed per-shard key counts once at startup across all shards in parallel.
+        let count_results = join_all(
+            db_pools
+                .iter()
+                .enumerate()
+                .map(|(i, pool)| async move { count_shard_keys(pool, i).await }),
+        )
+        .await;
+        let mut shard_key_counts = Vec::with_capacity(db_pools.len());
+        for res in count_results {
+            shard_key_counts.push(Arc::new(AtomicI64::new(res?)));
+        }
+
         // Caches for inflight async ops. An entry must never be evicted before
         // its op commits, or reads would miss an acknowledged write or delete.
         // Each entry belongs to an op that is queued (at most `queue_capacity`
@@ -246,6 +263,7 @@ impl AppState {
             db_pools,
             write_db_pools,
             check_db_pools,
+            shard_key_counts,
             inflight_cache,
             inflight_hcache,
             cluster_manager,
@@ -255,11 +273,29 @@ impl AppState {
         })
     }
 
+    /// Cached stored-key count for one shard.
+    pub fn shard_key_count(&self, shard_id: usize) -> u64 {
+        self.shard_key_counts[shard_id]
+            .load(Ordering::Relaxed)
+            .max(0) as u64
+    }
+
+    /// Cached total stored-key count across all shards on this node.
+    pub fn total_key_count(&self) -> u64 {
+        self.shard_key_counts
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed).max(0) as u64)
+            .sum()
+    }
+
     /// Set the gauges that are sampled rather than updated in place: queue
-    /// depth and pool connections. Called on each metrics scrape.
+    /// depth, pool connections, and cached per-shard key counts. Called on
+    /// each metrics scrape.
     pub fn record_gauges(&self) {
         for (i, sender) in self.shard_senders.iter().enumerate() {
             let shard = i.to_string();
+            metrics::gauge!("blobasaur_keys", "shard" => shard.clone())
+                .set(self.shard_key_count(i) as f64);
             metrics::gauge!("blobasaur_write_queue_depth", "shard" => shard.clone())
                 .set(sender.queue_depth() as f64);
             for (name, pool) in [
@@ -291,6 +327,38 @@ impl AppState {
     pub fn namespaced_key(&self, namespace: &str, key: &str) -> String {
         format!("{}:{}", namespace, key)
     }
+}
+
+/// Counts stored rows across `blobs` and every namespaced `blobs_*` table in one
+/// shard DB. Uses `SELECT COUNT(*)` which scans each table's primary-key index
+/// rather than the blob payloads.
+async fn count_shard_keys(pool: &SqlitePool, shard_id: usize) -> Result<i64> {
+    let tables: Vec<(String,)> = sqlx::query_as(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND (name = 'blobs' OR name LIKE 'blobs_%')",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| miette!("failed to list tables in shard {} DB: {}", shard_id, e))?;
+
+    let mut total: i64 = 0;
+    for (table,) in tables {
+        let escaped = table.replace('"', "\"\"");
+        let query = format!("SELECT COUNT(*) FROM \"{escaped}\"");
+        let count: i64 = sqlx::query_scalar(&query)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| {
+                miette!(
+                    "failed to count keys in shard {} table {}: {}",
+                    shard_id,
+                    table,
+                    e
+                )
+            })?;
+        total += count;
+    }
+
+    Ok(total)
 }
 
 fn build_sqlite_connect_options(cfg: &Cfg, shard_id: usize) -> SqliteConnectOptions {
@@ -833,5 +901,64 @@ mod tests {
             result.is_err(),
             "startup must fail fast when legacy auto_vacuum upgrade fails"
         );
+    }
+
+    #[tokio::test]
+    async fn app_state_seeds_key_counts_from_blobs_and_namespaced_tables() {
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let cfg = test_cfg(temp_dir.path().to_string_lossy().into_owned(), 2);
+
+        // First boot creates the shard files.
+        let mut receivers = Vec::new();
+        let initial = AppState::new(cfg.clone(), &mut receivers)
+            .await
+            .expect("initial boot");
+        assert_eq!(initial.shard_key_count(0), 0);
+        assert_eq!(initial.shard_key_count(1), 0);
+        assert_eq!(initial.total_key_count(), 0);
+
+        // Populate shard 0 with 2 default keys + 1 namespaced key, and shard 1 with 1 default key.
+        sqlx::query(
+            "INSERT INTO blobs (key, data, created_at, updated_at, expires_at, version)
+             VALUES ('k1', x'01', 0, 0, NULL, 0), ('k2', x'02', 0, 0, NULL, 0)",
+        )
+        .execute(&initial.db_pools[0])
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE blobs_users (
+                key TEXT PRIMARY KEY,
+                data BLOB,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                expires_at INTEGER,
+                version INTEGER NOT NULL DEFAULT 0
+             )",
+        )
+        .execute(&initial.db_pools[0])
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO blobs_users (key, data, created_at, updated_at, expires_at, version)
+             VALUES ('u1', x'03', 0, 0, NULL, 0)",
+        )
+        .execute(&initial.db_pools[0])
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO blobs (key, data, created_at, updated_at, expires_at, version)
+             VALUES ('s1', x'04', 0, 0, NULL, 0)",
+        )
+        .execute(&initial.db_pools[1])
+        .await
+        .unwrap();
+        drop(initial);
+
+        // Reboot should seed counts from disk across shards and tables.
+        let mut receivers = Vec::new();
+        let rebooted = AppState::new(cfg, &mut receivers).await.expect("reboot");
+        assert_eq!(rebooted.shard_key_count(0), 3);
+        assert_eq!(rebooted.shard_key_count(1), 1);
+        assert_eq!(rebooted.total_key_count(), 4);
     }
 }

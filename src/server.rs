@@ -72,6 +72,7 @@ pub async fn run(
                 inflight_cache: state.inflight_cache.clone(),
                 inflight_hcache: state.inflight_hcache.clone(),
                 metrics: state.metrics.clone(),
+                key_count: state.shard_key_counts[i].clone(),
                 shutdown: writers_shutdown.clone(),
             },
         )));
@@ -90,6 +91,7 @@ pub async fn run(
             state.write_db_pools[i].clone(),
             cfg.cleanup_interval_secs(),
             cfg.cleanup_chunk_size(),
+            state.shard_key_counts[i].clone(),
         )));
     }
 
@@ -927,7 +929,7 @@ async fn handle_info(
                  uptime_in_seconds:unknown\r\n\
                  \r\n\
                  # Keyspace\r\n\
-                 db0:keys=unknown,expires=0,avg_ttl=0\r\n\
+                 db0:keys={},expires=0,avg_ttl=0\r\n\
                  \r\n\
                  # Blobasaur\r\n\
                  shards:{}\r\n\
@@ -937,6 +939,7 @@ async fn handle_info(
                  batch_timeout_ms:{}\r\n\
                  write_queue_capacity:{}\r\n",
                 std::process::id(),
+                state.total_key_count(),
                 state.cfg.num_shards,
                 state.cfg.data_dir,
                 state.cfg.async_write.unwrap_or(false),
@@ -2588,6 +2591,7 @@ mod tests {
                             inflight_cache: state.inflight_cache.clone(),
                             inflight_hcache: state.inflight_hcache.clone(),
                             metrics: state.metrics.clone(),
+                            key_count: state.shard_key_counts[i].clone(),
                             shutdown: CancellationToken::new(),
                         },
                     )));
@@ -3727,6 +3731,84 @@ mod tests {
         assert_eq!(reads(&again, "sqlite", "hit"), 1.0);
         assert_eq!(reads(&again, "sqlite", "miss"), 2.0);
         assert_eq!(reads(&again, "inflight", "hit"), 1.0);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn application_metrics_and_info_report_cached_key_count() {
+        use crate::metrics::rendered_value;
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let ctx = TestContext::new(false).await;
+        let keys_gauge = || {
+            ctx.state.record_gauges();
+            rendered_value(&recorder.handle().render(), r#"blobasaur_keys{shard="0"}"#)
+        };
+
+        assert_eq!(keys_gauge(), 0.0);
+
+        // Insert a key, overwrite it, and insert a namespaced field.
+        for (k, v) in [("k1", b"v1"), ("k1", b"v2")] {
+            respond_with(&ctx, |state, mut stream| {
+                Box::pin(async move {
+                    handle_set(
+                        &mut stream,
+                        &state,
+                        k.to_string(),
+                        Bytes::from_static(v),
+                        None,
+                    )
+                    .await
+                })
+            })
+            .await;
+        }
+        respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_hset(
+                    &mut stream,
+                    &state,
+                    "ns".to_string(),
+                    "f1".to_string(),
+                    Bytes::from_static(b"hv"),
+                )
+                .await
+            })
+        })
+        .await;
+        assert_eq!(keys_gauge(), 2.0);
+
+        // INFO reflects the same cached total.
+        let info = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move { handle_info(&mut stream, &state, None).await })
+        })
+        .await;
+        match info {
+            BytesFrame::BulkString(bytes) => {
+                let text = std::str::from_utf8(&bytes).unwrap();
+                assert!(
+                    text.contains("db0:keys=2,expires=0,avg_ttl=0\r\n"),
+                    "unexpected INFO output:\n{text}"
+                );
+            }
+            other => panic!("Expected bulk string from INFO, got {other:?}"),
+        }
+
+        // Delete both keys.
+        respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_del_multiple(&mut stream, &state, vec!["k1".to_string()]).await
+            })
+        })
+        .await;
+        respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_hdel(&mut stream, &state, "ns".to_string(), "f1".to_string()).await
+            })
+        })
+        .await;
+        assert_eq!(keys_gauge(), 0.0);
 
         ctx.shutdown().await;
     }
