@@ -668,13 +668,15 @@ async fn process_batch(
                         .unwrap_or(false);
 
                     if exists {
-                        // Update existing record
+                        // Update existing record. A live TTL is kept; an
+                        // expired row is a new field, so its expiry is cleared.
                         let update_query = format!(
-                            "UPDATE {} SET data = ?, updated_at = ?, version = version + 1 WHERE key = ?",
+                            "UPDATE {} SET data = ?, updated_at = ?, expires_at = CASE WHEN expires_at <= ? THEN NULL ELSE expires_at END, version = version + 1 WHERE key = ?",
                             table_name
                         );
                         sqlx::query(&update_query)
                             .bind(value)
+                            .bind(now)
                             .bind(now)
                             .bind(key)
                             .execute(&mut *tx)
@@ -841,12 +843,16 @@ async fn process_batch(
             } => {
                 sync_operations.push(idx);
 
-                // Update the expires_at field for the key if it exists
-                match sqlx::query("UPDATE blobs SET expires_at = ? WHERE key = ?")
-                    .bind(expires_at)
-                    .bind(key)
-                    .execute(&mut *tx)
-                    .await
+                // Update the expires_at field for the key if it exists. An
+                // expired row not yet removed by cleanup counts as missing.
+                match sqlx::query(
+                    "UPDATE blobs SET expires_at = ? WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
+                )
+                .bind(expires_at)
+                .bind(key)
+                .bind(Utc::now().timestamp())
+                .execute(&mut *tx)
+                .await
                 {
                     Ok(result) => {
                         let rows_affected = result.rows_affected() > 0;
