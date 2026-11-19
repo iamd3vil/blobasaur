@@ -216,7 +216,6 @@ pub async fn run_redis_server(
             accepted = listener.accept() => accepted?,
             _ = shutdown.cancelled() => return Ok(()),
         };
-        tracing::info!("Accepted new connection from {}", addr);
         tracing::debug!("New Blobasaur connection from {}", addr);
 
         let state_clone = state.clone();
@@ -638,7 +637,7 @@ async fn handle_get(
         Err(e) => {
             state.metrics.record_read("get", "sqlite", "error");
             tracing::error!("Failed to GET key {}: {}", key, e);
-            let response = BytesFrame::Error("ERR database error ".into());
+            let response = BytesFrame::Error("ERR database error".into());
             stream.write_all(&serialize_frame(&response)).await?;
             state.metrics.record_error("storage");
         }
@@ -685,7 +684,7 @@ async fn handle_set(
                 "Failed to send ASYNC SET operation to shard {}",
                 shard_index
             );
-            let response = BytesFrame::Error("ERR internal error ".into());
+            let response = BytesFrame::Error("ERR internal error".into());
             stream.write_all(&serialize_frame(&response)).await?;
             state.metrics.record_error("storage");
         } else {
@@ -711,7 +710,7 @@ async fn handle_set(
 
         if sender.send(operation).await.is_err() {
             tracing::error!("Failed to send SET operation to shard {}", shard_index);
-            let response = BytesFrame::Error("ERR internal error ".into());
+            let response = BytesFrame::Error("ERR internal error".into());
             stream.write_all(&serialize_frame(&response)).await?;
             state.metrics.record_error("storage");
         } else {
@@ -725,13 +724,13 @@ async fn handle_set(
                 }
                 Ok(Err(e)) => {
                     tracing::error!("Shard writer failed for SET: {}", e);
-                    let response = BytesFrame::Error("ERR database error ".into());
+                    let response = BytesFrame::Error("ERR database error".into());
                     stream.write_all(&serialize_frame(&response)).await?;
                     state.metrics.record_error("storage");
                 }
                 Err(_) => {
-                    tracing::error!("Shard writer task cancelled or panicked for SET ");
-                    let response = BytesFrame::Error("ERR internal error ".into());
+                    tracing::error!("Shard writer task cancelled or panicked for SET");
+                    let response = BytesFrame::Error("ERR internal error".into());
                     stream.write_all(&serialize_frame(&response)).await?;
                     state.metrics.record_error("storage");
                 }
@@ -892,7 +891,7 @@ async fn handle_exists(
         }
         Err(e) => {
             tracing::error!("Failed to check EXISTS for key {}: {}", key, e);
-            let response = BytesFrame::Error("ERR database error ".into());
+            let response = BytesFrame::Error("ERR database error".into());
             stream.write_all(&serialize_frame(&response)).await?;
         }
     }
@@ -1188,7 +1187,7 @@ async fn handle_hget(
         Err(e) => {
             state.metrics.record_read("hget", "sqlite", "error");
             tracing::error!("Failed to HGET namespace {} key {}: {}", namespace, key, e);
-            let response = BytesFrame::Error("ERR database error ".into());
+            let response = BytesFrame::Error("ERR database error".into());
             stream.write_all(&serialize_frame(&response)).await?;
         }
     }
@@ -1251,7 +1250,7 @@ async fn hset_reply(
                 key,
                 e
             );
-            return Ok(BytesFrame::Error("ERR database error ".into()));
+            return Ok(BytesFrame::Error("ERR database error".into()));
         }
     };
     let added = BytesFrame::Integer(if existed_before { 0 } else { 1 });
@@ -1289,7 +1288,7 @@ async fn hset_reply(
                 "Failed to send ASYNC HSET operation to shard {}",
                 shard_index
             );
-            return Ok(BytesFrame::Error("ERR internal error ".into()));
+            return Ok(BytesFrame::Error("ERR internal error".into()));
         }
     } else {
         // Sync mode: wait for completion
@@ -1303,17 +1302,17 @@ async fn hset_reply(
 
         if sender.send(operation).await.is_err() {
             tracing::error!("Failed to send HSET operation to shard {}", shard_index);
-            return Ok(BytesFrame::Error("ERR internal error ".into()));
+            return Ok(BytesFrame::Error("ERR internal error".into()));
         }
         match responder_rx.await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 tracing::error!("Shard writer failed for HSET: {}", e);
-                return Ok(BytesFrame::Error("ERR database error ".into()));
+                return Ok(BytesFrame::Error("ERR database error".into()));
             }
             Err(_) => {
-                tracing::error!("Shard writer task cancelled or panicked for HSET ");
-                return Ok(BytesFrame::Error("ERR internal error ".into()));
+                tracing::error!("Shard writer task cancelled or panicked for HSET");
+                return Ok(BytesFrame::Error("ERR internal error".into()));
             }
         }
     }
@@ -1615,7 +1614,7 @@ async fn hdel_reply(state: &Arc<AppState>, namespace: String, key: String) -> By
                 "Failed to send ASYNC HDEL operation to shard {}",
                 shard_index
             );
-            return BytesFrame::Error("ERR internal error ".into());
+            return BytesFrame::Error("ERR internal error".into());
         }
         BytesFrame::Integer(1)
     } else {
@@ -1629,17 +1628,17 @@ async fn hdel_reply(state: &Arc<AppState>, namespace: String, key: String) -> By
 
         if sender.send(operation).await.is_err() {
             tracing::error!("Failed to send HDEL operation to shard {}", shard_index);
-            return BytesFrame::Error("ERR internal error ".into());
+            return BytesFrame::Error("ERR internal error".into());
         }
         match responder_rx.await {
             Ok(Ok(())) => BytesFrame::Integer(1),
             Ok(Err(e)) => {
                 tracing::error!("Shard writer failed for HDEL: {}", e);
-                BytesFrame::Error("ERR database error ".into())
+                BytesFrame::Error("ERR database error".into())
             }
             Err(_) => {
-                tracing::error!("Shard writer task cancelled or panicked for HDEL ");
-                BytesFrame::Error("ERR internal error ".into())
+                tracing::error!("Shard writer task cancelled or panicked for HDEL");
+                BytesFrame::Error("ERR internal error".into())
             }
         }
     }
@@ -1717,7 +1716,7 @@ async fn handle_hexists(
                 key,
                 e
             );
-            let response = BytesFrame::Error("ERR database error ".into());
+            let response = BytesFrame::Error("ERR database error".into());
             stream.write_all(&serialize_frame(&response)).await?;
         }
     }
@@ -1871,13 +1870,13 @@ async fn handle_cluster_nodes(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    tracing::info!("Handling CLUSTER NODES command ");
+    tracing::debug!("Handling CLUSTER NODES command");
     if let Some(ref cluster_manager) = state.cluster_manager {
         let nodes_info = cluster_manager.get_cluster_nodes().await;
         let response = BytesFrame::BulkString(nodes_info.into());
         stream.write_all(&serialize_frame(&response)).await?;
     } else {
-        let response = BytesFrame::Error("ERR This instance has cluster support disabled ".into());
+        let response = BytesFrame::Error("ERR This instance has cluster support disabled".into());
         stream.write_all(&serialize_frame(&response)).await?;
     }
     Ok(())
@@ -1892,7 +1891,7 @@ async fn handle_cluster_info(
         let response = BytesFrame::BulkString(cluster_info.into());
         stream.write_all(&serialize_frame(&response)).await?;
     } else {
-        let response = BytesFrame::Error("ERR This instance has cluster support disabled ".into());
+        let response = BytesFrame::Error("ERR This instance has cluster support disabled".into());
         stream.write_all(&serialize_frame(&response)).await?;
     }
     Ok(())
@@ -1976,7 +1975,7 @@ async fn handle_cluster_slots(
         let response = BytesFrame::Array(slot_ranges);
         stream.write_all(&serialize_frame(&response)).await?;
     } else {
-        let response = BytesFrame::Error("ERR This instance has cluster support disabled ".into());
+        let response = BytesFrame::Error("ERR This instance has cluster support disabled".into());
         stream.write_all(&serialize_frame(&response)).await?;
     }
     Ok(())
@@ -1995,12 +1994,12 @@ async fn handle_cluster_addslots(
             }
             Err(e) => {
                 tracing::error!("Failed to add slots: {}", e);
-                let response = BytesFrame::Error("ERR failed to add slots ".into());
+                let response = BytesFrame::Error("ERR failed to add slots".into());
                 stream.write_all(&serialize_frame(&response)).await?;
             }
         }
     } else {
-        let response = BytesFrame::Error("ERR This instance has cluster support disabled ".into());
+        let response = BytesFrame::Error("ERR This instance has cluster support disabled".into());
         stream.write_all(&serialize_frame(&response)).await?;
     }
     Ok(())
@@ -2019,12 +2018,12 @@ async fn handle_cluster_delslots(
             }
             Err(e) => {
                 tracing::error!("Failed to remove slots: {}", e);
-                let response = BytesFrame::Error("ERR failed to remove slots ".into());
+                let response = BytesFrame::Error("ERR failed to remove slots".into());
                 stream.write_all(&serialize_frame(&response)).await?;
             }
         }
     } else {
-        let response = BytesFrame::Error("ERR This instance has cluster support disabled ".into());
+        let response = BytesFrame::Error("ERR This instance has cluster support disabled".into());
         stream.write_all(&serialize_frame(&response)).await?;
     }
     Ok(())
