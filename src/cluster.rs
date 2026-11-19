@@ -86,12 +86,8 @@ impl ClusterManager {
         // Set up chitchat for gossip protocol
         let gossip_addr = SocketAddr::new(gossip_bind_addr.ip(), config.port);
 
-        // Use advertise_addr if provided, otherwise fall back to gossip_addr
-        let advertise_gossip_addr = if let Some(ref advertise_addr_str) = config.advertise_addr {
-            advertise_addr_str.parse().unwrap_or(gossip_addr)
-        } else {
-            gossip_addr
-        };
+        let advertise_gossip_addr =
+            gossip_advertise_addr(config.advertise_addr.as_deref(), gossip_addr);
 
         let chitchat_id = ChitchatId {
             node_id: config.node_id.clone(),
@@ -662,6 +658,18 @@ impl ClusterManager {
     }
 }
 
+/// The address peers should gossip to. `advertise_addr` is the Redis address
+/// clients connect to, so only its IP applies here; gossip uses the cluster
+/// port. Falls back to `gossip_addr` if `advertise_addr` is unset or not an
+/// `ip:port`.
+fn gossip_advertise_addr(advertise_addr: Option<&str>, gossip_addr: SocketAddr) -> SocketAddr {
+    advertise_addr
+        .and_then(|addr| addr.parse::<SocketAddr>().ok())
+        .map_or(gossip_addr, |addr| {
+            SocketAddr::new(addr.ip(), gossip_addr.port())
+        })
+}
+
 // Implement Clone for ClusterManager to allow sharing between tasks
 impl Clone for ClusterManager {
     fn clone(&self) -> Self {
@@ -682,6 +690,18 @@ mod tests {
     use super::*;
     use crate::config::ClusterConfig;
     use std::net::SocketAddr;
+
+    #[test]
+    fn gossip_is_advertised_on_the_cluster_port_not_the_redis_port() {
+        let gossip: SocketAddr = "0.0.0.0:7001".parse().unwrap();
+        // advertise_addr is the Redis address; only its IP carries over.
+        assert_eq!(
+            gossip_advertise_addr(Some("10.0.0.5:6381"), gossip),
+            "10.0.0.5:7001".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(gossip_advertise_addr(None, gossip), gossip);
+        assert_eq!(gossip_advertise_addr(Some("not-an-addr"), gossip), gossip);
+    }
 
     #[test]
     fn test_calculate_slot_basic_keys() {
