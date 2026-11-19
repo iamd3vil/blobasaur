@@ -612,44 +612,48 @@ async fn process_batch(
                 let now = Utc::now().timestamp();
 
                 // Check if record exists to determine if this is an insert or update
-                let exists = sqlx::query("SELECT 1 FROM blobs WHERE key = ?")
+                match sqlx::query("SELECT 1 FROM blobs WHERE key = ?")
                     .bind(key)
                     .fetch_optional(&mut *tx)
                     .await
-                    .map(|row| row.is_some())
-                    .unwrap_or(false);
-
-                if exists {
-                    // Update existing record - update data, updated_at, expires_at, and version
-                    sqlx::query("UPDATE blobs SET data = ?, updated_at = ?, expires_at = ?, version = version + 1 WHERE key = ?")
-                        .bind(value)
-                        .bind(now)
-                        .bind(expires_at)
-                        .bind(key)
-                        .execute(&mut *tx)
-                        .await
-                        .map(|_| ())
-                        .map_err(|e| {
-                            tracing::error!("[Shard {}] UPDATE error for key {}: {}", shard_id, key, e);
-                            e.to_string()
-                        })
-                } else {
-                    // Insert new record with metadata
-                    sqlx::query("INSERT INTO blobs (key, data, created_at, updated_at, expires_at, version) VALUES (?, ?, ?, ?, ?, 0)")
-                        .bind(key)
-                        .bind(value)
-                        .bind(now)
-                        .bind(now)
-                        .bind(expires_at)
-                        .execute(&mut *tx)
-                        .await
-                        .map(|res| {
-                            batch_delta += res.rows_affected() as i64;
-                        })
-                        .map_err(|e| {
-                            tracing::error!("[Shard {}] INSERT error for key {}: {}", shard_id, key, e);
-                            e.to_string()
-                        })
+                {
+                    Ok(Some(_)) => {
+                        // Update existing record - update data, updated_at, expires_at, and version
+                        sqlx::query("UPDATE blobs SET data = ?, updated_at = ?, expires_at = ?, version = version + 1 WHERE key = ?")
+                            .bind(value)
+                            .bind(now)
+                            .bind(expires_at)
+                            .bind(key)
+                            .execute(&mut *tx)
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| {
+                                tracing::error!("[Shard {}] UPDATE error for key {}: {}", shard_id, key, e);
+                                e.to_string()
+                            })
+                    }
+                    Ok(None) => {
+                        // Insert new record with metadata
+                        sqlx::query("INSERT INTO blobs (key, data, created_at, updated_at, expires_at, version) VALUES (?, ?, ?, ?, ?, 0)")
+                            .bind(key)
+                            .bind(value)
+                            .bind(now)
+                            .bind(now)
+                            .bind(expires_at)
+                            .execute(&mut *tx)
+                            .await
+                            .map(|res| {
+                                batch_delta += res.rows_affected() as i64;
+                            })
+                            .map_err(|e| {
+                                tracing::error!("[Shard {}] INSERT error for key {}: {}", shard_id, key, e);
+                                e.to_string()
+                            })
+                    }
+                    Err(e) => {
+                        tracing::error!("[Shard {}] SELECT error for key {}: {}", shard_id, key, e);
+                        Err(e.to_string())
+                    }
                 }
             }
             ShardWriteOperation::Delete { key, .. }
@@ -694,62 +698,68 @@ async fn process_batch(
 
                     // Check if record exists to determine if this is an insert or update
                     let query = format!("SELECT 1 FROM {} WHERE key = ?", table_name);
-                    let exists = sqlx::query(&query)
-                        .bind(key)
-                        .fetch_optional(&mut *tx)
-                        .await
-                        .map(|row| row.is_some())
-                        .unwrap_or(false);
-
-                    if exists {
-                        // Update existing record
-                        let update_query = format!(
-                            "UPDATE {} SET data = ?, updated_at = ?, version = version + 1 WHERE key = ?",
-                            table_name
-                        );
-                        sqlx::query(&update_query)
-                            .bind(value)
-                            .bind(now)
-                            .bind(key)
-                            .execute(&mut *tx)
-                            .await
-                            .map(|_| ())
-                            .map_err(|e| {
-                                tracing::error!(
-                                    "[Shard {}] HSET UPDATE error for namespace {} key {}: {}",
-                                    shard_id,
-                                    namespace,
-                                    key,
-                                    e
-                                );
-                                e.to_string()
-                            })
-                    } else {
-                        // Insert new record
-                        let insert_query = format!(
-                            "INSERT INTO {} (key, data, created_at, updated_at, expires_at, version) VALUES (?, ?, ?, ?, NULL, 0)",
-                            table_name
-                        );
-                        sqlx::query(&insert_query)
-                            .bind(key)
-                            .bind(value)
-                            .bind(now)
-                            .bind(now)
-                            .execute(&mut *tx)
-                            .await
-                            .map(|res| {
-                                batch_delta += res.rows_affected() as i64;
-                            })
-                            .map_err(|e| {
-                                tracing::error!(
-                                    "[Shard {}] HSET INSERT error for namespace {} key {}: {}",
-                                    shard_id,
-                                    namespace,
-                                    key,
-                                    e
-                                );
-                                e.to_string()
-                            })
+                    match sqlx::query(&query).bind(key).fetch_optional(&mut *tx).await {
+                        Ok(Some(_)) => {
+                            // Update existing record
+                            let update_query = format!(
+                                "UPDATE {} SET data = ?, updated_at = ?, version = version + 1 WHERE key = ?",
+                                table_name
+                            );
+                            sqlx::query(&update_query)
+                                .bind(value)
+                                .bind(now)
+                                .bind(key)
+                                .execute(&mut *tx)
+                                .await
+                                .map(|_| ())
+                                .map_err(|e| {
+                                    tracing::error!(
+                                        "[Shard {}] HSET UPDATE error for namespace {} key {}: {}",
+                                        shard_id,
+                                        namespace,
+                                        key,
+                                        e
+                                    );
+                                    e.to_string()
+                                })
+                        }
+                        Ok(None) => {
+                            // Insert new record
+                            let insert_query = format!(
+                                "INSERT INTO {} (key, data, created_at, updated_at, expires_at, version) VALUES (?, ?, ?, ?, NULL, 0)",
+                                table_name
+                            );
+                            sqlx::query(&insert_query)
+                                .bind(key)
+                                .bind(value)
+                                .bind(now)
+                                .bind(now)
+                                .execute(&mut *tx)
+                                .await
+                                .map(|res| {
+                                    batch_delta += res.rows_affected() as i64;
+                                })
+                                .map_err(|e| {
+                                    tracing::error!(
+                                        "[Shard {}] HSET INSERT error for namespace {} key {}: {}",
+                                        shard_id,
+                                        namespace,
+                                        key,
+                                        e
+                                    );
+                                    e.to_string()
+                                })
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "[Shard {}] HSET SELECT error for namespace {} key {}: {}",
+                                shard_id,
+                                namespace,
+                                key,
+                                e
+                            );
+                            Err(e.to_string())
+                        }
                     }
                 }
             }
@@ -787,64 +797,70 @@ async fn process_batch(
 
                     // Check if record exists to determine if this is an insert or update
                     let query = format!("SELECT 1 FROM {} WHERE key = ?", table_name);
-                    let exists = sqlx::query(&query)
-                        .bind(key)
-                        .fetch_optional(&mut *tx)
-                        .await
-                        .map(|row| row.is_some())
-                        .unwrap_or(false);
-
-                    if exists {
-                        // Update existing record with expiration
-                        let update_query = format!(
-                            "UPDATE {} SET data = ?, updated_at = ?, expires_at = ?, version = version + 1 WHERE key = ?",
-                            table_name
-                        );
-                        sqlx::query(&update_query)
-                            .bind(value)
-                            .bind(now)
-                            .bind(*expires_at)
-                            .bind(key)
-                            .execute(&mut *tx)
-                            .await
-                            .map(|_| ())
-                            .map_err(|e| {
-                                tracing::error!(
-                                    "[Shard {}] HSETEX UPDATE error for namespace {} key {}: {}",
-                                    shard_id,
-                                    namespace,
-                                    key,
-                                    e
-                                );
-                                e.to_string()
-                            })
-                    } else {
-                        // Insert new record with expiration
-                        let insert_query = format!(
-                            "INSERT INTO {} (key, data, created_at, updated_at, expires_at, version) VALUES (?, ?, ?, ?, ?, 0)",
-                            table_name
-                        );
-                        sqlx::query(&insert_query)
-                            .bind(key)
-                            .bind(value)
-                            .bind(now)
-                            .bind(now)
-                            .bind(*expires_at)
-                            .execute(&mut *tx)
-                            .await
-                            .map(|res| {
-                                batch_delta += res.rows_affected() as i64;
-                            })
-                            .map_err(|e| {
-                                tracing::error!(
-                                    "[Shard {}] HSETEX INSERT error for namespace {} key {}: {}",
-                                    shard_id,
-                                    namespace,
-                                    key,
-                                    e
-                                );
-                                e.to_string()
-                            })
+                    match sqlx::query(&query).bind(key).fetch_optional(&mut *tx).await {
+                        Ok(Some(_)) => {
+                            // Update existing record with expiration
+                            let update_query = format!(
+                                "UPDATE {} SET data = ?, updated_at = ?, expires_at = ?, version = version + 1 WHERE key = ?",
+                                table_name
+                            );
+                            sqlx::query(&update_query)
+                                .bind(value)
+                                .bind(now)
+                                .bind(*expires_at)
+                                .bind(key)
+                                .execute(&mut *tx)
+                                .await
+                                .map(|_| ())
+                                .map_err(|e| {
+                                    tracing::error!(
+                                        "[Shard {}] HSETEX UPDATE error for namespace {} key {}: {}",
+                                        shard_id,
+                                        namespace,
+                                        key,
+                                        e
+                                    );
+                                    e.to_string()
+                                })
+                        }
+                        Ok(None) => {
+                            // Insert new record with expiration
+                            let insert_query = format!(
+                                "INSERT INTO {} (key, data, created_at, updated_at, expires_at, version) VALUES (?, ?, ?, ?, ?, 0)",
+                                table_name
+                            );
+                            sqlx::query(&insert_query)
+                                .bind(key)
+                                .bind(value)
+                                .bind(now)
+                                .bind(now)
+                                .bind(*expires_at)
+                                .execute(&mut *tx)
+                                .await
+                                .map(|res| {
+                                    batch_delta += res.rows_affected() as i64;
+                                })
+                                .map_err(|e| {
+                                    tracing::error!(
+                                        "[Shard {}] HSETEX INSERT error for namespace {} key {}: {}",
+                                        shard_id,
+                                        namespace,
+                                        key,
+                                        e
+                                    );
+                                    e.to_string()
+                                })
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "[Shard {}] HSETEX SELECT error for namespace {} key {}: {}",
+                                shard_id,
+                                namespace,
+                                key,
+                                e
+                            );
+                            Err(e.to_string())
+                        }
                     }
                 }
             }
@@ -949,20 +965,35 @@ async fn process_batch(
     }
 
     // Commit transaction, or clean up if SQLite already rolled it back.
+    let mut discard_conn = false;
+    let mut commit_failed_error: Option<String> = None;
     let commit_result = if let Some(err) = rolled_back_error {
         if let Err(rb_err) = tx.rollback().await {
+            // If cleanup rollback fails, sqlx's internal transaction_depth may
+            // stay non-zero; discard the pooled connection so the next batch
+            // acquires a fresh writer instead of failing BEGIN IMMEDIATE.
+            discard_conn = true;
             tracing::debug!(
-                "[Shard {}] Cleanup rollback after implicit SQLite rollback: {}",
+                "[Shard {}] Cleanup rollback after implicit SQLite rollback failed: {}",
                 shard_id,
                 rb_err
             );
         }
         Err(format!("Transaction rolled back: {err}"))
     } else {
-        tx.commit().await.map_err(|e| {
-            tracing::error!("[Shard {}] Transaction commit failed: {}", shard_id, e);
-            e.to_string()
-        })
+        match tx.commit().await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // A failed COMMIT consumes `tx` without decrementing sqlx's
+                // transaction_depth, so discard the connection instead of
+                // returning a poisoned writer to the pool.
+                discard_conn = true;
+                tracing::error!("[Shard {}] Transaction commit failed: {}", shard_id, e);
+                let msg = e.to_string();
+                commit_failed_error = Some(msg.clone());
+                Err(msg)
+            }
+        }
     };
     if commit_result.is_ok() {
         if batch_delta != 0 {
@@ -973,10 +1004,16 @@ async fn process_batch(
             known_tables.remove(&table);
         }
     }
-    // Return the writer connection before the bookkeeping below.
-    drop(conn);
+    // Return (or discard) the writer connection before the bookkeeping below.
+    if discard_conn {
+        if let Ok(conn) = conn {
+            let _ = conn.close().await;
+        }
+    } else {
+        drop(conn);
+    }
     shard_metrics.record_transaction(commit_result.is_ok(), tx_start.elapsed());
-    if let Err(e) = &commit_result {
+    if let Some(e) = &commit_failed_error {
         shard_metrics.record_sqlite_error("commit", e);
     }
     for e in results.iter().filter_map(|r| r.as_ref().err()) {
@@ -1577,9 +1614,10 @@ async fn delete_expired(
     deleted_counter: &Counter,
     key_count: &AtomicI64,
 ) -> Result<u64, sqlx::Error> {
+    let escaped = table.replace('"', "\"\"");
     let query = format!(
-        "DELETE FROM {table} WHERE rowid IN (
-            SELECT rowid FROM {table} WHERE expires_at IS NOT NULL AND expires_at <= ? LIMIT ?
+        "DELETE FROM \"{escaped}\" WHERE rowid IN (
+            SELECT rowid FROM \"{escaped}\" WHERE expires_at IS NOT NULL AND expires_at <= ? LIMIT ?
         )"
     );
     let mut total = 0;
@@ -2805,6 +2843,9 @@ mod tests {
 
     #[tokio::test]
     async fn process_batch_stops_when_sqlite_rolls_back_transaction() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
         let temp_dir = TempDir::new().expect("failed to create temp dir");
         let db_path = temp_dir.path().join("shard_0.db");
         let connect_options =
@@ -2840,25 +2881,33 @@ mod tests {
         let key_count = AtomicI64::new(0);
         let mut known_tables = load_existing_tables(&pool, 0).await;
 
-        // Cap the DB size so a small insert fits, a large insert hits SQLITE_FULL
-        // and implicitly rolls back the transaction, and a third small insert would
-        // autocommit if the batch kept executing.
+        // Cap the DB size so creating a new namespace table + small insert fit,
+        // a 256 KiB insert hits SQLITE_FULL and implicitly rolls back the
+        // transaction, and subsequent ops would autocommit if execution continued.
         let current_pages: i64 = sqlx::query_scalar("PRAGMA page_count")
             .fetch_one(&pool)
             .await
             .unwrap();
-        let cap_pages = current_pages + 2;
+        let cap_pages = current_pages + 6;
         let applied_cap: i64 = sqlx::query_scalar(&format!("PRAGMA max_page_count = {cap_pages}"))
             .fetch_one(&pool)
             .await
             .unwrap();
         assert_eq!(applied_cap, cap_pages);
 
+        let (tx_ns, rx_ns) = oneshot::channel();
         let (tx1, rx1) = oneshot::channel();
         let (tx2, rx2) = oneshot::channel();
         let (tx3, rx3) = oneshot::channel();
         let (tx4, rx4) = oneshot::channel();
+        let (tx5, rx5) = oneshot::channel();
         let mut batch = VecDeque::from([
+            ShardWriteOperation::HSet {
+                namespace: "rolled_back_ns".into(),
+                key: "f1".into(),
+                data: Bytes::from_static(b"ok"),
+                responder: tx_ns,
+            },
             ShardWriteOperation::Set {
                 key: "small-before".into(),
                 data: Bytes::from_static(b"ok"),
@@ -2882,6 +2931,13 @@ mod tests {
                 expires_at: Utc::now().timestamp() + 60,
                 responder: tx4,
             },
+            ShardWriteOperation::HExpire {
+                namespace: "rolled_back_ns".into(),
+                key: "f1".into(),
+                expires_at: Utc::now().timestamp() + 60,
+                condition: None,
+                responder: tx5,
+            },
         ]);
 
         process_batch(
@@ -2896,19 +2952,44 @@ mod tests {
         )
         .await;
 
-        // Every op in the rolled-back batch gets an error, nothing is persisted,
+        // Every op in the rolled-back batch gets the rollback error (not a
+        // synthetic "could not find expire result" error), nothing is persisted,
         // and the cached key count stays 0.
+        let r_ns = rx_ns.await.unwrap();
         let r1 = rx1.await.unwrap();
         let r2 = rx2.await.unwrap();
         let r3 = rx3.await.unwrap();
         let r4 = rx4.await.unwrap();
-        assert!(
-            r1.is_err(),
-            "expected r1 err, got r1={r1:?} r2={r2:?} r3={r3:?} r4={r4:?}"
+        let r5 = rx5.await.unwrap();
+        for (label, res) in [
+            ("r_ns", r_ns.as_ref().err()),
+            ("r1", r1.as_ref().err()),
+            ("r2", r2.as_ref().err()),
+            ("r3", r3.as_ref().err()),
+            ("r4", r4.as_ref().err()),
+            ("r5", r5.as_ref().err()),
+        ] {
+            let err = res.unwrap_or_else(|| panic!("expected {label} to fail"));
+            assert!(
+                err.contains("Transaction rolled back"),
+                "{label} should report rollback cause, got: {err}"
+            );
+        }
+
+        // The implicit rollback was caused by a statement execution error, not
+        // an attempted COMMIT, so commit errors must not be incremented.
+        let output = recorder.handle().render();
+        assert_eq!(
+            crate::metrics::rendered_value(
+                &output,
+                r#"blobasaur_sqlite_transaction_duration_seconds_count{shard="0",result="error"}"#
+            ),
+            1.0
         );
-        assert!(r2.is_err(), "expected r2 err, got {r2:?}");
-        assert!(r3.is_err(), "expected r3 err, got {r3:?}");
-        assert!(r4.is_err(), "expected r4 err, got {r4:?}");
+        assert!(
+            !output.contains(r#"stage="commit""#),
+            "implicit rollback should not record a commit-stage error:\n{output}"
+        );
 
         let db_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM blobs")
             .fetch_one(&pool)
@@ -2917,18 +2998,29 @@ mod tests {
         assert_eq!(db_rows, 0);
         assert_eq!(key_count.load(Ordering::Relaxed), 0);
 
-        // Lift the cap and verify the pooled writer connection is still clean for the next batch.
+        // Lift the cap and verify: (a) the pooled writer connection is clean, and
+        // (b) retrying HSet to the namespace first created in the rolled-back batch
+        // recreates the table instead of failing on a stale `known_tables` entry.
         sqlx::query("PRAGMA max_page_count = 1073741823")
             .execute(&pool)
             .await
             .unwrap();
-        let (tx_next, rx_next) = oneshot::channel();
-        let mut next_batch = VecDeque::from([ShardWriteOperation::Set {
-            key: "after-recovery".into(),
-            data: Bytes::from_static(b"ok"),
-            expires_at: None,
-            responder: tx_next,
-        }]);
+        let (tx_next_set, rx_next_set) = oneshot::channel();
+        let (tx_next_hset, rx_next_hset) = oneshot::channel();
+        let mut next_batch = VecDeque::from([
+            ShardWriteOperation::Set {
+                key: "after-recovery".into(),
+                data: Bytes::from_static(b"ok"),
+                expires_at: None,
+                responder: tx_next_set,
+            },
+            ShardWriteOperation::HSet {
+                namespace: "rolled_back_ns".into(),
+                key: "f1".into(),
+                data: Bytes::from_static(b"ok"),
+                responder: tx_next_hset,
+            },
+        ]);
         process_batch(
             0,
             &pool,
@@ -2940,7 +3032,120 @@ mod tests {
             &key_count,
         )
         .await;
-        assert_eq!(rx_next.await.unwrap(), Ok(()));
+        assert_eq!(rx_next_set.await.unwrap(), Ok(()));
+        assert_eq!(rx_next_hset.await.unwrap(), Ok(()));
+        let db_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM blobs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let ns_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM blobs_rolled_back_ns")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(db_rows, 1);
+        assert_eq!(ns_rows, 1);
+        assert_eq!(key_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn process_batch_discards_connection_after_commit_failure() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let db_path = temp_dir.path().join("shard_0.db");
+        let connect_options =
+            SqliteConnectOptions::from_str(&format!("sqlite:{}", db_path.display()))
+                .expect("failed to parse sqlite connection string")
+                .create_if_missing(true)
+                .journal_mode(SqliteJournalMode::Wal)
+                .pragma("foreign_keys", "true")
+                .busy_timeout(std::time::Duration::from_secs(5));
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(connect_options)
+            .await
+            .expect("failed to create sqlite pool");
+        sqlx::query("CREATE TABLE allowed_keys (key TEXT PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO allowed_keys (key) VALUES ('allowed')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // A deferred FK check passes INSERT and fails specifically during COMMIT.
+        sqlx::query(
+            "CREATE TABLE blobs (
+                key TEXT PRIMARY KEY REFERENCES allowed_keys(key) DEFERRABLE INITIALLY DEFERRED,
+                data BLOB,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                expires_at INTEGER,
+                version INTEGER NOT NULL DEFAULT 0
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let cache: Cache<String, Pending> = Cache::new(16);
+        let hcache: Cache<String, Pending> = Cache::new(16);
+        let shard_metrics = ShardMetrics::new(0);
+        let key_count = AtomicI64::new(0);
+        let mut known_tables = load_existing_tables(&pool, 0).await;
+
+        let (tx_bad, rx_bad) = oneshot::channel();
+        let mut bad_batch = VecDeque::from([ShardWriteOperation::Set {
+            key: "disallowed".into(),
+            data: Bytes::from_static(b"v"),
+            expires_at: None,
+            responder: tx_bad,
+        }]);
+        process_batch(
+            0,
+            &pool,
+            &mut bad_batch,
+            &mut known_tables,
+            &cache,
+            &hcache,
+            &shard_metrics,
+            &key_count,
+        )
+        .await;
+        assert!(rx_bad.await.unwrap().is_err());
+        assert_eq!(key_count.load(Ordering::Relaxed), 0);
+
+        let output = recorder.handle().render();
+        assert_eq!(
+            crate::metrics::rendered_value(
+                &output,
+                r#"blobasaur_sqlite_errors_total{shard="0",stage="commit",kind="constraint"}"#
+            ),
+            1.0
+        );
+
+        // Next batch on the same 1-connection pool must succeed on a fresh
+        // connection rather than failing with a stuck sqlx transaction_depth.
+        let (tx_ok, rx_ok) = oneshot::channel();
+        let mut ok_batch = VecDeque::from([ShardWriteOperation::Set {
+            key: "allowed".into(),
+            data: Bytes::from_static(b"v"),
+            expires_at: None,
+            responder: tx_ok,
+        }]);
+        process_batch(
+            0,
+            &pool,
+            &mut ok_batch,
+            &mut known_tables,
+            &cache,
+            &hcache,
+            &shard_metrics,
+            &key_count,
+        )
+        .await;
+        assert_eq!(rx_ok.await.unwrap(), Ok(()));
         let db_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM blobs")
             .fetch_one(&pool)
             .await
