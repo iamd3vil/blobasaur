@@ -5,7 +5,7 @@ use mpchash::HashRing;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Connection, SqliteConnection, SqlitePool};
 use std::fs;
-use std::hash::{BuildHasher, RandomState};
+use std::hash::{BuildHasher, Hasher, RandomState};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::{Mutex, MutexGuard, Semaphore, mpsc};
@@ -89,16 +89,35 @@ impl Default for KeyLocks {
 impl KeyLocks {
     const STRIPES: usize = 4096;
 
-    /// Locks every key in `keys` until the guards are dropped. Each mutex is
-    /// taken once and in index order, so two commands locking overlapping sets
-    /// of keys can't deadlock.
-    pub async fn lock<'k>(
-        &self,
-        keys: impl IntoIterator<Item = &'k str>,
-    ) -> Vec<MutexGuard<'_, ()>> {
-        let mut stripes: Vec<usize> = keys
+    /// Locks plain keys (DEL, EXPIRE) until the guards are dropped.
+    pub async fn lock_keys(&self, keys: &[&str]) -> Vec<MutexGuard<'_, ()>> {
+        let hashes = keys.iter().map(|key| self.hasher.hash_one(key));
+        self.lock_stripes(hashes.collect()).await
+    }
+
+    /// Locks fields of a hash namespace until the guards are dropped. The
+    /// namespace is hashed lowercased, as it's stored (see
+    /// [`crate::shard_manager::namespace_table`]), and in place: a command with
+    /// many fields doesn't copy it once per field.
+    pub async fn lock_fields(&self, namespace: &str, fields: &[&str]) -> Vec<MutexGuard<'_, ()>> {
+        let hashes = fields.iter().map(|field| {
+            let mut hasher = self.hasher.build_hasher();
+            for byte in namespace.bytes() {
+                hasher.write_u8(byte.to_ascii_lowercase());
+            }
+            hasher.write_u8(b':');
+            hasher.write(field.as_bytes());
+            hasher.finish()
+        });
+        self.lock_stripes(hashes.collect()).await
+    }
+
+    /// Each mutex is taken once and in index order, so two commands locking
+    /// overlapping sets of keys can't deadlock.
+    async fn lock_stripes(&self, hashes: Vec<u64>) -> Vec<MutexGuard<'_, ()>> {
+        let mut stripes: Vec<usize> = hashes
             .into_iter()
-            .map(|key| self.hasher.hash_one(key) as usize % self.stripes.len())
+            .map(|hash| hash as usize % self.stripes.len())
             .collect();
         stripes.sort_unstable();
         stripes.dedup();
@@ -341,7 +360,7 @@ impl AppState {
 
     /// Get a namespaced cache key for HGET/HSET operations
     pub fn namespaced_key(&self, namespace: &str, key: &str) -> String {
-        format!("{}:{}", namespace, key)
+        crate::shard_manager::namespaced_key(namespace, key)
     }
 }
 

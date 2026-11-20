@@ -245,6 +245,19 @@ pub async fn queue_pending(
     Ok(())
 }
 
+/// The table holding `namespace`'s hash fields. SQLite matches table names
+/// regardless of case, so `NS` and `ns` share a table; the name is lowercased
+/// so the writer's table bookkeeping agrees.
+pub fn namespace_table(namespace: &str) -> String {
+    format!("blobs_{}", namespace.to_ascii_lowercase())
+}
+
+/// The inflight cache key of a hash field. The namespace is lowercased, as in
+/// [`namespace_table`], so `NS` and `ns` share an entry as they share a table.
+pub fn namespaced_key(namespace: &str, key: &str) -> String {
+    format!("{}:{}", namespace.to_ascii_lowercase(), key)
+}
+
 /// A fresh token for a [`Pending`] entry and its queued async op.
 pub fn next_pending_token() -> u64 {
     static NEXT_TOKEN: AtomicU64 = AtomicU64::new(0);
@@ -481,7 +494,7 @@ async fn clear_pending_entries(
                 ..
             } => {
                 value_bytes += data.len();
-                let namespaced_key = format!("{}:{}", namespace, key);
+                let namespaced_key = namespaced_key(namespace, key);
                 clear_pending_write(inflight_hcache, &namespaced_key, *token).await;
             }
             ShardWriteOperation::HDeleteAsync {
@@ -489,7 +502,7 @@ async fn clear_pending_entries(
                 key,
                 token,
             } => {
-                let namespaced_key = format!("{}:{}", namespace, key);
+                let namespaced_key = namespaced_key(namespace, key);
                 clear_pending_write(inflight_hcache, &namespaced_key, *token).await;
             }
             _ => {}
@@ -665,7 +678,7 @@ async fn process_batch(
                     sync_operations.push(idx)
                 }
 
-                let table_name = format!("blobs_{}", namespace);
+                let table_name = namespace_table(namespace);
 
                 // Ensure table exists
                 if let Err(e) =
@@ -753,7 +766,7 @@ async fn process_batch(
                     sync_operations.push(idx)
                 }
 
-                let table_name = format!("blobs_{}", namespace);
+                let table_name = namespace_table(namespace);
 
                 // Ensure table exists
                 if let Err(e) =
@@ -831,7 +844,7 @@ async fn process_batch(
                     sync_operations.push(idx)
                 }
 
-                let table_name = format!("blobs_{}", namespace);
+                let table_name = namespace_table(namespace);
 
                 // Only delete if table exists
                 if known_tables.contains(&table_name) {
@@ -1048,7 +1061,7 @@ async fn handle_hexpire_operation(
     expires_at: i64,
     condition: Option<HExpireCondition>,
 ) -> (i64, Result<(), String>) {
-    let table_name = format!("blobs_{}", namespace);
+    let table_name = namespace_table(namespace);
 
     // HEXPIRE should be a no-op for missing namespaces.
     if !known_tables.contains(&table_name) {
@@ -1407,7 +1420,9 @@ async fn load_existing_tables(pool: &SqlitePool, shard_id: usize) -> HashSet<Str
     {
         Ok(rows) => {
             for (table_name,) in rows {
-                tables.insert(table_name);
+                // Lowercased like namespace_table, since SQLite matches
+                // table names regardless of case.
+                tables.insert(table_name.to_ascii_lowercase());
             }
             tracing::info!(
                 "[Shard {}] Loaded {} existing namespaced tables",

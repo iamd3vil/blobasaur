@@ -771,7 +771,8 @@ async fn del_reply(state: &Arc<AppState>, mut keys: Vec<String>) -> BytesFrame {
     keys.dedup();
     // Held until every delete is queued or committed, so concurrent DELs
     // can't all see a key and all count it as deleted.
-    let _guards = state.key_locks.lock(keys.iter().map(String::as_str)).await;
+    let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+    let _guards = state.key_locks.lock_keys(&key_refs).await;
 
     let mut deleted_count = 0;
     for key in keys {
@@ -1074,10 +1075,10 @@ async fn hash_field_live(
     pool: &sqlx::SqlitePool,
     namespace: &str,
     key: &str,
-    namespaced_key: &str,
 ) -> Result<bool, sqlx::Error> {
+    let namespaced_key = state.namespaced_key(namespace, key);
     if let Some(exists) =
-        shard_manager::pending_exists(&state.inflight_hcache, namespaced_key).await
+        shard_manager::pending_exists(&state.inflight_hcache, &namespaced_key).await
     {
         return Ok(exists);
     }
@@ -1238,14 +1239,15 @@ async fn hset_reply(
 
     let shard_index = state.get_shard(&key);
     let pool = &state.check_db_pools[shard_index];
-    let namespaced_key = state.namespaced_key(&namespace, &key);
 
     // Held until the write is queued or committed, so concurrent HSETs of a
     // new field can't all report it as added.
-    let _guard = state.key_locks.lock([namespaced_key.as_str()]).await;
+    let _guard = state
+        .key_locks
+        .lock_fields(&namespace, &[key.as_str()])
+        .await;
 
-    let existed_before = match hash_field_live(state, pool, &namespace, &key, &namespaced_key).await
-    {
+    let existed_before = match hash_field_live(state, pool, &namespace, &key).await {
         Ok(exists) => exists,
         Err(e) => {
             tracing::error!(
@@ -1268,6 +1270,7 @@ async fn hset_reply(
     if state.cfg.async_write.unwrap_or(false) {
         // Async mode: respond immediately after queueing. The inflight cache
         // serves the value until it commits.
+        let namespaced_key = state.namespaced_key(&namespace, &key);
         let token = shard_manager::next_pending_token();
         let operation = ShardWriteOperation::HSetAsync {
             namespace,
@@ -1337,8 +1340,6 @@ async fn handle_hsetex(
     expire_option: Option<crate::redis::protocol::ExpireOption>,
     fields: Vec<(String, Bytes)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use crate::redis::protocol::ExpireOption;
-
     // In Blobasaur, the hash key is the namespace, and fields are the actual keys
     let namespace = key;
 
@@ -1346,7 +1347,33 @@ async fn handle_hsetex(
         return Ok(());
     }
 
-    // Calculate expires_at timestamp from expire option
+    let response = hsetex_reply(state, namespace, fnx, fxx, expire_option, fields).await?;
+    stream.write_all(&serialize_frame(&response)).await?;
+    Ok(())
+}
+
+/// HSETEX's reply; it releases its key locks before the reply is written, as
+/// DEL.
+async fn hsetex_reply(
+    state: &Arc<AppState>,
+    namespace: String,
+    fnx: bool,
+    fxx: bool,
+    expire_option: Option<crate::redis::protocol::ExpireOption>,
+    fields: Vec<(String, Bytes)>,
+) -> Result<BytesFrame, Box<dyn std::error::Error>> {
+    use crate::redis::protocol::ExpireOption;
+
+    // Held until every write is queued or committed, so the FNX/FXX condition
+    // and the new-field count still hold when the writes land.
+    let field_refs: Vec<&str> = fields
+        .iter()
+        .map(|(field_key, _)| field_key.as_str())
+        .collect();
+    let _guards = state.key_locks.lock_fields(&namespace, &field_refs).await;
+
+    // Resolved only now, so time spent waiting for the locks doesn't shorten
+    // a relative TTL.
     let expires_at = match expire_option {
         Some(ExpireOption::Ex(seconds)) => Some(chrono::Utc::now().timestamp() + seconds as i64),
         // Round up like SET PX (the parser has range-checked it).
@@ -1362,37 +1389,11 @@ async fn handle_hsetex(
         None => None,
     };
 
-    let response = hsetex_reply(state, namespace, fnx, fxx, expires_at, fields).await?;
-    stream.write_all(&serialize_frame(&response)).await?;
-    Ok(())
-}
-
-/// HSETEX's reply; it releases its key locks before the reply is written, as
-/// DEL.
-async fn hsetex_reply(
-    state: &Arc<AppState>,
-    namespace: String,
-    fnx: bool,
-    fxx: bool,
-    expires_at: Option<i64>,
-    fields: Vec<(String, Bytes)>,
-) -> Result<BytesFrame, Box<dyn std::error::Error>> {
-    // Held until every write is queued or committed, so the FNX/FXX condition
-    // and the new-field count still hold when the writes land.
-    let namespaced_keys: Vec<String> = fields
-        .iter()
-        .map(|(field_key, _)| state.namespaced_key(&namespace, field_key))
-        .collect();
-    let _guards = state
-        .key_locks
-        .lock(namespaced_keys.iter().map(String::as_str))
-        .await;
-
     // Check every field before writing any, so a redirect or a failed FNX/FXX
     // condition leaves the hash untouched.
     let mut checked = Vec::with_capacity(fields.len());
     let mut seen = HashSet::with_capacity(fields.len());
-    for ((field_key, field_value), namespaced_key) in fields.into_iter().zip(namespaced_keys) {
+    for (field_key, field_value) in fields {
         // Check if we should handle this hash operation locally in a cluster
         if let Some(ref cluster_manager) = state.cluster_manager
             && !cluster_manager
@@ -1408,19 +1409,18 @@ async fn hsetex_reply(
         let shard_index = state.get_shard(&field_key);
         let pool = &state.check_db_pools[shard_index];
 
-        let exists =
-            match hash_field_live(state, pool, &namespace, &field_key, &namespaced_key).await {
-                Ok(exists) => exists,
-                Err(e) => {
-                    tracing::error!(
-                        "Failed to check field existence for namespace {} key {}: {}",
-                        namespace,
-                        field_key,
-                        e
-                    );
-                    return Ok(BytesFrame::Error("ERR database error".into()));
-                }
-            };
+        let exists = match hash_field_live(state, pool, &namespace, &field_key).await {
+            Ok(exists) => exists,
+            Err(e) => {
+                tracing::error!(
+                    "Failed to check field existence for namespace {} key {}: {}",
+                    namespace,
+                    field_key,
+                    e
+                );
+                return Ok(BytesFrame::Error("ERR database error".into()));
+            }
+        };
 
         // FNX sets only if no field exists, FXX only if all of them do.
         if (fnx && exists) || (fxx && !exists) {
@@ -1429,17 +1429,11 @@ async fn hsetex_reply(
 
         // A field repeated in one command is created once; the last value wins.
         let is_new_field = !exists && seen.insert(field_key.clone());
-        checked.push((
-            field_key,
-            field_value,
-            namespaced_key,
-            shard_index,
-            is_new_field,
-        ));
+        checked.push((field_key, field_value, shard_index, is_new_field));
     }
 
     let mut new_fields_added = 0;
-    for (field_key, field_value, namespaced_key, shard_index, is_new_field) in checked {
+    for (field_key, field_value, shard_index, is_new_field) in checked {
         let value_len = field_value.len() as f64;
         let sender = &state.shard_senders[shard_index];
 
@@ -1449,6 +1443,7 @@ async fn hsetex_reply(
 
         if state.cfg.async_write.unwrap_or(false) {
             // The inflight cache serves the value until it commits.
+            let namespaced_key = state.namespaced_key(&namespace, &field_key);
             let token = shard_manager::next_pending_token();
             let pending = Pending::Value {
                 data: compressed_value.clone(),
@@ -1569,15 +1564,17 @@ async fn hdel_reply(state: &Arc<AppState>, namespace: String, key: String) -> By
 
     let shard_index = state.get_shard(&key);
     let pool = &state.check_db_pools[shard_index];
-    let namespaced_key = state.namespaced_key(&namespace, &key);
 
     // Held until the delete is queued or committed, as in DEL.
-    let _guard = state.key_locks.lock([namespaced_key.as_str()]).await;
+    let _guard = state
+        .key_locks
+        .lock_fields(&namespace, &[key.as_str()])
+        .await;
 
     // A queued async HSET counts as existing: skipping the delete would let
     // that HSET commit afterwards and bring the field back. A failed check
     // must surface instead of being reported as "not found".
-    let exists = match hash_field_live(state, pool, &namespace, &key, &namespaced_key).await {
+    let exists = match hash_field_live(state, pool, &namespace, &key).await {
         Ok(exists) => exists,
         Err(e) => {
             tracing::error!(
@@ -1600,6 +1597,7 @@ async fn hdel_reply(state: &Arc<AppState>, namespace: String, key: String) -> By
     if state.cfg.async_write.unwrap_or(false) {
         // Async mode: respond immediately after queueing. Reads see the field
         // as gone until the delete commits.
+        let namespaced_key = state.namespaced_key(&namespace, &key);
         let token = shard_manager::next_pending_token();
         let operation = ShardWriteOperation::HDeleteAsync {
             namespace,
@@ -1740,8 +1738,8 @@ async fn handle_hexpire(
     condition: Option<HExpireCondition>,
     fields: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let expires_at = chrono::Utc::now().timestamp() + seconds;
-    handle_hexpire_internal(stream, state, key, expires_at, condition, fields).await
+    let deadline = Deadline::In(seconds);
+    handle_hexpire_internal(stream, state, key, deadline, condition, fields).await
 }
 
 async fn handle_hexpireat(
@@ -1752,16 +1750,34 @@ async fn handle_hexpireat(
     condition: Option<HExpireCondition>,
     fields: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    handle_hexpire_internal(stream, state, key, unix_time_seconds, condition, fields).await
+    let deadline = Deadline::At(unix_time_seconds);
+    handle_hexpire_internal(stream, state, key, deadline, condition, fields).await
+}
+
+/// When an expiry set by a command falls: `In` seconds from when the command
+/// gets its key locks, or `At` a Unix time. A relative one is resolved only
+/// once the locks are held, so time spent waiting for them doesn't shorten it.
+#[derive(Clone, Copy)]
+enum Deadline {
+    In(i64),
+    At(i64),
+}
+
+impl Deadline {
+    fn resolve(self) -> i64 {
+        match self {
+            Deadline::In(seconds) => chrono::Utc::now().timestamp() + seconds,
+            Deadline::At(timestamp) => timestamp,
+        }
+    }
 }
 
 /// Shared implementation for HEXPIRE and HEXPIREAT.
-/// Both commands resolve to an absolute `expires_at` timestamp before calling this.
 async fn handle_hexpire_internal(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
     key: String,
-    expires_at: i64,
+    deadline: Deadline,
     condition: Option<HExpireCondition>,
     fields: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1772,7 +1788,7 @@ async fn handle_hexpire_internal(
         return Ok(());
     }
 
-    let response = hexpire_reply(state, namespace, expires_at, condition, fields).await;
+    let response = hexpire_reply(state, namespace, deadline, condition, fields).await;
     if matches!(response, BytesFrame::Array(_)) {
         state.metrics.record_storage_operation();
     }
@@ -1785,7 +1801,7 @@ async fn handle_hexpire_internal(
 async fn hexpire_reply(
     state: &Arc<AppState>,
     namespace: String,
-    expires_at: i64,
+    deadline: Deadline,
     condition: Option<HExpireCondition>,
     fields: Vec<String>,
 ) -> BytesFrame {
@@ -1806,14 +1822,9 @@ async fn hexpire_reply(
 
     // An expiry in the past removes a field, so this orders against the
     // commands that check one, as in HDEL.
-    let namespaced_keys: Vec<String> = fields
-        .iter()
-        .map(|field_key| state.namespaced_key(&namespace, field_key))
-        .collect();
-    let _guards = state
-        .key_locks
-        .lock(namespaced_keys.iter().map(String::as_str))
-        .await;
+    let field_refs: Vec<&str> = fields.iter().map(String::as_str).collect();
+    let _guards = state.key_locks.lock_fields(&namespace, &field_refs).await;
+    let expires_at = deadline.resolve();
 
     let mut field_results: Vec<i64> = Vec::with_capacity(fields.len());
     for field_key in fields {
@@ -2100,10 +2111,12 @@ async fn handle_expire(
 async fn expire_reply(state: &Arc<AppState>, key: String, seconds: u64) -> BytesFrame {
     let shard_index = state.get_shard(&key);
     let sender = &state.shard_senders[shard_index];
-    let expires_at = chrono::Utc::now().timestamp() + seconds as i64;
 
     // EXPIRE 0 removes the key, so this orders against DEL's check.
-    let _guard = state.key_locks.lock([key.as_str()]).await;
+    let _guard = state.key_locks.lock_keys(&[key.as_str()]).await;
+    // Resolved only now, so time spent waiting for the lock doesn't shorten
+    // the TTL.
+    let expires_at = chrono::Utc::now().timestamp() + seconds as i64;
 
     let (responder_tx, responder_rx) = oneshot::channel();
 
@@ -2830,11 +2843,17 @@ mod tests {
             let ctx = TestContext::new(async_write).await;
             for round in 0..ROUNDS {
                 // A new namespace each round, so the winner's write also
-                // creates the namespace table.
+                // creates the namespace table. Half the clients spell it in
+                // upper case: SQLite stores both spellings in one table.
                 let namespace = format!("ns{round}");
                 let field = "lock".to_string();
                 let replies = concurrent_integer_replies(&ctx, CLIENTS, |i, state, mut stream| {
-                    let (namespace, field) = (namespace.clone(), field.clone());
+                    let namespace = if i % 2 == 0 {
+                        namespace.clone()
+                    } else {
+                        namespace.to_ascii_uppercase()
+                    };
+                    let field = field.clone();
                     Box::pin(async move {
                         let value = Bytes::from(format!("client{i}"));
                         handle_hsetex(
@@ -2904,19 +2923,17 @@ mod tests {
                 assert_null(hget_value(&ctx, "ns", &field).await);
             }
 
-            // Control: with no HDEL racing them, every FXX write lands.
+            // Control: with no HDEL racing them, FXX writes land. HSETEX
+            // replies with the count of new fields, which FXX never adds.
+            let frame = respond_with(&ctx, |state, mut stream| {
+                Box::pin(async move {
+                    handle_hset(&mut stream, &state, "ns".into(), "kept".into(), "v0".into()).await
+                })
+            })
+            .await;
+            assert_integer_response(frame, 1);
             let replies = concurrent_integer_replies(&ctx, CLIENTS, |i, state, mut stream| {
                 Box::pin(async move {
-                    if i == 0 {
-                        return handle_hset(
-                            &mut stream,
-                            &state,
-                            "ns".into(),
-                            "kept".into(),
-                            "v0".into(),
-                        )
-                        .await;
-                    }
                     handle_hsetex(
                         &mut stream,
                         &state,
@@ -2930,15 +2947,13 @@ mod tests {
                 })
             })
             .await;
-            // HSETEX replies with the count of new fields, which FXX never adds.
-            assert_eq!(
-                replies,
-                [1, 0, 0, 0, 0, 0, 0, 0],
-                "async_write={async_write}"
-            );
-            assert_bulk_string(
-                hget_value(&ctx, "ns", "kept").await,
-                format!("client{}", CLIENTS - 1).as_bytes(),
+            assert_eq!(replies, [0; CLIENTS], "async_write={async_write}");
+            let BytesFrame::BulkString(value) = hget_value(&ctx, "ns", "kept").await else {
+                panic!("FXX control field is missing");
+            };
+            assert!(
+                value.starts_with(b"client"),
+                "async_write={async_write}: no FXX write landed"
             );
             ctx.shutdown().await;
         }
@@ -3013,6 +3028,67 @@ mod tests {
             }
             ctx.shutdown().await;
         }
+    }
+
+    #[tokio::test]
+    async fn hdel_finds_a_field_whatever_the_namespace_case() {
+        for async_write in [false, true] {
+            let ctx = TestContext::new(async_write).await;
+            let frame = respond_with(&ctx, |state, mut stream| {
+                Box::pin(async move {
+                    handle_hset(&mut stream, &state, "NS".into(), "f".into(), "v".into()).await
+                })
+            })
+            .await;
+            assert_integer_response(frame, 1);
+            wait_for_commit(
+                &ctx.state.inflight_hcache,
+                &ctx.state.namespaced_key("NS", "f"),
+            )
+            .await;
+
+            let frame = respond_with(&ctx, |state, mut stream| {
+                Box::pin(
+                    async move { handle_hdel(&mut stream, &state, "ns".into(), "f".into()).await },
+                )
+            })
+            .await;
+            assert_integer_response(frame, 1);
+            assert_null(hget_value(&ctx, "NS", "f").await);
+            ctx.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn waiting_for_a_key_lock_doesnt_shorten_a_relative_ttl() {
+        let ctx = TestContext::new(false).await;
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_hset(&mut stream, &state, "ns".into(), "f".into(), "v".into()).await
+            })
+        })
+        .await;
+        assert_integer_response(frame, 1);
+
+        // Hold the field's lock past the second HEXPIRE asks for. Its TTL
+        // counts from when it gets the lock, so the field must survive.
+        let guard = ctx.state.key_locks.lock_fields("ns", &["f"]).await;
+        let hexpire = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_hexpire(&mut stream, &state, "ns".into(), 1, None, vec!["f".into()]).await
+            })
+        });
+        let release = async {
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            drop(guard);
+        };
+        let (frame, ()) = tokio::join!(hexpire, release);
+        match frame {
+            BytesFrame::Array(codes) => assert_eq!(codes, [BytesFrame::Integer(1)]),
+            other => panic!("Expected HEXPIRE codes, got {:?}", other),
+        }
+        assert_bulk_string(hget_value(&ctx, "ns", "f").await, b"v");
+        ctx.shutdown().await;
     }
 
     #[tokio::test]
