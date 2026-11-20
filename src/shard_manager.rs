@@ -266,6 +266,12 @@ pub fn is_missing_table(error: &sqlx::Error, table: &str) -> bool {
     let sqlx::Error::Database(db) = error else {
         return false;
     };
+    // A missing table is a plain SQLITE_ERROR (1). Checking the code too keeps
+    // a trigger's RAISE with the same message (SQLITE_CONSTRAINT_TRIGGER) an
+    // error.
+    if db.code().as_deref() != Some("1") {
+        return false;
+    }
     let Some(missing) = db.message().strip_prefix("no such table: ") else {
         return false;
     };
@@ -1686,6 +1692,11 @@ mod tests {
              updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)",
             "INSERT INTO blobs_trig (key, data, created_at, updated_at) VALUES ('f', x'00', 0, 0)",
             "CREATE TRIGGER audit AFTER DELETE ON blobs_trig BEGIN INSERT INTO missing_audit VALUES (old.key); END",
+            // ...or on a trigger raising the message a missing table gives.
+            "CREATE TABLE blobs_raise (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)",
+            "INSERT INTO blobs_raise (key, data, created_at, updated_at) VALUES ('f', x'00', 0, 0)",
+            "CREATE TRIGGER spoof BEFORE DELETE ON blobs_raise BEGIN SELECT RAISE(ABORT, 'no such table: blobs_raise'); END",
         ] {
             sqlx::query(sql).execute(&pool).await.unwrap();
         }
@@ -1697,6 +1708,7 @@ mod tests {
         let (delete_tx, delete_rx) = oneshot::channel();
         let (missing_tx, missing_rx) = oneshot::channel();
         let (trigger_tx, trigger_rx) = oneshot::channel();
+        let (raise_tx, raise_rx) = oneshot::channel();
         let mut batch = VecDeque::from([
             ShardWriteOperation::HExpire {
                 namespace: "ns".to_string(),
@@ -1723,6 +1735,11 @@ mod tests {
                 key: "f".to_string(),
                 responder: trigger_tx,
             },
+            ShardWriteOperation::HDelete {
+                namespace: "raise".to_string(),
+                key: "f".to_string(),
+                responder: raise_tx,
+            },
         ]);
         process_batch(
             0,
@@ -1742,6 +1759,11 @@ mod tests {
         assert!(
             trigger_result.is_err(),
             "HDEL hid another table's error: {trigger_result:?}"
+        );
+        let raise_result = raise_rx.await.unwrap();
+        assert!(
+            raise_result.is_err(),
+            "HDEL hid a trigger's error: {raise_result:?}"
         );
         let keys: Vec<(String,)> = sqlx::query_as("SELECT key FROM blobs_ns")
             .fetch_all(&pool)
