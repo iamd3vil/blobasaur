@@ -1058,12 +1058,6 @@ async fn validate_hash_namespace(
     Ok(false)
 }
 
-/// Namespace tables are created per shard on the first HSET routed there, so a
-/// read can hit a shard without the table. That's a miss, not an error.
-fn is_missing_table(error: &sqlx::Error) -> bool {
-    matches!(error, sqlx::Error::Database(db) if db.message().starts_with("no such table"))
-}
-
 /// Whether a live hash field exists, for the commands that check before
 /// writing. A queued async write or delete of the field decides it; otherwise
 /// the DB does. The inflight cache must be checked first: an entry is cleared
@@ -1094,7 +1088,7 @@ async fn hash_field_live(
         .await
     {
         Ok(row) => Ok(row.is_some()),
-        Err(e) if is_missing_table(&e) => Ok(false),
+        Err(e) if shard_manager::is_missing_table(&e) => Ok(false),
         Err(e) => Err(e),
     }
 }
@@ -1184,7 +1178,7 @@ async fn handle_hget(
             let response = BytesFrame::Null;
             stream.write_all(&serialize_frame(&response)).await?;
         }
-        Err(e) if is_missing_table(&e) => {
+        Err(e) if shard_manager::is_missing_table(&e) => {
             state.metrics.record_read("hget", "sqlite", "miss");
             stream
                 .write_all(&serialize_frame(&BytesFrame::Null))
@@ -1710,7 +1704,7 @@ async fn handle_hexists(
             let response = BytesFrame::Integer(0);
             stream.write_all(&serialize_frame(&response)).await?;
         }
-        Err(e) if is_missing_table(&e) => {
+        Err(e) if shard_manager::is_missing_table(&e) => {
             stream
                 .write_all(&serialize_frame(&BytesFrame::Integer(0)))
                 .await?;
