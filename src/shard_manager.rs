@@ -245,6 +245,45 @@ pub async fn queue_pending(
     Ok(())
 }
 
+/// The table holding `namespace`'s hash fields. SQLite matches table names
+/// regardless of case, so `NS` and `ns` share a table; the name is lowercased
+/// so the writer's table bookkeeping agrees.
+pub fn namespace_table(namespace: &str) -> String {
+    format!("blobs_{}", namespace.to_ascii_lowercase())
+}
+
+/// The inflight cache key of a hash field. The namespace is lowercased, as in
+/// [`namespace_table`], so `NS` and `ns` share an entry as they share a table.
+pub fn namespaced_key(namespace: &str, key: &str) -> String {
+    format!("{}:{}", namespace.to_ascii_lowercase(), key)
+}
+
+/// Whether a query on `table` failed because that table doesn't exist.
+/// Namespace tables are created per shard on the first HSET routed there, so a
+/// query can hit a shard without the table. That's a miss, not an error. Any
+/// other missing table, e.g. one a trigger refers to, is a real error.
+pub fn is_missing_table(error: &sqlx::Error, table: &str) -> bool {
+    let sqlx::Error::Database(db) = error else {
+        return false;
+    };
+    // A missing table is SQLITE_ERROR (1), or SQLITE_SCHEMA (17) when the
+    // schema changed while the statement was prepared, e.g. as another
+    // connection creates the table. Checking the code keeps a trigger's RAISE
+    // with the same message (SQLITE_CONSTRAINT_TRIGGER) an error.
+    let primary_code = db
+        .code()
+        .and_then(|code| code.parse::<i32>().ok())
+        .map(|code| code & 0xff);
+    if !matches!(primary_code, Some(1 | 17)) {
+        return false;
+    }
+    let Some(missing) = db.message().strip_prefix("no such table: ") else {
+        return false;
+    };
+    let missing = missing.strip_prefix("main.").unwrap_or(missing);
+    missing.eq_ignore_ascii_case(table)
+}
+
 /// A fresh token for a [`Pending`] entry and its queued async op.
 pub fn next_pending_token() -> u64 {
     static NEXT_TOKEN: AtomicU64 = AtomicU64::new(0);
@@ -481,7 +520,7 @@ async fn clear_pending_entries(
                 ..
             } => {
                 value_bytes += data.len();
-                let namespaced_key = format!("{}:{}", namespace, key);
+                let namespaced_key = namespaced_key(namespace, key);
                 clear_pending_write(inflight_hcache, &namespaced_key, *token).await;
             }
             ShardWriteOperation::HDeleteAsync {
@@ -489,7 +528,7 @@ async fn clear_pending_entries(
                 key,
                 token,
             } => {
-                let namespaced_key = format!("{}:{}", namespace, key);
+                let namespaced_key = namespaced_key(namespace, key);
                 clear_pending_write(inflight_hcache, &namespaced_key, *token).await;
             }
             _ => {}
@@ -583,6 +622,8 @@ async fn process_batch(
 
     // One entry per op, in batch order.
     let mut results: Vec<Result<(), String>> = Vec::with_capacity(batch.len());
+    // Tables this batch added to known_tables; see the commit below.
+    let mut created_tables: Vec<String> = Vec::new();
     let mut expire_results: Vec<(usize, bool)> = Vec::new();
     let mut hexpire_results: Vec<(usize, i64)> = Vec::new();
     let mut sync_operations: Vec<usize> = Vec::new();
@@ -665,11 +706,16 @@ async fn process_batch(
                     sync_operations.push(idx)
                 }
 
-                let table_name = format!("blobs_{}", namespace);
+                let table_name = namespace_table(namespace);
 
                 // Ensure table exists
-                if let Err(e) =
-                    ensure_namespaced_table_exists(&mut tx, &table_name, known_tables).await
+                if let Err(e) = ensure_namespaced_table_exists(
+                    &mut tx,
+                    namespace,
+                    known_tables,
+                    &mut created_tables,
+                )
+                .await
                 {
                     tracing::error!("[Shard {}] Failed to ensure table exists: {}", shard_id, e);
                     Err(e)
@@ -753,11 +799,16 @@ async fn process_batch(
                     sync_operations.push(idx)
                 }
 
-                let table_name = format!("blobs_{}", namespace);
+                let table_name = namespace_table(namespace);
 
                 // Ensure table exists
-                if let Err(e) =
-                    ensure_namespaced_table_exists(&mut tx, &table_name, known_tables).await
+                if let Err(e) = ensure_namespaced_table_exists(
+                    &mut tx,
+                    namespace,
+                    known_tables,
+                    &mut created_tables,
+                )
+                .await
                 {
                     tracing::error!("[Shard {}] Failed to ensure table exists: {}", shard_id, e);
                     Err(e)
@@ -831,29 +882,25 @@ async fn process_batch(
                     sync_operations.push(idx)
                 }
 
-                let table_name = format!("blobs_{}", namespace);
+                let table_name = namespace_table(namespace);
 
-                // Only delete if table exists
-                if known_tables.contains(&table_name) {
-                    let delete_query = format!("DELETE FROM {} WHERE key = ?", table_name);
-                    sqlx::query(&delete_query)
-                        .bind(key)
-                        .execute(&mut *tx)
-                        .await
-                        .map(|_| ())
-                        .map_err(|e| {
-                            tracing::error!(
-                                "[Shard {}] HDEL error for namespace {} key {}: {}",
-                                shard_id,
-                                namespace,
-                                key,
-                                e
-                            );
-                            e.to_string()
-                        })
-                } else {
-                    // Table doesn't exist, operation succeeds (key doesn't exist)
-                    Ok(())
+                // Asks SQLite rather than known_tables, which can be wrong
+                // after a failed commit (see process_batch). A missing table
+                // means the field doesn't exist: nothing to delete.
+                let delete_query = format!("DELETE FROM {} WHERE key = ?", table_name);
+                match sqlx::query(&delete_query).bind(key).execute(&mut *tx).await {
+                    Ok(_) => Ok(()),
+                    Err(e) if is_missing_table(&e, &table_name) => Ok(()),
+                    Err(e) => {
+                        tracing::error!(
+                            "[Shard {}] HDEL error for namespace {} key {}: {}",
+                            shard_id,
+                            namespace,
+                            key,
+                            e
+                        );
+                        Err(e.to_string())
+                    }
                 }
             }
             ShardWriteOperation::Expire {
@@ -895,7 +942,6 @@ async fn process_batch(
                 let (result_code, operation_result) = handle_hexpire_operation(
                     &mut tx,
                     shard_id,
-                    known_tables,
                     namespace,
                     key,
                     *expires_at,
@@ -923,6 +969,15 @@ async fn process_batch(
     shard_metrics.record_transaction(commit_result.is_ok(), tx_start.elapsed());
     if let Err(e) = &commit_result {
         shard_metrics.record_sqlite_error("commit", e);
+        // Their CREATE TABLE may have rolled back with the batch. Forgetting
+        // them makes the next write to their namespace create them again.
+        // Some may exist anyway (after e.g. SQLITE_FULL, SQLite rolls back
+        // and runs the rest of the batch outside the transaction); then the
+        // CREATE TABLE IF NOT EXISTS is a no-op. Nothing else trusts
+        // known_tables: HDEL and HEXPIRE ask SQLite.
+        for table in &created_tables {
+            known_tables.remove(table);
+        }
     }
     for e in results.iter().filter_map(|r| r.as_ref().err()) {
         shard_metrics.record_sqlite_error("execute", e);
@@ -1042,18 +1097,12 @@ async fn begin<'c>(
 async fn handle_hexpire_operation(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     shard_id: usize,
-    known_tables: &HashSet<String>,
     namespace: &str,
     key: &str,
     expires_at: i64,
     condition: Option<HExpireCondition>,
 ) -> (i64, Result<(), String>) {
-    let table_name = format!("blobs_{}", namespace);
-
-    // HEXPIRE should be a no-op for missing namespaces.
-    if !known_tables.contains(&table_name) {
-        return (-2, Ok(()));
-    }
+    let table_name = namespace_table(namespace);
 
     // Treat logically expired fields as non-existent.
     let now = Utc::now().timestamp();
@@ -1067,7 +1116,9 @@ async fn handle_hexpire_operation(
         .fetch_optional(&mut **tx)
         .await
     {
+        // A missing namespace table is a missing field, as in HDEL.
         Ok(None) => (-2, Ok(())),
+        Err(e) if is_missing_table(&e, &table_name) => (-2, Ok(())),
         Ok(Some((current_expires_at,))) => {
             // Apply condition check before mutating the row.
             let should_set = match condition {
@@ -1407,7 +1458,9 @@ async fn load_existing_tables(pool: &SqlitePool, shard_id: usize) -> HashSet<Str
     {
         Ok(rows) => {
             for (table_name,) in rows {
-                tables.insert(table_name);
+                // Lowercased like namespace_table, since SQLite matches
+                // table names regardless of case.
+                tables.insert(table_name.to_ascii_lowercase());
             }
             tracing::info!(
                 "[Shard {}] Loaded {} existing namespaced tables",
@@ -1423,12 +1476,17 @@ async fn load_existing_tables(pool: &SqlitePool, shard_id: usize) -> HashSet<Str
     tables
 }
 
-// Ensure a namespaced table exists, creating it if necessary
+/// Ensures `namespace`'s table exists, creating it if necessary. A table it
+/// creates is added to `known_tables` and to `created`, so the caller can
+/// forget it again if the transaction doesn't commit.
 async fn ensure_namespaced_table_exists(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    table_name: &str,
+    namespace: &str,
     known_tables: &mut HashSet<String>,
+    created: &mut Vec<String>,
 ) -> Result<(), String> {
+    let table_name = namespace_table(namespace);
+    let table_name = table_name.as_str();
     if known_tables.contains(table_name) {
         return Ok(());
     }
@@ -1450,13 +1508,17 @@ async fn ensure_namespaced_table_exists(
             // Create index on expires_at for efficient expiry queries
             let index_query = format!(
                 "CREATE INDEX IF NOT EXISTS idx_{}_expires_at ON {}(expires_at) WHERE expires_at IS NOT NULL",
-                table_name.replace("blobs_", ""),
+                // Named from the namespace as the client spelled it, as before
+                // table names were lowercased, so lowercasing doesn't change
+                // index names or make new ones collide with existing ones.
+                namespace.replace("blobs_", ""),
                 table_name
             );
 
             match sqlx::query(&index_query).execute(&mut **tx).await {
                 Ok(_) => {
                     known_tables.insert(table_name.to_string());
+                    created.push(table_name.to_string());
                     tracing::info!(
                         "Created namespaced table and expires_at index: {}",
                         table_name
@@ -1618,6 +1680,101 @@ mod tests {
         assert_eq!(value, vec![7u8; 1024]);
         // A copy would be a new allocation sized to the value.
         assert_eq!(value.capacity(), 4096, "value was copied");
+    }
+
+    #[tokio::test]
+    async fn hdel_and_hexpire_dont_trust_known_tables() {
+        // A table the writer has no record of, as after a commit that failed
+        // although SQLite kept the table (see process_batch).
+        let (_temp_dir, pool) = create_test_pool().await;
+        for sql in [
+            "CREATE TABLE blobs_ns (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)",
+            "INSERT INTO blobs_ns (key, data, created_at, updated_at) VALUES ('e', x'00', 0, 0)",
+            "INSERT INTO blobs_ns (key, data, created_at, updated_at) VALUES ('d', x'00', 0, 0)",
+            // A delete here fails on a missing table other than its own.
+            "CREATE TABLE blobs_trig (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)",
+            "INSERT INTO blobs_trig (key, data, created_at, updated_at) VALUES ('f', x'00', 0, 0)",
+            "CREATE TRIGGER audit AFTER DELETE ON blobs_trig BEGIN INSERT INTO missing_audit VALUES (old.key); END",
+            // ...or on a trigger raising the message a missing table gives.
+            "CREATE TABLE blobs_raise (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)",
+            "INSERT INTO blobs_raise (key, data, created_at, updated_at) VALUES ('f', x'00', 0, 0)",
+            "CREATE TRIGGER spoof BEFORE DELETE ON blobs_raise BEGIN SELECT RAISE(ABORT, 'no such table: blobs_raise'); END",
+        ] {
+            sqlx::query(sql).execute(&pool).await.unwrap();
+        }
+        let mut tables = HashSet::from(["blobs".to_string()]);
+        let cache = Cache::new(16);
+        let hcache = Cache::new(16);
+
+        let (expire_tx, expire_rx) = oneshot::channel();
+        let (delete_tx, delete_rx) = oneshot::channel();
+        let (missing_tx, missing_rx) = oneshot::channel();
+        let (trigger_tx, trigger_rx) = oneshot::channel();
+        let (raise_tx, raise_rx) = oneshot::channel();
+        let mut batch = VecDeque::from([
+            ShardWriteOperation::HExpire {
+                namespace: "ns".to_string(),
+                key: "e".to_string(),
+                expires_at: Utc::now().timestamp() + 60,
+                condition: None,
+                responder: expire_tx,
+            },
+            ShardWriteOperation::HDelete {
+                namespace: "ns".to_string(),
+                key: "d".to_string(),
+                responder: delete_tx,
+            },
+            // A namespace with no table at all is still a plain miss.
+            ShardWriteOperation::HExpire {
+                namespace: "other".to_string(),
+                key: "e".to_string(),
+                expires_at: Utc::now().timestamp() + 60,
+                condition: None,
+                responder: missing_tx,
+            },
+            ShardWriteOperation::HDelete {
+                namespace: "trig".to_string(),
+                key: "f".to_string(),
+                responder: trigger_tx,
+            },
+            ShardWriteOperation::HDelete {
+                namespace: "raise".to_string(),
+                key: "f".to_string(),
+                responder: raise_tx,
+            },
+        ]);
+        process_batch(
+            0,
+            &pool,
+            &mut batch,
+            &mut tables,
+            &cache,
+            &hcache,
+            &ShardMetrics::new(0),
+        )
+        .await;
+
+        assert_eq!(expire_rx.await.unwrap(), Ok(1));
+        assert_eq!(delete_rx.await.unwrap(), Ok(()));
+        assert_eq!(missing_rx.await.unwrap(), Ok(-2));
+        let trigger_result = trigger_rx.await.unwrap();
+        assert!(
+            trigger_result.is_err(),
+            "HDEL hid another table's error: {trigger_result:?}"
+        );
+        let raise_result = raise_rx.await.unwrap();
+        assert!(
+            raise_result.is_err(),
+            "HDEL hid a trigger's error: {raise_result:?}"
+        );
+        let keys: Vec<(String,)> = sqlx::query_as("SELECT key FROM blobs_ns")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(keys, [("e".to_string(),)], "HDEL left its field in place");
     }
 
     async fn create_test_pool() -> (TempDir, SqlitePool) {
@@ -1816,6 +1973,19 @@ mod tests {
         drop(batch);
 
         // Only the test's own handle is left: the cache let go of its copy.
+        // moka frees a removed value through crossbeam-epoch, once every
+        // thread in the process has moved past the epoch it was removed in, so
+        // other tests running in parallel can delay it. Activity on another
+        // cache lets that reclamation run without housekeeping `cache` itself,
+        // which is what clear_pending_entries must do.
+        let other: Cache<u32, ()> = Cache::new(16);
+        for i in 0..1000 {
+            if value.is_unique() {
+                break;
+            }
+            other.insert(i % 16, ()).await;
+            tokio::task::yield_now().await;
+        }
         assert!(value.is_unique(), "cache still holds the value");
     }
 
