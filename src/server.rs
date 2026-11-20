@@ -763,6 +763,10 @@ async fn handle_del_multiple(
         let shard_index = state.get_shard(&key);
         let pool = &state.check_db_pools[shard_index];
 
+        // Held until the delete is queued or committed, so concurrent DELs of
+        // this key can't all see it and all count it as deleted.
+        let _guard = state.key_locks.lock([key.as_str()]).await;
+
         // A queued async SET is in the inflight cache but not the DB yet. It
         // counts as existing: skipping the delete would let that SET commit
         // afterwards and bring the key back. A queued DEL means it's gone.
@@ -1230,6 +1234,11 @@ async fn handle_hset(
     let shard_index = state.get_shard(&key);
     let pool = &state.check_db_pools[shard_index];
     let table_name = format!("blobs_{}", namespace);
+    let namespaced_key = state.namespaced_key(&namespace, &key);
+
+    // Held until the write is queued or committed, so concurrent HSETs of a
+    // new field can't all report it as added.
+    let _guard = state.key_locks.lock([namespaced_key.as_str()]).await;
 
     let table_exists = match hash_table_exists(pool, &table_name).await {
         Ok(exists) => exists,
@@ -1246,11 +1255,7 @@ async fn handle_hset(
     };
 
     // A queued async HSET or HDEL of this field decides it, as in HDEL.
-    let pending = shard_manager::pending_exists(
-        &state.inflight_hcache,
-        &state.namespaced_key(&namespace, &key),
-    )
-    .await;
+    let pending = shard_manager::pending_exists(&state.inflight_hcache, &namespaced_key).await;
     let existed_before = match pending {
         Some(exists) => exists,
         None => match hash_field_exists(pool, &table_name, &key, table_exists).await {
@@ -1279,7 +1284,6 @@ async fn handle_hset(
     if state.cfg.async_write.unwrap_or(false) {
         // Async mode: respond immediately after queueing. The inflight cache
         // serves the value until it commits.
-        let namespaced_key = state.namespaced_key(&namespace, &key);
         let token = shard_manager::next_pending_token();
         let operation = ShardWriteOperation::HSetAsync {
             namespace,
@@ -1390,6 +1394,17 @@ async fn handle_hsetex(
         }
         None => None,
     };
+
+    // Held until every write is queued or committed, so the FNX/FXX condition
+    // and the new-field count still hold when the writes land.
+    let lock_keys: Vec<String> = fields
+        .iter()
+        .map(|(field_key, _)| state.namespaced_key(&namespace, field_key))
+        .collect();
+    let _guards = state
+        .key_locks
+        .lock(lock_keys.iter().map(String::as_str))
+        .await;
 
     // Check every field before writing any, so a redirect or a failed FNX/FXX
     // condition leaves the hash untouched.
@@ -1620,6 +1635,8 @@ async fn handle_hdel(
     // Otherwise check the DB. A missing namespace table is a genuine miss; any
     // other failure must surface instead of being reported as "not found".
     let namespaced_key = state.namespaced_key(&namespace, &key);
+    // Held until the delete is queued or committed, as in DEL.
+    let _guard = state.key_locks.lock([namespaced_key.as_str()]).await;
     let pending = shard_manager::pending_exists(&state.inflight_hcache, &namespaced_key).await;
     let exists = if let Some(exists) = pending {
         exists
@@ -1871,6 +1888,11 @@ async fn handle_hexpire_internal(
 
         let shard_index = state.get_shard(&field_key);
         let sender = &state.shard_senders[shard_index];
+
+        // An expiry in the past removes the field, so this orders against the
+        // commands that check it, as in HDEL.
+        let namespaced_key = state.namespaced_key(&namespace, &field_key);
+        let _guard = state.key_locks.lock([namespaced_key.as_str()]).await;
 
         let (responder_tx, responder_rx) = oneshot::channel();
 
@@ -2157,6 +2179,9 @@ async fn handle_expire(
     let shard_index = state.get_shard(&key);
     let sender = &state.shard_senders[shard_index];
     let expires_at = chrono::Utc::now().timestamp() + seconds as i64;
+
+    // EXPIRE 0 removes the key, so this orders against DEL's check.
+    let _guard = state.key_locks.lock([key.as_str()]).await;
 
     let (responder_tx, responder_rx) = oneshot::channel();
 
@@ -2480,7 +2505,7 @@ mod tests {
     use crate::config::{Cfg, SqliteConfig};
     use crate::redis::parse_resp_with_remaining;
     use crate::shard_manager::{self, ShardWriteOperation};
-    use futures::future::BoxFuture;
+    use futures::future::{BoxFuture, join_all};
     use tempfile::TempDir;
     use tokio::net::{TcpListener, TcpStream};
     use tokio::time::{Duration, timeout};
@@ -2841,6 +2866,200 @@ mod tests {
         assert_integer_response(read_response(client_stream).await, 1);
 
         ctx.shutdown().await;
+    }
+
+    type CommandFuture = BoxFuture<'static, Result<(), Box<dyn std::error::Error>>>;
+
+    /// Runs `clients` copies of a command at once and returns their integer
+    /// replies. They interleave at every await, so without the key lock each
+    /// one's existence check runs before any of their writes land.
+    async fn concurrent_integer_replies(
+        ctx: &TestContext,
+        clients: usize,
+        command: impl Fn(usize, Arc<AppState>, TcpStream) -> CommandFuture,
+    ) -> Vec<i64> {
+        let command = &command;
+        let replies = join_all(
+            (0..clients).map(|i| respond_with(ctx, move |state, stream| command(i, state, stream))),
+        )
+        .await;
+        replies
+            .into_iter()
+            .map(|frame| match frame {
+                BytesFrame::Integer(n) => n,
+                other => panic!("Expected integer, got {:?}", other),
+            })
+            .collect()
+    }
+
+    async fn hget_value(ctx: &TestContext, namespace: &str, field: &str) -> BytesFrame {
+        let (namespace, field) = (namespace.to_string(), field.to_string());
+        respond_with(ctx, |state, mut stream| {
+            Box::pin(async move { handle_hget(&mut stream, &state, namespace, field).await })
+        })
+        .await
+    }
+
+    /// Waits for `key`'s queued async write to commit, so checks of it read
+    /// the DB (and yield) instead of the inflight cache.
+    async fn wait_for_commit(cache: &moka::future::Cache<String, Pending>, key: &str) {
+        timeout(Duration::from_secs(5), async {
+            while cache.contains_key(key) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("async write didn't commit");
+    }
+
+    const CLIENTS: usize = 8;
+    const ROUNDS: usize = 20;
+
+    #[tokio::test]
+    async fn concurrent_hsetex_fnx_has_one_winner() {
+        for async_write in [false, true] {
+            let ctx = TestContext::new(async_write).await;
+            for round in 0..ROUNDS {
+                let field = format!("lock{round}");
+                let replies = concurrent_integer_replies(&ctx, CLIENTS, |i, state, mut stream| {
+                    let field = field.clone();
+                    Box::pin(async move {
+                        let value = Bytes::from(format!("client{i}"));
+                        handle_hsetex(
+                            &mut stream,
+                            &state,
+                            "ns".to_string(),
+                            true,
+                            false,
+                            Some(crate::redis::protocol::ExpireOption::Ex(100_000)),
+                            vec![(field, value)],
+                        )
+                        .await
+                    })
+                })
+                .await;
+                let winners: Vec<usize> = (0..CLIENTS).filter(|&i| replies[i] == 1).collect();
+                assert_eq!(winners.len(), 1, "async_write={async_write}: {replies:?}");
+                let expected = format!("client{}", winners[0]);
+                assert_bulk_string(hget_value(&ctx, "ns", &field).await, expected.as_bytes());
+            }
+            ctx.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn hsetex_fxx_never_revives_a_concurrently_deleted_field() {
+        for async_write in [false, true] {
+            let ctx = TestContext::new(async_write).await;
+            for round in 0..ROUNDS {
+                let field = format!("f{round}");
+                let frame = respond_with(&ctx, |state, mut stream| {
+                    let field = field.clone();
+                    Box::pin(async move {
+                        handle_hset(&mut stream, &state, "ns".into(), field, "v0".into()).await
+                    })
+                })
+                .await;
+                assert_integer_response(frame, 1);
+                wait_for_commit(&ctx.state.inflight_hcache, &format!("ns:{field}")).await;
+
+                // Client 0 deletes the field, the rest overwrite it only if it
+                // still exists. Whatever order they run in, the field ends up
+                // deleted: an FXX write after the HDEL must not bring it back.
+                concurrent_integer_replies(&ctx, CLIENTS, |i, state, mut stream| {
+                    let field = field.clone();
+                    Box::pin(async move {
+                        if i == 0 {
+                            handle_hdel(&mut stream, &state, "ns".into(), field).await
+                        } else {
+                            handle_hsetex(
+                                &mut stream,
+                                &state,
+                                "ns".to_string(),
+                                false,
+                                true,
+                                None,
+                                vec![(field, Bytes::from(format!("client{i}")))],
+                            )
+                            .await
+                        }
+                    })
+                })
+                .await;
+                assert_null(hget_value(&ctx, "ns", &field).await);
+            }
+            ctx.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_del_counts_the_key_once() {
+        for async_write in [false, true] {
+            let ctx = TestContext::new(async_write).await;
+            for round in 0..ROUNDS {
+                let key = format!("k{round}");
+                let frame = respond_with(&ctx, |state, mut stream| {
+                    let key = key.clone();
+                    Box::pin(
+                        async move { handle_set(&mut stream, &state, key, "v".into(), None).await },
+                    )
+                })
+                .await;
+                assert_simple_string(frame, "OK");
+                wait_for_commit(&ctx.state.inflight_cache, &key).await;
+
+                let replies = concurrent_integer_replies(&ctx, CLIENTS, |_, state, mut stream| {
+                    let key = key.clone();
+                    Box::pin(
+                        async move { handle_del_multiple(&mut stream, &state, vec![key]).await },
+                    )
+                })
+                .await;
+                assert_eq!(
+                    replies.iter().sum::<i64>(),
+                    1,
+                    "async_write={async_write}: {replies:?}"
+                );
+            }
+            ctx.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_hset_and_hdel_count_the_field_once() {
+        for async_write in [false, true] {
+            let ctx = TestContext::new(async_write).await;
+            for round in 0..ROUNDS {
+                let field = format!("f{round}");
+                let added = concurrent_integer_replies(&ctx, CLIENTS, |i, state, mut stream| {
+                    let field = field.clone();
+                    Box::pin(async move {
+                        let value = Bytes::from(format!("client{i}"));
+                        handle_hset(&mut stream, &state, "ns".into(), field, value).await
+                    })
+                })
+                .await;
+                assert_eq!(
+                    added.iter().sum::<i64>(),
+                    1,
+                    "HSET async_write={async_write}: {added:?}"
+                );
+
+                let deleted = concurrent_integer_replies(&ctx, CLIENTS, |_, state, mut stream| {
+                    let field = field.clone();
+                    Box::pin(
+                        async move { handle_hdel(&mut stream, &state, "ns".into(), field).await },
+                    )
+                })
+                .await;
+                assert_eq!(
+                    deleted.iter().sum::<i64>(),
+                    1,
+                    "HDEL async_write={async_write}: {deleted:?}"
+                );
+            }
+            ctx.shutdown().await;
+        }
     }
 
     #[tokio::test]

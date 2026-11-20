@@ -5,9 +5,10 @@ use mpchash::HashRing;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Connection, SqliteConnection, SqlitePool};
 use std::fs;
+use std::hash::{BuildHasher, RandomState};
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Mutex, MutexGuard, Semaphore, mpsc};
 use tokio::task::JoinSet;
 
 use crate::compression::{self, Compressor};
@@ -55,8 +56,58 @@ pub struct AppState {
     pub compressor: Option<Box<dyn Compressor>>,
     /// Metrics collector
     pub metrics: Metrics,
+    /// Held by commands that check a key before writing it; see [`KeyLocks`].
+    pub key_locks: KeyLocks,
 
     ring: HashRing<ShardNode>,
+}
+
+/// Makes a command's existence check and its write one step per key.
+///
+/// DEL, HDEL, HSET and HSETEX decide their reply (and HSETEX FNX/FXX whether to
+/// write at all) from a check made before the write is queued. Without a lock,
+/// concurrent commands on the same key all pass the check before any of their
+/// writes land. A command holds the lock for each key it checks until its write
+/// is queued (async mode) or committed (sync mode); EXPIRE and HEXPIRE hold it
+/// too, since an expiry in the past removes the key.
+///
+/// Keys map onto a fixed set of mutexes, so unrelated keys sometimes share one.
+pub struct KeyLocks {
+    stripes: Box<[Mutex<()>]>,
+    hasher: RandomState,
+}
+
+impl Default for KeyLocks {
+    fn default() -> Self {
+        Self {
+            stripes: (0..Self::STRIPES).map(|_| Mutex::new(())).collect(),
+            hasher: RandomState::new(),
+        }
+    }
+}
+
+impl KeyLocks {
+    const STRIPES: usize = 4096;
+
+    /// Locks every key in `keys` until the guards are dropped. Each mutex is
+    /// taken once and in index order, so two commands locking overlapping sets
+    /// of keys can't deadlock.
+    pub async fn lock<'k>(
+        &self,
+        keys: impl IntoIterator<Item = &'k str>,
+    ) -> Vec<MutexGuard<'_, ()>> {
+        let mut stripes: Vec<usize> = keys
+            .into_iter()
+            .map(|key| self.hasher.hash_one(key) as usize % self.stripes.len())
+            .collect();
+        stripes.sort_unstable();
+        stripes.dedup();
+        let mut guards = Vec::with_capacity(stripes.len());
+        for stripe in stripes {
+            guards.push(self.stripes[stripe].lock().await);
+        }
+        guards
+    }
 }
 
 impl AppState {
@@ -251,6 +302,7 @@ impl AppState {
             cluster_manager,
             compressor,
             metrics,
+            key_locks: KeyLocks::default(),
             ring,
         })
     }
