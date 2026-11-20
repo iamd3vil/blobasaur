@@ -266,10 +266,15 @@ pub fn is_missing_table(error: &sqlx::Error, table: &str) -> bool {
     let sqlx::Error::Database(db) = error else {
         return false;
     };
-    // A missing table is a plain SQLITE_ERROR (1). Checking the code too keeps
-    // a trigger's RAISE with the same message (SQLITE_CONSTRAINT_TRIGGER) an
-    // error.
-    if db.code().as_deref() != Some("1") {
+    // A missing table is SQLITE_ERROR (1), or SQLITE_SCHEMA (17) when the
+    // schema changed while the statement was prepared, e.g. as another
+    // connection creates the table. Checking the code keeps a trigger's RAISE
+    // with the same message (SQLITE_CONSTRAINT_TRIGGER) an error.
+    let primary_code = db
+        .code()
+        .and_then(|code| code.parse::<i32>().ok())
+        .map(|code| code & 0xff);
+    if !matches!(primary_code, Some(1 | 17)) {
         return false;
     }
     let Some(missing) = db.message().strip_prefix("no such table: ") else {
