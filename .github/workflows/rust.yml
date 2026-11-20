@@ -21,5 +21,9 @@ jobs:
         go-version-file: tests/goredis/go.mod
         cache-dependency-path: tests/goredis/go.sum
     - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+    - name: Check formatting
+      run: cargo fmt --all -- --check
+    - name: Clippy
+      run: cargo clippy --all-targets --locked -- -D warnings
     - name: Run tests
-      run: cargo test --verbose
+      run: cargo test --locked --verbose
