@@ -609,7 +609,7 @@ CREATE TABLE blobs (
 
 **Features:**
 - **Redis-Compatible TTL**: Full support for `SET EX/PX`, `TTL`, and `EXPIRE` commands
-- **Automatic Expiry**: All read operations (`GET`, `EXISTS`, `TTL`) automatically filter expired keys
+- **Automatic Expiry**: Expired keys and hash fields count as missing for reads (`GET`, `EXISTS`, `TTL`, `HGET`, `HEXISTS`) and for writes (`EXPIRE`, `DEL`, `HSET`, `HSETEX`, `HDEL`, `HEXPIRE`), even before cleanup removes them
 - **Background Cleanup**: Per-shard cleanup tasks run every 60 seconds (`cleanup_interval_secs`) to remove expired keys
 - **Efficient Storage**: Uses indexed `expires_at` timestamps for fast expiry queries
 - **Second Resolution**: Expiry is stored in whole seconds, so `PX` TTLs are rounded up (`PX 500` lives for 1 second). `EX 0`, `PX 0` and out-of-range TTLs are rejected, as in Redis

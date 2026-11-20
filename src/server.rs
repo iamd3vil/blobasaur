@@ -770,10 +770,13 @@ async fn handle_del_multiple(
         // locked or unreadable) must not be reported as "key not found".
         let exists = match shard_manager::pending_exists(&state.inflight_cache, &key).await {
             Some(exists) => exists,
-            None => match sqlx::query("SELECT 1 FROM blobs WHERE key = ?")
-                .bind(&key)
-                .fetch_optional(pool)
-                .await
+            None => match sqlx::query(
+                "SELECT 1 FROM blobs WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
+            )
+            .bind(&key)
+            .bind(chrono::Utc::now().timestamp())
+            .fetch_optional(pool)
+            .await
             {
                 Ok(row) => row.is_some(),
                 Err(e) => {
@@ -1083,9 +1086,13 @@ async fn hash_field_exists(
         return Ok(false);
     }
 
-    let query = format!("SELECT 1 FROM {} WHERE key = ?", table_name);
+    let query = format!(
+        "SELECT 1 FROM {} WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
+        table_name
+    );
     sqlx::query(&query)
         .bind(key)
+        .bind(chrono::Utc::now().timestamp())
         .fetch_optional(pool)
         .await
         .map(|row| row.is_some())
@@ -4571,6 +4578,99 @@ mod tests {
         .await;
         assert_null(frame);
 
+        ctx.shutdown().await;
+    }
+
+    // Expired rows that cleanup has not removed yet must count as missing.
+
+    /// Calls a command handler and returns its reply.
+    macro_rules! run {
+        ($ctx:expr, $handler:ident($($arg:expr),*)) => {
+            respond_with(&$ctx, |state, stream| {
+                Box::pin(async move {
+                    let mut stream = stream;
+                    $handler(&mut stream, &state, $($arg),*).await
+                })
+            })
+            .await
+        };
+    }
+
+    async fn set_expires_at(ctx: &TestContext, table: &str, key: &str, at: i64) {
+        let pool = &ctx.state.db_pools[ctx.state.get_shard(key)];
+        sqlx::query(&format!("UPDATE {table} SET expires_at = ? WHERE key = ?"))
+            .bind(at)
+            .bind(key)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    fn past() -> i64 {
+        chrono::Utc::now().timestamp() - 60
+    }
+
+    fn v(bytes: &'static [u8]) -> Bytes {
+        Bytes::from_static(bytes)
+    }
+
+    #[tokio::test]
+    async fn expire_and_del_treat_expired_key_as_missing() {
+        let ctx = TestContext::new(false).await;
+        run!(ctx, handle_set("k".into(), v(b"old"), None));
+        set_expires_at(&ctx, "blobs", "k", past()).await;
+
+        assert_integer_response(run!(ctx, handle_expire("k".into(), 100)), 0);
+        assert_null(run!(ctx, handle_get("k".into())));
+        assert_integer_response(run!(ctx, handle_del_multiple(vec!["k".into()])), 0);
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn hash_writes_treat_expired_field_as_missing() {
+        let ctx = TestContext::new(false).await;
+        for field in ["f", "d", "x", "n"] {
+            run!(ctx, handle_hset("ns".into(), field.into(), v(b"v1")));
+            set_expires_at(&ctx, "blobs_ns", field, past()).await;
+        }
+
+        // HSET over an expired field adds it and makes it visible.
+        assert_integer_response(run!(ctx, handle_hset("ns".into(), "f".into(), v(b"v2"))), 1);
+        assert_bulk_string(hget_frame(&ctx, "f").await, b"v2");
+
+        assert_integer_response(run!(ctx, handle_hdel("ns".into(), "d".into())), 0);
+
+        let fxx = vec![("x".to_string(), v(b"v2"))];
+        assert_integer_response(
+            run!(ctx, handle_hsetex("ns".into(), false, true, None, fxx)),
+            0,
+        );
+        assert_null(hget_frame(&ctx, "x").await);
+
+        let fnx = vec![("n".to_string(), v(b"v2"))];
+        assert_integer_response(
+            run!(ctx, handle_hsetex("ns".into(), true, false, None, fnx)),
+            1,
+        );
+        assert_bulk_string(hget_frame(&ctx, "n").await, b"v2");
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn hset_keeps_ttl_of_live_field() {
+        let ctx = TestContext::new(false).await;
+        run!(ctx, handle_hset("ns".into(), "f".into(), v(b"v1")));
+        let future = chrono::Utc::now().timestamp() + 1000;
+        set_expires_at(&ctx, "blobs_ns", "f", future).await;
+
+        assert_integer_response(run!(ctx, handle_hset("ns".into(), "f".into(), v(b"v2"))), 0);
+        let pool = &ctx.state.db_pools[ctx.state.get_shard("f")];
+        let expires_at: Option<i64> =
+            sqlx::query_scalar("SELECT expires_at FROM blobs_ns WHERE key = 'f'")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(expires_at, Some(future));
         ctx.shutdown().await;
     }
 
