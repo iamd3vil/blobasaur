@@ -596,6 +596,8 @@ async fn process_batch(
 
     // One entry per op, in batch order.
     let mut results: Vec<Result<(), String>> = Vec::with_capacity(batch.len());
+    // Tables this batch added to known_tables; see the commit below.
+    let mut created_tables: Vec<String> = Vec::new();
     let mut expire_results: Vec<(usize, bool)> = Vec::new();
     let mut hexpire_results: Vec<(usize, i64)> = Vec::new();
     let mut sync_operations: Vec<usize> = Vec::new();
@@ -681,8 +683,13 @@ async fn process_batch(
                 let table_name = namespace_table(namespace);
 
                 // Ensure table exists
-                if let Err(e) =
-                    ensure_namespaced_table_exists(&mut tx, &table_name, known_tables).await
+                if let Err(e) = ensure_namespaced_table_exists(
+                    &mut tx,
+                    namespace,
+                    known_tables,
+                    &mut created_tables,
+                )
+                .await
                 {
                     tracing::error!("[Shard {}] Failed to ensure table exists: {}", shard_id, e);
                     Err(e)
@@ -769,8 +776,13 @@ async fn process_batch(
                 let table_name = namespace_table(namespace);
 
                 // Ensure table exists
-                if let Err(e) =
-                    ensure_namespaced_table_exists(&mut tx, &table_name, known_tables).await
+                if let Err(e) = ensure_namespaced_table_exists(
+                    &mut tx,
+                    namespace,
+                    known_tables,
+                    &mut created_tables,
+                )
+                .await
                 {
                     tracing::error!("[Shard {}] Failed to ensure table exists: {}", shard_id, e);
                     Err(e)
@@ -936,6 +948,12 @@ async fn process_batch(
     shard_metrics.record_transaction(commit_result.is_ok(), tx_start.elapsed());
     if let Err(e) = &commit_result {
         shard_metrics.record_sqlite_error("commit", e);
+        // Their CREATE TABLE may have rolled back with the batch. Forgetting
+        // them makes the next write to their namespace create them again;
+        // if they do exist, that's a no-op.
+        for table in &created_tables {
+            known_tables.remove(table);
+        }
     }
     for e in results.iter().filter_map(|r| r.as_ref().err()) {
         shard_metrics.record_sqlite_error("execute", e);
@@ -1438,12 +1456,17 @@ async fn load_existing_tables(pool: &SqlitePool, shard_id: usize) -> HashSet<Str
     tables
 }
 
-// Ensure a namespaced table exists, creating it if necessary
+/// Ensures `namespace`'s table exists, creating it if necessary. A table it
+/// creates is added to `known_tables` and to `created`, so the caller can
+/// forget it again if the transaction doesn't commit.
 async fn ensure_namespaced_table_exists(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    table_name: &str,
+    namespace: &str,
     known_tables: &mut HashSet<String>,
+    created: &mut Vec<String>,
 ) -> Result<(), String> {
+    let table_name = namespace_table(namespace);
+    let table_name = table_name.as_str();
     if known_tables.contains(table_name) {
         return Ok(());
     }
@@ -1465,15 +1488,17 @@ async fn ensure_namespaced_table_exists(
             // Create index on expires_at for efficient expiry queries
             let index_query = format!(
                 "CREATE INDEX IF NOT EXISTS idx_{}_expires_at ON {}(expires_at) WHERE expires_at IS NOT NULL",
-                // Only the prefix: namespace BLOBS_FOO's table is
-                // blobs_blobs_foo, whose index must not be foo's.
-                table_name.strip_prefix("blobs_").unwrap_or(table_name),
+                // Named from the namespace as the client spelled it, as before
+                // table names were lowercased, so lowercasing doesn't change
+                // index names or make new ones collide with existing ones.
+                namespace.replace("blobs_", ""),
                 table_name
             );
 
             match sqlx::query(&index_query).execute(&mut **tx).await {
                 Ok(_) => {
                     known_tables.insert(table_name.to_string());
+                    created.push(table_name.to_string());
                     tracing::info!(
                         "Created namespaced table and expires_at index: {}",
                         table_name
