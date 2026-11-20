@@ -258,10 +258,19 @@ pub fn namespaced_key(namespace: &str, key: &str) -> String {
     format!("{}:{}", namespace.to_ascii_lowercase(), key)
 }
 
+/// Whether a query on `table` failed because that table doesn't exist.
 /// Namespace tables are created per shard on the first HSET routed there, so a
-/// query can hit a shard without the table. That's a miss, not an error.
-pub fn is_missing_table(error: &sqlx::Error) -> bool {
-    matches!(error, sqlx::Error::Database(db) if db.message().starts_with("no such table"))
+/// query can hit a shard without the table. That's a miss, not an error. Any
+/// other missing table, e.g. one a trigger refers to, is a real error.
+pub fn is_missing_table(error: &sqlx::Error, table: &str) -> bool {
+    let sqlx::Error::Database(db) = error else {
+        return false;
+    };
+    let Some(missing) = db.message().strip_prefix("no such table: ") else {
+        return false;
+    };
+    let missing = missing.strip_prefix("main.").unwrap_or(missing);
+    missing.eq_ignore_ascii_case(table)
 }
 
 /// A fresh token for a [`Pending`] entry and its queued async op.
@@ -870,7 +879,7 @@ async fn process_batch(
                 let delete_query = format!("DELETE FROM {} WHERE key = ?", table_name);
                 match sqlx::query(&delete_query).bind(key).execute(&mut *tx).await {
                     Ok(_) => Ok(()),
-                    Err(e) if is_missing_table(&e) => Ok(()),
+                    Err(e) if is_missing_table(&e, &table_name) => Ok(()),
                     Err(e) => {
                         tracing::error!(
                             "[Shard {}] HDEL error for namespace {} key {}: {}",
@@ -1098,7 +1107,7 @@ async fn handle_hexpire_operation(
     {
         // A missing namespace table is a missing field, as in HDEL.
         Ok(None) => (-2, Ok(())),
-        Err(e) if is_missing_table(&e) => (-2, Ok(())),
+        Err(e) if is_missing_table(&e, &table_name) => (-2, Ok(())),
         Ok(Some((current_expires_at,))) => {
             // Apply condition check before mutating the row.
             let should_set = match condition {
@@ -1672,6 +1681,11 @@ mod tests {
              updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)",
             "INSERT INTO blobs_ns (key, data, created_at, updated_at) VALUES ('e', x'00', 0, 0)",
             "INSERT INTO blobs_ns (key, data, created_at, updated_at) VALUES ('d', x'00', 0, 0)",
+            // A delete here fails on a missing table other than its own.
+            "CREATE TABLE blobs_trig (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)",
+            "INSERT INTO blobs_trig (key, data, created_at, updated_at) VALUES ('f', x'00', 0, 0)",
+            "CREATE TRIGGER audit AFTER DELETE ON blobs_trig BEGIN INSERT INTO missing_audit VALUES (old.key); END",
         ] {
             sqlx::query(sql).execute(&pool).await.unwrap();
         }
@@ -1682,6 +1696,7 @@ mod tests {
         let (expire_tx, expire_rx) = oneshot::channel();
         let (delete_tx, delete_rx) = oneshot::channel();
         let (missing_tx, missing_rx) = oneshot::channel();
+        let (trigger_tx, trigger_rx) = oneshot::channel();
         let mut batch = VecDeque::from([
             ShardWriteOperation::HExpire {
                 namespace: "ns".to_string(),
@@ -1703,6 +1718,11 @@ mod tests {
                 condition: None,
                 responder: missing_tx,
             },
+            ShardWriteOperation::HDelete {
+                namespace: "trig".to_string(),
+                key: "f".to_string(),
+                responder: trigger_tx,
+            },
         ]);
         process_batch(
             0,
@@ -1718,6 +1738,11 @@ mod tests {
         assert_eq!(expire_rx.await.unwrap(), Ok(1));
         assert_eq!(delete_rx.await.unwrap(), Ok(()));
         assert_eq!(missing_rx.await.unwrap(), Ok(-2));
+        let trigger_result = trigger_rx.await.unwrap();
+        assert!(
+            trigger_result.is_err(),
+            "HDEL hid another table's error: {trigger_result:?}"
+        );
         let keys: Vec<(String,)> = sqlx::query_as("SELECT key FROM blobs_ns")
             .fetch_all(&pool)
             .await

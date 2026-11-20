@@ -1077,9 +1077,10 @@ async fn hash_field_live(
         return Ok(exists);
     }
 
+    let table_name = shard_manager::namespace_table(namespace);
     let query = format!(
-        "SELECT 1 FROM blobs_{} WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
-        namespace
+        "SELECT 1 FROM {} WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
+        table_name
     );
     match sqlx::query(&query)
         .bind(key)
@@ -1088,7 +1089,7 @@ async fn hash_field_live(
         .await
     {
         Ok(row) => Ok(row.is_some()),
-        Err(e) if shard_manager::is_missing_table(&e) => Ok(false),
+        Err(e) if shard_manager::is_missing_table(&e, &table_name) => Ok(false),
         Err(e) => Err(e),
     }
 }
@@ -1178,7 +1179,7 @@ async fn handle_hget(
             let response = BytesFrame::Null;
             stream.write_all(&serialize_frame(&response)).await?;
         }
-        Err(e) if shard_manager::is_missing_table(&e) => {
+        Err(e) if shard_manager::is_missing_table(&e, &table_name) => {
             state.metrics.record_read("hget", "sqlite", "miss");
             stream
                 .write_all(&serialize_frame(&BytesFrame::Null))
@@ -1704,7 +1705,7 @@ async fn handle_hexists(
             let response = BytesFrame::Integer(0);
             stream.write_all(&serialize_frame(&response)).await?;
         }
-        Err(e) if shard_manager::is_missing_table(&e) => {
+        Err(e) if shard_manager::is_missing_table(&e, &table_name) => {
             stream
                 .write_all(&serialize_frame(&BytesFrame::Integer(0)))
                 .await?;
