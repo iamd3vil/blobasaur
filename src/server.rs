@@ -3070,24 +3070,77 @@ mod tests {
         .await;
         assert_integer_response(frame, 1);
 
-        // Hold the field's lock past the second HEXPIRE asks for. Its TTL
-        // counts from when it gets the lock, so the field must survive.
+        // Hold the field's lock across a second boundary. HEXPIRE's TTL
+        // counts from when it gets the lock, so its expiry can't be earlier
+        // than the release plus the TTL.
+        const TTL: i64 = 100;
         let guard = ctx.state.key_locks.lock_fields("ns", &["f"]).await;
         let hexpire = respond_with(&ctx, |state, mut stream| {
             Box::pin(async move {
-                handle_hexpire(&mut stream, &state, "ns".into(), 1, None, vec!["f".into()]).await
+                handle_hexpire(
+                    &mut stream,
+                    &state,
+                    "ns".into(),
+                    TTL,
+                    None,
+                    vec!["f".into()],
+                )
+                .await
             })
         });
         let release = async {
             tokio::time::sleep(Duration::from_millis(1200)).await;
+            let released_at = chrono::Utc::now().timestamp();
             drop(guard);
+            released_at
         };
-        let (frame, ()) = tokio::join!(hexpire, release);
+        let (frame, released_at) = tokio::join!(hexpire, release);
         match frame {
             BytesFrame::Array(codes) => assert_eq!(codes, [BytesFrame::Integer(1)]),
             other => panic!("Expected HEXPIRE codes, got {:?}", other),
         }
-        assert_bulk_string(hget_value(&ctx, "ns", "f").await, b"v");
+        let (expires_at,): (i64,) =
+            sqlx::query_as("SELECT expires_at FROM blobs_ns WHERE key = 'f'")
+                .fetch_one(&ctx.state.db_pools[0])
+                .await
+                .unwrap();
+        assert!(
+            expires_at >= released_at + TTL,
+            "expiry {expires_at} counts from before the lock was released at {released_at}"
+        );
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn namespaces_get_their_own_expiry_index() {
+        let ctx = TestContext::new(false).await;
+        // BLOBS_FOO's table is blobs_blobs_foo: its index name must keep the
+        // inner "blobs_", or it's foo's and SQLite skips creating it.
+        for namespace in ["foo", "BLOBS_FOO"] {
+            let frame = respond_with(&ctx, |state, mut stream| {
+                Box::pin(async move {
+                    handle_hset(
+                        &mut stream,
+                        &state,
+                        namespace.into(),
+                        "f".into(),
+                        "v".into(),
+                    )
+                    .await
+                })
+            })
+            .await;
+            assert_integer_response(frame, 1);
+        }
+        let indexes: Vec<(String,)> = sqlx::query_as(
+            "SELECT tbl_name FROM sqlite_master WHERE type = 'index' AND name LIKE '%_expires_at'
+             AND tbl_name IN ('blobs_foo', 'blobs_blobs_foo') ORDER BY tbl_name",
+        )
+        .fetch_all(&ctx.state.db_pools[0])
+        .await
+        .unwrap();
+        let tables: Vec<&str> = indexes.iter().map(|(table,)| table.as_str()).collect();
+        assert_eq!(tables, ["blobs_blobs_foo", "blobs_foo"]);
         ctx.shutdown().await;
     }
 

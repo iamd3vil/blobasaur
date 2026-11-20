@@ -1465,7 +1465,9 @@ async fn ensure_namespaced_table_exists(
             // Create index on expires_at for efficient expiry queries
             let index_query = format!(
                 "CREATE INDEX IF NOT EXISTS idx_{}_expires_at ON {}(expires_at) WHERE expires_at IS NOT NULL",
-                table_name.replace("blobs_", ""),
+                // Only the prefix: namespace BLOBS_FOO's table is
+                // blobs_blobs_foo, whose index must not be foo's.
+                table_name.strip_prefix("blobs_").unwrap_or(table_name),
                 table_name
             );
 

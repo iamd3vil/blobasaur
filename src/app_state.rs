@@ -97,18 +97,17 @@ impl KeyLocks {
 
     /// Locks fields of a hash namespace until the guards are dropped. The
     /// namespace is hashed lowercased, as it's stored (see
-    /// [`crate::shard_manager::namespace_table`]), and in place: a command with
-    /// many fields doesn't copy it once per field.
+    /// [`crate::shard_manager::namespace_table`]), and once: a command with
+    /// many fields doesn't copy or rehash it per field.
     pub async fn lock_fields(&self, namespace: &str, fields: &[&str]) -> Vec<MutexGuard<'_, ()>> {
-        let hashes = fields.iter().map(|field| {
-            let mut hasher = self.hasher.build_hasher();
-            for byte in namespace.bytes() {
-                hasher.write_u8(byte.to_ascii_lowercase());
-            }
-            hasher.write_u8(b':');
-            hasher.write(field.as_bytes());
-            hasher.finish()
-        });
+        let mut namespace_hasher = self.hasher.build_hasher();
+        for byte in namespace.bytes() {
+            namespace_hasher.write_u8(byte.to_ascii_lowercase());
+        }
+        let namespace_hash = namespace_hasher.finish();
+        let hashes = fields
+            .iter()
+            .map(|field| self.hasher.hash_one((namespace_hash, field)));
         self.lock_stripes(hashes.collect()).await
     }
 
