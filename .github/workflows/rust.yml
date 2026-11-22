@@ -16,6 +16,9 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@1.100.0
+      with:
+        components: rustfmt, clippy
     - uses: actions/setup-go@v5
       with:
         go-version-file: tests/goredis/go.mod
