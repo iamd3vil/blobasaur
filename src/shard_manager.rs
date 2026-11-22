@@ -2475,6 +2475,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn namespace_table_is_recreated_after_its_creating_batch_fails_to_commit() {
+        let (_temp_dir, pool) = create_test_pool().await;
+        // Inserting "poison" adds a row with a deferred foreign key to a missing
+        // parent, so its batch fails only at COMMIT, after the batch's
+        // CREATE TABLE for the namespace has run.
+        sqlx::query(
+            "CREATE TABLE fk_child (parent_id INTEGER REFERENCES fk_parent(id) \
+             DEFERRABLE INITIALLY DEFERRED)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("CREATE TABLE fk_parent (id INTEGER PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER poison AFTER INSERT ON blobs WHEN NEW.key = 'poison' \
+             BEGIN INSERT INTO fk_child VALUES (1); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let hset = || {
+            let (responder, rx) = oneshot::channel();
+            let op = ShardWriteOperation::HSet {
+                namespace: "ns".to_string(),
+                key: "k".to_string(),
+                data: Bytes::from_static(b"v"),
+                responder,
+            };
+            (op, rx)
+        };
+        let (poison_responder, poison_rx) = oneshot::channel();
+        let poison = ShardWriteOperation::Set {
+            key: "poison".to_string(),
+            data: Bytes::from_static(b"v"),
+            expires_at: None,
+            responder: poison_responder,
+        };
+
+        // Queue both before the writer starts so they share one batch.
+        let (sender, receiver) = mpsc::channel(8);
+        let (first_hset, first_rx) = hset();
+        sender.send(first_hset).await.unwrap();
+        sender.send(poison).await.unwrap();
+        let writer = tokio::spawn(shard_writer_task(ShardWriter {
+            shard_id: 0,
+            pool: pool.clone(),
+            receiver,
+            batch_size: 8,
+            batch_timeout_ms: 0,
+            inflight_cache: Cache::new(16),
+            inflight_hcache: Cache::new(16),
+            metrics: Metrics::new(),
+            shutdown: CancellationToken::new(),
+        }));
+
+        let first = first_rx.await.unwrap();
+        assert!(
+            first.as_ref().is_err_and(|e| e.contains("FOREIGN KEY")),
+            "the batch should fail at commit: {first:?}"
+        );
+        assert!(poison_rx.await.unwrap().is_err());
+
+        // The rolled-back table must be created again, not assumed to exist.
+        let (second_hset, second_rx) = hset();
+        sender.send(second_hset).await.unwrap();
+        assert_eq!(second_rx.await.unwrap(), Ok(()));
+
+        drop(sender);
+        writer.await.unwrap();
+        let rows: Vec<(String,)> = sqlx::query_as("SELECT key FROM blobs_ns")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, vec![("k".to_string(),)]);
+    }
+
+    #[tokio::test]
     async fn async_write_waits_out_an_outside_write_lock() {
         let (_temp_dir, pool) = create_test_pool().await;
         // Another connection, e.g. a sqlite3 session, holds the write lock.
