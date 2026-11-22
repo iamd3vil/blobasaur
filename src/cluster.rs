@@ -27,6 +27,31 @@ use crate::config::ClusterConfig;
 /// Redis cluster has 16384 hash slots
 pub const REDIS_CLUSTER_SLOTS: u16 = 16384;
 
+/// Redis Cluster error reply for a hash slot with no known owner.
+pub const CLUSTERDOWN_HASH_SLOT_NOT_SERVED: &str = "CLUSTERDOWN Hash slot not served";
+
+/// Routing decision for a hash slot on this cluster node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlotRoute {
+    /// This node owns the slot and should execute the command locally.
+    Local,
+    /// Another known node owns the slot (`MOVED <slot> <addr>`).
+    Moved(String),
+    /// Neither this node nor any known peer owns the slot.
+    Unserved,
+}
+
+impl SlotRoute {
+    /// Returns the Redis error reply when the command must not execute locally.
+    pub fn into_error(self) -> Option<String> {
+        match self {
+            SlotRoute::Local => None,
+            SlotRoute::Moved(redirect) => Some(redirect),
+            SlotRoute::Unserved => Some(CLUSTERDOWN_HASH_SLOT_NOT_SERVED.to_string()),
+        }
+    }
+}
+
 /// Represents the state of a cluster node
 #[derive(Debug, Clone)]
 pub struct ClusterNode {
@@ -346,24 +371,31 @@ impl ClusterManager {
         }
     }
 
-    /// Get the node responsible for a given slot
-    pub async fn get_node_for_slot(&self, slot: u16) -> Option<ClusterNode> {
-        let nodes = self.nodes.read().await;
-
-        // First check if we own this slot
-        let local_slots = self.local_slots.read().await;
-        if local_slots.contains(&slot) {
-            return None; // We handle this slot locally
+    /// Determine how this node should route a command for `slot`.
+    pub async fn route_slot(&self, slot: u16) -> SlotRoute {
+        if self.local_slots.read().await.contains(&slot) {
+            return SlotRoute::Local;
         }
 
-        // Find the node that owns this slot
+        let nodes = self.nodes.read().await;
         for node in nodes.values() {
             if node.slots.contains(&slot) {
-                return Some(node.clone());
+                return SlotRoute::Moved(format!("MOVED {} {}", slot, node.addr));
             }
         }
 
-        None
+        SlotRoute::Unserved
+    }
+
+    /// Determine how this node should route a key command.
+    pub async fn route_key(&self, key: &str) -> SlotRoute {
+        self.route_slot(Self::calculate_slot(key)).await
+    }
+
+    /// Determine how this node should route a hash operation.
+    pub async fn route_hash(&self, namespace: &str, key: &str) -> SlotRoute {
+        self.route_slot(self.calculate_slot_for_hash(namespace, key))
+            .await
     }
 
     /// Calculate Redis hash slot for a key
@@ -413,23 +445,6 @@ impl ClusterManager {
                 // extracts the hash tag for HashTagAware.
                 Self::calculate_slot_with_strategy(key, self.namespace_strategy)
             }
-        }
-    }
-
-    /// Check if we should handle a hash operation locally
-    pub async fn should_handle_hash_locally(&self, namespace: &str, key: &str) -> bool {
-        let slot = self.calculate_slot_for_hash(namespace, key);
-        let local_slots = self.local_slots.read().await;
-        local_slots.contains(&slot)
-    }
-
-    /// Get redirect response for a hash operation
-    pub async fn get_hash_redirect_response(&self, namespace: &str, key: &str) -> Option<String> {
-        let slot = self.calculate_slot_for_hash(namespace, key);
-        if let Some(node) = self.get_node_for_slot(slot).await {
-            Some(format!("MOVED {} {}", slot, node.addr))
-        } else {
-            None
         }
     }
 
@@ -548,28 +563,6 @@ impl ClusterManager {
              cluster_stats_messages_received:0\n",
             cluster_state, total_assigned_slots, total_assigned_slots, total_nodes, total_nodes
         )
-    }
-
-    /// Check if we should handle a key locally or redirect
-    pub async fn should_handle_locally(&self, key: &str) -> bool {
-        let slot = Self::calculate_slot(key);
-        let local_slots = self.local_slots.read().await;
-        local_slots.contains(&slot)
-    }
-
-    /// Get redirect response for a key
-    pub async fn get_redirect_response(&self, key: &str) -> Option<String> {
-        let slot = Self::calculate_slot(key);
-        if let Some(node) = self.get_node_for_slot(slot).await {
-            Some(format!(
-                "MOVED {} {}:{}",
-                slot,
-                node.addr.ip(),
-                node.addr.port()
-            ))
-        } else {
-            None
-        }
     }
 
     /// Add slots to this node
@@ -853,7 +846,7 @@ mod tests {
                 for i in 0..1000 {
                     let test_key = format!("testkey{}", i);
                     if ClusterManager::calculate_slot(&test_key) == slot {
-                        assert!(manager.should_handle_locally(&test_key).await);
+                        assert_eq!(manager.route_key(&test_key).await, SlotRoute::Local);
                         break;
                     }
                 }
@@ -862,7 +855,7 @@ mod tests {
             // Test a key that definitely won't be in slots 0, 1, 2
             // We'll use a key that we know maps to a different slot
             let remote_key = "key"; // This maps to slot 12539
-            assert!(!manager.should_handle_locally(remote_key).await);
+            assert_eq!(manager.route_key(remote_key).await, SlotRoute::Unserved);
         }
     }
 
@@ -907,5 +900,91 @@ mod tests {
             assert!(after_remove.contains(&10));
             assert!(after_remove.contains(&12));
         }
+    }
+
+    fn make_test_manager(local_slots: impl IntoIterator<Item = u16>) -> ClusterManager {
+        let config = ClusterConfig {
+            enabled: true,
+            node_id: "node-a".to_string(),
+            seeds: vec![],
+            port: 7001,
+            slots: None,
+            slot_ranges: None,
+            gossip_interval_ms: Some(1000),
+            advertise_addr: Some("127.0.0.1:6401".to_string()),
+        };
+
+        ClusterManager {
+            node_id: config.node_id.clone(),
+            nodes: Arc::new(RwLock::new(HashMap::new())),
+            local_slots: Arc::new(RwLock::new(local_slots.into_iter().collect())),
+            config,
+            chitchat_handle: Arc::new(None),
+            local_addr: "127.0.0.1:6401".parse().unwrap(),
+            namespace_strategy: NamespaceDistributionStrategy::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn route_slot_distinguishes_local_moved_and_unserved() {
+        let manager = make_test_manager(0..=8191);
+        let peer_addr: SocketAddr = "127.0.0.1:6402".parse().unwrap();
+
+        // Before gossip converges: non-local slots have no known owner.
+        assert_eq!(manager.route_slot(5061).await, SlotRoute::Local);
+        assert_eq!(manager.route_slot(9706).await, SlotRoute::Unserved);
+        assert_eq!(
+            manager.route_slot(9706).await.into_error().as_deref(),
+            Some(CLUSTERDOWN_HASH_SLOT_NOT_SERVED)
+        );
+
+        // Once the peer is discovered, its slots route as MOVED.
+        manager.nodes.write().await.insert(
+            "node-b".to_string(),
+            ClusterNode {
+                id: "node-b".to_string(),
+                addr: peer_addr,
+                slots: (8192..=16383).collect(),
+                _state: "master".to_string(),
+            },
+        );
+        assert_eq!(
+            manager.route_slot(9706).await,
+            SlotRoute::Moved(format!("MOVED 9706 {}", peer_addr))
+        );
+        assert_eq!(
+            manager.route_slot(9706).await.into_error().as_deref(),
+            Some("MOVED 9706 127.0.0.1:6402")
+        );
+
+        // When the peer leaves gossip (e.g. after dead_node_grace_period),
+        // its slots must become Unserved rather than falling through locally.
+        manager.nodes.write().await.remove("node-b");
+        assert_eq!(manager.route_slot(9706).await, SlotRoute::Unserved);
+        assert_eq!(
+            manager.route_slot(9706).await.into_error().as_deref(),
+            Some(CLUSTERDOWN_HASH_SLOT_NOT_SERVED)
+        );
+        assert_eq!(manager.route_slot(5061).await, SlotRoute::Local);
+    }
+
+    #[tokio::test]
+    async fn route_key_and_route_hash_return_unserved_for_unowned_slots() {
+        let manager = make_test_manager(0..=8191);
+
+        // "bar" -> slot 5061 (local), "layout:user42" -> slot 9706 (unserved)
+        assert_eq!(ClusterManager::calculate_slot("bar"), 5061);
+        assert_eq!(ClusterManager::calculate_slot("layout:user42"), 9706);
+
+        assert_eq!(manager.route_key("bar").await, SlotRoute::Local);
+        assert_eq!(
+            manager.route_key("layout:user42").await,
+            SlotRoute::Unserved
+        );
+        assert_eq!(manager.route_hash("ns", "bar").await, SlotRoute::Local);
+        assert_eq!(
+            manager.route_hash("ns", "layout:user42").await,
+            SlotRoute::Unserved
+        );
     }
 }
