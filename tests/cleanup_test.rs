@@ -137,14 +137,15 @@ async fn cleanup_deletes_expired_rows_in_chunks_and_keeps_live_ones() {
     );
 
     // Sync writes are on disk once acknowledged.
+    let sessions_table = blobasaur::shard_manager::namespace_table("sessions");
     assert_eq!(keys_on_disk(dir.path(), "blobs").await.len(), EXPIRED + 2);
     assert_eq!(
-        keys_on_disk(dir.path(), "blobs_sessions").await.len(),
+        keys_on_disk(dir.path(), &sessions_table).await.len(),
         EXPIRED + 1
     );
 
     expire_on_disk(dir.path(), "blobs", "tmp").await;
-    expire_on_disk(dir.path(), "blobs_sessions", "f").await;
+    expire_on_disk(dir.path(), &sessions_table, "f").await;
 
     // The next 1s sweep must delete every expired row.
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -152,13 +153,13 @@ async fn cleanup_deletes_expired_rows_in_chunks_and_keeps_live_ones() {
     let kept = HashSet::from(["keep".to_string()]);
     loop {
         let blobs = keys_on_disk(dir.path(), "blobs").await;
-        let hash = keys_on_disk(dir.path(), "blobs_sessions").await;
+        let hash = keys_on_disk(dir.path(), &sessions_table).await;
         if blobs == live && hash == kept {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "expired rows not cleaned up: blobs={blobs:?} blobs_sessions={hash:?}"
+            "expired rows not cleaned up: blobs={blobs:?} {sessions_table}={hash:?}"
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }

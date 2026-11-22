@@ -1136,7 +1136,7 @@ async fn handle_hget(
 
     let shard_index = state.get_shard(&key);
     let pool = &state.db_pools[shard_index];
-    let table_name = format!("blobs_{}", namespace);
+    let table_name = shard_manager::namespace_table(&namespace);
 
     let query = format!(
         "SELECT data FROM {} WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
@@ -1649,7 +1649,7 @@ async fn handle_hexists(
 
     let shard_index = state.get_shard(&key);
     let pool = &state.db_pools[shard_index];
-    let table_name = format!("blobs_{}", namespace);
+    let table_name = shard_manager::namespace_table(&namespace);
 
     let query = format!(
         "SELECT 1 FROM {} WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
@@ -2794,16 +2794,17 @@ mod tests {
         for async_write in [false, true] {
             let ctx = TestContext::new(async_write).await;
             for round in 0..ROUNDS {
-                // A new namespace each round, so the winner's write also
-                // creates the namespace table. Half the clients spell it in
-                // upper case: SQLite stores both spellings in one table.
+                // A new namespace each round, so each winner's write also
+                // creates its namespace table. Half the clients spell it in
+                // upper case: distinct cases get distinct tables and one winner each.
                 let namespace = format!("ns{round}");
+                let upper_namespace = namespace.to_ascii_uppercase();
                 let field = "lock".to_string();
                 let replies = concurrent_integer_replies(&ctx, CLIENTS, |i, state, mut stream| {
                     let namespace = if i % 2 == 0 {
                         namespace.clone()
                     } else {
-                        namespace.to_ascii_uppercase()
+                        upper_namespace.clone()
                     };
                     let field = field.clone();
                     Box::pin(async move {
@@ -2821,12 +2822,31 @@ mod tests {
                     })
                 })
                 .await;
-                let winners: Vec<usize> = (0..CLIENTS).filter(|&i| replies[i] == 1).collect();
-                assert_eq!(winners.len(), 1, "async_write={async_write}: {replies:?}");
-                let expected = format!("client{}", winners[0]);
+                let lower_winners: Vec<usize> = (0..CLIENTS)
+                    .filter(|&i| i % 2 == 0 && replies[i] == 1)
+                    .collect();
+                let upper_winners: Vec<usize> = (0..CLIENTS)
+                    .filter(|&i| i % 2 == 1 && replies[i] == 1)
+                    .collect();
+                assert_eq!(
+                    lower_winners.len(),
+                    1,
+                    "async_write={async_write}: lower winners {replies:?}"
+                );
+                assert_eq!(
+                    upper_winners.len(),
+                    1,
+                    "async_write={async_write}: upper winners {replies:?}"
+                );
+                let expected_lower = format!("client{}", lower_winners[0]);
+                let expected_upper = format!("client{}", upper_winners[0]);
                 assert_bulk_string(
                     hget_value(&ctx, &namespace, &field).await,
-                    expected.as_bytes(),
+                    expected_lower.as_bytes(),
+                );
+                assert_bulk_string(
+                    hget_value(&ctx, &upper_namespace, &field).await,
+                    expected_upper.as_bytes(),
                 );
             }
             ctx.shutdown().await;
@@ -2983,32 +3003,246 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hdel_finds_a_field_whatever_the_namespace_case() {
+    async fn hash_namespaces_are_case_sensitive() {
         for async_write in [false, true] {
             let ctx = TestContext::new(async_write).await;
+
+            // Exact reproduction from #24: Users and users stay completely isolated.
             let frame = respond_with(&ctx, |state, mut stream| {
                 Box::pin(async move {
-                    handle_hset(&mut stream, &state, "NS".into(), "f".into(), "v".into()).await
+                    handle_hset(
+                        &mut stream,
+                        &state,
+                        "Users".into(),
+                        "alice".into(),
+                        "upper".into(),
+                    )
+                    .await
                 })
             })
             .await;
             assert_integer_response(frame, 1);
-            wait_for_commit(
-                &ctx.state.inflight_hcache,
-                &ctx.state.namespaced_key("NS", "f"),
-            )
-            .await;
 
             let frame = respond_with(&ctx, |state, mut stream| {
-                Box::pin(
-                    async move { handle_hdel(&mut stream, &state, "ns".into(), "f".into()).await },
-                )
+                Box::pin(async move {
+                    handle_hset(
+                        &mut stream,
+                        &state,
+                        "users".into(),
+                        "alice".into(),
+                        "lower".into(),
+                    )
+                    .await
+                })
             })
             .await;
             assert_integer_response(frame, 1);
-            assert_null(hget_value(&ctx, "NS", "f").await);
+
+            // Both reads see their own value immediately (including inflight cache in async mode).
+            assert_bulk_string(hget_value(&ctx, "Users", "alice").await, b"upper");
+            assert_bulk_string(hget_value(&ctx, "users", "alice").await, b"lower");
+
+            wait_for_commit(
+                &ctx.state.inflight_hcache,
+                &ctx.state.namespaced_key("Users", "alice"),
+            )
+            .await;
+            wait_for_commit(
+                &ctx.state.inflight_hcache,
+                &ctx.state.namespaced_key("users", "alice"),
+            )
+            .await;
+
+            // Both reads still see their own value from SQLite.
+            assert_bulk_string(hget_value(&ctx, "Users", "alice").await, b"upper");
+            assert_bulk_string(hget_value(&ctx, "users", "alice").await, b"lower");
+
+            // HDEL on `users` removes only `users`, leaving `Users` untouched.
+            let frame = respond_with(&ctx, |state, mut stream| {
+                Box::pin(async move {
+                    handle_hdel(&mut stream, &state, "users".into(), "alice".into()).await
+                })
+            })
+            .await;
+            assert_integer_response(frame, 1);
+            assert_null(hget_value(&ctx, "users", "alice").await);
+            assert_bulk_string(hget_value(&ctx, "Users", "alice").await, b"upper");
+
+            // HEXISTS and HEXPIRE stay isolated too.
+            let frame = respond_with(&ctx, |state, mut stream| {
+                Box::pin(async move {
+                    handle_hexists(&mut stream, &state, "users".into(), "alice".into()).await
+                })
+            })
+            .await;
+            assert_integer_response(frame, 0);
+            let frame = respond_with(&ctx, |state, mut stream| {
+                Box::pin(async move {
+                    handle_hexists(&mut stream, &state, "Users".into(), "alice".into()).await
+                })
+            })
+            .await;
+            assert_integer_response(frame, 1);
+
+            let frame = respond_with(&ctx, |state, mut stream| {
+                Box::pin(async move {
+                    handle_hexpire(
+                        &mut stream,
+                        &state,
+                        "users".into(),
+                        60,
+                        None,
+                        vec!["alice".into()],
+                    )
+                    .await
+                })
+            })
+            .await;
+            assert_eq!(frame, BytesFrame::Array(vec![BytesFrame::Integer(-2)]));
+
+            // Both namespaces are recorded in blob_namespaces with distinct tables.
+            let shard_idx = ctx.state.get_shard("alice");
+            let meta: Vec<(String, String)> = sqlx::query_as(
+                "SELECT namespace, table_name FROM blob_namespaces ORDER BY namespace",
+            )
+            .fetch_all(&ctx.state.db_pools[shard_idx])
+            .await
+            .unwrap();
+            assert_eq!(
+                meta,
+                vec![
+                    ("Users".to_string(), shard_manager::namespace_table("Users")),
+                    ("users".to_string(), shard_manager::namespace_table("users")),
+                ]
+            );
+            assert_ne!(meta[0].1, meta[1].1);
+
             ctx.shutdown().await;
         }
+    }
+
+    #[tokio::test]
+    async fn startup_migrates_legacy_namespace_tables_in_place() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let db_path = temp_dir.path().join("shard_0.db");
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}?mode=rwc", db_path.display()))
+            .await
+            .unwrap();
+
+        // Simulate a legacy (user_version = 0) shard with lowercase and mixed-case tables.
+        sqlx::query(
+            "CREATE TABLE blobs (
+                key TEXT PRIMARY KEY,
+                data BLOB,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                expires_at INTEGER,
+                version INTEGER NOT NULL DEFAULT 0
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE blobs_workspaces (
+                key TEXT PRIMARY KEY,
+                data BLOB,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                expires_at INTEGER,
+                version INTEGER NOT NULL DEFAULT 0
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE INDEX idx_workspaces_expires_at ON blobs_workspaces(expires_at) WHERE expires_at IS NOT NULL",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO blobs_workspaces (key, data, created_at, updated_at, expires_at, version)
+             VALUES ('ws1', ?, 0, 0, NULL, 1)",
+        )
+        .bind(b"legacy-data".as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let mut cfg = single_read_connection_cfg(&temp_dir, false);
+        cfg.sqlite = None;
+        let ctx = TestContext::from_cfg(temp_dir, cfg).await;
+
+        // Legacy data is readable under its original namespace and isolated from different casing.
+        assert_bulk_string(hget_value(&ctx, "workspaces", "ws1").await, b"legacy-data");
+        assert_null(hget_value(&ctx, "Workspaces", "ws1").await);
+
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_hset(
+                    &mut stream,
+                    &state,
+                    "Workspaces".into(),
+                    "ws1".into(),
+                    "upper-data".into(),
+                )
+                .await
+            })
+        })
+        .await;
+        assert_integer_response(frame, 1);
+        assert_bulk_string(hget_value(&ctx, "workspaces", "ws1").await, b"legacy-data");
+        assert_bulk_string(hget_value(&ctx, "Workspaces", "ws1").await, b"upper-data");
+
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&ctx.state.db_pools[0])
+            .await
+            .unwrap();
+        assert_eq!(version, shard_manager::SHARD_SCHEMA_VERSION);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_future_schema_version_without_creating_blobs_table() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let db_path = temp_dir.path().join("shard_0.db");
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}?mode=rwc", db_path.display()))
+            .await
+            .unwrap();
+        sqlx::query(&format!(
+            "PRAGMA user_version = {}",
+            shard_manager::SHARD_SCHEMA_VERSION + 1
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let mut cfg = single_read_connection_cfg(&temp_dir, false);
+        cfg.sqlite = None;
+        let mut receivers = Vec::new();
+        let err = match AppState::new(cfg, &mut receivers).await {
+            Ok(_) => panic!("future schema version must be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("unsupported schema version"));
+
+        // Verify startup did not create a `blobs` table in the future-version shard.
+        let ro_pool = sqlx::SqlitePool::connect(&format!("sqlite:{}?mode=ro", db_path.display()))
+            .await
+            .unwrap();
+        let blobs_exists: Option<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'blobs'",
+        )
+        .fetch_optional(&ro_pool)
+        .await
+        .unwrap();
+        assert_eq!(blobs_exists, None);
+        ro_pool.close().await;
     }
 
     #[tokio::test]
@@ -3051,11 +3285,13 @@ mod tests {
             BytesFrame::Array(codes) => assert_eq!(codes, [BytesFrame::Integer(1)]),
             other => panic!("Expected HEXPIRE codes, got {:?}", other),
         }
-        let (expires_at,): (i64,) =
-            sqlx::query_as("SELECT expires_at FROM blobs_ns WHERE key = 'f'")
-                .fetch_one(&ctx.state.db_pools[0])
-                .await
-                .unwrap();
+        let ns_table = shard_manager::namespace_table("ns");
+        let (expires_at,): (i64,) = sqlx::query_as(&format!(
+            "SELECT expires_at FROM {ns_table} WHERE key = 'f'"
+        ))
+        .fetch_one(&ctx.state.db_pools[0])
+        .await
+        .unwrap();
         assert!(
             expires_at >= released_at + TTL,
             "expiry {expires_at} counts from before the lock was released at {released_at}"
@@ -3066,9 +3302,7 @@ mod tests {
     #[tokio::test]
     async fn namespaces_get_their_own_expiry_index() {
         let ctx = TestContext::new(false).await;
-        // BLOBS_FOO's table is blobs_blobs_foo: its index name must keep the
-        // inner "blobs_", or it's foo's and SQLite skips creating it.
-        for namespace in ["foo", "BLOBS_FOO"] {
+        for namespace in ["foo", "FOO", "BLOBS_FOO"] {
             let frame = respond_with(&ctx, |state, mut stream| {
                 Box::pin(async move {
                     handle_hset(
@@ -3084,15 +3318,24 @@ mod tests {
             .await;
             assert_integer_response(frame, 1);
         }
+        let mut expected = vec![
+            shard_manager::namespace_table("foo"),
+            shard_manager::namespace_table("FOO"),
+            shard_manager::namespace_table("BLOBS_FOO"),
+        ];
+        expected.sort();
         let indexes: Vec<(String,)> = sqlx::query_as(
             "SELECT tbl_name FROM sqlite_master WHERE type = 'index' AND name LIKE '%_expires_at'
-             AND tbl_name IN ('blobs_foo', 'blobs_blobs_foo') ORDER BY tbl_name",
+             AND tbl_name IN (?, ?, ?) ORDER BY tbl_name",
         )
+        .bind(&expected[0])
+        .bind(&expected[1])
+        .bind(&expected[2])
         .fetch_all(&ctx.state.db_pools[0])
         .await
         .unwrap();
-        let tables: Vec<&str> = indexes.iter().map(|(table,)| table.as_str()).collect();
-        assert_eq!(tables, ["blobs_blobs_foo", "blobs_foo"]);
+        let tables: Vec<String> = indexes.into_iter().map(|(table,)| table).collect();
+        assert_eq!(tables, expected);
         ctx.shutdown().await;
     }
 
@@ -3557,12 +3800,14 @@ mod tests {
 
         drop(read_conn);
 
-        let remaining =
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM blobs_users WHERE key = ?")
-                .bind("alice")
-                .fetch_one(&ctx.state.db_pools[0])
-                .await
-                .expect("check deleted hash field");
+        let users_table = shard_manager::namespace_table("users");
+        let remaining = sqlx::query_scalar::<_, i64>(&format!(
+            "SELECT COUNT(*) FROM {users_table} WHERE key = ?"
+        ))
+        .bind("alice")
+        .fetch_one(&ctx.state.db_pools[0])
+        .await
+        .expect("check deleted hash field");
         assert_eq!(remaining, 0);
 
         ctx.shutdown().await;
@@ -3623,18 +3868,23 @@ mod tests {
 
         drop(read_conn);
 
-        let alice = sqlx::query_scalar::<_, Vec<u8>>("SELECT data FROM blobs_users WHERE key = ?")
-            .bind("alice")
-            .fetch_one(&ctx.state.db_pools[0])
-            .await
-            .expect("read back alice");
+        let users_table = shard_manager::namespace_table("users");
+        let alice = sqlx::query_scalar::<_, Vec<u8>>(&format!(
+            "SELECT data FROM {users_table} WHERE key = ?"
+        ))
+        .bind("alice")
+        .fetch_one(&ctx.state.db_pools[0])
+        .await
+        .expect("read back alice");
         assert_eq!(alice, b"first");
 
-        let bob = sqlx::query_scalar::<_, Vec<u8>>("SELECT data FROM blobs_users WHERE key = ?")
-            .bind("bob")
-            .fetch_one(&ctx.state.db_pools[0])
-            .await
-            .expect("read back bob");
+        let bob = sqlx::query_scalar::<_, Vec<u8>>(&format!(
+            "SELECT data FROM {users_table} WHERE key = ?"
+        ))
+        .bind("bob")
+        .fetch_one(&ctx.state.db_pools[0])
+        .await
+        .expect("read back bob");
         assert_eq!(bob, b"second");
 
         ctx.shutdown().await;
@@ -3812,16 +4062,17 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
-        sqlx::query(
-            "CREATE TABLE blobs_ns (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL,
-             updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)",
-        )
+        let ns_table = shard_manager::namespace_table("ns");
+        sqlx::query(&format!(
+            "CREATE TABLE {ns_table} (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)"
+        ))
         .execute(pool)
         .await
         .unwrap();
-        sqlx::query(
-            "INSERT INTO blobs_ns (key, data, created_at, updated_at) VALUES ('f', 'v', 0, 0)",
-        )
+        sqlx::query(&format!(
+            "INSERT INTO {ns_table} (key, data, created_at, updated_at) VALUES ('f', 'v', 0, 0)"
+        ))
         .execute(pool)
         .await
         .unwrap();
@@ -3951,10 +4202,11 @@ mod tests {
         // Pre-create the namespace table (leaving f and f2 absent) so the
         // second pipelined HSET cannot see a stale table-absent check if the
         // first HSET commits before pending_exists runs.
-        sqlx::query(
-            "CREATE TABLE blobs_ns (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL,
-             updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)",
-        )
+        let ns_table = shard_manager::namespace_table("ns");
+        sqlx::query(&format!(
+            "CREATE TABLE {ns_table} (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)"
+        ))
         .execute(&ctx.state.write_db_pools[0])
         .await
         .unwrap();
@@ -4828,12 +5080,15 @@ mod tests {
         let shard_index = ctx.state.get_shard("field1");
         let pool = &ctx.state.db_pools[shard_index];
         let past = chrono::Utc::now().timestamp() - 60;
-        sqlx::query("UPDATE blobs_ns SET expires_at = ? WHERE key = ?")
-            .bind(past)
-            .bind("field1")
-            .execute(pool)
-            .await
-            .expect("failed to force field expiration");
+        let ns_table = shard_manager::namespace_table("ns");
+        sqlx::query(&format!(
+            "UPDATE {ns_table} SET expires_at = ? WHERE key = ?"
+        ))
+        .bind(past)
+        .bind("field1")
+        .execute(pool)
+        .await
+        .expect("failed to force field expiration");
 
         // Expired field should be treated as missing and not revived.
         let frame = respond_with(&ctx, |state, stream| {
@@ -4919,9 +5174,10 @@ mod tests {
     #[tokio::test]
     async fn hash_writes_treat_expired_field_as_missing() {
         let ctx = TestContext::new(false).await;
+        let ns_table = shard_manager::namespace_table("ns");
         for field in ["f", "d", "x", "n"] {
             run!(ctx, handle_hset("ns".into(), field.into(), v(b"v1")));
-            set_expires_at(&ctx, "blobs_ns", field, past()).await;
+            set_expires_at(&ctx, &ns_table, field, past()).await;
         }
 
         // HSET over an expired field adds it and makes it visible.
@@ -4949,17 +5205,19 @@ mod tests {
     #[tokio::test]
     async fn hset_keeps_ttl_of_live_field() {
         let ctx = TestContext::new(false).await;
+        let ns_table = shard_manager::namespace_table("ns");
         run!(ctx, handle_hset("ns".into(), "f".into(), v(b"v1")));
         let future = chrono::Utc::now().timestamp() + 1000;
-        set_expires_at(&ctx, "blobs_ns", "f", future).await;
+        set_expires_at(&ctx, &ns_table, "f", future).await;
 
         assert_integer_response(run!(ctx, handle_hset("ns".into(), "f".into(), v(b"v2"))), 0);
         let pool = &ctx.state.db_pools[ctx.state.get_shard("f")];
-        let expires_at: Option<i64> =
-            sqlx::query_scalar("SELECT expires_at FROM blobs_ns WHERE key = 'f'")
-                .fetch_one(pool)
-                .await
-                .unwrap();
+        let expires_at: Option<i64> = sqlx::query_scalar(&format!(
+            "SELECT expires_at FROM {ns_table} WHERE key = 'f'"
+        ))
+        .fetch_one(pool)
+        .await
+        .unwrap();
         assert_eq!(expires_at, Some(future));
         ctx.shutdown().await;
     }
@@ -4969,7 +5227,7 @@ mod tests {
         let ctx = TestContext::new(false).await;
 
         let namespace = "ghost_ns";
-        let table_name = format!("blobs_{}", namespace);
+        let table_name = shard_manager::namespace_table(namespace);
         let shard_index = ctx.state.get_shard("field1");
         let pool = &ctx.state.db_pools[shard_index];
 

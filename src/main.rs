@@ -227,11 +227,9 @@ async fn handle_shard_command(shard_cmd: ShardCommand, config_path: &str) -> Res
                 data_dir,
             )?;
 
-            migration_manager.run_migration().await?;
-
-            if migrate_opts.verify {
-                migration_manager.verify_migration().await?;
-            }
+            migration_manager
+                .run_migration_with_verify(migrate_opts.verify)
+                .await?;
 
             Ok(())
         }

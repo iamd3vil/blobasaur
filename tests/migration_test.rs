@@ -543,3 +543,458 @@ async fn test_migration_manager_validation() {
     let result = blobasaur::migration::MigrationManager::new(2, 3, "/tmp".to_string());
     assert!(result.is_ok(), "Should succeed with valid configuration");
 }
+
+#[tokio::test]
+async fn test_migration_preserves_schema_version_and_blob_namespaces()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = TempDir::new()?;
+    let old_shard_count = 2;
+    let new_shard_count = 3;
+    let test_keys = ["k1", "k2", "k3", "k4", "k5", "k6", "k7", "k8"];
+
+    let users_table = blobasaur::shard_manager::namespace_table("users");
+    let upper_users_table = blobasaur::shard_manager::namespace_table("Users");
+
+    for shard_id in 0..old_shard_count {
+        let db_path = temp_dir.path().join(format!("shard_{}.db", shard_id));
+        let pool = create_test_pool(db_path.to_str().unwrap()).await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS blobs (
+                key TEXT PRIMARY KEY,
+                data BLOB,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                expires_at INTEGER,
+                version INTEGER NOT NULL DEFAULT 0
+            )",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(blobasaur::shard_manager::CREATE_BLOB_NAMESPACES_TABLE)
+            .execute(&pool)
+            .await?;
+        sqlx::query(&format!(
+            "PRAGMA user_version = {}",
+            blobasaur::shard_manager::SHARD_SCHEMA_VERSION
+        ))
+        .execute(&pool)
+        .await?;
+
+        for (ns, table) in [("users", &users_table), ("Users", &upper_users_table)] {
+            sqlx::query(&format!(
+                "CREATE TABLE IF NOT EXISTS {table} (
+                    key TEXT PRIMARY KEY,
+                    data BLOB,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    expires_at INTEGER,
+                    version INTEGER NOT NULL DEFAULT 0
+                )"
+            ))
+            .execute(&pool)
+            .await?;
+            sqlx::query(
+                "INSERT OR IGNORE INTO blob_namespaces (namespace, table_name) VALUES (?, ?)",
+            )
+            .bind(ns)
+            .bind(table)
+            .execute(&pool)
+            .await?;
+        }
+
+        for key in &test_keys {
+            if get_shard_for_key(key, old_shard_count) == shard_id {
+                sqlx::query(&format!(
+                    "INSERT INTO {users_table} (key, data, created_at, updated_at, version) VALUES (?, ?, 0, 0, 1)"
+                ))
+                .bind(key)
+                .bind(format!("lower_{key}").as_bytes())
+                .execute(&pool)
+                .await?;
+                sqlx::query(&format!(
+                    "INSERT INTO {upper_users_table} (key, data, created_at, updated_at, version) VALUES (?, ?, 0, 0, 1)"
+                ))
+                .bind(key)
+                .bind(format!("upper_{key}").as_bytes())
+                .execute(&pool)
+                .await?;
+            }
+        }
+
+        pool.close().await;
+    }
+
+    let migration_manager = blobasaur::migration::MigrationManager::new(
+        old_shard_count,
+        new_shard_count,
+        temp_dir.path().to_str().unwrap().to_string(),
+    )?;
+    migration_manager.run_migration().await?;
+    migration_manager.verify_migration().await?;
+
+    // All shards (including the newly created shard_2) must keep user_version = 1.
+    for shard_id in 0..new_shard_count {
+        let db_path = temp_dir.path().join(format!("shard_{}.db", shard_id));
+        let pool = create_test_pool(db_path.to_str().unwrap()).await?;
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(version, blobasaur::shard_manager::SHARD_SCHEMA_VERSION);
+
+        // Any namespaced table present on the shard must map to its exact expected namespace.
+        let tables: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'blobs\\_%' ESCAPE '\\'",
+        )
+        .fetch_all(&pool)
+        .await?;
+        for (table_name,) in tables {
+            let mapped: Option<(String,)> =
+                sqlx::query_as("SELECT namespace FROM blob_namespaces WHERE table_name = ?")
+                    .bind(&table_name)
+                    .fetch_optional(&pool)
+                    .await?;
+            let expected_ns = if table_name == users_table {
+                "users"
+            } else if table_name == upper_users_table {
+                "Users"
+            } else {
+                panic!("unexpected table {table_name}");
+            };
+            assert_eq!(
+                mapped.as_ref().map(|(ns,)| ns.as_str()),
+                Some(expected_ns),
+                "shard {shard_id} wrong blob_namespaces entry for {table_name}"
+            );
+        }
+        pool.close().await;
+    }
+
+    assert!(
+        verify_data_integrity(
+            &temp_dir,
+            new_shard_count,
+            &test_keys,
+            &users_table,
+            "lower_"
+        )
+        .await?
+    );
+    assert!(
+        verify_data_integrity(
+            &temp_dir,
+            new_shard_count,
+            &test_keys,
+            &upper_users_table,
+            "upper_"
+        )
+        .await?
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_migration_rejects_mismatched_destination_future_version_and_ambiguous_v0()
+-> Result<(), Box<dyn std::error::Error>> {
+    // 1. Existing v1 destination shard when resharding v0 sources must be rejected before modifying files.
+    {
+        let temp_dir = TempDir::new()?;
+        create_test_data(&temp_dir, 2, &["k1", "k2", "k3", "k4"]).await?;
+        let dest_path = temp_dir.path().join("shard_2.db");
+        let dest_pool = create_test_pool(dest_path.to_str().unwrap()).await?;
+        sqlx::query(&format!(
+            "PRAGMA user_version = {}",
+            blobasaur::shard_manager::SHARD_SCHEMA_VERSION
+        ))
+        .execute(&dest_pool)
+        .await?;
+        dest_pool.close().await;
+
+        let mgr = blobasaur::migration::MigrationManager::new(
+            2,
+            3,
+            temp_dir.path().to_str().unwrap().to_string(),
+        )?;
+        let err = mgr
+            .run_migration()
+            .await
+            .expect_err("v0 sources + existing v1 destination must fail");
+        assert!(err.to_string().contains("mismatched schema versions"));
+        // Source rows must be untouched.
+        assert_eq!(
+            count_records_in_shards(&temp_dir, 2, "blobs_users").await?,
+            4
+        );
+    }
+
+    // 2. Unsupported future schema version must be rejected.
+    {
+        let temp_dir = TempDir::new()?;
+        create_test_data(&temp_dir, 2, &["k1", "k2"]).await?;
+        for shard_id in 0..2 {
+            let db_path = temp_dir.path().join(format!("shard_{shard_id}.db"));
+            let pool = create_test_pool(db_path.to_str().unwrap()).await?;
+            sqlx::query(&format!(
+                "PRAGMA user_version = {}",
+                blobasaur::shard_manager::SHARD_SCHEMA_VERSION + 1
+            ))
+            .execute(&pool)
+            .await?;
+            pool.close().await;
+        }
+
+        let mgr = blobasaur::migration::MigrationManager::new(
+            2,
+            3,
+            temp_dir.path().to_str().unwrap().to_string(),
+        )?;
+        let err = mgr
+            .run_migration()
+            .await
+            .expect_err("future schema version must fail");
+        assert!(err.to_string().contains("unsupported schema version"));
+    }
+
+    // 3. Ambiguous v0 spellings across shards (`blobs_Users` vs `blobs_users`) must be rejected.
+    {
+        let temp_dir = TempDir::new()?;
+        for (shard_id, table) in [(0, "blobs_Users"), (1, "blobs_users")] {
+            let db_path = temp_dir.path().join(format!("shard_{shard_id}.db"));
+            let pool = create_test_pool(db_path.to_str().unwrap()).await?;
+            sqlx::query(
+                "CREATE TABLE blobs (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)",
+            )
+            .execute(&pool)
+            .await?;
+            sqlx::query(&format!(
+                "CREATE TABLE {table} (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)"
+            ))
+            .execute(&pool)
+            .await?;
+            pool.close().await;
+        }
+
+        let mgr = blobasaur::migration::MigrationManager::new(
+            2,
+            3,
+            temp_dir.path().to_str().unwrap().to_string(),
+        )?;
+        let err = mgr
+            .run_migration()
+            .await
+            .expect_err("ambiguous v0 namespace spellings across shards must fail");
+        assert!(
+            err.to_string()
+                .contains("Ambiguous legacy namespace tables")
+        );
+    }
+
+    // 4. v1 shard missing blob_namespaces entry for a namespaced table must fail preflight AND verify_migration independently.
+    {
+        let temp_dir = TempDir::new()?;
+        let users_table = blobasaur::shard_manager::namespace_table("users");
+        for shard_id in 0..2 {
+            let db_path = temp_dir.path().join(format!("shard_{shard_id}.db"));
+            let pool = create_test_pool(db_path.to_str().unwrap()).await?;
+            sqlx::query(
+                "CREATE TABLE blobs (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)",
+            )
+            .execute(&pool)
+            .await?;
+            sqlx::query(blobasaur::shard_manager::CREATE_BLOB_NAMESPACES_TABLE)
+                .execute(&pool)
+                .await?;
+            sqlx::query(&format!(
+                "CREATE TABLE {users_table} (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)"
+            ))
+            .execute(&pool)
+            .await?;
+            sqlx::query(&format!(
+                "PRAGMA user_version = {}",
+                blobasaur::shard_manager::SHARD_SCHEMA_VERSION
+            ))
+            .execute(&pool)
+            .await?;
+            pool.close().await;
+        }
+
+        let mgr = blobasaur::migration::MigrationManager::new(
+            2,
+            3,
+            temp_dir.path().to_str().unwrap().to_string(),
+        )?;
+        let err = mgr
+            .run_migration()
+            .await
+            .expect_err("v1 shard missing blob_namespaces entry must fail preflight");
+        assert!(err.to_string().contains("Missing blob_namespaces entry"));
+
+        let verify_mgr = blobasaur::migration::MigrationManager::new(
+            1,
+            2,
+            temp_dir.path().to_str().unwrap().to_string(),
+        )?;
+        let verify_err = verify_mgr
+            .verify_migration()
+            .await
+            .expect_err("verify_migration must independently reject missing blob_namespaces entry");
+        assert!(
+            verify_err
+                .to_string()
+                .contains("Missing blob_namespaces entry")
+        );
+    }
+
+    // 5. Orphan blob_namespaces entry whose physical table was dropped must fail verify_migration.
+    {
+        let temp_dir = TempDir::new()?;
+        let users_table = blobasaur::shard_manager::namespace_table("users");
+        for shard_id in 0..2 {
+            let db_path = temp_dir.path().join(format!("shard_{shard_id}.db"));
+            let pool = create_test_pool(db_path.to_str().unwrap()).await?;
+            sqlx::query(
+                "CREATE TABLE blobs (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)",
+            )
+            .execute(&pool)
+            .await?;
+            sqlx::query(blobasaur::shard_manager::CREATE_BLOB_NAMESPACES_TABLE)
+                .execute(&pool)
+                .await?;
+            sqlx::query("INSERT INTO blob_namespaces (namespace, table_name) VALUES ('users', ?)")
+                .bind(&users_table)
+                .execute(&pool)
+                .await?;
+            sqlx::query(&format!(
+                "PRAGMA user_version = {}",
+                blobasaur::shard_manager::SHARD_SCHEMA_VERSION
+            ))
+            .execute(&pool)
+            .await?;
+            pool.close().await;
+        }
+
+        let verify_mgr = blobasaur::migration::MigrationManager::new(
+            1,
+            2,
+            temp_dir.path().to_str().unwrap().to_string(),
+        )?;
+        let verify_err = verify_mgr
+            .verify_migration()
+            .await
+            .expect_err("verify_migration must reject orphan blob_namespaces entry");
+        assert!(
+            verify_err
+                .to_string()
+                .contains("Orphan blob_namespaces entry")
+        );
+    }
+
+    // 6. Failed preflight must not switch a rollback-journal shard into WAL mode.
+    {
+        let temp_dir = TempDir::new()?;
+        for (shard_id, version) in [
+            (0, 0i64),
+            (1, blobasaur::shard_manager::SHARD_SCHEMA_VERSION),
+        ] {
+            let db_path = temp_dir.path().join(format!("shard_{shard_id}.db"));
+            let opts = SqliteConnectOptions::from_str(&format!("sqlite:{}", db_path.display()))?
+                .create_if_missing(true)
+                .journal_mode(SqliteJournalMode::Delete);
+            let pool = SqlitePool::connect_with(opts).await?;
+            sqlx::query(
+                "CREATE TABLE blobs (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)",
+            )
+            .execute(&pool)
+            .await?;
+            sqlx::query(&format!("PRAGMA user_version = {version}"))
+                .execute(&pool)
+                .await?;
+            pool.close().await;
+        }
+
+        let mgr = blobasaur::migration::MigrationManager::new(
+            2,
+            3,
+            temp_dir.path().to_str().unwrap().to_string(),
+        )?;
+        assert!(mgr.run_migration().await.is_err());
+
+        let db0 = temp_dir.path().join("shard_0.db");
+        let ro_opts =
+            SqliteConnectOptions::from_str(&format!("sqlite:{}", db0.display()))?.read_only(true);
+        let ro_pool = SqlitePool::connect_with(ro_opts).await?;
+        let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&ro_pool)
+            .await?;
+        assert_eq!(journal_mode.to_ascii_lowercase(), "delete");
+        ro_pool.close().await;
+    }
+
+    // 7. Equivalent v0 prefixes (`BLOBS_Users` and `blobs_Users`) have the same suffix `Users`
+    // and must NOT be rejected as ambiguous.
+    {
+        let temp_dir = TempDir::new()?;
+        for (shard_id, table) in [(0, "BLOBS_Users"), (1, "blobs_Users")] {
+            let db_path = temp_dir.path().join(format!("shard_{shard_id}.db"));
+            let pool = create_test_pool(db_path.to_str().unwrap()).await?;
+            sqlx::query(
+                "CREATE TABLE blobs (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)",
+            )
+            .execute(&pool)
+            .await?;
+            sqlx::query(&format!(
+                "CREATE TABLE {table} (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)"
+            ))
+            .execute(&pool)
+            .await?;
+            pool.close().await;
+        }
+
+        let mgr = blobasaur::migration::MigrationManager::new(
+            2,
+            3,
+            temp_dir.path().to_str().unwrap().to_string(),
+        )?;
+        mgr.run_migration().await?;
+    }
+
+    // 8. Concurrent resharding on the same data_dir is rejected by the migration lockfile.
+    {
+        let temp_dir = TempDir::new()?;
+        create_test_data(&temp_dir, 2, &["k1", "k2"]).await?;
+        let lock_path = temp_dir.path().join(".blobasaur_migration.lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        lock_file.try_lock()?;
+
+        let mgr = blobasaur::migration::MigrationManager::new(
+            2,
+            3,
+            temp_dir.path().to_str().unwrap().to_string(),
+        )?;
+        let err = mgr
+            .run_migration()
+            .await
+            .expect_err("locked data_dir must reject concurrent migration");
+        assert!(
+            err.to_string()
+                .contains("Another shard migration is already running")
+        );
+        drop(lock_file);
+    }
+
+    Ok(())
+}

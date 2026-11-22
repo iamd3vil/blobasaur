@@ -3,10 +3,15 @@ use crate::redis::protocol::HExpireCondition;
 use bytes::Bytes;
 use chrono::Utc;
 use metrics::Counter;
+use miette::{Result as MietteResult, miette};
 use moka::future::Cache;
 use moka::ops::compute::Op;
-use sqlx::{Connection, Sqlite, SqlitePool, pool::PoolConnection};
+use sha2::{Digest, Sha256};
+use sqlx::sqlite::SqliteConnectOptions;
+use sqlx::{Connection, Sqlite, SqliteConnection, SqlitePool, pool::PoolConnection};
 use std::collections::{HashSet, VecDeque};
+use std::fmt::Write as _;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, interval, timeout_at};
@@ -245,17 +250,542 @@ pub async fn queue_pending(
     Ok(())
 }
 
-/// The table holding `namespace`'s hash fields. SQLite matches table names
-/// regardless of case, so `NS` and `ns` share a table; the name is lowercased
-/// so the writer's table bookkeeping agrees.
+/// Current SQLite schema version stored in `PRAGMA user_version` on each shard.
+///
+/// Version 0 (legacy): namespaced tables were named `blobs_{namespace}`.
+/// Version 1: namespaced tables are named `blobs_{slug}_{sha256_prefix}` so
+/// namespaces differing only in case map to distinct SQLite tables, with a
+/// `blob_namespaces` lookup table mapping each namespace to its table name.
+pub const SHARD_SCHEMA_VERSION: i64 = 1;
+
+pub const CREATE_BLOB_NAMESPACES_TABLE: &str = "CREATE TABLE IF NOT EXISTS blob_namespaces (
+    namespace TEXT PRIMARY KEY,
+    table_name TEXT NOT NULL UNIQUE
+)";
+
+const MAX_NAMESPACE_SLUG_LEN: usize = 32;
+
+/// The table holding `namespace`'s hash fields.
+///
+/// SQLite matches table names case-insensitively, so a raw `blobs_{namespace}`
+/// name collapses namespaces like `Users` and `users` into one table. Suffixing
+/// a lowercase readable slug with 128 bits (32 hex chars) of SHA-256 over the
+/// exact namespace keeps distinct cases (and arbitrary characters) isolated
+/// while remaining a readable, unquoted SQLite identifier.
 pub fn namespace_table(namespace: &str) -> String {
-    format!("blobs_{}", namespace.to_ascii_lowercase())
+    let digest = Sha256::digest(namespace.as_bytes());
+    let slug_len = namespace.chars().take(MAX_NAMESPACE_SLUG_LEN).count();
+    let mut table = String::with_capacity("blobs_".len() + slug_len + 1 + 32);
+    table.push_str("blobs_");
+    for ch in namespace.chars().take(MAX_NAMESPACE_SLUG_LEN) {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            table.push(ch.to_ascii_lowercase());
+        } else {
+            table.push('_');
+        }
+    }
+    table.push('_');
+    for byte in &digest[..16] {
+        let _ = write!(&mut table, "{byte:02x}");
+    }
+    table
 }
 
-/// The inflight cache key of a hash field. The namespace is lowercased, as in
-/// [`namespace_table`], so `NS` and `ns` share an entry as they share a table.
+/// The `expires_at` partial index name for a namespaced table.
+pub fn namespace_index(table_name: &str) -> String {
+    let suffix = strip_blobs_prefix_ignore_ascii_case(table_name).unwrap_or(table_name);
+    format!("idx_{suffix}_expires_at")
+}
+
+/// Strips a leading `blobs_` prefix ASCII-case-insensitively, preserving the
+/// exact case of the suffix (e.g. `BLOBS_Users` -> `Some("Users")`).
+pub fn strip_blobs_prefix_ignore_ascii_case(table_name: &str) -> Option<&str> {
+    let prefix = table_name.as_bytes().get(..6)?;
+    if prefix.eq_ignore_ascii_case(b"blobs_") {
+        let suffix = &table_name[6..];
+        (!suffix.is_empty()).then_some(suffix)
+    } else {
+        None
+    }
+}
+
+fn is_readonly_recovery_error(error: &sqlx::Error) -> bool {
+    let sqlx::Error::Database(db) = error else {
+        return false;
+    };
+    // SQLITE_READONLY_RECOVERY (264), SQLITE_READONLY_ROLLBACK (776),
+    // SQLITE_READONLY_CANTINIT (1288): hot rollback journal or missing WAL -shm
+    // needs a writable connection to recover before any read can proceed.
+    db.code()
+        .and_then(|c| c.parse::<i32>().ok())
+        .is_some_and(|code| matches!(code, 264 | 776 | 1288))
+}
+
+/// Probes `PRAGMA user_version` for an existing shard DB without changing its
+/// journal mode or running any application DDL.
+///
+/// Opens read-only first; if SQLite reports a hot rollback journal / WAL
+/// recovery requirement (`SQLITE_READONLY_ROLLBACK` / `SQLITE_READONLY_RECOVERY`
+/// / `SQLITE_READONLY_CANTINIT`), retries on a plain writable connection with
+/// no journal-mode or schema changes so SQLite can finish crash recovery before
+/// reading the version.
+pub async fn probe_shard_schema_version(
+    db_path: &str,
+    shard_id: usize,
+    busy_timeout_ms: u64,
+) -> MietteResult<i64> {
+    let ro_options = SqliteConnectOptions::from_str(&format!("sqlite:{db_path}"))
+        .map_err(|e| {
+            miette!(
+                "failed to parse connection string for shard {}: {}",
+                shard_id,
+                e
+            )
+        })?
+        .read_only(true)
+        .busy_timeout(Duration::from_millis(busy_timeout_ms));
+
+    match SqliteConnection::connect_with(&ro_options).await {
+        Ok(mut conn) => {
+            let res = sqlx::query_scalar::<_, i64>("PRAGMA user_version")
+                .fetch_one(&mut conn)
+                .await;
+            let _ = conn.close().await;
+            match res {
+                Ok(version) => return Ok(version),
+                Err(e) if is_readonly_recovery_error(&e) => {}
+                Err(e) => {
+                    return Err(miette!(
+                        "failed to read user_version for shard {} DB: {}",
+                        shard_id,
+                        e
+                    ));
+                }
+            }
+        }
+        Err(e) if is_readonly_recovery_error(&e) => {}
+        Err(e) => {
+            return Err(miette!(
+                "failed to open shard {} DB read-only: {}",
+                shard_id,
+                e
+            ));
+        }
+    }
+
+    // Hot journal recovery needed: open without create_if_missing, without
+    // changing journal_mode, and without any DDL, so SQLite recovers the
+    // journal cleanly before reading PRAGMA user_version.
+    let recovery_options = SqliteConnectOptions::from_str(&format!("sqlite:{db_path}"))
+        .map_err(|e| {
+            miette!(
+                "failed to parse connection string for shard {}: {}",
+                shard_id,
+                e
+            )
+        })?
+        .create_if_missing(false)
+        .busy_timeout(Duration::from_millis(busy_timeout_ms));
+    let mut conn = SqliteConnection::connect_with(&recovery_options)
+        .await
+        .map_err(|e| {
+            miette!(
+                "failed to open shard {} DB for journal recovery: {}",
+                shard_id,
+                e
+            )
+        })?;
+    let version = sqlx::query_scalar::<_, i64>("PRAGMA user_version")
+        .fetch_one(&mut conn)
+        .await
+        .map_err(|e| {
+            miette!(
+                "failed to read user_version for shard {} DB after recovery: {}",
+                shard_id,
+                e
+            )
+        });
+    let _ = conn.close().await;
+    version
+}
+
+/// The inflight cache key of a hash field. Preserves namespace case so `Users`
+/// and `users` stay isolated in the cache as they are in SQLite.
 pub fn namespaced_key(namespace: &str, key: &str) -> String {
-    format!("{}:{}", namespace.to_ascii_lowercase(), key)
+    format!("{namespace}:{key}")
+}
+
+pub fn validate_schema_version(version: i64, shard_id: usize) -> MietteResult<()> {
+    if !(0..=SHARD_SCHEMA_VERSION).contains(&version) {
+        return Err(miette!(
+            "shard {} has unsupported schema version {} (supported: 0..={})",
+            shard_id,
+            version,
+            SHARD_SCHEMA_VERSION
+        ));
+    }
+    Ok(())
+}
+
+/// Validates that a v1 shard's `blob_namespaces` metadata table exists and
+/// matches its physical `blobs_*` tables bidirectionally:
+/// - every physical `blobs_*` table has a `blob_namespaces` entry,
+/// - every `blob_namespaces` entry points to an existing physical `blobs_*` table,
+/// - every `(namespace, table_name)` row satisfies `namespace_table(namespace) == table_name`.
+pub async fn validate_v1_shard_metadata(
+    conn: &mut SqliteConnection,
+    shard_id: usize,
+) -> MietteResult<()> {
+    let physical_tables: Vec<(String,)> = sqlx::query_as(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'blobs\\_%' ESCAPE '\\'",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| {
+        miette!(
+            "failed to list namespace tables while validating shard {}: {}",
+            shard_id,
+            e
+        )
+    })?;
+    let physical_set: HashSet<String> = physical_tables.into_iter().map(|(t,)| t).collect();
+
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT namespace, table_name FROM blob_namespaces")
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|e| {
+                miette!(
+                    "failed to read blob_namespaces on v{} shard {}: {}",
+                    SHARD_SCHEMA_VERSION,
+                    shard_id,
+                    e
+                )
+            })?;
+
+    let mut mapped_tables: HashSet<String> = HashSet::with_capacity(rows.len());
+    for (namespace, table_name) in rows {
+        let expected_table = namespace_table(&namespace);
+        if expected_table != table_name {
+            return Err(miette!(
+                "corrupted blob_namespaces entry on shard {}: namespace '{}' maps to '{}' but expected '{}'",
+                shard_id,
+                namespace,
+                table_name,
+                expected_table
+            ));
+        }
+        if !physical_set.contains(&table_name) {
+            return Err(miette!(
+                "orphan blob_namespaces entry on shard {}: namespace '{}' references missing table '{}'",
+                shard_id,
+                namespace,
+                table_name
+            ));
+        }
+        mapped_tables.insert(table_name);
+    }
+
+    for table_name in physical_set {
+        if !mapped_tables.contains(&table_name) {
+            return Err(miette!(
+                "missing blob_namespaces entry for table '{}' on v{} shard {}",
+                table_name,
+                SHARD_SCHEMA_VERSION,
+                shard_id
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Migrates a shard database to [`SHARD_SCHEMA_VERSION`] in place.
+///
+/// Rejects unsupported future schema versions (`> SHARD_SCHEMA_VERSION`) and
+/// validates v1 `blob_namespaces` metadata bidirectionally before accepting
+/// writes. For legacy (version 0) shards, takes an `IMMEDIATE` write lock and
+/// re-checks `PRAGMA user_version` under the lock so concurrent startups cannot
+/// migrate the same shard twice. Existing `blobs_{namespace}` tables (matched
+/// case-insensitively on the `blobs_` prefix) are staged through unique
+/// temporary names before moving to their hashed [`namespace_table`] names.
+/// Existing `expires_at` indexes are kept without rebuilding (or created if
+/// absent), `blob_namespaces` is populated and validated, and
+/// `PRAGMA user_version` is bumped to [`SHARD_SCHEMA_VERSION`] atomically.
+pub async fn migrate_shard_schema(
+    conn: &mut SqliteConnection,
+    shard_id: usize,
+) -> MietteResult<()> {
+    migrate_shard_schema_inner(conn, shard_id, None).await
+}
+
+async fn migrate_shard_schema_inner(
+    conn: &mut SqliteConnection,
+    shard_id: usize,
+    after_initial_read: Option<oneshot::Sender<()>>,
+) -> MietteResult<()> {
+    let current_version: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|e| miette!("failed to read user_version for shard {}: {}", shard_id, e))?;
+    validate_schema_version(current_version, shard_id)?;
+
+    if current_version == SHARD_SCHEMA_VERSION {
+        // Validate inside a read transaction so sqlite_master and
+        // blob_namespaces come from one consistent snapshot even if a writer
+        // creates a namespace concurrently.
+        let mut read_tx = conn.begin().await.map_err(|e| {
+            miette!(
+                "failed to begin read tx for v{} metadata validation on shard {}: {}",
+                SHARD_SCHEMA_VERSION,
+                shard_id,
+                e
+            )
+        })?;
+        validate_v1_shard_metadata(&mut read_tx, shard_id).await?;
+        read_tx.commit().await.map_err(|e| {
+            miette!(
+                "failed to close read tx for v{} metadata validation on shard {}: {}",
+                SHARD_SCHEMA_VERSION,
+                shard_id,
+                e
+            )
+        })?;
+        return Ok(());
+    }
+
+    if let Some(tx) = after_initial_read {
+        let _ = tx.send(());
+    }
+
+    let mut tx = conn
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(|e| miette!("failed to begin migration tx for shard {}: {}", shard_id, e))?;
+
+    // Re-read under the write lock so a second concurrent startup cannot
+    // re-migrate tables that a racing process just migrated and committed.
+    let locked_version: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| {
+            miette!(
+                "failed to re-read user_version under lock for shard {}: {}",
+                shard_id,
+                e
+            )
+        })?;
+    validate_schema_version(locked_version, shard_id)?;
+    if locked_version == SHARD_SCHEMA_VERSION {
+        validate_v1_shard_metadata(&mut tx, shard_id).await?;
+        tx.commit().await.map_err(|e| {
+            miette!(
+                "failed to finish no-op migration tx for shard {}: {}",
+                shard_id,
+                e
+            )
+        })?;
+        return Ok(());
+    }
+
+    sqlx::query(CREATE_BLOB_NAMESPACES_TABLE)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            miette!(
+                "failed to create blob_namespaces table for shard {}: {}",
+                shard_id,
+                e
+            )
+        })?;
+
+    // Include tables, indexes, views, and triggers so staged temporary table
+    // names never collide with any existing SQLite schema object.
+    let all_existing_objects: Vec<(String,)> =
+        sqlx::query_as("SELECT name FROM sqlite_master WHERE name IS NOT NULL")
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| {
+                miette!(
+                    "failed to list schema objects for shard {}: {}",
+                    shard_id,
+                    e
+                )
+            })?;
+    let mut occupied_lower: HashSet<String> = all_existing_objects
+        .iter()
+        .map(|(name,)| name.to_ascii_lowercase())
+        .collect();
+
+    let legacy_tables: Vec<(String,)> = sqlx::query_as(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'blobs\\_%' ESCAPE '\\' ORDER BY name",
+    )
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| {
+        miette!(
+            "failed to list legacy namespace tables for shard {}: {}",
+            shard_id,
+            e
+        )
+    })?;
+
+    // Plan all renames up front and stage through unique temporary table names
+    // so a legacy table occupying another legacy table's hashed destination
+    // (e.g. `users` and `users_<sha256_prefix("users")>`) cannot collide.
+    let mut planned: Vec<(String, String, String, String)> = Vec::new();
+    let mut tmp_counter: usize = 0;
+    for (old_table,) in legacy_tables {
+        let Some(namespace) = strip_blobs_prefix_ignore_ascii_case(&old_table) else {
+            continue;
+        };
+        let namespace = namespace.to_string();
+        let new_table = namespace_table(&namespace);
+        let temp_table = loop {
+            let candidate = format!("__blobasaur_migrate_tmp_{tmp_counter}");
+            tmp_counter += 1;
+            if occupied_lower.insert(candidate.clone()) {
+                break candidate;
+            }
+        };
+        planned.push((old_table, namespace, temp_table, new_table));
+    }
+
+    // Phase 1: move every legacy table to its temporary name.
+    for (old_table, _, temp_table, new_table) in &planned {
+        if old_table != new_table {
+            let escaped_old = old_table.replace('"', "\"\"");
+            let rename_sql = format!("ALTER TABLE \"{escaped_old}\" RENAME TO \"{temp_table}\"");
+            sqlx::query(&rename_sql)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    miette!(
+                        "failed to stage legacy table {} -> {} on shard {}: {}",
+                        old_table,
+                        temp_table,
+                        shard_id,
+                        e
+                    )
+                })?;
+        }
+    }
+
+    // Phase 2: move every staged table to its final hashed name.
+    let mut renamed = 0usize;
+    for (old_table, _, temp_table, new_table) in &planned {
+        if old_table != new_table {
+            let rename_sql = format!("ALTER TABLE \"{temp_table}\" RENAME TO \"{new_table}\"");
+            sqlx::query(&rename_sql)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    miette!(
+                        "failed to finalize table rename {} -> {} on shard {}: {}",
+                        old_table,
+                        new_table,
+                        shard_id,
+                        e
+                    )
+                })?;
+            renamed += 1;
+            tracing::info!(
+                "[Shard {}] Migrated legacy namespace table {} -> {}",
+                shard_id,
+                old_table,
+                new_table
+            );
+        }
+    }
+
+    // Phase 3: keep each migrated table's existing `expires_at` index (SQLite
+    // preserves it across ALTER TABLE RENAME without rebuilding), or create one
+    // if missing, and record the namespace mapping in `blob_namespaces`.
+    for (_, namespace, _, new_table) in &planned {
+        let has_expires_index: Option<(i64,)> = sqlx::query_as(
+            "SELECT 1 FROM pragma_index_list(?) AS il
+             JOIN pragma_index_info(il.name) AS ii
+             WHERE il.origin = 'c' AND ii.name = 'expires_at'
+             LIMIT 1",
+        )
+        .bind(new_table)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| {
+            miette!(
+                "failed to check expires_at index for table {} on shard {}: {}",
+                new_table,
+                shard_id,
+                e
+            )
+        })?;
+
+        if has_expires_index.is_none() {
+            let index_name = namespace_index(new_table);
+            let index_sql = format!(
+                "CREATE INDEX IF NOT EXISTS {index_name} ON {new_table}(expires_at) WHERE expires_at IS NOT NULL"
+            );
+            sqlx::query(&index_sql)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    miette!(
+                        "failed to create expires_at index for {} on shard {}: {}",
+                        new_table,
+                        shard_id,
+                        e
+                    )
+                })?;
+        }
+
+        sqlx::query("INSERT INTO blob_namespaces (namespace, table_name) VALUES (?, ?)")
+            .bind(namespace)
+            .bind(new_table)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                miette!(
+                    "failed to record namespace {} -> {} on shard {}: {}",
+                    namespace,
+                    new_table,
+                    shard_id,
+                    e
+                )
+            })?;
+    }
+
+    // Validate the complete mapping before bumping user_version so pre-existing
+    // conflicting or orphan rows in blob_namespaces cannot slip into v1.
+    validate_v1_shard_metadata(&mut tx, shard_id).await?;
+
+    sqlx::query(&format!("PRAGMA user_version = {SHARD_SCHEMA_VERSION}"))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            miette!(
+                "failed to update user_version for shard {}: {}",
+                shard_id,
+                e
+            )
+        })?;
+    tx.commit().await.map_err(|e| {
+        miette!(
+            "failed to commit schema migration for shard {}: {}",
+            shard_id,
+            e
+        )
+    })?;
+
+    if renamed > 0 {
+        tracing::info!(
+            "[Shard {}] Completed schema migration to version {} ({} legacy tables renamed)",
+            shard_id,
+            SHARD_SCHEMA_VERSION,
+            renamed
+        );
+    }
+
+    Ok(())
 }
 
 /// Whether a query on `table` failed because that table doesn't exist.
@@ -1451,15 +1981,13 @@ async fn load_existing_tables(pool: &SqlitePool, shard_id: usize) -> HashSet<Str
     tables.insert("blobs".to_string());
 
     match sqlx::query_as::<_, (String,)>(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'blobs_%'",
+        "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'blobs\\_%' ESCAPE '\\'",
     )
     .fetch_all(pool)
     .await
     {
         Ok(rows) => {
             for (table_name,) in rows {
-                // Lowercased like namespace_table, since SQLite matches
-                // table names regardless of case.
                 tables.insert(table_name.to_ascii_lowercase());
             }
             tracing::info!(
@@ -1491,53 +2019,97 @@ async fn ensure_namespaced_table_exists(
         return Ok(());
     }
 
-    let create_query = format!(
-        "CREATE TABLE IF NOT EXISTS {} (
-            key TEXT PRIMARY KEY,
-            data BLOB,
-            created_at INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL,
-            expires_at INTEGER,
-            version INTEGER NOT NULL DEFAULT 0
-        )",
-        table_name
-    );
+    // Run table, index, and metadata creation inside a savepoint so a failure
+    // on any step (e.g. CREATE INDEX failing) rolls back the table creation
+    // even if the outer batch transaction commits other operations.
+    let mut sp = tx.begin().await.map_err(|e| {
+        tracing::error!("Failed to start savepoint for table {}: {}", table_name, e);
+        format!("Failed to start savepoint: {}", e)
+    })?;
 
-    match sqlx::query(&create_query).execute(&mut **tx).await {
-        Ok(_) => {
-            // Create index on expires_at for efficient expiry queries
-            let index_query = format!(
-                "CREATE INDEX IF NOT EXISTS idx_{}_expires_at ON {}(expires_at) WHERE expires_at IS NOT NULL",
-                // Named from the namespace as the client spelled it, as before
-                // table names were lowercased, so lowercasing doesn't change
-                // index names or make new ones collide with existing ones.
-                namespace.replace("blobs_", ""),
-                table_name
-            );
-
-            match sqlx::query(&index_query).execute(&mut **tx).await {
-                Ok(_) => {
-                    known_tables.insert(table_name.to_string());
-                    created.push(table_name.to_string());
-                    tracing::info!(
-                        "Created namespaced table and expires_at index: {}",
-                        table_name
-                    );
-                    Ok(())
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "Failed to create expires_at index for table {}: {}",
-                        table_name,
-                        e
-                    );
-                    Err(format!("Failed to create index: {}", e))
-                }
-            }
-        }
-        Err(e) => {
+    let init_res: Result<(), String> = async {
+        let create_query = format!(
+            "CREATE TABLE IF NOT EXISTS {} (
+                key TEXT PRIMARY KEY,
+                data BLOB,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                expires_at INTEGER,
+                version INTEGER NOT NULL DEFAULT 0
+            )",
+            table_name
+        );
+        if let Err(e) = sqlx::query(&create_query).execute(&mut *sp).await {
             tracing::error!("Failed to create namespaced table {}: {}", table_name, e);
-            Err(format!("Failed to create table: {}", e))
+            return Err(format!("Failed to create table: {}", e));
+        }
+
+        // Create index on expires_at for efficient expiry queries
+        let index_name = namespace_index(table_name);
+        let index_query = format!(
+            "CREATE INDEX IF NOT EXISTS {} ON {}(expires_at) WHERE expires_at IS NOT NULL",
+            index_name, table_name
+        );
+        if let Err(e) = sqlx::query(&index_query).execute(&mut *sp).await {
+            tracing::error!(
+                "Failed to create expires_at index for table {}: {}",
+                table_name,
+                e
+            );
+            return Err(format!("Failed to create index: {}", e));
+        }
+
+        if let Err(e) = sqlx::query(CREATE_BLOB_NAMESPACES_TABLE)
+            .execute(&mut *sp)
+            .await
+        {
+            tracing::error!("Failed to ensure blob_namespaces table: {}", e);
+            return Err(format!("Failed to create blob_namespaces table: {}", e));
+        }
+
+        if let Err(e) = sqlx::query(
+            "INSERT OR IGNORE INTO blob_namespaces (namespace, table_name) VALUES (?, ?)",
+        )
+        .bind(namespace)
+        .bind(table_name)
+        .execute(&mut *sp)
+        .await
+        {
+            tracing::error!(
+                "Failed to record namespace {} -> {} in blob_namespaces: {}",
+                namespace,
+                table_name,
+                e
+            );
+            return Err(format!("Failed to record namespace metadata: {}", e));
+        }
+
+        Ok(())
+    }
+    .await;
+
+    match init_res {
+        Ok(()) => {
+            if let Err(e) = sp.commit().await {
+                tracing::error!(
+                    "Failed to release savepoint for table {}: {}",
+                    table_name,
+                    e
+                );
+                return Err(format!("Failed to release savepoint: {}", e));
+            }
+            known_tables.insert(table_name.to_string());
+            created.push(table_name.to_string());
+            tracing::info!(
+                "Created namespaced table and expires_at index: {} (namespace: {})",
+                table_name,
+                namespace
+            );
+            Ok(())
+        }
+        Err(err) => {
+            let _ = sp.rollback().await;
+            Err(err)
         }
     }
 }
@@ -1602,7 +2174,7 @@ pub async fn shard_cleanup_task(
         // The main blobs table plus every namespaced "blobs_*" table
         let mut tables = vec!["blobs".to_string()];
         match sqlx::query_as::<_, (String,)>(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'blobs_%'",
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'blobs\\_%' ESCAPE '\\'",
         )
         .fetch_all(&pool)
         .await
@@ -1687,23 +2259,44 @@ mod tests {
         // A table the writer has no record of, as after a commit that failed
         // although SQLite kept the table (see process_batch).
         let (_temp_dir, pool) = create_test_pool().await;
+        let ns_table = namespace_table("ns");
+        let trig_table = namespace_table("trig");
+        let raise_table = namespace_table("raise");
         for sql in [
-            "CREATE TABLE blobs_ns (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL,
-             updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)",
-            "INSERT INTO blobs_ns (key, data, created_at, updated_at) VALUES ('e', x'00', 0, 0)",
-            "INSERT INTO blobs_ns (key, data, created_at, updated_at) VALUES ('d', x'00', 0, 0)",
+            format!(
+                "CREATE TABLE {ns_table} (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)"
+            ),
+            format!(
+                "INSERT INTO {ns_table} (key, data, created_at, updated_at) VALUES ('e', x'00', 0, 0)"
+            ),
+            format!(
+                "INSERT INTO {ns_table} (key, data, created_at, updated_at) VALUES ('d', x'00', 0, 0)"
+            ),
             // A delete here fails on a missing table other than its own.
-            "CREATE TABLE blobs_trig (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL,
-             updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)",
-            "INSERT INTO blobs_trig (key, data, created_at, updated_at) VALUES ('f', x'00', 0, 0)",
-            "CREATE TRIGGER audit AFTER DELETE ON blobs_trig BEGIN INSERT INTO missing_audit VALUES (old.key); END",
+            format!(
+                "CREATE TABLE {trig_table} (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)"
+            ),
+            format!(
+                "INSERT INTO {trig_table} (key, data, created_at, updated_at) VALUES ('f', x'00', 0, 0)"
+            ),
+            format!(
+                "CREATE TRIGGER audit AFTER DELETE ON {trig_table} BEGIN INSERT INTO missing_audit VALUES (old.key); END"
+            ),
             // ...or on a trigger raising the message a missing table gives.
-            "CREATE TABLE blobs_raise (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL,
-             updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)",
-            "INSERT INTO blobs_raise (key, data, created_at, updated_at) VALUES ('f', x'00', 0, 0)",
-            "CREATE TRIGGER spoof BEFORE DELETE ON blobs_raise BEGIN SELECT RAISE(ABORT, 'no such table: blobs_raise'); END",
+            format!(
+                "CREATE TABLE {raise_table} (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)"
+            ),
+            format!(
+                "INSERT INTO {raise_table} (key, data, created_at, updated_at) VALUES ('f', x'00', 0, 0)"
+            ),
+            format!(
+                "CREATE TRIGGER spoof BEFORE DELETE ON {raise_table} BEGIN SELECT RAISE(ABORT, 'no such table: {raise_table}'); END"
+            ),
         ] {
-            sqlx::query(sql).execute(&pool).await.unwrap();
+            sqlx::query(&sql).execute(&pool).await.unwrap();
         }
         let mut tables = HashSet::from(["blobs".to_string()]);
         let cache = Cache::new(16);
@@ -1770,7 +2363,7 @@ mod tests {
             raise_result.is_err(),
             "HDEL hid a trigger's error: {raise_result:?}"
         );
-        let keys: Vec<(String,)> = sqlx::query_as("SELECT key FROM blobs_ns")
+        let keys: Vec<(String,)> = sqlx::query_as(&format!("SELECT key FROM {ns_table}"))
             .fetch_all(&pool)
             .await
             .unwrap();
@@ -2219,10 +2812,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(s_val, b"same");
-        let (h_val,): (Vec<u8>,) = sqlx::query_as("SELECT data FROM blobs_ns WHERE key = 'f'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let ns_table = namespace_table("ns");
+        let (h_val,): (Vec<u8>,) =
+            sqlx::query_as(&format!("SELECT data FROM {ns_table} WHERE key = 'f'"))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert!(h_val.is_empty());
     }
 
@@ -2263,29 +2858,23 @@ mod tests {
         let value = |series: &str| rendered_value(&recorder.handle().render(), series);
 
         let (_temp_dir, pool) = create_test_pool().await;
+        // Force one statement in the batch to fail while the transaction still commits.
+        sqlx::query(
+            "CREATE TRIGGER fail_bad BEFORE INSERT ON blobs WHEN NEW.key = 'bad' \
+             BEGIN SELECT RAISE(ABORT, 'forced failure'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         let cache: Cache<String, Pending> = Cache::new(16);
         let hcache: Cache<String, Pending> = Cache::new(16);
         let (sender, mut receiver) = test_channel(16);
         let shard_metrics = ShardMetrics::new(0);
 
-        // Two writes to one key are two pending ops, plus one whose statement
-        // fails: a namespace that isn't a valid table name.
+        // Two writes to one key are two pending ops, plus one whose statement fails.
         queue_set(&cache, &sender, "k", Bytes::from_static(b"1")).await;
         queue_set(&cache, &sender, "k", Bytes::from_static(b"2")).await;
-        let token = next_pending_token();
-        let op = ShardWriteOperation::HSetAsync {
-            namespace: "bad name".to_string(),
-            key: "f".to_string(),
-            data: Bytes::from_static(b"v"),
-            token,
-        };
-        let pending = Pending::Value {
-            data: Bytes::from_static(b"v"),
-            token,
-        };
-        queue_pending(&hcache, &sender, "bad name:f".to_string(), pending, op)
-            .await
-            .unwrap();
+        queue_set(&cache, &sender, "bad", Bytes::from_static(b"v")).await;
         assert_eq!(sender.queue_depth(), 3);
         assert_eq!(value(r#"blobasaur_async_writes_pending{shard="0"}"#), 3.0);
         assert_eq!(
@@ -2548,11 +3137,18 @@ mod tests {
 
         drop(sender);
         writer.await.unwrap();
-        let rows: Vec<(String,)> = sqlx::query_as("SELECT key FROM blobs_ns")
+        let ns_table = namespace_table("ns");
+        let rows: Vec<(String,)> = sqlx::query_as(&format!("SELECT key FROM {ns_table}"))
             .fetch_all(&pool)
             .await
             .unwrap();
         assert_eq!(rows, vec![("k".to_string(),)]);
+        let meta: Vec<(String, String)> =
+            sqlx::query_as("SELECT namespace, table_name FROM blob_namespaces")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(meta, vec![("ns".to_string(), ns_table)]);
     }
 
     #[tokio::test]
@@ -2986,5 +3582,474 @@ mod tests {
         wal_checkpoint_truncate(&writer)
             .await
             .expect("checkpoint should complete once the reader is gone");
+    }
+
+    #[test]
+    fn namespace_table_and_index_distinguish_case_and_keep_valid_identifiers() {
+        let lower = namespace_table("users");
+        let upper = namespace_table("Users");
+        assert_ne!(lower, upper);
+        assert!(lower.starts_with("blobs_users_"));
+        assert!(upper.starts_with("blobs_users_"));
+        assert_eq!(lower.len(), "blobs_users_".len() + 32);
+        assert!(
+            lower
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        );
+        assert!(
+            upper
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        );
+        assert_ne!(namespace_index(&lower), namespace_index(&upper));
+
+        // Long namespaces cap the slug at MAX_NAMESPACE_SLUG_LEN while hashing the full name.
+        let long_a = format!("{}a", "x".repeat(40));
+        let long_b = format!("{}b", "x".repeat(40));
+        let table_a = namespace_table(&long_a);
+        let table_b = namespace_table(&long_b);
+        assert_ne!(table_a, table_b);
+        assert_eq!(
+            table_a.len(),
+            "blobs_".len() + MAX_NAMESPACE_SLUG_LEN + 1 + 32
+        );
+
+        // Non-[a-z0-9_] characters are sanitized in the slug without losing uniqueness.
+        assert_ne!(namespace_table("chart-tv"), namespace_table("chart_tv"));
+        assert!(namespace_table("chart-tv").starts_with("blobs_chart_tv_"));
+    }
+
+    #[tokio::test]
+    async fn migrate_shard_schema_renames_legacy_tables_and_is_idempotent() {
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let db_path = temp_dir.path().join("shard_0.db");
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", db_path.display()))
+            .unwrap()
+            .create_if_missing(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+
+        // Legacy shard (user_version = 0) with two tables: one with an index, one without.
+        for sql in [
+            "CREATE TABLE blobs (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)",
+            "CREATE TABLE blobs_users (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)",
+            "CREATE INDEX idx_users_expires_at ON blobs_users(expires_at) WHERE expires_at IS NOT NULL",
+            "INSERT INTO blobs_users (key, data, created_at, updated_at, version) VALUES ('alice', x'0102', 1, 1, 0)",
+            "CREATE TABLE blobs_MixedCase (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)",
+            "INSERT INTO blobs_MixedCase (key, data, created_at, updated_at, version) VALUES ('bob', x'0304', 2, 2, 0)",
+        ] {
+            sqlx::query(sql).execute(&mut conn).await.unwrap();
+        }
+
+        migrate_shard_schema(&mut conn, 0).await.unwrap();
+
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(version, SHARD_SCHEMA_VERSION);
+
+        let users_table = namespace_table("users");
+        let mixed_table = namespace_table("MixedCase");
+
+        let (alice_data,): (Vec<u8>,) = sqlx::query_as(&format!(
+            "SELECT data FROM {users_table} WHERE key = 'alice'"
+        ))
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(alice_data, vec![1, 2]);
+
+        let (bob_data,): (Vec<u8>,) =
+            sqlx::query_as(&format!("SELECT data FROM {mixed_table} WHERE key = 'bob'"))
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(bob_data, vec![3, 4]);
+
+        // Existing index on blobs_users was preserved without creating a duplicate;
+        // missing index on blobs_MixedCase was created.
+        let users_indexes: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND sql LIKE '%expires_at%'",
+        )
+        .bind(&users_table)
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(users_indexes, vec![("idx_users_expires_at".to_string(),)]);
+
+        let mixed_indexes: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND sql LIKE '%expires_at%'",
+        )
+        .bind(&mixed_table)
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(mixed_indexes, vec![(namespace_index(&mixed_table),)]);
+
+        let meta: Vec<(String, String)> =
+            sqlx::query_as("SELECT namespace, table_name FROM blob_namespaces ORDER BY namespace")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(
+            meta,
+            vec![
+                ("MixedCase".to_string(), mixed_table.clone()),
+                ("users".to_string(), users_table.clone()),
+            ]
+        );
+
+        // Running migration a second time is a no-op and does not double-hash tables.
+        migrate_shard_schema(&mut conn, 0).await.unwrap();
+        let tables_after: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'blobs\\_%' ESCAPE '\\' ORDER BY name",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        let mut expected_tables = vec![users_table, mixed_table];
+        expected_tables.sort();
+        assert_eq!(
+            tables_after
+                .into_iter()
+                .map(|(name,)| name)
+                .collect::<Vec<_>>(),
+            expected_tables
+        );
+    }
+
+    #[tokio::test]
+    async fn migrate_shard_schema_handles_concurrent_startups_without_double_migrating() {
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let db_path = temp_dir.path().join("shard_0.db");
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", db_path.display()))
+            .unwrap()
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(5));
+
+        let mut setup = SqliteConnection::connect_with(&options).await.unwrap();
+        for sql in [
+            "CREATE TABLE blobs (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)",
+            "CREATE TABLE blobs_users (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)",
+            "INSERT INTO blobs_users (key, data, created_at, updated_at, version) VALUES ('alice', x'aa', 1, 1, 0)",
+        ] {
+            sqlx::query(sql).execute(&mut setup).await.unwrap();
+        }
+        setup.close().await.unwrap();
+
+        // Deterministic race: conn_a holds BEGIN IMMEDIATE while conn_b starts
+        // migrate_shard_schema_inner, reads user_version = 0, notifies
+        // `read_tx`, and then blocks on BEGIN IMMEDIATE. conn_a commits the v1
+        // migration only AFTER conn_b's initial v0 read has completed; conn_b
+        // must re-read user_version = 1 under the lock and NOT re-hash.
+        let mut conn_a = SqliteConnection::connect_with(&options).await.unwrap();
+        let mut conn_b = SqliteConnection::connect_with(&options).await.unwrap();
+
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut conn_a)
+            .await
+            .unwrap();
+
+        let (read_tx, read_rx) = oneshot::channel();
+        let racer = tokio::spawn(async move {
+            migrate_shard_schema_inner(&mut conn_b, 0, Some(read_tx))
+                .await
+                .unwrap();
+            conn_b.close().await.unwrap();
+        });
+        // Wait until racer has definitely completed its initial user_version = 0 read.
+        read_rx.await.unwrap();
+
+        let users_table = namespace_table("users");
+        sqlx::query(CREATE_BLOB_NAMESPACES_TABLE)
+            .execute(&mut conn_a)
+            .await
+            .unwrap();
+        sqlx::query(&format!("ALTER TABLE blobs_users RENAME TO {users_table}"))
+            .execute(&mut conn_a)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO blob_namespaces (namespace, table_name) VALUES ('users', ?)")
+            .bind(&users_table)
+            .execute(&mut conn_a)
+            .await
+            .unwrap();
+        sqlx::query(&format!("PRAGMA user_version = {SHARD_SCHEMA_VERSION}"))
+            .execute(&mut conn_a)
+            .await
+            .unwrap();
+        sqlx::query("COMMIT").execute(&mut conn_a).await.unwrap();
+
+        racer.await.unwrap();
+
+        // Table must still be `users_table` (not double-hashed) with original payload.
+        let (data,): (Vec<u8>,) = sqlx::query_as(&format!(
+            "SELECT data FROM {users_table} WHERE key = 'alice'"
+        ))
+        .fetch_one(&mut conn_a)
+        .await
+        .unwrap();
+        assert_eq!(data, vec![0xaa]);
+        conn_a.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn migrate_shard_schema_handles_legacy_table_occupying_rename_destination_and_index_name()
+    {
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let db_path = temp_dir.path().join("shard_0.db");
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", db_path.display()))
+            .unwrap()
+            .create_if_missing(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+
+        // `users` hashes to `blobs_users_<hash>`. A legacy shard can validly
+        // contain a namespace literally named `users_<hash>` whose legacy table
+        // name equals `users`'s destination table name and whose legacy index
+        // name equals `users`'s v1 index name.
+        let users_table = namespace_table("users");
+        let colliding_ns = users_table.strip_prefix("blobs_").unwrap().to_string();
+        let colliding_final_table = namespace_table(&colliding_ns);
+        assert_ne!(users_table, colliding_final_table);
+
+        for sql in [
+            "CREATE TABLE blobs (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)",
+            "CREATE TABLE blobs_users (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)",
+            "INSERT INTO blobs_users (key, data, created_at, updated_at, version) VALUES ('k', x'11', 1, 1, 0)",
+            &format!(
+                "CREATE TABLE {users_table} (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)"
+            ),
+            &format!(
+                "CREATE INDEX idx_{colliding_ns}_expires_at ON {users_table}(expires_at) WHERE expires_at IS NOT NULL"
+            ),
+            &format!(
+                "INSERT INTO {users_table} (key, data, created_at, updated_at, version) VALUES ('k', x'22', 1, 1, 0)"
+            ),
+        ] {
+            sqlx::query(sql).execute(&mut conn).await.unwrap();
+        }
+
+        migrate_shard_schema(&mut conn, 0).await.unwrap();
+
+        let (users_val,): (Vec<u8>,) =
+            sqlx::query_as(&format!("SELECT data FROM {users_table} WHERE key = 'k'"))
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        let (colliding_val,): (Vec<u8>,) = sqlx::query_as(&format!(
+            "SELECT data FROM {colliding_final_table} WHERE key = 'k'"
+        ))
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(users_val, vec![0x11]);
+        assert_eq!(colliding_val, vec![0x22]);
+    }
+
+    #[tokio::test]
+    async fn migrate_shard_schema_checks_indexed_columns_and_rejects_future_versions() {
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let db_path = temp_dir.path().join("shard_0.db");
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", db_path.display()))
+            .unwrap()
+            .create_if_missing(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+
+        // A namespace named `expires_at` with an index only on `key` still has
+        // "expires_at" in the index's SQL text (via the table name) and must
+        // get a real expires_at index during migration.
+        for sql in [
+            "CREATE TABLE blobs (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)",
+            "CREATE TABLE blobs_expires_at (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)",
+            "CREATE INDEX idx_other ON blobs_expires_at(key)",
+        ] {
+            sqlx::query(sql).execute(&mut conn).await.unwrap();
+        }
+
+        migrate_shard_schema(&mut conn, 0).await.unwrap();
+
+        let table = namespace_table("expires_at");
+        let expected_idx = namespace_index(&table);
+        let indexes: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM pragma_index_list(?) WHERE origin = 'c' ORDER BY name",
+        )
+        .bind(&table)
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        assert!(
+            indexes.iter().any(|(name,)| name == &expected_idx),
+            "expected expires_at index {expected_idx} to be created, found {indexes:?}"
+        );
+
+        // Unsupported future schema versions must be rejected.
+        sqlx::query(&format!(
+            "PRAGMA user_version = {}",
+            SHARD_SCHEMA_VERSION + 1
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        let err = migrate_shard_schema(&mut conn, 0)
+            .await
+            .expect_err("future schema version must be rejected");
+        assert!(err.to_string().contains("unsupported schema version"));
+    }
+
+    #[tokio::test]
+    async fn migrate_shard_schema_handles_uppercase_prefix_and_temp_index_collision() {
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let db_path = temp_dir.path().join("shard_0.db");
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", db_path.display()))
+            .unwrap()
+            .create_if_missing(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+
+        for sql in [
+            "CREATE TABLE blobs (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)",
+            // An existing index occupying the first temporary table name candidate.
+            "CREATE INDEX __blobasaur_migrate_tmp_0 ON blobs(key)",
+            // Uppercase `BLOBS_` prefix must still migrate and retain the `Users` suffix.
+            "CREATE TABLE BLOBS_Users (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)",
+            "INSERT INTO BLOBS_Users (key, data, created_at, updated_at, version) VALUES ('a', x'fe', 1, 1, 0)",
+        ] {
+            sqlx::query(sql).execute(&mut conn).await.unwrap();
+        }
+
+        migrate_shard_schema(&mut conn, 0).await.unwrap();
+
+        let upper_table = namespace_table("Users");
+        let (val,): (Vec<u8>,) =
+            sqlx::query_as(&format!("SELECT data FROM {upper_table} WHERE key = 'a'"))
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(val, vec![0xfe]);
+
+        // Dropping blob_namespaces on a v1 shard must fail startup validation instead of silently recreating it.
+        sqlx::query("DROP TABLE blob_namespaces")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let err = migrate_shard_schema(&mut conn, 0)
+            .await
+            .expect_err("missing blob_namespaces on v1 shard must fail");
+        assert!(err.to_string().contains("blob_namespaces"));
+    }
+
+    #[tokio::test]
+    async fn migrate_shard_schema_rejects_bad_v0_meta() {
+        // Pre-existing orphan/conflicting blob_namespaces row on a v0 shard must abort upgrade.
+        let temp_dir = TempDir::new().expect("temp dir");
+        let db_path = temp_dir.path().join("shard_0.db");
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", db_path.display()))
+            .unwrap()
+            .create_if_missing(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        for sql in [
+            "CREATE TABLE blobs (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)",
+            CREATE_BLOB_NAMESPACES_TABLE,
+            "CREATE TABLE blobs_users (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)",
+            "INSERT INTO blob_namespaces (namespace, table_name) VALUES ('ghost', 'blobs_ghost_00000000000000000000000000000000')",
+        ] {
+            sqlx::query(sql).execute(&mut conn).await.unwrap();
+        }
+        assert!(
+            migrate_shard_schema(&mut conn, 0).await.is_err(),
+            "pre-existing invalid blob_namespaces row must fail v0 migration"
+        );
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(version, 0);
+    }
+
+    #[tokio::test]
+    async fn failed_ensure_namespaced_table_rolls_back_savepoint_and_keeps_shard_valid() {
+        let (_temp_dir, pool) = create_test_pool().await;
+        sqlx::query(CREATE_BLOB_NAMESPACES_TABLE)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(&format!("PRAGMA user_version = {SHARD_SCHEMA_VERSION}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Pre-create a table occupying the index name that `failns` will try to create,
+        // forcing CREATE INDEX inside ensure_namespaced_table_exists to fail after
+        // CREATE TABLE succeeds.
+        let fail_table = namespace_table("failns");
+        let blocking_name = namespace_index(&fail_table);
+        sqlx::query(&format!("CREATE TABLE {blocking_name} (id INTEGER)"))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let (set_tx, set_rx) = oneshot::channel();
+        let (hset_tx, hset_rx) = oneshot::channel();
+        let mut batch = VecDeque::from([
+            ShardWriteOperation::Set {
+                key: "ok".to_string(),
+                data: Bytes::from_static(b"1"),
+                expires_at: None,
+                responder: set_tx,
+            },
+            ShardWriteOperation::HSet {
+                namespace: "failns".to_string(),
+                key: "f".to_string(),
+                data: Bytes::from_static(b"v"),
+                responder: hset_tx,
+            },
+        ]);
+        let mut tables = HashSet::from(["blobs".to_string()]);
+        process_batch(
+            0,
+            &pool,
+            &mut batch,
+            &mut tables,
+            &Cache::new(16),
+            &Cache::new(16),
+            &ShardMetrics::new(0),
+        )
+        .await;
+
+        // Outer batch committed `Set("ok")`, while `HSet("failns")` failed AND
+        // rolled back its CREATE TABLE savepoint so the shard stays valid for restart.
+        assert_eq!(set_rx.await.unwrap(), Ok(()));
+        assert!(hset_rx.await.unwrap().is_err());
+
+        let exists: Option<(String,)> =
+            sqlx::query_as("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
+                .bind(&fail_table)
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            exists, None,
+            "failed namespace creation must not leave an unmapped table behind"
+        );
+
+        let mut conn = pool.acquire().await.unwrap();
+        validate_v1_shard_metadata(&mut conn, 0)
+            .await
+            .expect("shard must remain valid for restart after failed HSET");
     }
 }

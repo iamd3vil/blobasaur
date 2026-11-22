@@ -357,7 +357,7 @@ Blobasaur implements core Redis commands for blob operations:
 
 Use namespaces to organize data into logical groups.
 
-> **Namespace format:** `namespace` must be non-empty and contain only ASCII letters, numbers, and underscore (`[A-Za-z0-9_]`).
+> **Namespace format:** `namespace` must be non-empty, case-sensitive (`Users` and `users` are distinct), and contain only ASCII letters, numbers, and underscore (`[A-Za-z0-9_]`).
 > Examples: `users`, `users123`, `users_123`.
 
 - **`HSET namespace key value`**: Store in namespace
@@ -599,11 +599,13 @@ CREATE TABLE blobs (
 );
 ```
 
-**Namespaced Tables (`blobs_{namespace}`):**
+**Namespaced Tables (`blobs_{slug}_{hash}`):**
 - Created automatically on first access
 - Same schema as default table
-- Isolated from other namespaces
+- Case-sensitive and isolated from other namespaces (e.g., `Users` and `users` use distinct tables)
 - `namespace` must match `[A-Za-z0-9_]+`
+- Table names combine a lowercased slug (up to 32 characters) with a 32-hex-character SHA-256 prefix of the exact namespace; a `blob_namespaces(namespace, table_name)` table in each shard maps namespaces to their SQLite table names for inspection
+- Legacy `blobs_{namespace}` tables from earlier versions are renamed in place on startup via `PRAGMA user_version` migration. Each legacy table migrates under the exact suffix stored in SQLite's `sqlite_master` (e.g., data previously written under `Users` into a lowercased `blobs_users` table migrates under `users`, because SQLite retained only one table spelling and no per-row namespace case)
 
 ### TTL and Key Expiration
 

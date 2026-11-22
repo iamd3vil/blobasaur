@@ -236,7 +236,8 @@ async fn shutdown_flushes_queued_async_hsets() {
 
     let dir = server.stop().await;
     let expected: HashSet<String> = (0..N).map(|i| format!("key-{i}")).collect();
-    assert_eq!(keys(dir.path(), "blobs_ns").await, expected);
+    let ns_table = blobasaur::shard_manager::namespace_table("ns");
+    assert_eq!(keys(dir.path(), &ns_table).await, expected);
 }
 
 /// Clients keep writing while shutdown starts. Each write must be either
