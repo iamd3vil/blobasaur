@@ -37,3 +37,7 @@ metrics-exporter-prometheus = "0.15"
 
 [dev-dependencies]
 tempfile = "3.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
