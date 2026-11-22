@@ -80,14 +80,14 @@ pub async fn run(
     let mut background = Vec::new();
 
     // Spawn cleanup tasks for each shard
-    for i in 0..cfg.num_shards {
+    for (i, write_pool) in state.write_db_pools.iter().enumerate() {
         // Expiry cleanup deletes rows, so it shares the shard's single writer
         // connection: taking turns with the writer instead of holding the SQLite
         // write lock from another connection, which made writer batches fail
         // with SQLITE_BUSY.
         background.push(tokio::spawn(shard_manager::shard_cleanup_task(
             i,
-            state.write_db_pools[i].clone(),
+            write_pool.clone(),
             cfg.cleanup_interval_secs(),
             cfg.cleanup_chunk_size(),
         )));
