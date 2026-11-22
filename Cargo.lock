@@ -320,6 +320,7 @@ dependencies = [
  "redis-protocol",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "tempfile",
  "thiserror 1.0.69",

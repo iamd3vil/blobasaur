@@ -5,7 +5,7 @@ use mpchash::HashRing;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Connection, SqliteConnection, SqlitePool};
 use std::fs;
-use std::hash::{BuildHasher, Hasher, RandomState};
+use std::hash::{BuildHasher, RandomState};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::{Mutex, MutexGuard, Semaphore, mpsc};
@@ -96,15 +96,11 @@ impl KeyLocks {
     }
 
     /// Locks fields of a hash namespace until the guards are dropped. The
-    /// namespace is hashed lowercased, as it's stored (see
+    /// namespace is hashed case-sensitively (matching
     /// [`crate::shard_manager::namespace_table`]), and once: a command with
     /// many fields doesn't copy or rehash it per field.
     pub async fn lock_fields(&self, namespace: &str, fields: &[&str]) -> Vec<MutexGuard<'_, ()>> {
-        let mut namespace_hasher = self.hasher.build_hasher();
-        for byte in namespace.bytes() {
-            namespace_hasher.write_u8(byte.to_ascii_lowercase());
-        }
-        let namespace_hash = namespace_hasher.finish();
+        let namespace_hash = self.hasher.hash_one(namespace);
         let hashes = fields
             .iter()
             .map(|field| self.hasher.hash_one((namespace_hash, field)));
@@ -164,6 +160,20 @@ impl AppState {
         // sets it, before the pools open the file. Older shards keep their mode;
         // the enforcement below handles them.
         for i in 0..cfg.num_shards {
+            // Check schema version before opening a writable WAL connection or
+            // running application DDL, so a future-version shard is rejected
+            // untouched (while still allowing SQLite hot-journal recovery).
+            let db_path = format!("{}/shard_{}.db", cfg.data_dir, i);
+            if std::path::Path::new(&db_path).exists() {
+                let version = crate::shard_manager::probe_shard_schema_version(
+                    &db_path,
+                    i,
+                    cfg.sqlite_busy_timeout_ms(),
+                )
+                .await?;
+                crate::shard_manager::validate_schema_version(version, i)?;
+            }
+
             let options =
                 build_sqlite_connect_options(&cfg, i).pragma("auto_vacuum", "INCREMENTAL");
             let mut conn = SqliteConnection::connect_with(&options)
@@ -173,6 +183,9 @@ impl AppState {
                 .execute(&mut conn)
                 .await
                 .map_err(|e| miette!("failed to create table in shard {} DB: {}", i, e))?;
+            crate::shard_manager::migrate_shard_schema(&mut conn, i)
+                .await
+                .map_err(|e| miette!("failed to migrate schema in shard {} DB: {}", i, e))?;
             conn.close()
                 .await
                 .map_err(|e| miette!("failed to close shard {} DB: {}", i, e))?;
