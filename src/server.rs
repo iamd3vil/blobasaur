@@ -383,6 +383,30 @@ async fn handle_redis_command(
     result
 }
 
+async fn check_key_route(state: &AppState, key: &str) -> Result<(), BytesFrame> {
+    let Some(cluster_manager) = state.cluster_manager.as_ref() else {
+        return Ok(());
+    };
+    match cluster_manager.route_key(key).await.into_error() {
+        Some(err) => Err(BytesFrame::Error(err.into())),
+        None => Ok(()),
+    }
+}
+
+async fn check_hash_route(state: &AppState, namespace: &str, key: &str) -> Result<(), BytesFrame> {
+    let Some(cluster_manager) = state.cluster_manager.as_ref() else {
+        return Ok(());
+    };
+    match cluster_manager
+        .route_hash(namespace, key)
+        .await
+        .into_error()
+    {
+        Some(err) => Err(BytesFrame::Error(err.into())),
+        None => Ok(()),
+    }
+}
+
 async fn handle_redis_command_inner(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
@@ -390,11 +414,7 @@ async fn handle_redis_command_inner(
 ) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         RedisCommand::Get { key } => {
-            if let Some(ref cluster_manager) = state.cluster_manager
-                && !cluster_manager.should_handle_locally(&key).await
-                && let Some(redirect) = cluster_manager.get_redirect_response(&key).await
-            {
-                let response = BytesFrame::Error(redirect.into());
+            if let Err(response) = check_key_route(state, &key).await {
                 stream.write_all(&serialize_frame(&response)).await?;
                 return Ok(());
             }
@@ -405,11 +425,7 @@ async fn handle_redis_command_inner(
             value,
             ttl_seconds,
         } => {
-            if let Some(ref cluster_manager) = state.cluster_manager
-                && !cluster_manager.should_handle_locally(&key).await
-                && let Some(redirect) = cluster_manager.get_redirect_response(&key).await
-            {
-                let response = BytesFrame::Error(redirect.into());
+            if let Err(response) = check_key_route(state, &key).await {
                 stream.write_all(&serialize_frame(&response)).await?;
                 return Ok(());
             }
@@ -419,11 +435,7 @@ async fn handle_redis_command_inner(
             handle_del_multiple(stream, state, keys).await?;
         }
         RedisCommand::Exists { key } => {
-            if let Some(ref cluster_manager) = state.cluster_manager
-                && !cluster_manager.should_handle_locally(&key).await
-                && let Some(redirect) = cluster_manager.get_redirect_response(&key).await
-            {
-                let response = BytesFrame::Error(redirect.into());
+            if let Err(response) = check_key_route(state, &key).await {
                 stream.write_all(&serialize_frame(&response)).await?;
                 return Ok(());
             }
@@ -498,22 +510,14 @@ async fn handle_redis_command_inner(
             handle_cluster_keyslot(stream, key).await?;
         }
         RedisCommand::Ttl { key } => {
-            if let Some(ref cluster_manager) = state.cluster_manager
-                && !cluster_manager.should_handle_locally(&key).await
-                && let Some(redirect) = cluster_manager.get_redirect_response(&key).await
-            {
-                let response = BytesFrame::Error(redirect.into());
+            if let Err(response) = check_key_route(state, &key).await {
                 stream.write_all(&serialize_frame(&response)).await?;
                 return Ok(());
             }
             handle_ttl(stream, state, key).await?;
         }
         RedisCommand::Expire { key, seconds } => {
-            if let Some(ref cluster_manager) = state.cluster_manager
-                && !cluster_manager.should_handle_locally(&key).await
-                && let Some(redirect) = cluster_manager.get_redirect_response(&key).await
-            {
-                let response = BytesFrame::Error(redirect.into());
+            if let Err(response) = check_key_route(state, &key).await {
                 stream.write_all(&serialize_frame(&response)).await?;
                 return Ok(());
             }
@@ -754,14 +758,10 @@ async fn handle_del_multiple(
 /// DEL's reply. Like every command that takes key locks, it releases them
 /// before the reply is written, so a client slow to read can't hold them.
 async fn del_reply(state: &Arc<AppState>, mut keys: Vec<String>) -> BytesFrame {
-    // Route every key before deleting any, so a redirect leaves them all.
-    if let Some(ref cluster_manager) = state.cluster_manager {
-        for key in &keys {
-            if !cluster_manager.should_handle_locally(key).await
-                && let Some(redirect) = cluster_manager.get_redirect_response(key).await
-            {
-                return BytesFrame::Error(redirect.into());
-            }
+    // Route every key before deleting any, so a redirect or unserved slot leaves them all.
+    for key in &keys {
+        if let Err(response) = check_key_route(state, key).await {
+            return response;
         }
     }
 
@@ -1104,15 +1104,7 @@ async fn handle_hget(
     }
 
     // Check if we should handle this hash operation locally in a cluster
-    if let Some(ref cluster_manager) = state.cluster_manager
-        && !cluster_manager
-            .should_handle_hash_locally(&namespace, &key)
-            .await
-        && let Some(redirect) = cluster_manager
-            .get_hash_redirect_response(&namespace, &key)
-            .await
-    {
-        let response = BytesFrame::Error(redirect.into());
+    if let Err(response) = check_hash_route(state, &namespace, &key).await {
         stream.write_all(&serialize_frame(&response)).await?;
         return Ok(());
     }
@@ -1218,15 +1210,8 @@ async fn hset_reply(
     value: Bytes,
 ) -> Result<BytesFrame, Box<dyn std::error::Error>> {
     // Check if we should handle this hash operation locally in a cluster
-    if let Some(ref cluster_manager) = state.cluster_manager
-        && !cluster_manager
-            .should_handle_hash_locally(&namespace, &key)
-            .await
-        && let Some(redirect) = cluster_manager
-            .get_hash_redirect_response(&namespace, &key)
-            .await
-    {
-        return Ok(BytesFrame::Error(redirect.into()));
+    if let Err(response) = check_hash_route(state, &namespace, &key).await {
+        return Ok(response);
     }
 
     let value_len = value.len() as f64;
@@ -1358,6 +1343,14 @@ async fn hsetex_reply(
 ) -> Result<BytesFrame, Box<dyn std::error::Error>> {
     use crate::redis::protocol::ExpireOption;
 
+    // Route every field before locking or checking FNX/FXX, so a redirect or
+    // unserved slot leaves the hash untouched and isn't masked by another field.
+    for (field_key, _) in &fields {
+        if let Err(response) = check_hash_route(state, &namespace, field_key).await {
+            return Ok(response);
+        }
+    }
+
     // Held until every write is queued or committed, so the FNX/FXX condition
     // and the new-field count still hold when the writes land.
     let field_refs: Vec<&str> = fields
@@ -1383,23 +1376,11 @@ async fn hsetex_reply(
         None => None,
     };
 
-    // Check every field before writing any, so a redirect or a failed FNX/FXX
-    // condition leaves the hash untouched.
+    // Check every field before writing any, so a failed FNX/FXX condition
+    // leaves the hash untouched.
     let mut checked = Vec::with_capacity(fields.len());
     let mut seen = HashSet::with_capacity(fields.len());
     for (field_key, field_value) in fields {
-        // Check if we should handle this hash operation locally in a cluster
-        if let Some(ref cluster_manager) = state.cluster_manager
-            && !cluster_manager
-                .should_handle_hash_locally(&namespace, &field_key)
-                .await
-            && let Some(redirect) = cluster_manager
-                .get_hash_redirect_response(&namespace, &field_key)
-                .await
-        {
-            return Ok(BytesFrame::Error(redirect.into()));
-        }
-
         let shard_index = state.get_shard(&field_key);
         let pool = &state.check_db_pools[shard_index];
 
@@ -1545,15 +1526,8 @@ async fn handle_hdel(
 /// HDEL's reply; it releases its key lock before the reply is written, as DEL.
 async fn hdel_reply(state: &Arc<AppState>, namespace: String, key: String) -> BytesFrame {
     // Check if we should handle this hash operation locally in a cluster
-    if let Some(ref cluster_manager) = state.cluster_manager
-        && !cluster_manager
-            .should_handle_hash_locally(&namespace, &key)
-            .await
-        && let Some(redirect) = cluster_manager
-            .get_hash_redirect_response(&namespace, &key)
-            .await
-    {
-        return BytesFrame::Error(redirect.into());
+    if let Err(response) = check_hash_route(state, &namespace, &key).await {
+        return response;
     }
 
     let shard_index = state.get_shard(&key);
@@ -1655,15 +1629,7 @@ async fn handle_hexists(
     }
 
     // Check if we should handle this hash operation locally in a cluster
-    if let Some(ref cluster_manager) = state.cluster_manager
-        && !cluster_manager
-            .should_handle_hash_locally(&namespace, &key)
-            .await
-        && let Some(redirect) = cluster_manager
-            .get_hash_redirect_response(&namespace, &key)
-            .await
-    {
-        let response = BytesFrame::Error(redirect.into());
+    if let Err(response) = check_hash_route(state, &namespace, &key).await {
         stream.write_all(&serialize_frame(&response)).await?;
         return Ok(());
     }
@@ -1799,18 +1765,10 @@ async fn hexpire_reply(
     condition: Option<HExpireCondition>,
     fields: Vec<String>,
 ) -> BytesFrame {
-    // Route every field before expiring any, so a redirect leaves them all.
-    if let Some(ref cluster_manager) = state.cluster_manager {
-        for field_key in &fields {
-            if !cluster_manager
-                .should_handle_hash_locally(&namespace, field_key)
-                .await
-                && let Some(redirect) = cluster_manager
-                    .get_hash_redirect_response(&namespace, field_key)
-                    .await
-            {
-                return BytesFrame::Error(redirect.into());
-            }
+    // Route every field before expiring any, so a redirect or unserved slot leaves them all.
+    for field_key in &fields {
+        if let Err(response) = check_hash_route(state, &namespace, field_key).await {
+            return response;
         }
     }
 
