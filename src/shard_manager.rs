@@ -2555,8 +2555,8 @@ mod tests {
 
     #[tokio::test]
     async fn clearing_a_large_async_value_frees_it() {
-        let cache: Cache<String, Pending> = Cache::new(16);
-        let hcache: Cache<String, Pending> = Cache::new(16);
+        let cache: Cache<String, Pending> = Cache::builder().build();
+        let hcache: Cache<String, Pending> = Cache::builder().build();
         let (sender, mut receiver) = test_channel(16);
 
         let value = Bytes::from(vec![1u8; FREE_NOW_BYTES]);

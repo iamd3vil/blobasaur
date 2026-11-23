@@ -5422,4 +5422,142 @@ mod tests {
 
         ctx.shutdown().await;
     }
+
+    #[tokio::test]
+    async fn async_inflight_cache_does_not_evict_when_batch_exceeds_queue_capacity() {
+        use sqlx::{Connection, SqliteConnection, sqlite::SqliteConnectOptions};
+        use std::str::FromStr;
+
+        const BATCH_SIZE: usize = 64;
+        const QUEUE_CAPACITY: usize = 1;
+        const TOTAL_OPS: usize = BATCH_SIZE + QUEUE_CAPACITY;
+
+        async fn new_ctx_with_lock() -> (TestContext, SqliteConnection) {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let data_dir = temp_dir.path().to_string_lossy().into_owned();
+            let cfg = Cfg {
+                data_dir: data_dir.clone(),
+                num_shards: 1,
+                storage_compression: None,
+                async_write: Some(true),
+                batch_size: Some(BATCH_SIZE),
+                batch_timeout_ms: Some(10_000),
+                write_queue_capacity: Some(QUEUE_CAPACITY),
+                addr: None,
+                cluster: None,
+                metrics: None,
+                shutdown_timeout_secs: None,
+                max_request_size_mb: None,
+                cleanup_chunk_size: None,
+                cleanup_interval_secs: None,
+                sqlite: Some(SqliteConfig {
+                    cache_size_mb: None,
+                    busy_timeout_ms: Some(10_000),
+                    synchronous: None,
+                    mmap_size: None,
+                    max_connections: Some(2),
+                    auto_upgrade_legacy_auto_vacuum: None,
+                    auto_upgrade_legacy_auto_vacuum_concurrency: None,
+                }),
+            };
+            let ctx = TestContext::from_cfg(temp_dir, cfg).await;
+
+            // Hold the shard's SQLite write lock so the writer's batch stays uncommitted.
+            let opts = SqliteConnectOptions::from_str(&format!("sqlite:{data_dir}/shard_0.db"))
+                .expect("sqlite connect options");
+            let mut blocker = SqliteConnection::connect_with(&opts)
+                .await
+                .expect("connect blocker");
+            sqlx::query("BEGIN IMMEDIATE")
+                .execute(&mut blocker)
+                .await
+                .expect("acquire SQLite write lock");
+
+            (ctx, blocker)
+        }
+
+        // Plain SET/GET (inflight_cache)
+        {
+            let (ctx, mut blocker) = new_ctx_with_lock().await;
+
+            for i in 0..TOTAL_OPS {
+                let key = format!("k:{i}");
+                let val = Bytes::from(format!("v:{i}"));
+                let frame = respond_with(&ctx, |state, stream| {
+                    Box::pin(async move {
+                        let mut stream = stream;
+                        handle_set(&mut stream, &state, key, val, None).await
+                    })
+                })
+                .await;
+                assert_simple_string(frame, "OK");
+            }
+
+            // Force Moka housekeeping so any capacity-based eviction would happen now.
+            ctx.state.inflight_cache.run_pending_tasks().await;
+
+            // Every acknowledged write must still be visible before the batch commits.
+            for i in 0..TOTAL_OPS {
+                let key = format!("k:{i}");
+                let expected = format!("v:{i}");
+                let frame = respond_with(&ctx, |state, stream| {
+                    Box::pin(async move {
+                        let mut stream = stream;
+                        handle_get(&mut stream, &state, key).await
+                    })
+                })
+                .await;
+                assert_bulk_string(frame, expected.as_bytes());
+            }
+
+            sqlx::query("ROLLBACK")
+                .execute(&mut blocker)
+                .await
+                .expect("release SQLite write lock");
+            blocker.close().await.expect("close blocker");
+
+            ctx.shutdown().await;
+        }
+
+        // Namespaced HSET/HGET (inflight_hcache)
+        {
+            let (ctx, mut blocker) = new_ctx_with_lock().await;
+
+            for i in 0..TOTAL_OPS {
+                let field = format!("f:{i}");
+                let val = Bytes::from(format!("hv:{i}"));
+                let frame = respond_with(&ctx, |state, stream| {
+                    Box::pin(async move {
+                        let mut stream = stream;
+                        handle_hset(&mut stream, &state, "ns".to_string(), field, val).await
+                    })
+                })
+                .await;
+                assert_integer_response(frame, 1);
+            }
+
+            ctx.state.inflight_hcache.run_pending_tasks().await;
+
+            for i in 0..TOTAL_OPS {
+                let field = format!("f:{i}");
+                let expected = format!("hv:{i}");
+                let frame = respond_with(&ctx, |state, stream| {
+                    Box::pin(async move {
+                        let mut stream = stream;
+                        handle_hget(&mut stream, &state, "ns".to_string(), field).await
+                    })
+                })
+                .await;
+                assert_bulk_string(frame, expected.as_bytes());
+            }
+
+            sqlx::query("ROLLBACK")
+                .execute(&mut blocker)
+                .await
+                .expect("release SQLite write lock");
+            blocker.close().await.expect("close blocker");
+
+            ctx.shutdown().await;
+        }
+    }
 }
