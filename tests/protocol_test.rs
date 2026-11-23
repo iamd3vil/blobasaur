@@ -255,3 +255,22 @@ async fn hsetex_counts_a_repeated_new_field_once() {
     client.send(&request(&[b"HGET", b"ns", b"f"])).await;
     assert_eq!(client.bulk().await, b"b");
 }
+
+// Redis treats a negative EXPIRE like EXPIRE 0: the key is deleted.
+#[tokio::test]
+async fn expire_with_a_negative_ttl_deletes_the_key() {
+    let server = start(None).await;
+    assert_eq!(
+        server.call(&[b"SET", b"k", b"v"]).await.as_deref(),
+        Some("+OK")
+    );
+    assert_eq!(
+        server.call(&[b"EXPIRE", b"k", b"-5"]).await.as_deref(),
+        Some(":1")
+    );
+    assert_eq!(server.call(&[b"EXISTS", b"k"]).await.as_deref(), Some(":0"));
+    assert_eq!(
+        server.call(&[b"EXPIRE", b"k", b"-5"]).await.as_deref(),
+        Some(":0")
+    );
+}
