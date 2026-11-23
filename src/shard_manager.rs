@@ -193,8 +193,13 @@ pub struct ShardWriter {
 /// queued op, so clearing after commit only removes the entry that op recorded.
 #[derive(Clone, Debug)]
 pub enum Pending {
-    /// A queued SET/HSET/HSETEX.
-    Value { data: Bytes, token: u64 },
+    /// A queued SET/HSET/HSETEX. `expires_at` is the expiry a SET writes, which
+    /// replaces the key's; TTL reads it. Hash writes leave it `None`.
+    Value {
+        data: Bytes,
+        token: u64,
+        expires_at: Option<i64>,
+    },
     /// A queued DEL/HDEL: the key reads as absent.
     Deleted(u64),
 }
@@ -2533,7 +2538,11 @@ mod tests {
             cache,
             sender,
             key.to_string(),
-            Pending::Value { data, token },
+            Pending::Value {
+                data,
+                token,
+                expires_at: None,
+            },
             op,
         )
         .await
@@ -2687,6 +2696,7 @@ mod tests {
             Pending::Value {
                 data: Bytes::new(),
                 token: h0,
+                expires_at: None,
             },
             ShardWriteOperation::HSetAsync {
                 namespace: "ns".to_string(),
@@ -2705,6 +2715,7 @@ mod tests {
             Pending::Value {
                 data: Bytes::from_static(b"a"),
                 token: h1,
+                expires_at: None,
             },
             ShardWriteOperation::HSetAsync {
                 namespace: "ns".to_string(),
@@ -2723,6 +2734,7 @@ mod tests {
             Pending::Value {
                 data: Bytes::new(),
                 token: last_h_token,
+                expires_at: None,
             },
             ShardWriteOperation::HSetExAsync {
                 namespace: "ns".to_string(),
@@ -2767,21 +2779,21 @@ mod tests {
         assert!(
             matches!(
                 cache.get("k").await,
-                Some(Pending::Value { data, token }) if data.is_empty() && token == last_k_token
+                Some(Pending::Value { data, token, .. }) if data.is_empty() && token == last_k_token
             ),
             "newer empty SET was cleared by older empty SET"
         );
         assert!(
             matches!(
                 cache.get("s").await,
-                Some(Pending::Value { data, token }) if data == shared && token == last_s_token
+                Some(Pending::Value { data, token, .. }) if data == shared && token == last_s_token
             ),
             "newer aliased SET was cleared by older aliased SET"
         );
         assert!(
             matches!(
                 hcache.get("ns:f").await,
-                Some(Pending::Value { data, token }) if data.is_empty() && token == last_h_token
+                Some(Pending::Value { data, token, .. }) if data.is_empty() && token == last_h_token
             ),
             "newer empty HSETEX was cleared by older empty HSET"
         );

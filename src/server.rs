@@ -678,7 +678,11 @@ async fn handle_set(
             expires_at,
             token,
         };
-        let pending = Pending::Value { data: value, token };
+        let pending = Pending::Value {
+            data: value,
+            token,
+            expires_at,
+        };
 
         if shard_manager::queue_pending(&state.inflight_cache, sender, key, pending, operation)
             .await
@@ -1257,7 +1261,11 @@ async fn hset_reply(
             data: value.clone(),
             token,
         };
-        let pending = Pending::Value { data: value, token };
+        let pending = Pending::Value {
+            data: value,
+            token,
+            expires_at: None,
+        };
 
         if shard_manager::queue_pending(
             &state.inflight_hcache,
@@ -1423,6 +1431,7 @@ async fn hsetex_reply(
             let pending = Pending::Value {
                 data: compressed_value.clone(),
                 token,
+                expires_at: None,
             };
             let operation = if let Some(exp) = expires_at {
                 ShardWriteOperation::HSetExAsync {
@@ -2002,11 +2011,25 @@ async fn handle_ttl(
     state: &Arc<AppState>,
     key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // A queued DEL means the key is gone. (A queued SET's expiry isn't in the
-    // cache, so TTL still reads the DB for those.)
-    if shard_manager::pending_exists(&state.inflight_cache, &key).await == Some(false) {
+    // A queued SET or DEL decides it, as it does for GET. A SET replaces the
+    // key's expiry with its own, so the DB's would be stale or missing.
+    if let Some(pending) = state.inflight_cache.get(&key).await {
+        let ttl = match pending {
+            Pending::Deleted(_) => -2,
+            Pending::Value { expires_at, .. } => match expires_at {
+                None => -1,
+                Some(expires_at) => {
+                    let now = chrono::Utc::now().timestamp();
+                    if expires_at > now {
+                        expires_at - now
+                    } else {
+                        -2
+                    }
+                }
+            },
+        };
         stream
-            .write_all(&serialize_frame(&BytesFrame::Integer(-2)))
+            .write_all(&serialize_frame(&BytesFrame::Integer(ttl)))
             .await?;
         return Ok(());
     }
@@ -3980,6 +4003,7 @@ mod tests {
                 Pending::Value {
                     data: value.clone(),
                     token: shard_manager::next_pending_token(),
+                    expires_at: None,
                 },
             )
             .await;
@@ -3990,6 +4014,7 @@ mod tests {
                 Pending::Value {
                     data: value,
                     token: shard_manager::next_pending_token(),
+                    expires_at: None,
                 },
             )
             .await;
@@ -5559,5 +5584,62 @@ mod tests {
 
             ctx.shutdown().await;
         }
+    }
+
+    fn assert_ttl_about(frame: BytesFrame, expected: i64) {
+        // A second boundary may pass between the write and the read.
+        match frame {
+            BytesFrame::Integer(ttl) => assert!(
+                ttl == expected || ttl == expected - 1,
+                "expected TTL {expected}, got {ttl}"
+            ),
+            other => panic!("Expected integer TTL, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn ttl_reads_the_expiry_of_a_queued_async_set() {
+        let mut ctx = TestContext::new_paused(true).await;
+        // A committed key with a TTL, which the queued SET below replaces.
+        sqlx::query(
+            "INSERT INTO blobs (key, data, created_at, updated_at, expires_at) VALUES ('old', 'v', 0, 0, ?)",
+        )
+        .bind(chrono::Utc::now().timestamp() + 1000)
+        .execute(&ctx.state.write_db_pools[0])
+        .await
+        .unwrap();
+
+        // The writer is paused, so these SETs stay queued. GET already serves
+        // them, so TTL must report the expiry each one will write.
+        let set = run!(ctx, handle_set("new".into(), v(b"v"), Some(100)));
+        assert_simple_string(set, "OK");
+        assert_ttl_about(run!(ctx, handle_ttl("new".into())), 100);
+        let set = run!(ctx, handle_set("old".into(), v(b"v2"), None));
+        assert_simple_string(set, "OK");
+        assert_integer_response(run!(ctx, handle_ttl("old".into())), -1);
+
+        // A queued SET whose TTL has already run out reads as gone, as GET
+        // would once it commits.
+        ctx.state
+            .inflight_cache
+            .insert(
+                "stale".into(),
+                Pending::Value {
+                    data: v(b"v"),
+                    token: shard_manager::next_pending_token(),
+                    expires_at: Some(chrono::Utc::now().timestamp() - 1),
+                },
+            )
+            .await;
+        assert_integer_response(run!(ctx, handle_ttl("stale".into())), -2);
+        ctx.state.inflight_cache.invalidate("stale").await;
+
+        // Once committed, the DB gives the same answers.
+        ctx.resume();
+        wait_for_commit(&ctx.state.inflight_cache, "new").await;
+        wait_for_commit(&ctx.state.inflight_cache, "old").await;
+        assert_ttl_about(run!(ctx, handle_ttl("new".into())), 100);
+        assert_integer_response(run!(ctx, handle_ttl("old".into())), -1);
+        ctx.shutdown().await;
     }
 }
