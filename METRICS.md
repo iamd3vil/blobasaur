@@ -85,6 +85,7 @@ Blocking-pool size, worker-local queue depth, poll counts, and work-steal counts
 
 ### Storage Metrics
 
+- `blobasaur_keys{shard}` - Cached count of stored rows in the shard across `blobs` and all namespaced `blobs_*` tables. Seeded once from SQLite on startup and updated in memory on every committed writer batch and expiry cleanup chunk, so scrapes do not scan SQLite. Expired rows remain counted until the cleanup task deletes them. Sampled on each scrape
 - `blobasaur_storage_operations_total` - Total storage operations
 - `blobasaur_sqlite_auto_vacuum_misconfigured_total` - Number of shard DBs observed at startup with `PRAGMA auto_vacuum` not set to `INCREMENTAL` (primarily useful when startup auto-upgrade is disabled)
 - `blobasaur_sqlite_auto_vacuum_upgrade_runs_total{result}` - Startup legacy auto-vacuum conversion attempts by outcome:
@@ -227,6 +228,20 @@ sum by (command) (rate(blobasaur_reads_total{source="inflight"}[5m])) / sum by (
 
 ```promql
 sum(rate(blobasaur_cleanup_deleted_keys_total[5m]))
+```
+
+### Total keys (per node and cluster)
+
+Per node:
+
+```promql
+sum by (instance) (blobasaur_keys)
+```
+
+Across one cluster (scope with your deployment's cluster/job label if Prometheus scrapes multiple clusters):
+
+```promql
+sum(blobasaur_keys{cluster="prod"})
 ```
 
 ### Command Latency (95th percentile)
