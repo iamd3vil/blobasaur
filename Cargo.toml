@@ -39,6 +39,11 @@ metrics-exporter-prometheus = "0.15"
 [dev-dependencies]
 tempfile = "3.0"
 
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { version = "0.7.0", features = [
+    "override_allocator_on_supported_platforms",
+] }
+
 [profile.release]
 lto = true
 codegen-units = 1

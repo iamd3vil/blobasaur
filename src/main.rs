@@ -1,5 +1,9 @@
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use miette::{Context, Result, miette};
 use redis_protocol::resp2::types::BytesFrame;
 use tokio::{
