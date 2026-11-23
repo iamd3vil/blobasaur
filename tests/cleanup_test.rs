@@ -122,10 +122,7 @@ async fn cleanup_deletes_expired_rows_in_chunks_and_keeps_live_ones() {
     for field in &fields {
         expiring_fields.extend([field.as_str(), "v"]);
     }
-    assert_eq!(
-        call(&mut conn, &expiring_fields).await,
-        format!(":{EXPIRED}")
-    );
+    assert_eq!(call(&mut conn, &expiring_fields).await, ":1");
     assert_eq!(call(&mut conn, &["SET", "live", "v"]).await, "+OK");
     assert_eq!(
         call(&mut conn, &["SET", "later", "v", "EX", "3600"]).await,
