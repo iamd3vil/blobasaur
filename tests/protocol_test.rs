@@ -406,3 +406,86 @@ async fn expire_with_a_negative_ttl_deletes_the_key() {
         Some(":0")
     );
 }
+
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+/// Sleeps until the wall clock's sub-second part is `millis`: later this
+/// second, or in the next one if this second is already past it.
+async fn sleep_until_subsec(millis: u64) {
+    let subsec = unix_millis() % 1000;
+    let wait = if subsec <= millis {
+        millis - subsec
+    } else {
+        1000 + millis - subsec
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+}
+
+// Expiry is stored in whole seconds. A key written late in a second must still
+// live for its whole TTL, not just until the next whole-second boundary.
+#[tokio::test]
+async fn ttl_is_not_cut_short_by_whole_second_storage() {
+    let server = start(None).await;
+    // Create the namespace's table up front, so HSETEX below is a plain write.
+    assert_eq!(
+        server
+            .call(&[b"HSET", b"ns", b"other", b"v"])
+            .await
+            .as_deref(),
+        Some(":1")
+    );
+
+    // Both writes must land late in the same second; retry if a slow run
+    // pushes them past it.
+    let second = loop {
+        sleep_until_subsec(900).await;
+        let second = unix_millis() / 1000;
+        assert_eq!(
+            server
+                .call(&[b"SET", b"k", b"v", b"EX", b"1"])
+                .await
+                .as_deref(),
+            Some("+OK")
+        );
+        assert_eq!(
+            server
+                .call(&[b"HSETEX", b"ns", b"EX", b"1", b"FIELDS", b"1", b"f", b"v"])
+                .await
+                .as_deref(),
+            Some(":1")
+        );
+        if unix_millis() / 1000 == second {
+            break second;
+        }
+    };
+
+    // Just past the next whole second, well under the 1s asked for.
+    let wait = (second * 1000 + 1150).saturating_sub(unix_millis());
+    tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+    assert_eq!(server.call(&[b"EXISTS", b"k"]).await.as_deref(), Some(":1"));
+    assert_eq!(
+        server.call(&[b"HEXISTS", b"ns", b"f"]).await.as_deref(),
+        Some(":1")
+    );
+}
+
+#[tokio::test]
+async fn ttl_reports_the_ttl_that_was_set() {
+    let server = start(None).await;
+    for ex in [&b"100"[..], b"1"] {
+        // Partway into a second, so the stored expiry has to round up, with
+        // ~900ms left before TTL could cross into the next one.
+        sleep_until_subsec(100).await;
+        server.call(&[b"SET", b"k", b"v", b"EX", ex]).await;
+        let expected = format!(":{}", std::str::from_utf8(ex).unwrap());
+        assert_eq!(
+            server.call(&[b"TTL", b"k"]).await.as_deref(),
+            Some(expected.as_str())
+        );
+    }
+}

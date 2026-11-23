@@ -688,7 +688,7 @@ async fn handle_set(
     // Check if async_write is enabled
     if state.cfg.async_write.unwrap_or(false) {
         // Calculate expires_at timestamp if TTL is provided
-        let expires_at = ttl_seconds.map(|ttl| chrono::Utc::now().timestamp() + ttl as i64);
+        let expires_at = ttl_seconds.map(|ttl| expiry_in(ttl as i64));
 
         // Async mode: respond immediately after queueing. The inflight cache
         // serves the value until it commits.
@@ -721,7 +721,7 @@ async fn handle_set(
         }
     } else {
         // Calculate expires_at timestamp if TTL is provided
-        let expires_at = ttl_seconds.map(|ttl| chrono::Utc::now().timestamp() + ttl as i64);
+        let expires_at = ttl_seconds.map(|ttl| expiry_in(ttl as i64));
 
         // Sync mode: wait for completion
         let (responder_tx, responder_rx) = oneshot::channel();
@@ -1386,13 +1386,11 @@ async fn hsetex_reply(
     // a relative TTL.
     let keep_ttl = expire_option == Some(ExpireOption::KeepTtl);
     let expires_at = match expire_option {
-        Some(ExpireOption::Ex(seconds)) => Some(chrono::Utc::now().timestamp() + seconds as i64),
+        Some(ExpireOption::Ex(seconds)) => Some(expiry_in(seconds as i64)),
         // Round up like SET PX (the parser has range-checked it).
-        Some(ExpireOption::Px(millis)) => {
-            Some(chrono::Utc::now().timestamp() + millis.div_ceil(1000) as i64)
-        }
+        Some(ExpireOption::Px(millis)) => Some(expiry_in(millis.div_ceil(1000) as i64)),
         Some(ExpireOption::ExAt(timestamp)) => Some(timestamp),
-        Some(ExpireOption::PxAt(timestamp)) => Some(timestamp / 1000),
+        Some(ExpireOption::PxAt(timestamp)) => Some(pxat_secs(timestamp)),
         Some(ExpireOption::KeepTtl) | None => None,
     };
 
@@ -1764,10 +1762,35 @@ enum Deadline {
     At(i64),
 }
 
+/// `now` in whole seconds, rounded up.
+fn whole_secs_up(now: chrono::DateTime<chrono::Utc>) -> i64 {
+    now.timestamp() + i64::from(now.timestamp_subsec_nanos() > 0)
+}
+
+/// The stored expiry for a TTL of `seconds` from `now`. Expiry is in whole
+/// seconds and a key is expired from that second on, so `now` rounds up and
+/// the key lives at least `seconds`. A TTL of zero or less is already due.
+fn expiry_from(now: chrono::DateTime<chrono::Utc>, seconds: i64) -> i64 {
+    if seconds <= 0 {
+        return now.timestamp() + seconds;
+    }
+    whole_secs_up(now) + seconds
+}
+
+fn expiry_in(seconds: i64) -> i64 {
+    expiry_from(chrono::Utc::now(), seconds)
+}
+
+/// A Unix time in milliseconds as a whole-second expiry, rounded up so the
+/// field doesn't expire before the millisecond asked for.
+fn pxat_secs(millis: i64) -> i64 {
+    millis.div_euclid(1000) + i64::from(millis.rem_euclid(1000) > 0)
+}
+
 impl Deadline {
     fn resolve(self) -> i64 {
         match self {
-            Deadline::In(seconds) => chrono::Utc::now().timestamp() + seconds,
+            Deadline::In(seconds) => expiry_in(seconds),
             Deadline::At(timestamp) => timestamp,
         }
     }
@@ -2054,19 +2077,21 @@ async fn handle_ttl(
 
     let shard_index = state.get_shard(&key);
     let pool = &state.db_pools[shard_index];
-    let now = chrono::Utc::now().timestamp();
+    let now = chrono::Utc::now();
 
     match sqlx::query_as::<_, (Option<i64>,)>(
         "SELECT expires_at FROM blobs WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
     )
     .bind(&key)
-    .bind(now)
+    .bind(now.timestamp())
     .fetch_optional(pool)
     .await
     {
         Ok(Some((expires_at,))) => {
             let ttl = match expires_at {
-                Some(expires_at) => expires_at - now,
+                // Counted from `now` rounded up, as expiry_from sets it, so
+                // a fresh EX 100 reports 100.
+                Some(expires_at) => expires_at - whole_secs_up(now),
                 None => -1, // Key exists but has no expiration
             };
             let response = BytesFrame::Integer(ttl);
@@ -2109,7 +2134,7 @@ async fn expire_reply(state: &Arc<AppState>, key: String, seconds: u64) -> Bytes
     let _guard = state.key_locks.lock_keys(&[key.as_str()]).await;
     // Resolved only now, so time spent waiting for the lock doesn't shorten
     // the TTL.
-    let expires_at = chrono::Utc::now().timestamp() + seconds as i64;
+    let expires_at = expiry_in(seconds as i64);
 
     let (responder_tx, responder_rx) = oneshot::channel();
 
@@ -2424,6 +2449,43 @@ mod tests {
     use tempfile::TempDir;
     use tokio::net::{TcpListener, TcpStream};
     use tokio::time::{Duration, timeout};
+
+    #[test]
+    fn expiry_rounds_now_up_so_a_ttl_is_never_cut_short() {
+        let at = |millis| chrono::DateTime::from_timestamp_millis(millis).unwrap();
+        // A key is expired once the clock's whole second reaches expires_at.
+        // Set at 10.950s with EX 1, it must live until 11.950s at least.
+        assert_eq!(expiry_from(at(10_950), 1), 12);
+        assert_eq!(expiry_from(at(10_001), 100), 111);
+        // On a whole second there's nothing to round.
+        assert_eq!(expiry_from(at(10_000), 1), 11);
+        // Zero or less is already due, as EXPIRE 0 needs.
+        assert_eq!(expiry_from(at(10_950), 0), 10);
+        assert_eq!(expiry_from(at(10_950), -5), 5);
+        // TTL counts from the same rounded-up second.
+        assert_eq!(
+            expiry_from(at(10_950), 100) - whole_secs_up(at(10_950)),
+            100
+        );
+        // In the key's last second, TTL is 0: the key still exists.
+        assert_eq!(expiry_from(at(10_950), 1) - whole_secs_up(at(11_050)), 0);
+    }
+
+    #[test]
+    fn pxat_rounds_up_to_the_next_whole_second() {
+        // Exact multiples are already whole seconds.
+        assert_eq!(pxat_secs(0), 0);
+        assert_eq!(pxat_secs(12_000), 12);
+        assert_eq!(pxat_secs(-2_000), -2);
+        // Anything else rounds up, towards +infinity for negatives too.
+        assert_eq!(pxat_secs(12_001), 13);
+        assert_eq!(pxat_secs(12_999), 13);
+        assert_eq!(pxat_secs(-1_500), -1);
+        assert_eq!(pxat_secs(-1), 0);
+        // The extremes don't overflow.
+        assert_eq!(pxat_secs(i64::MAX), i64::MAX / 1000 + 1);
+        assert_eq!(pxat_secs(i64::MIN), i64::MIN / 1000);
+    }
 
     #[test]
     fn large_request_owns_its_buffer_after_release() {
