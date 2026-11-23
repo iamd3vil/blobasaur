@@ -64,12 +64,13 @@ pub struct AppState {
 
 /// Makes a command's existence check and its write one step per key.
 ///
-/// DEL, HDEL, HSET and HSETEX decide their reply (and HSETEX FNX/FXX whether to
-/// write at all) from a check made before the write is queued. Without a lock,
+/// DEL, HDEL and HSET decide their reply, and HSETEX FNX/FXX whether to write at
+/// all, from a check made before the write is queued. Without a lock,
 /// concurrent commands on the same key all pass the check before any of their
 /// writes land. A command holds the lock for each key it checks until its write
-/// is queued (async mode) or committed (sync mode); EXPIRE and HEXPIRE hold it
-/// too, since an expiry in the past removes the key.
+/// is queued (async mode) or committed (sync mode). Plain HSETEX, EXPIRE and
+/// HEXPIRE hold it too: HSETEX writes the field, and an expiry in the past
+/// removes the key.
 ///
 /// Keys map onto a fixed set of mutexes, so unrelated keys sometimes share one.
 pub struct KeyLocks {

@@ -368,8 +368,52 @@ async fn hsetex_fnx_and_fxx_write_all_fields_or_none() {
     assert_eq!(client.bulk().await, b"v");
 }
 
+// Redis replies 1 when HSETEX sets every field and 0 when it sets none; it
+// doesn't count new fields like HSET does. FXX only ever updates existing
+// fields, so a count would make a successful FXX write look like a failed one.
 #[tokio::test]
-async fn hsetex_counts_a_repeated_new_field_once() {
+async fn hsetex_replies_1_when_all_fields_are_set() {
+    let server = start(None).await;
+    assert_eq!(
+        server
+            .call(&[b"HSET", b"ns", b"old", b"v"])
+            .await
+            .as_deref(),
+        Some(":1")
+    );
+
+    let fxx = [
+        &b"HSETEX"[..],
+        b"ns",
+        b"FXX",
+        b"EX",
+        b"3600",
+        b"FIELDS",
+        b"1",
+        b"old",
+        b"v2",
+    ];
+    assert_eq!(server.call(&fxx).await.as_deref(), Some(":1"));
+    let mut client = server.connect().await;
+    client.send(&request(&[b"HGET", b"ns", b"old"])).await;
+    assert_eq!(client.bulk().await, b"v2");
+
+    // Several new fields still reply 1, not the number added.
+    let new_fields = [
+        &b"HSETEX"[..],
+        b"ns",
+        b"FIELDS",
+        b"2",
+        b"a",
+        b"1",
+        b"b",
+        b"2",
+    ];
+    assert_eq!(server.call(&new_fields).await.as_deref(), Some(":1"));
+}
+
+#[tokio::test]
+async fn hsetex_repeated_field_last_value_wins() {
     let server = start(None).await;
     let dup = [
         &b"HSETEX"[..],

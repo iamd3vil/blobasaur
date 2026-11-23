@@ -12,7 +12,6 @@ use crate::shard_manager::{
 use bytes::{Buf, Bytes, BytesMut};
 use futures::FutureExt;
 use redis_protocol::resp2::types::BytesFrame;
-use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -1375,7 +1374,9 @@ async fn hsetex_reply(
     }
 
     // Held until every write is queued or committed, so the FNX/FXX condition
-    // and the new-field count still hold when the writes land.
+    // still holds when the writes land. Plain HSETEX checks nothing but still
+    // takes them, so its writes can't land between another command's check and
+    // write.
     let field_refs: Vec<&str> = fields
         .iter()
         .map(|(field_key, _)| field_key.as_str())
@@ -1399,36 +1400,36 @@ async fn hsetex_reply(
     // Check every field before writing any, so a failed FNX/FXX condition
     // leaves the hash untouched.
     let mut checked = Vec::with_capacity(fields.len());
-    let mut seen = HashSet::with_capacity(fields.len());
     for (field_key, field_value) in fields {
         let shard_index = state.get_shard(&field_key);
-        let pool = &state.check_db_pools[shard_index];
 
-        let exists = match hash_field_live(state, pool, &namespace, &field_key).await {
-            Ok(exists) => exists,
-            Err(e) => {
-                tracing::error!(
-                    "Failed to check field existence for namespace {} key {}: {}",
-                    namespace,
-                    field_key,
-                    e
-                );
-                return Ok(BytesFrame::Error("ERR database error".into()));
+        // Only FNX/FXX depend on whether the field exists.
+        if fnx || fxx {
+            let pool = &state.check_db_pools[shard_index];
+            let exists = match hash_field_live(state, pool, &namespace, &field_key).await {
+                Ok(exists) => exists,
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to check field existence for namespace {} key {}: {}",
+                        namespace,
+                        field_key,
+                        e
+                    );
+                    return Ok(BytesFrame::Error("ERR database error".into()));
+                }
+            };
+
+            // FNX sets only if no field exists, FXX only if all of them do.
+            if (fnx && exists) || (fxx && !exists) {
+                return Ok(BytesFrame::Integer(0));
             }
-        };
-
-        // FNX sets only if no field exists, FXX only if all of them do.
-        if (fnx && exists) || (fxx && !exists) {
-            return Ok(BytesFrame::Integer(0));
         }
 
-        // A field repeated in one command is created once; the last value wins.
-        let is_new_field = !exists && seen.insert(field_key.clone());
-        checked.push((field_key, field_value, shard_index, is_new_field));
+        checked.push((field_key, field_value, shard_index));
     }
 
     if expires_at.is_some_and(|deadline| deadline <= chrono::Utc::now().timestamp()) {
-        for (field, _, shard, _) in checked {
+        for (field, _, shard) in checked {
             let reply = delete_hash_field(state, namespace.clone(), field, shard).await;
             if matches!(reply, BytesFrame::Error(_)) {
                 return Ok(reply);
@@ -1437,8 +1438,8 @@ async fn hsetex_reply(
         return Ok(BytesFrame::Integer(1));
     }
 
-    let mut new_fields_added = 0;
-    for (field_key, field_value, shard_index, is_new_field) in checked {
+    // A field repeated in one command is written in order, so the last value wins.
+    for (field_key, field_value, shard_index) in checked {
         let value_len = field_value.len() as f64;
         let sender = &state.shard_senders[shard_index];
 
@@ -1533,12 +1534,11 @@ async fn hsetex_reply(
             .metrics
             .stored_value_size_hset_bytes
             .record(stored_len);
-        if is_new_field {
-            new_fields_added += 1;
-        }
     }
 
-    Ok(BytesFrame::Integer(new_fields_added))
+    // Unlike HSET, HSETEX doesn't count new fields: Redis replies 1 once it
+    // has set every field (and 0 above, when FNX/FXX sets none).
+    Ok(BytesFrame::Integer(1))
 }
 
 async fn handle_hdel(
@@ -2741,7 +2741,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hsetex_returns_new_field_count() {
+    async fn hsetex_replies_1_whether_fields_are_new_or_updated() {
         let ctx = TestContext::new(false).await;
 
         let (mut server_stream, client_stream) = tcp_pair().await;
@@ -2760,7 +2760,7 @@ mod tests {
         .await
         .unwrap();
         server_stream.shutdown().await.unwrap();
-        assert_integer_response(read_response(client_stream).await, 2);
+        assert_integer_response(read_response(client_stream).await, 1);
 
         let (mut server_stream, client_stream) = tcp_pair().await;
         handle_hsetex(
@@ -2773,6 +2773,25 @@ mod tests {
             vec![
                 ("user1".to_string(), Bytes::from_static(b"updated")),
                 ("user3".to_string(), Bytes::from_static(b"gamma")),
+            ],
+        )
+        .await
+        .unwrap();
+        server_stream.shutdown().await.unwrap();
+        assert_integer_response(read_response(client_stream).await, 1);
+
+        // Only existing fields, without FXX.
+        let (mut server_stream, client_stream) = tcp_pair().await;
+        handle_hsetex(
+            &mut server_stream,
+            &ctx.state,
+            "sessions".to_string(),
+            false,
+            false,
+            None,
+            vec![
+                ("user1".to_string(), Bytes::from_static(b"again")),
+                ("user2".to_string(), Bytes::from_static(b"again")),
             ],
         )
         .await
@@ -2936,8 +2955,8 @@ mod tests {
                 assert_null(hget_value(&ctx, "ns", &field).await);
             }
 
-            // Control: with no HDEL racing them, FXX writes land. HSETEX
-            // replies with the count of new fields, which FXX never adds.
+            // Control: with no HDEL racing them, every FXX write lands and
+            // replies 1.
             let frame = respond_with(&ctx, |state, mut stream| {
                 Box::pin(async move {
                     handle_hset(&mut stream, &state, "ns".into(), "kept".into(), "v0".into()).await
@@ -2960,7 +2979,7 @@ mod tests {
                 })
             })
             .await;
-            assert_eq!(replies, [0; CLIENTS], "async_write={async_write}");
+            assert_eq!(replies, [1; CLIENTS], "async_write={async_write}");
             let BytesFrame::BulkString(value) = hget_value(&ctx, "ns", "kept").await else {
                 panic!("FXX control field is missing");
             };
@@ -4375,8 +4394,8 @@ mod tests {
         }
         client_stream.write_all(&payload).await.unwrap();
         let replies = read_replies(&mut client_stream, &mut read_buf, 150).await;
-        for (idx, reply) in replies.into_iter().enumerate() {
-            assert_integer_response(reply, if idx == 0 { 1 } else { 0 });
+        for reply in replies {
+            assert_integer_response(reply, 1);
         }
         client_stream
             .write_all(&encode_cmd(&[b"HGET", b"ns", b"f2"]))
