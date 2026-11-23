@@ -274,12 +274,12 @@ impl AppState {
 
         // Caches for inflight async ops. An entry must never be evicted before
         // its op commits, or reads would miss an acknowledged write or delete.
-        // Each entry belongs to an op that is queued (at most `queue_capacity`
-        // per shard) or in the batch being written (at most `batch_size`, which
-        // is no larger), so this capacity is never reached.
-        let inflight_capacity = (cfg.num_shards * 2 * queue_capacity) as u64;
-        let inflight_cache = Cache::new(inflight_capacity);
-        let inflight_hcache = Cache::new(inflight_capacity);
+        // Live entries are already bounded by the per-shard write queues and
+        // active batches (`num_shards * (write_queue_capacity + batch_size)`),
+        // and each entry is removed once its batch finishes, so no capacity
+        // limit is set here.
+        let inflight_cache = Cache::builder().build();
+        let inflight_hcache = Cache::builder().build();
 
         // Initialize cluster manager if clustering is enabled
         let cluster_manager = if let Some(ref cluster_config) = cfg.cluster {
