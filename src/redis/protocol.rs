@@ -873,13 +873,14 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
             }
             let key = extract_string(&elements[1])?;
             let seconds_str = extract_string(&elements[2])?;
-            let seconds = seconds_str.parse::<u64>().map_err(|_| {
+            let seconds = seconds_str.parse::<i64>().map_err(|_| {
                 ParseError::Invalid(format!("Invalid seconds value: {}", seconds_str))
             })?;
-            // 0 is allowed: like Redis, it expires the key immediately.
-            if seconds > MAX_TTL_SECS {
+            if seconds.unsigned_abs() > MAX_TTL_SECS {
                 return Err(invalid_expire_time("expire"));
             }
+            // Like Redis, 0 or less expires the key immediately.
+            let seconds = seconds.max(0) as u64;
             Ok(RedisCommand::Expire { key, seconds })
         }
         "BLOBASAUR.VACUUM" => parse_blobasaur_vacuum_command(&elements),
@@ -1247,8 +1248,15 @@ mod tests {
             parse(&["EXPIRE", "k", "0"]),
             Ok(RedisCommand::Expire { seconds: 0, .. })
         ));
+        // A negative TTL expires the key at once, like 0, as in Redis.
+        assert!(matches!(
+            parse(&["EXPIRE", "k", "-5"]),
+            Ok(RedisCommand::Expire { seconds: 0, .. })
+        ));
         let too_big = (MAX_TTL_SECS + 1).to_string();
-        assert_parse_error(&["EXPIRE", "k", &too_big], "invalid expire time");
+        for seconds in [too_big.as_str(), "-9223372036854775808"] {
+            assert_parse_error(&["EXPIRE", "k", seconds], "invalid expire time");
+        }
         for seconds in [too_big.as_str(), "-9223372036854775808"] {
             assert_parse_error(
                 &["HEXPIRE", "ns", seconds, "FIELDS", "1", "f"],
