@@ -461,6 +461,22 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
             // Parse options
             while idx < elements.len() {
                 let opt = extract_string(&elements[idx])?.to_uppercase();
+                // As in Redis, a condition or expiry given twice is an error
+                // rather than the last one silently winning.
+                match opt.as_str() {
+                    "FNX" | "FXX" if fnx || fxx => {
+                        return Err(ParseError::Invalid(
+                            "Only one of FXX or FNX arguments can be specified".to_string(),
+                        ));
+                    }
+                    "EX" | "PX" | "EXAT" | "PXAT" | "KEEPTTL" if expire_option.is_some() => {
+                        return Err(ParseError::Invalid(
+                            "Only one of EX, PX, EXAT, PXAT or KEEPTTL arguments can be specified"
+                                .to_string(),
+                        ));
+                    }
+                    _ => {}
+                }
                 match opt.as_str() {
                     "FNX" => {
                         fnx = true;
@@ -557,6 +573,7 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
                 fields.push((field, value));
                 idx += 2;
             }
+            reject_extra_args(&elements, idx)?;
 
             if fields.is_empty() {
                 return Err(ParseError::Invalid(
@@ -686,6 +703,7 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
                 fields.push(extract_string(&elements[idx])?);
                 idx += 1;
             }
+            reject_extra_args(&elements, idx)?;
 
             Ok(RedisCommand::HExpire {
                 key,
@@ -785,6 +803,7 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
                 fields.push(extract_string(&elements[idx])?);
                 idx += 1;
             }
+            reject_extra_args(&elements, idx)?;
 
             Ok(RedisCommand::HExpireAt {
                 key,
@@ -1027,6 +1046,21 @@ fn ttl_secs(ttl: u64, millis: bool, command: &str) -> Result<u64, ParseError> {
 
 fn invalid_expire_time(command: &str) -> ParseError {
     ParseError::Invalid(format!("invalid expire time in '{}' command", command))
+}
+
+/// Errors on anything after the last field, as Redis does, instead of
+/// dropping arguments past `numfields`.
+fn reject_extra_args(elements: &[BytesFrame], idx: usize) -> Result<(), ParseError> {
+    match elements.get(idx) {
+        Some(BytesFrame::BulkString(arg) | BytesFrame::SimpleString(arg)) => {
+            Err(ParseError::Invalid(format!(
+                "unknown argument: {}",
+                String::from_utf8_lossy(arg)
+            )))
+        }
+        Some(_) => Err(ParseError::Invalid("unknown argument".to_string())),
+        None => Ok(()),
+    }
 }
 
 /// Extract bytes from RESP value
@@ -1996,6 +2030,72 @@ mod tests {
                 .to_string()
                 .contains("Invalid timestamp value")
         );
+    }
+
+    #[test]
+    fn hsetex_rejects_conflicting_options() {
+        for flags in [["FNX", "FXX"], ["FXX", "FNX"], ["FNX", "FNX"]] {
+            let mut parts = vec!["HSETEX", "ns"];
+            parts.extend(flags);
+            parts.extend(["FIELDS", "1", "f", "v"]);
+            assert_parse_error(&parts, "Only one of FXX or FNX");
+        }
+
+        for expiry in [
+            &["EX", "10", "PX", "100"][..],
+            &["EX", "10", "KEEPTTL"],
+            &["KEEPTTL", "EXAT", "4102444800"],
+            &["PXAT", "4102444800000", "EX", "10"],
+        ] {
+            let mut parts = vec!["HSETEX", "ns", "FXX"];
+            parts.extend(expiry);
+            parts.extend(["FIELDS", "1", "f", "v"]);
+            assert_parse_error(&parts, "Only one of EX, PX, EXAT, PXAT or KEEPTTL");
+        }
+
+        assert!(matches!(
+            parse(&["HSETEX", "ns", "FXX", "EX", "10", "FIELDS", "1", "f", "v"]),
+            Ok(RedisCommand::HSetEx {
+                fxx: true,
+                fnx: false,
+                expire_option: Some(ExpireOption::Ex(10)),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn hash_field_commands_reject_args_past_numfields() {
+        assert_parse_error(
+            &["HSETEX", "ns", "FIELDS", "1", "a", "b", "c"],
+            "unknown argument: c",
+        );
+        assert_parse_error(
+            &["HSETEX", "ns", "FIELDS", "1", "a", "b", "c", "d"],
+            "unknown argument: c",
+        );
+        assert_parse_error(
+            &["HEXPIRE", "ns", "10", "FIELDS", "1", "f", "extra"],
+            "unknown argument: extra",
+        );
+        assert_parse_error(
+            &[
+                "HEXPIREAT",
+                "ns",
+                "4102444800",
+                "NX",
+                "FIELDS",
+                "1",
+                "f",
+                "g",
+            ],
+            "unknown argument: g",
+        );
+
+        // Exactly numfields still parses.
+        assert!(parse(&["HSETEX", "ns", "FIELDS", "2", "a", "1", "b", "2"]).is_ok());
+        assert!(parse(&["HEXPIRE", "ns", "10", "FIELDS", "2", "f", "g"]).is_ok());
+        assert!(parse(&["HEXPIREAT", "ns", "4102444800", "FIELDS", "1", "f"]).is_ok());
     }
 
     #[test]
