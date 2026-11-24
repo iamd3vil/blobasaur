@@ -5222,6 +5222,83 @@ mod tests {
         ctx.shutdown().await;
     }
 
+    /// Parses `parts` as a client request and runs it.
+    async fn run_request(ctx: &TestContext, parts: &[&str]) -> BytesFrame {
+        let request = BytesFrame::Array(
+            parts
+                .iter()
+                .map(|part| BytesFrame::BulkString(part.as_bytes().to_vec().into()))
+                .collect(),
+        );
+        let command = parse_command(request).unwrap();
+        respond_with(ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_redis_command(&mut stream, &state, command).await
+            })
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn hash_expiry_options_after_fields_take_effect() {
+        let ctx = TestContext::new(false).await;
+        let ns_table = shard_manager::namespace_table("ns");
+        let expires_at = |key: &'static str| {
+            let pool = ctx.state.db_pools[ctx.state.get_shard(key)].clone();
+            let query = format!("SELECT expires_at FROM {ns_table} WHERE key = ?");
+            async move {
+                sqlx::query_scalar::<_, Option<i64>>(&query)
+                    .bind(key)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // HSETEX with the expiry after the fields sets the TTL.
+        let before = chrono::Utc::now().timestamp();
+        assert_integer_response(
+            run_request(&ctx, &["HSETEX", "ns", "FIELDS", "1", "f", "v", "EX", "60"]).await,
+            1,
+        );
+        let after = chrono::Utc::now().timestamp();
+        let f_expiry = expires_at("f")
+            .await
+            .expect("EX 60 after FIELDS was ignored");
+        assert!((before + 60..=after + 61).contains(&f_expiry), "{f_expiry}");
+
+        // A condition after the fields is applied, not dropped: NX on a field
+        // that has a TTL leaves it alone.
+        let codes = |frame: BytesFrame| match frame {
+            BytesFrame::Array(codes) => codes,
+            other => panic!("Expected HEXPIRE codes, got {:?}", other),
+        };
+        let reply = run_request(&ctx, &["HEXPIRE", "ns", "500", "FIELDS", "1", "f", "NX"]).await;
+        assert_eq!(codes(reply), [BytesFrame::Integer(0)]);
+        assert_eq!(expires_at("f").await, Some(f_expiry));
+
+        // XX after the fields on a field with no TTL leaves it alone.
+        run!(ctx, handle_hset("ns".into(), "g".into(), v(b"v")));
+        let reply = run_request(
+            &ctx,
+            &["HEXPIREAT", "ns", "4102444800", "FIELDS", "1", "g", "XX"],
+        )
+        .await;
+        assert_eq!(codes(reply), [BytesFrame::Integer(0)]);
+        assert_eq!(expires_at("g").await, None);
+
+        // And conditions that hold still set the expiry.
+        let reply = run_request(
+            &ctx,
+            &["HEXPIREAT", "ns", "4102444800", "FIELDS", "1", "g", "NX"],
+        )
+        .await;
+        assert_eq!(codes(reply), [BytesFrame::Integer(1)]);
+        assert_eq!(expires_at("g").await, Some(4102444800));
+        ctx.shutdown().await;
+    }
+
     #[tokio::test]
     async fn hexpire_miss_does_not_create_namespace_table() {
         let ctx = TestContext::new(false).await;

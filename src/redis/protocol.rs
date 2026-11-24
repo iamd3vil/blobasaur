@@ -457,10 +457,28 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
             let mut fnx = false;
             let mut fxx = false;
             let mut expire_option = None;
+            let mut fields = None;
 
             // Parse options
             while idx < elements.len() {
-                let opt = extract_string(&elements[idx])?.to_uppercase();
+                let arg = extract_string(&elements[idx])?;
+                let opt = arg.to_uppercase();
+                // As in Redis, a condition or expiry given twice is an error
+                // rather than the last one silently winning.
+                match opt.as_str() {
+                    "FNX" | "FXX" if fnx || fxx => {
+                        return Err(ParseError::Invalid(
+                            "Only one of FXX or FNX arguments can be specified".to_string(),
+                        ));
+                    }
+                    "EX" | "PX" | "EXAT" | "PXAT" | "KEEPTTL" if expire_option.is_some() => {
+                        return Err(ParseError::Invalid(
+                            "Only one of EX, PX, EXAT, PXAT or KEEPTTL arguments can be specified"
+                                .to_string(),
+                        ));
+                    }
+                    _ => {}
+                }
                 match opt.as_str() {
                     "FNX" => {
                         fnx = true;
@@ -516,47 +534,49 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
                         expire_option = Some(ExpireOption::KeepTtl);
                         idx += 1;
                     }
+                    // Like Redis, options may also follow the fields, so parsing
+                    // goes on after them.
                     "FIELDS" => {
-                        break; // Found FIELDS keyword, exit options parsing
+                        if fields.is_some() {
+                            return Err(fields_given_twice());
+                        }
+                        idx += 1;
+
+                        // Get number of fields
+                        if idx >= elements.len() {
+                            return Err(ParseError::Invalid(
+                                "HSETEX requires field count after FIELDS".to_string(),
+                            ));
+                        }
+                        let num_fields = extract_string(&elements[idx])?
+                            .parse::<usize>()
+                            .map_err(|_| ParseError::Invalid("Invalid field count".to_string()))?;
+                        idx += 1;
+
+                        // Parse field-value pairs
+                        let mut pairs = Vec::new();
+                        for _ in 0..num_fields {
+                            if idx + 1 >= elements.len() {
+                                return Err(ParseError::Invalid(
+                                    "Not enough field-value pairs".to_string(),
+                                ));
+                            }
+                            let field = extract_string(&elements[idx])?;
+                            let value = extract_bytes(&elements[idx + 1])?;
+                            pairs.push((field, value));
+                            idx += 2;
+                        }
+                        fields = Some(pairs);
                     }
-                    _ => {
-                        return Err(ParseError::Invalid(format!("Unknown option: {}", opt)));
-                    }
+                    _ => return Err(unknown_argument(&arg)),
                 }
             }
 
-            // Check for FIELDS keyword
-            if idx >= elements.len() || extract_string(&elements[idx])?.to_uppercase() != "FIELDS" {
+            let Some(fields) = fields else {
                 return Err(ParseError::Invalid(
                     "HSETEX requires FIELDS keyword".to_string(),
                 ));
-            }
-            idx += 1;
-
-            // Get number of fields
-            if idx >= elements.len() {
-                return Err(ParseError::Invalid(
-                    "HSETEX requires field count after FIELDS".to_string(),
-                ));
-            }
-            let num_fields = extract_string(&elements[idx])?
-                .parse::<usize>()
-                .map_err(|_| ParseError::Invalid("Invalid field count".to_string()))?;
-            idx += 1;
-
-            // Parse field-value pairs
-            let mut fields = Vec::new();
-            for _ in 0..num_fields {
-                if idx + 1 >= elements.len() {
-                    return Err(ParseError::Invalid(
-                        "Not enough field-value pairs".to_string(),
-                    ));
-                }
-                let field = extract_string(&elements[idx])?;
-                let value = extract_bytes(&elements[idx + 1])?;
-                fields.push((field, value));
-                idx += 2;
-            }
+            };
 
             if fields.is_empty() {
                 return Err(ParseError::Invalid(
@@ -611,81 +631,7 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
                 return Err(invalid_expire_time("hexpire"));
             }
 
-            let mut idx = 3;
-            let mut condition = None;
-
-            // Parse optional condition (NX | XX | GT | LT)
-            if idx < elements.len() {
-                let token = extract_string(&elements[idx])?.to_uppercase();
-                match token.as_str() {
-                    "NX" => {
-                        condition = Some(HExpireCondition::Nx);
-                        idx += 1;
-                    }
-                    "XX" => {
-                        condition = Some(HExpireCondition::Xx);
-                        idx += 1;
-                    }
-                    "GT" => {
-                        condition = Some(HExpireCondition::Gt);
-                        idx += 1;
-                    }
-                    "LT" => {
-                        condition = Some(HExpireCondition::Lt);
-                        idx += 1;
-                    }
-                    "FIELDS" => {} // Not a condition, will be parsed below
-                    _ => {
-                        return Err(ParseError::Invalid(format!(
-                            "Unknown HEXPIRE option: {}",
-                            token
-                        )));
-                    }
-                }
-            }
-
-            // Parse FIELDS keyword
-            if idx >= elements.len() {
-                return Err(ParseError::Invalid(
-                    "HEXPIRE requires FIELDS keyword".to_string(),
-                ));
-            }
-            let fields_keyword = extract_string(&elements[idx])?.to_uppercase();
-            if fields_keyword != "FIELDS" {
-                return Err(ParseError::Invalid(
-                    "HEXPIRE requires FIELDS keyword".to_string(),
-                ));
-            }
-            idx += 1;
-
-            // Parse numfields
-            if idx >= elements.len() {
-                return Err(ParseError::Invalid(
-                    "HEXPIRE requires field count after FIELDS".to_string(),
-                ));
-            }
-            let num_fields = extract_string(&elements[idx])?
-                .parse::<usize>()
-                .map_err(|_| ParseError::Invalid("Invalid field count".to_string()))?;
-            idx += 1;
-
-            if num_fields == 0 {
-                return Err(ParseError::Invalid(
-                    "HEXPIRE requires at least one field".to_string(),
-                ));
-            }
-
-            // Parse field names
-            let mut fields = Vec::with_capacity(num_fields);
-            for _ in 0..num_fields {
-                if idx >= elements.len() {
-                    return Err(ParseError::Invalid(
-                        "Not enough fields provided".to_string(),
-                    ));
-                }
-                fields.push(extract_string(&elements[idx])?);
-                idx += 1;
-            }
+            let (condition, fields) = parse_hexpire_args(&elements, "HEXPIRE")?;
 
             Ok(RedisCommand::HExpire {
                 key,
@@ -710,81 +656,7 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
                 ParseError::Invalid(format!("Invalid timestamp value: {}", timestamp_str))
             })?;
 
-            let mut idx = 3;
-            let mut condition = None;
-
-            // Parse optional condition (NX | XX | GT | LT)
-            if idx < elements.len() {
-                let token = extract_string(&elements[idx])?.to_uppercase();
-                match token.as_str() {
-                    "NX" => {
-                        condition = Some(HExpireCondition::Nx);
-                        idx += 1;
-                    }
-                    "XX" => {
-                        condition = Some(HExpireCondition::Xx);
-                        idx += 1;
-                    }
-                    "GT" => {
-                        condition = Some(HExpireCondition::Gt);
-                        idx += 1;
-                    }
-                    "LT" => {
-                        condition = Some(HExpireCondition::Lt);
-                        idx += 1;
-                    }
-                    "FIELDS" => {} // Not a condition, will be parsed below
-                    _ => {
-                        return Err(ParseError::Invalid(format!(
-                            "Unknown HEXPIREAT option: {}",
-                            token
-                        )));
-                    }
-                }
-            }
-
-            // Parse FIELDS keyword
-            if idx >= elements.len() {
-                return Err(ParseError::Invalid(
-                    "HEXPIREAT requires FIELDS keyword".to_string(),
-                ));
-            }
-            let fields_keyword = extract_string(&elements[idx])?.to_uppercase();
-            if fields_keyword != "FIELDS" {
-                return Err(ParseError::Invalid(
-                    "HEXPIREAT requires FIELDS keyword".to_string(),
-                ));
-            }
-            idx += 1;
-
-            // Parse numfields
-            if idx >= elements.len() {
-                return Err(ParseError::Invalid(
-                    "HEXPIREAT requires field count after FIELDS".to_string(),
-                ));
-            }
-            let num_fields = extract_string(&elements[idx])?
-                .parse::<usize>()
-                .map_err(|_| ParseError::Invalid("Invalid field count".to_string()))?;
-            idx += 1;
-
-            if num_fields == 0 {
-                return Err(ParseError::Invalid(
-                    "HEXPIREAT requires at least one field".to_string(),
-                ));
-            }
-
-            // Parse field names
-            let mut fields = Vec::with_capacity(num_fields);
-            for _ in 0..num_fields {
-                if idx >= elements.len() {
-                    return Err(ParseError::Invalid(
-                        "Not enough fields provided".to_string(),
-                    ));
-                }
-                fields.push(extract_string(&elements[idx])?);
-                idx += 1;
-            }
+            let (condition, fields) = parse_hexpire_args(&elements, "HEXPIREAT")?;
 
             Ok(RedisCommand::HExpireAt {
                 key,
@@ -1028,6 +900,88 @@ fn ttl_secs(ttl: u64, millis: bool, command: &str) -> Result<u64, ParseError> {
 
 fn invalid_expire_time(command: &str) -> ParseError {
     ParseError::Invalid(format!("invalid expire time in '{}' command", command))
+}
+
+fn unknown_argument(arg: &str) -> ParseError {
+    ParseError::Invalid(format!("unknown argument: {}", arg))
+}
+
+fn fields_given_twice() -> ParseError {
+    ParseError::Invalid("FIELDS keyword specified multiple times".to_string())
+}
+
+/// Parses what follows the time in HEXPIRE/HEXPIREAT: an optional condition
+/// and `FIELDS numfields field [field ...]`. Like Redis, the condition may
+/// come before or after the fields.
+fn parse_hexpire_args(
+    elements: &[BytesFrame],
+    command: &str,
+) -> Result<(Option<HExpireCondition>, Vec<String>), ParseError> {
+    let mut idx = 3;
+    let mut condition = None;
+    let mut fields = None;
+
+    while idx < elements.len() {
+        let arg = extract_string(&elements[idx])?;
+        let parsed = match arg.to_uppercase().as_str() {
+            "NX" => HExpireCondition::Nx,
+            "XX" => HExpireCondition::Xx,
+            "GT" => HExpireCondition::Gt,
+            "LT" => HExpireCondition::Lt,
+            "FIELDS" => {
+                if fields.is_some() {
+                    return Err(fields_given_twice());
+                }
+                idx += 1;
+
+                // Parse numfields
+                if idx >= elements.len() {
+                    return Err(ParseError::Invalid(format!(
+                        "{} requires field count after FIELDS",
+                        command
+                    )));
+                }
+                let num_fields = extract_string(&elements[idx])?
+                    .parse::<usize>()
+                    .map_err(|_| ParseError::Invalid("Invalid field count".to_string()))?;
+                idx += 1;
+
+                if num_fields == 0 {
+                    return Err(ParseError::Invalid(format!(
+                        "{} requires at least one field",
+                        command
+                    )));
+                }
+
+                // Parse field names
+                let mut names = Vec::new();
+                for _ in 0..num_fields {
+                    if idx >= elements.len() {
+                        return Err(ParseError::Invalid(
+                            "Not enough fields provided".to_string(),
+                        ));
+                    }
+                    names.push(extract_string(&elements[idx])?);
+                    idx += 1;
+                }
+                fields = Some(names);
+                continue;
+            }
+            _ => return Err(unknown_argument(&arg)),
+        };
+
+        if condition.is_some() {
+            return Err(ParseError::Invalid(
+                "Multiple condition flags specified".to_string(),
+            ));
+        }
+        condition = Some(parsed);
+        idx += 1;
+    }
+
+    let fields = fields
+        .ok_or_else(|| ParseError::Invalid(format!("{} requires FIELDS keyword", command)))?;
+    Ok((condition, fields))
 }
 
 /// Extract bytes from RESP value
@@ -2003,6 +1957,153 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("Invalid timestamp value")
+        );
+    }
+
+    #[test]
+    fn hsetex_rejects_conflicting_options() {
+        for flags in [["FNX", "FXX"], ["FXX", "FNX"], ["FNX", "FNX"]] {
+            let mut parts = vec!["HSETEX", "ns"];
+            parts.extend(flags);
+            parts.extend(["FIELDS", "1", "f", "v"]);
+            assert_parse_error(&parts, "Only one of FXX or FNX");
+        }
+
+        for expiry in [
+            &["EX", "10", "PX", "100"][..],
+            &["EX", "10", "KEEPTTL"],
+            &["KEEPTTL", "EXAT", "4102444800"],
+            &["PXAT", "4102444800000", "EX", "10"],
+        ] {
+            let mut parts = vec!["HSETEX", "ns", "FXX"];
+            parts.extend(expiry);
+            parts.extend(["FIELDS", "1", "f", "v"]);
+            assert_parse_error(&parts, "Only one of EX, PX, EXAT, PXAT or KEEPTTL");
+        }
+
+        assert!(matches!(
+            parse(&["HSETEX", "ns", "FXX", "EX", "10", "FIELDS", "1", "f", "v"]),
+            Ok(RedisCommand::HSetEx {
+                fxx: true,
+                fnx: false,
+                expire_option: Some(ExpireOption::Ex(10)),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn hash_field_commands_reject_args_past_numfields() {
+        assert_parse_error(
+            &["HSETEX", "ns", "FIELDS", "1", "a", "b", "c"],
+            "unknown argument: c",
+        );
+        assert_parse_error(
+            &["HSETEX", "ns", "FIELDS", "1", "a", "b", "c", "d"],
+            "unknown argument: c",
+        );
+        assert_parse_error(
+            &["HEXPIRE", "ns", "10", "FIELDS", "1", "f", "extra"],
+            "unknown argument: extra",
+        );
+        assert_parse_error(
+            &[
+                "HEXPIREAT",
+                "ns",
+                "4102444800",
+                "NX",
+                "FIELDS",
+                "1",
+                "f",
+                "g",
+            ],
+            "unknown argument: g",
+        );
+
+        // Exactly numfields still parses.
+        assert!(parse(&["HSETEX", "ns", "FIELDS", "2", "a", "1", "b", "2"]).is_ok());
+        assert!(parse(&["HEXPIRE", "ns", "10", "FIELDS", "2", "f", "g"]).is_ok());
+        assert!(parse(&["HEXPIREAT", "ns", "4102444800", "FIELDS", "1", "f"]).is_ok());
+
+        assert_parse_error(
+            &[
+                "HSETEX", "ns", "FIELDS", "1", "a", "b", "FIELDS", "1", "c", "d",
+            ],
+            "FIELDS keyword specified multiple times",
+        );
+        assert_parse_error(
+            &[
+                "HEXPIRE", "ns", "10", "FIELDS", "1", "f", "FIELDS", "1", "g",
+            ],
+            "FIELDS keyword specified multiple times",
+        );
+        assert_parse_error(&["HSETEX", "ns", "FNX", "EX", "10"], "requires FIELDS");
+    }
+
+    #[test]
+    fn hash_field_commands_take_options_after_fields() {
+        // Redis accepts options on either side of the fields.
+        assert!(matches!(
+            parse(&["HSETEX", "ns", "FIELDS", "1", "f", "v", "EX", "60"]),
+            Ok(RedisCommand::HSetEx {
+                fnx: false,
+                fxx: false,
+                expire_option: Some(ExpireOption::Ex(60)),
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse(&["HSETEX", "ns", "PX", "5000", "FIELDS", "1", "f", "v", "FNX"]),
+            Ok(RedisCommand::HSetEx {
+                fnx: true,
+                fxx: false,
+                expire_option: Some(ExpireOption::Px(5000)),
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse(&["HEXPIRE", "ns", "10", "FIELDS", "1", "f", "NX"]),
+            Ok(RedisCommand::HExpire {
+                condition: Some(HExpireCondition::Nx),
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse(&["HEXPIREAT", "ns", "4102444800", "FIELDS", "1", "f", "XX"]),
+            Ok(RedisCommand::HExpireAt {
+                condition: Some(HExpireCondition::Xx),
+                ..
+            })
+        ));
+
+        // Fields named like options are still fields.
+        match parse(&["HEXPIRE", "ns", "10", "FIELDS", "2", "NX", "FIELDS"]) {
+            Ok(RedisCommand::HExpire {
+                condition: None,
+                fields,
+                ..
+            }) => assert_eq!(fields, ["NX", "FIELDS"]),
+            other => panic!("unexpected parse: {other:?}"),
+        }
+
+        // Conflicts are caught across both sides of the fields.
+        assert_parse_error(
+            &[
+                "HSETEX", "ns", "EX", "10", "FIELDS", "1", "a", "b", "PX", "100",
+            ],
+            "Only one of EX, PX, EXAT, PXAT or KEEPTTL",
+        );
+        assert_parse_error(
+            &["HSETEX", "ns", "FNX", "FIELDS", "1", "a", "b", "FXX"],
+            "Only one of FXX or FNX",
+        );
+        assert_parse_error(
+            &["HEXPIRE", "ns", "10", "NX", "FIELDS", "1", "f", "XX"],
+            "Multiple condition flags specified",
+        );
+        assert_parse_error(
+            &["HEXPIRE", "ns", "10", "FIELDS", "1", "f", "NX", "extra"],
+            "unknown argument: extra",
         );
     }
 
