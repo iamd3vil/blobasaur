@@ -263,6 +263,7 @@ async fn handle_connection(
     let max_request_size = state.cfg.max_request_size();
     let mut buffer = BytesMut::with_capacity(READ_CHUNK);
     let mut grown_to = READ_CHUNK;
+    let mut client_name = None;
 
     loop {
         // Run every complete request already buffered before reading more.
@@ -289,7 +290,9 @@ async fn handle_connection(
             match parse_command(request) {
                 Ok(command) => {
                     let quit = matches!(command, RedisCommand::Quit);
-                    if let Err(e) = handle_redis_command(&mut stream, &state, command).await {
+                    if let Err(e) =
+                        handle_redis_command(&mut stream, &state, &mut client_name, command).await
+                    {
                         tracing::error!("Error handling command: {}", e);
                         return Err(e);
                     }
@@ -366,12 +369,13 @@ struct ShardVacuumDispatchResult {
 async fn handle_redis_command(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
+    client_name: &mut Option<Bytes>,
     command: RedisCommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let timer = Timer::start();
     let cmd_name = command.name();
 
-    let result = handle_redis_command_inner(stream, state, command).await;
+    let result = handle_redis_command_inner(stream, state, client_name, command).await;
 
     // Record command metrics
     state.metrics.record_command(&cmd_name, timer.start);
@@ -410,6 +414,7 @@ async fn check_hash_route(state: &AppState, namespace: &str, key: &str) -> Resul
 async fn handle_redis_command_inner(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
+    client_name: &mut Option<Bytes>,
     command: RedisCommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match command {
@@ -446,6 +451,12 @@ async fn handle_redis_command_inner(
         }
         RedisCommand::Info { section } => {
             handle_info(stream, state, section).await?;
+        }
+        RedisCommand::CommandCount => {
+            // Count top-level commands in parse_command_array, including BLOBASAUR.VACUUM.
+            stream
+                .write_all(&serialize_frame(&BytesFrame::Integer(21)))
+                .await?;
         }
         RedisCommand::Command => {
             handle_command(stream).await?;
@@ -533,6 +544,16 @@ async fn handle_redis_command_inner(
         }
         RedisCommand::Hello { protover } => {
             handle_hello(stream, protover).await?;
+        }
+        RedisCommand::ClientGetName => {
+            let reply = client_name
+                .clone()
+                .map_or(BytesFrame::Null, BytesFrame::BulkString);
+            stream.write_all(&serialize_frame(&reply)).await?;
+        }
+        RedisCommand::ClientSetName(name) => {
+            *client_name = (!name.is_empty()).then_some(name);
+            stream.write_all(b"+OK\r\n").await?;
         }
         RedisCommand::Client { subcommand } => {
             handle_client(stream, &subcommand).await?;
@@ -1253,6 +1274,7 @@ async fn hset_reply(
         let token = shard_manager::next_pending_token();
         let operation = ShardWriteOperation::HSetAsync {
             namespace,
+            keep_ttl: false,
             key,
             data: value.clone(),
             token,
@@ -1280,6 +1302,7 @@ async fn hset_reply(
         let (responder_tx, responder_rx) = oneshot::channel();
         let operation = ShardWriteOperation::HSet {
             namespace,
+            keep_ttl: false,
             key,
             data: value,
             responder: responder_tx,
@@ -1361,6 +1384,7 @@ async fn hsetex_reply(
 
     // Resolved only now, so time spent waiting for the locks doesn't shorten
     // a relative TTL.
+    let keep_ttl = expire_option == Some(ExpireOption::KeepTtl);
     let expires_at = match expire_option {
         Some(ExpireOption::Ex(seconds)) => Some(chrono::Utc::now().timestamp() + seconds as i64),
         // Round up like SET PX (the parser has range-checked it).
@@ -1369,11 +1393,7 @@ async fn hsetex_reply(
         }
         Some(ExpireOption::ExAt(timestamp)) => Some(timestamp),
         Some(ExpireOption::PxAt(timestamp)) => Some(timestamp / 1000),
-        Some(ExpireOption::KeepTtl) => {
-            // For KEEPTTL, we'd need to fetch existing TTL - for now, skip TTL setting
-            None
-        }
-        None => None,
+        Some(ExpireOption::KeepTtl) | None => None,
     };
 
     // Check every field before writing any, so a failed FNX/FXX condition
@@ -1407,6 +1427,16 @@ async fn hsetex_reply(
         checked.push((field_key, field_value, shard_index, is_new_field));
     }
 
+    if expires_at.is_some_and(|deadline| deadline <= chrono::Utc::now().timestamp()) {
+        for (field, _, shard, _) in checked {
+            let reply = delete_hash_field(state, namespace.clone(), field, shard).await;
+            if matches!(reply, BytesFrame::Error(_)) {
+                return Ok(reply);
+            }
+        }
+        return Ok(BytesFrame::Integer(1));
+    }
+
     let mut new_fields_added = 0;
     for (field_key, field_value, shard_index, is_new_field) in checked {
         let value_len = field_value.len() as f64;
@@ -1435,6 +1465,7 @@ async fn hsetex_reply(
             } else {
                 ShardWriteOperation::HSetAsync {
                     namespace: namespace.clone(),
+                    keep_ttl,
                     key: field_key,
                     data: compressed_value,
                     token,
@@ -1472,6 +1503,7 @@ async fn hsetex_reply(
             } else {
                 ShardWriteOperation::HSet {
                     namespace: namespace.clone(),
+                    keep_ttl,
                     key: field_key,
                     data: compressed_value,
                     responder: responder_tx,
@@ -1560,6 +1592,15 @@ async fn hdel_reply(state: &Arc<AppState>, namespace: String, key: String) -> By
         return BytesFrame::Integer(0);
     }
 
+    delete_hash_field(state, namespace, key, shard_index).await
+}
+
+async fn delete_hash_field(
+    state: &Arc<AppState>,
+    namespace: String,
+    key: String,
+    shard_index: usize,
+) -> BytesFrame {
     let sender = &state.shard_senders[shard_index];
 
     if state.cfg.async_write.unwrap_or(false) {
@@ -4730,7 +4771,9 @@ mod tests {
         let frame = respond_with(&ctx, |state, stream| {
             Box::pin(async move {
                 let mut stream = stream;
-                let _ = handle_redis_command_inner(&mut stream, &state, RedisCommand::Quit).await;
+                let _ =
+                    handle_redis_command_inner(&mut stream, &state, &mut None, RedisCommand::Quit)
+                        .await;
                 Ok(())
             })
         });
@@ -4749,6 +4792,7 @@ mod tests {
                 handle_redis_command_inner(
                     &mut stream,
                     &state,
+                    &mut None,
                     RedisCommand::BlobasaurVacuum {
                         target: VacuumShardTarget::All,
                         mode: VacuumCommandMode::Incremental,
@@ -4797,6 +4841,7 @@ mod tests {
                 handle_redis_command_inner(
                     &mut stream,
                     &state,
+                    &mut None,
                     RedisCommand::BlobasaurVacuum {
                         target: VacuumShardTarget::Shard(99),
                         mode: VacuumCommandMode::Incremental,
@@ -5203,7 +5248,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hset_keeps_ttl_of_live_field() {
+    async fn hset_clears_ttl_of_live_field() {
         let ctx = TestContext::new(false).await;
         let ns_table = shard_manager::namespace_table("ns");
         run!(ctx, handle_hset("ns".into(), "f".into(), v(b"v1")));
@@ -5218,7 +5263,7 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap();
-        assert_eq!(expires_at, Some(future));
+        assert_eq!(expires_at, None);
         ctx.shutdown().await;
     }
 
@@ -5234,7 +5279,7 @@ mod tests {
         respond_with(ctx, |state, stream| {
             Box::pin(async move {
                 let mut stream = stream;
-                handle_redis_command(&mut stream, &state, command).await
+                handle_redis_command(&mut stream, &state, &mut None, command).await
             })
         })
         .await

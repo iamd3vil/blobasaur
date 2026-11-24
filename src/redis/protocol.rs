@@ -109,6 +109,7 @@ pub enum RedisCommand {
         section: Option<String>,
     },
     Command,
+    CommandCount,
     // Cluster commands
     ClusterNodes,
     ClusterInfo,
@@ -141,6 +142,8 @@ pub enum RedisCommand {
     Client {
         subcommand: String,
     },
+    ClientGetName,
+    ClientSetName(Bytes),
     Quit,
     Unknown(String),
 }
@@ -162,7 +165,7 @@ impl RedisCommand {
             RedisCommand::HExpireAt { .. } => "HEXPIREAT".to_string(),
             RedisCommand::Ping { .. } => "PING".to_string(),
             RedisCommand::Info { .. } => "INFO".to_string(),
-            RedisCommand::Command => "COMMAND".to_string(),
+            RedisCommand::Command | RedisCommand::CommandCount => "COMMAND".to_string(),
             RedisCommand::ClusterNodes => "CLUSTER NODES".to_string(),
             RedisCommand::ClusterInfo => "CLUSTER INFO".to_string(),
             RedisCommand::ClusterSlots => "CLUSTER SLOTS".to_string(),
@@ -173,7 +176,9 @@ impl RedisCommand {
             RedisCommand::Expire { .. } => "EXPIRE".to_string(),
             RedisCommand::BlobasaurVacuum { .. } => "BLOBASAUR.VACUUM".to_string(),
             RedisCommand::Hello { .. } => "HELLO".to_string(),
-            RedisCommand::Client { .. } => "CLIENT".to_string(),
+            RedisCommand::Client { .. }
+            | RedisCommand::ClientGetName
+            | RedisCommand::ClientSetName(_) => "CLIENT".to_string(),
             RedisCommand::Quit => "QUIT".to_string(),
             RedisCommand::Unknown(cmd) => cmd.clone(),
         }
@@ -344,26 +349,15 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
             while i < elements.len() {
                 let option = extract_string(&elements[i])?.to_uppercase();
                 match option.as_str() {
-                    "EX" => {
+                    "EX" | "PX" => {
                         if i + 1 >= elements.len() {
-                            return Err(ParseError::Invalid("EX requires a value".to_string()));
+                            return Err(ParseError::Invalid(format!("{option} requires a value")));
                         }
-                        let seconds_str = extract_string(&elements[i + 1])?;
-                        let seconds = seconds_str.parse::<u64>().map_err(|_| {
-                            ParseError::Invalid(format!("Invalid EX value: {}", seconds_str))
-                        })?;
-                        ttl_seconds = Some(ttl_secs(seconds, false, "set")?);
-                        i += 2;
-                    }
-                    "PX" => {
-                        if i + 1 >= elements.len() {
-                            return Err(ParseError::Invalid("PX requires a value".to_string()));
+                        let ttl = redis_integer(&elements[i + 1])?;
+                        if ttl <= 0 {
+                            return Err(invalid_expire_time("set"));
                         }
-                        let millis_str = extract_string(&elements[i + 1])?;
-                        let millis = millis_str.parse::<u64>().map_err(|_| {
-                            ParseError::Invalid(format!("Invalid PX value: {}", millis_str))
-                        })?;
-                        ttl_seconds = Some(ttl_secs(millis, true, "set")?);
+                        ttl_seconds = Some(ttl_secs(ttl as u64, option == "PX", "set")?);
                         i += 2;
                     }
                     _ => {
@@ -403,6 +397,11 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
             Ok(RedisCommand::Exists { key })
         }
         "PING" => {
+            if elements.len() > 2 {
+                return Err(ParseError::Invalid(
+                    "wrong number of arguments for 'ping' command".into(),
+                ));
+            }
             let message = if elements.len() > 1 {
                 Some(extract_string(&elements[1])?)
             } else {
@@ -418,7 +417,20 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
             };
             Ok(RedisCommand::Info { section })
         }
-        "COMMAND" => Ok(RedisCommand::Command),
+        "COMMAND" => {
+            if let Some(subcommand) = elements.get(1)
+                && extract_string(subcommand)?.eq_ignore_ascii_case("COUNT")
+            {
+                if elements.len() != 2 {
+                    return Err(ParseError::Invalid(
+                        "wrong number of arguments for 'command|count' command".into(),
+                    ));
+                }
+                Ok(RedisCommand::CommandCount)
+            } else {
+                Ok(RedisCommand::Command)
+            }
+        }
         "HGET" => {
             if elements.len() != 3 {
                 return Err(ParseError::Invalid(
@@ -488,46 +500,19 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
                         fxx = true;
                         idx += 1;
                     }
-                    "EX" => {
-                        if idx + 1 >= elements.len() {
-                            return Err(ParseError::Invalid("EX requires a value".to_string()));
-                        }
-                        let seconds = extract_string(&elements[idx + 1])?
-                            .parse::<u64>()
-                            .map_err(|_| ParseError::Invalid("Invalid EX value".to_string()))?;
-                        ttl_secs(seconds, false, "hsetex")?;
-                        expire_option = Some(ExpireOption::Ex(seconds));
-                        idx += 2;
-                    }
-                    "PX" => {
-                        if idx + 1 >= elements.len() {
-                            return Err(ParseError::Invalid("PX requires a value".to_string()));
-                        }
-                        let millis = extract_string(&elements[idx + 1])?
-                            .parse::<u64>()
-                            .map_err(|_| ParseError::Invalid("Invalid PX value".to_string()))?;
-                        ttl_secs(millis, true, "hsetex")?;
-                        expire_option = Some(ExpireOption::Px(millis));
-                        idx += 2;
-                    }
-                    "EXAT" => {
-                        if idx + 1 >= elements.len() {
-                            return Err(ParseError::Invalid("EXAT requires a value".to_string()));
-                        }
-                        let timestamp = extract_string(&elements[idx + 1])?
-                            .parse::<i64>()
-                            .map_err(|_| ParseError::Invalid("Invalid EXAT value".to_string()))?;
-                        expire_option = Some(ExpireOption::ExAt(timestamp));
-                        idx += 2;
-                    }
-                    "PXAT" => {
-                        if idx + 1 >= elements.len() {
-                            return Err(ParseError::Invalid("PXAT requires a value".to_string()));
-                        }
-                        let timestamp = extract_string(&elements[idx + 1])?
-                            .parse::<i64>()
-                            .map_err(|_| ParseError::Invalid("Invalid PXAT value".to_string()))?;
-                        expire_option = Some(ExpireOption::PxAt(timestamp));
+                    "EX" | "PX" | "EXAT" | "PXAT" => {
+                        let value = elements.get(idx + 1).ok_or_else(|| {
+                            ParseError::Invalid(format!("{opt} requires a value"))
+                        })?;
+                        let millis = opt.starts_with("PX");
+                        let relative = !opt.ends_with("AT");
+                        let time = hash_expiry_time(value, millis, relative, "hsetex")?;
+                        expire_option = Some(match (millis, relative) {
+                            (false, true) => ExpireOption::Ex(time as u64),
+                            (true, true) => ExpireOption::Px(time as u64),
+                            (false, false) => ExpireOption::ExAt(time),
+                            (true, false) => ExpireOption::PxAt(time),
+                        });
                         idx += 2;
                     }
                     "KEEPTTL" => {
@@ -548,9 +533,7 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
                                 "HSETEX requires field count after FIELDS".to_string(),
                             ));
                         }
-                        let num_fields = extract_string(&elements[idx])?
-                            .parse::<usize>()
-                            .map_err(|_| ParseError::Invalid("Invalid field count".to_string()))?;
+                        let num_fields = field_count(&elements[idx], "invalid number of fields")?;
                         idx += 1;
 
                         // Parse field-value pairs
@@ -577,12 +560,6 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
                     "HSETEX requires FIELDS keyword".to_string(),
                 ));
             };
-
-            if fields.is_empty() {
-                return Err(ParseError::Invalid(
-                    "HSETEX requires at least one field-value pair".to_string(),
-                ));
-            }
 
             Ok(RedisCommand::HSetEx {
                 key,
@@ -623,14 +600,7 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
             }
 
             let key = extract_string(&elements[1])?;
-            let seconds_str = extract_string(&elements[2])?;
-            let seconds = seconds_str.parse::<i64>().map_err(|_| {
-                ParseError::Invalid(format!("Invalid seconds value: {}", seconds_str))
-            })?;
-            if seconds.unsigned_abs() > MAX_TTL_SECS {
-                return Err(invalid_expire_time("hexpire"));
-            }
-
+            let seconds = hash_expiry_time(&elements[2], false, true, "hexpire")?;
             let (condition, fields) = parse_hexpire_args(&elements, "HEXPIRE")?;
 
             Ok(RedisCommand::HExpire {
@@ -651,11 +621,7 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
             }
 
             let key = extract_string(&elements[1])?;
-            let timestamp_str = extract_string(&elements[2])?;
-            let unix_time_seconds = timestamp_str.parse::<i64>().map_err(|_| {
-                ParseError::Invalid(format!("Invalid timestamp value: {}", timestamp_str))
-            })?;
-
+            let unix_time_seconds = hash_expiry_time(&elements[2], false, false, "hexpireat")?;
             let (condition, fields) = parse_hexpire_args(&elements, "HEXPIREAT")?;
 
             Ok(RedisCommand::HExpireAt {
@@ -744,10 +710,7 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
                 ));
             }
             let key = extract_string(&elements[1])?;
-            let seconds_str = extract_string(&elements[2])?;
-            let seconds = seconds_str.parse::<i64>().map_err(|_| {
-                ParseError::Invalid(format!("Invalid seconds value: {}", seconds_str))
-            })?;
+            let seconds = redis_integer(&elements[2])?;
             if seconds.unsigned_abs() > MAX_TTL_SECS {
                 return Err(invalid_expire_time("expire"));
             }
@@ -774,7 +737,24 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
             } else {
                 String::new()
             };
-            Ok(RedisCommand::Client { subcommand })
+            match subcommand.as_str() {
+                "GETNAME" if elements.len() == 2 => Ok(RedisCommand::ClientGetName),
+                "SETNAME" if elements.len() == 3 => {
+                    let name = extract_bytes(&elements[2])?;
+                    if !name.iter().all(u8::is_ascii_graphic) {
+                        return Err(ParseError::Invalid(
+                            "Client names cannot contain spaces, newlines or special characters."
+                                .into(),
+                        ));
+                    }
+                    Ok(RedisCommand::ClientSetName(name))
+                }
+                "SETNAME" | "GETNAME" => Err(ParseError::Invalid(format!(
+                    "wrong number of arguments for 'client|{}' command",
+                    subcommand.to_ascii_lowercase()
+                ))),
+                _ => Ok(RedisCommand::Client { subcommand }),
+            }
         }
         "QUIT" => Ok(RedisCommand::Quit),
         _ => Ok(RedisCommand::Unknown(command_name)),
@@ -887,7 +867,55 @@ fn extract_string(value: &BytesFrame) -> Result<String, ParseError> {
     }
 }
 
-/// Checks a relative TTL for SET/HSETEX: must be positive and in range.
+fn redis_integer(value: &BytesFrame) -> Result<i64, ParseError> {
+    let text = extract_string(value)?;
+    let invalid = || ParseError::Invalid("value is not an integer or out of range".into());
+    if text.starts_with('+') || text.starts_with("-0") || (text.starts_with('0') && text.len() > 1)
+    {
+        return Err(invalid());
+    }
+    text.parse().map_err(|_| invalid())
+}
+
+fn field_count(value: &BytesFrame, error: &str) -> Result<i64, ParseError> {
+    redis_integer(value)
+        .ok()
+        .filter(|count| (1..=i64::from(i32::MAX)).contains(count))
+        .ok_or_else(|| ParseError::Invalid(error.into()))
+}
+
+fn hash_expiry_time(
+    value: &BytesFrame,
+    millis: bool,
+    relative: bool,
+    command: &str,
+) -> Result<i64, ParseError> {
+    // Redis reserves the top two bits of its 48-bit hash expiry timestamp.
+    const MAX_HASH_EXPIRY_MS: i64 = (1 << 46) - 1;
+    let time = redis_integer(value)?;
+    if time < 0 {
+        return Err(ParseError::Invalid(
+            "invalid expire time, must be >= 0".into(),
+        ));
+    }
+    let base = if relative {
+        chrono::Utc::now().timestamp_millis()
+    } else {
+        0
+    };
+    let remaining_ms = MAX_HASH_EXPIRY_MS - base;
+    let limit = if millis {
+        remaining_ms
+    } else {
+        remaining_ms / 1000
+    };
+    if time > limit {
+        return Err(invalid_expire_time(command));
+    }
+    Ok(time)
+}
+
+/// Checks a relative TTL for SET: must be positive and in range.
 /// Expiry is stored in whole seconds, so millisecond TTLs round up and a key
 /// never expires before the time asked for.
 fn ttl_secs(ttl: u64, millis: bool, command: &str) -> Result<u64, ParseError> {
@@ -941,17 +969,11 @@ fn parse_hexpire_args(
                         command
                     )));
                 }
-                let num_fields = extract_string(&elements[idx])?
-                    .parse::<usize>()
-                    .map_err(|_| ParseError::Invalid("Invalid field count".to_string()))?;
+                let num_fields = field_count(
+                    &elements[idx],
+                    "Parameter `numFields` should be greater than 0",
+                )?;
                 idx += 1;
-
-                if num_fields == 0 {
-                    return Err(ParseError::Invalid(format!(
-                        "{} requires at least one field",
-                        command
-                    )));
-                }
 
                 // Parse field names
                 let mut names = Vec::new();
@@ -970,7 +992,7 @@ fn parse_hexpire_args(
             _ => return Err(unknown_argument(&arg)),
         };
 
-        if condition.is_some() {
+        if condition.is_some_and(|previous| previous != parsed) {
             return Err(ParseError::Invalid(
                 "Multiple condition flags specified".to_string(),
             ));
@@ -1190,10 +1212,44 @@ mod tests {
         for (option, value) in [("EX", "0"), ("PX", "0"), ("EX", too_big.as_str())] {
             assert_parse_error(&["SET", "k", "v", option, value], "invalid expire time");
         }
-        assert_parse_error(
-            &["HSETEX", "ns", "EX", "0", "FIELDS", "1", "f", "v"],
-            "invalid expire time",
-        );
+        assert!(parse(&["HSETEX", "ns", "EX", "0", "FIELDS", "1", "f", "v"]).is_ok());
+    }
+
+    #[test]
+    fn hash_expiries_respect_redis_deadline_limits() {
+        let max_ms = ((1_i64 << 46) - 1).to_string();
+        let over_ms = (1_i64 << 46).to_string();
+        assert!(parse(&["HSETEX", "h", "PXAT", &max_ms, "FIELDS", "1", "f", "v"]).is_ok());
+        for (option, value) in [("PXAT", &over_ms), ("PX", &max_ms)] {
+            assert_parse_error(
+                &["HSETEX", "h", option, value, "FIELDS", "1", "f", "v"],
+                "invalid expire time",
+            );
+        }
+        for cmd in ["HEXPIRE", "HEXPIREAT"] {
+            for value in ["-1", "70368744178"] {
+                assert_parse_error(
+                    &[cmd, "h", value, "FIELDS", "1", "f"],
+                    "invalid expire time",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn redis_integers_reject_noncanonical_expiries_and_counts() {
+        for value in ["00", "-0", "+0", "01"] {
+            assert_parse_error(&["EXPIRE", "k", value], "not an integer");
+            assert_parse_error(&["SET", "k", "v", "EX", value], "not an integer");
+            assert_parse_error(
+                &["HSETEX", "h", "EXAT", value, "FIELDS", "1", "f", "v"],
+                "not an integer",
+            );
+            assert_parse_error(
+                &["HSETEX", "h", "FIELDS", value, "f", "v"],
+                "invalid number of fields",
+            );
+        }
     }
 
     #[test]
@@ -1322,14 +1378,19 @@ mod tests {
         let (resp, _) = parse_resp_with_remaining(input).unwrap();
         let result = parse_command(resp);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Invalid EX value"));
+        assert!(result.unwrap_err().to_string().contains("not an integer"));
 
         // Test SET with invalid PX value
         let input = b"*5\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$5\r\nvalue\r\n$2\r\nPX\r\n$3\r\n-10\r\n";
         let (resp, _) = parse_resp_with_remaining(input).unwrap();
         let result = parse_command(resp);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Invalid PX value"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid expire time")
+        );
     }
 
     #[test]
@@ -1379,12 +1440,7 @@ mod tests {
         let (resp, _) = parse_resp_with_remaining(input).unwrap();
         let result = parse_command(resp);
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Invalid seconds value")
-        );
+        assert!(result.unwrap_err().to_string().contains("not an integer"));
     }
 
     #[test]
@@ -1866,12 +1922,7 @@ mod tests {
             "HEXPIRE", "myhash", "abc", "FIELDS", "1", "field1",
         ]));
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Invalid seconds value")
-        );
+        assert!(result.unwrap_err().to_string().contains("not an integer"));
     }
 
     #[test]
@@ -1881,12 +1932,7 @@ mod tests {
             "HEXPIRE", "myhash", "10", "NX", "FIELDS", "0",
         ]));
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("at least one field")
-        );
+        assert!(result.unwrap_err().to_string().contains("greater than 0"));
     }
 
     #[test]
@@ -1952,12 +1998,7 @@ mod tests {
             "field1",
         ]));
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Invalid timestamp value")
-        );
+        assert!(result.unwrap_err().to_string().contains("not an integer"));
     }
 
     #[test]
