@@ -308,12 +308,12 @@ async fn multi_key_and_multi_field_commands_abort_before_touching_local_data() {
         Some(&b"hkeep"[..])
     );
 
-    // HEXPIRE with a past expiry on a local field + an unserved field must not delete the local field.
+    // An immediate expiry must route both fields before deleting the local one.
     assert_eq!(
         node.call_line(&[
             b"HEXPIRE",
             b"ns",
-            b"-10",
+            b"0",
             b"FIELDS",
             b"2",
             b"bar",

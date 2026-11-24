@@ -45,12 +45,14 @@ pub enum ShardWriteOperation {
         namespace: String,
         key: String,
         data: Bytes,
+        keep_ttl: bool,
         responder: oneshot::Sender<Result<(), String>>,
     },
     HSetAsync {
         namespace: String,
         key: String,
         data: Bytes,
+        keep_ttl: bool,
         /// Matches the [`Pending::Value`] entry HSET left in the cache.
         token: u64,
     },
@@ -1041,6 +1043,7 @@ async fn clear_pending_entries(
                 key,
                 data,
                 token,
+                ..
             }
             | ShardWriteOperation::HSetExAsync {
                 namespace,
@@ -1230,8 +1233,18 @@ async fn process_batch(
                         e.to_string()
                     })
             }
-            ShardWriteOperation::HSet { namespace, key, .. }
-            | ShardWriteOperation::HSetAsync { namespace, key, .. } => {
+            ShardWriteOperation::HSet {
+                namespace,
+                key,
+                keep_ttl,
+                ..
+            }
+            | ShardWriteOperation::HSetAsync {
+                namespace,
+                key,
+                keep_ttl,
+                ..
+            } => {
                 if let ShardWriteOperation::HSet { .. } = operation {
                     sync_operations.push(idx)
                 }
@@ -1262,15 +1275,15 @@ async fn process_batch(
                         .unwrap_or(false);
 
                     if exists {
-                        // Update existing record. A live TTL is kept; an
-                        // expired row is a new field, so its expiry is cleared.
+                        // KEEPTTL preserves only a live field's deadline.
                         let update_query = format!(
-                            "UPDATE {} SET data = ?, updated_at = ?, expires_at = CASE WHEN expires_at <= ? THEN NULL ELSE expires_at END, version = version + 1 WHERE key = ?",
+                            "UPDATE {} SET data = ?, updated_at = ?, expires_at = CASE WHEN ? AND expires_at > ? THEN expires_at END, version = version + 1 WHERE key = ?",
                             table_name
                         );
                         sqlx::query(&update_query)
                             .bind(value)
                             .bind(now)
+                            .bind(*keep_ttl)
                             .bind(now)
                             .bind(key)
                             .execute(&mut *tx)
@@ -2690,6 +2703,7 @@ mod tests {
             },
             ShardWriteOperation::HSetAsync {
                 namespace: "ns".to_string(),
+                keep_ttl: false,
                 key: "f".to_string(),
                 data: Bytes::new(),
                 token: h0,
@@ -2708,6 +2722,7 @@ mod tests {
             },
             ShardWriteOperation::HSetAsync {
                 namespace: "ns".to_string(),
+                keep_ttl: false,
                 key: "f".to_string(),
                 data: Bytes::from_static(b"a"),
                 token: h1,
@@ -3092,6 +3107,7 @@ mod tests {
             let (responder, rx) = oneshot::channel();
             let op = ShardWriteOperation::HSet {
                 namespace: "ns".to_string(),
+                keep_ttl: false,
                 key: "k".to_string(),
                 data: Bytes::from_static(b"v"),
                 responder,
@@ -4014,6 +4030,7 @@ mod tests {
             },
             ShardWriteOperation::HSet {
                 namespace: "failns".to_string(),
+                keep_ttl: false,
                 key: "f".to_string(),
                 data: Bytes::from_static(b"v"),
                 responder: hset_tx,

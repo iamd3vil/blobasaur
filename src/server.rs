@@ -1274,6 +1274,7 @@ async fn hset_reply(
         let token = shard_manager::next_pending_token();
         let operation = ShardWriteOperation::HSetAsync {
             namespace,
+            keep_ttl: false,
             key,
             data: value.clone(),
             token,
@@ -1301,6 +1302,7 @@ async fn hset_reply(
         let (responder_tx, responder_rx) = oneshot::channel();
         let operation = ShardWriteOperation::HSet {
             namespace,
+            keep_ttl: false,
             key,
             data: value,
             responder: responder_tx,
@@ -1382,6 +1384,7 @@ async fn hsetex_reply(
 
     // Resolved only now, so time spent waiting for the locks doesn't shorten
     // a relative TTL.
+    let keep_ttl = expire_option == Some(ExpireOption::KeepTtl);
     let expires_at = match expire_option {
         Some(ExpireOption::Ex(seconds)) => Some(chrono::Utc::now().timestamp() + seconds as i64),
         // Round up like SET PX (the parser has range-checked it).
@@ -1390,11 +1393,7 @@ async fn hsetex_reply(
         }
         Some(ExpireOption::ExAt(timestamp)) => Some(timestamp),
         Some(ExpireOption::PxAt(timestamp)) => Some(timestamp / 1000),
-        Some(ExpireOption::KeepTtl) => {
-            // For KEEPTTL, we'd need to fetch existing TTL - for now, skip TTL setting
-            None
-        }
-        None => None,
+        Some(ExpireOption::KeepTtl) | None => None,
     };
 
     // Check every field before writing any, so a failed FNX/FXX condition
@@ -1428,6 +1427,16 @@ async fn hsetex_reply(
         checked.push((field_key, field_value, shard_index, is_new_field));
     }
 
+    if expires_at.is_some_and(|deadline| deadline <= chrono::Utc::now().timestamp()) {
+        for (field, _, shard, _) in checked {
+            let reply = delete_hash_field(state, namespace.clone(), field, shard).await;
+            if matches!(reply, BytesFrame::Error(_)) {
+                return Ok(reply);
+            }
+        }
+        return Ok(BytesFrame::Integer(1));
+    }
+
     let mut new_fields_added = 0;
     for (field_key, field_value, shard_index, is_new_field) in checked {
         let value_len = field_value.len() as f64;
@@ -1456,6 +1465,7 @@ async fn hsetex_reply(
             } else {
                 ShardWriteOperation::HSetAsync {
                     namespace: namespace.clone(),
+                    keep_ttl,
                     key: field_key,
                     data: compressed_value,
                     token,
@@ -1493,6 +1503,7 @@ async fn hsetex_reply(
             } else {
                 ShardWriteOperation::HSet {
                     namespace: namespace.clone(),
+                    keep_ttl,
                     key: field_key,
                     data: compressed_value,
                     responder: responder_tx,
@@ -1581,6 +1592,15 @@ async fn hdel_reply(state: &Arc<AppState>, namespace: String, key: String) -> By
         return BytesFrame::Integer(0);
     }
 
+    delete_hash_field(state, namespace, key, shard_index).await
+}
+
+async fn delete_hash_field(
+    state: &Arc<AppState>,
+    namespace: String,
+    key: String,
+    shard_index: usize,
+) -> BytesFrame {
     let sender = &state.shard_senders[shard_index];
 
     if state.cfg.async_write.unwrap_or(false) {
@@ -5228,7 +5248,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hset_keeps_ttl_of_live_field() {
+    async fn hset_clears_ttl_of_live_field() {
         let ctx = TestContext::new(false).await;
         let ns_table = shard_manager::namespace_table("ns");
         run!(ctx, handle_hset("ns".into(), "f".into(), v(b"v1")));
@@ -5243,7 +5263,7 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap();
-        assert_eq!(expires_at, Some(future));
+        assert_eq!(expires_at, None);
         ctx.shutdown().await;
     }
 

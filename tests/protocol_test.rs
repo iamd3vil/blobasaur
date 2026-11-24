@@ -231,6 +231,59 @@ async fn command_count_and_ping_check_their_arguments() {
 }
 
 #[tokio::test]
+async fn hsetex_negative_absolute_expiry_preserves_field() {
+    let server = start(None).await;
+    let mut client = server.connect().await;
+    client.send(&request(&[b"HSET", b"h", b"f", b"old"])).await;
+    assert_eq!(client.line().await.as_deref(), Some(":1"));
+
+    for option in [b"EXAT".as_slice(), b"PXAT"] {
+        let commands: [&[&[u8]]; 2] = [
+            &[
+                b"HSETEX", b"h", option, b"-1", b"FIELDS", b"1", b"f", b"new",
+            ],
+            &[
+                b"HSETEX", b"h", b"FIELDS", b"1", b"f", b"new", option, b"-1",
+            ],
+        ];
+        for command in commands {
+            client.send(&request(command)).await;
+            assert_eq!(
+                client.line().await.as_deref(),
+                Some("-ERR invalid expire time, must be >= 0")
+            );
+            client.send(&request(&[b"HGET", b"h", b"f"])).await;
+            assert_eq!(client.bulk().await, b"old");
+        }
+    }
+}
+
+#[tokio::test]
+async fn hash_expiry_accepts_repeated_identical_conditions() {
+    let server = start(None).await;
+    let mut client = server.connect().await;
+    client.send(&request(&[b"HSET", b"h", b"f", b"v"])).await;
+    assert_eq!(client.line().await.as_deref(), Some(":1"));
+
+    for (command, time, flag, expected) in [
+        (b"HEXPIRE".as_slice(), b"60".as_slice(), b"NX", ":1"),
+        (b"HEXPIREAT", b"0", b"XX", ":2"),
+    ] {
+        client
+            .send(&request(&[
+                command, b"h", time, flag, b"FIELDS", b"1", b"f", flag,
+            ]))
+            .await;
+        assert_eq!(client.line().await.as_deref(), Some("*1"));
+        assert_eq!(client.line().await.as_deref(), Some(expected));
+    }
+    assert_eq!(
+        server.call(&[b"HEXISTS", b"h", b"f"]).await.as_deref(),
+        Some(":0")
+    );
+}
+
+#[tokio::test]
 async fn hsetex_fnx_and_fxx_write_all_fields_or_none() {
     let server = start(None).await;
     assert_eq!(

@@ -142,6 +142,40 @@ func TestHashes(t *testing.T) {
 	})
 }
 
+func TestHashFieldOverwriteExpiry(t *testing.T) {
+	forEachProtocol(t, func(t *testing.T, rdb *redis.Client, p string) {
+		ns := namespace(p)
+		for _, tc := range []struct {
+			field  string
+			update []any
+			wantNX int64
+		}{
+			{"plain", []any{"HSET", ns, "plain", "new"}, 1},
+			{"setex", []any{"HSETEX", ns, "FIELDS", 1, "setex", "new"}, 1},
+			{"keep", []any{"HSETEX", ns, "KEEPTTL", "FIELDS", 1, "keep", "new"}, 0},
+		} {
+			if err := rdb.Do(ctx, "HSETEX", ns, "EX", 300, "FIELDS", 1, tc.field, "old").Err(); err != nil {
+				t.Fatal(err)
+			}
+			if err := rdb.Do(ctx, tc.update...).Err(); err != nil {
+				t.Fatal(err)
+			}
+			got, err := rdb.Do(ctx, "HEXPIRE", ns, 60, "NX", "FIELDS", 1, tc.field).Int64Slice()
+			if err != nil || len(got) != 1 || got[0] != tc.wantNX {
+				t.Fatalf("%s: HEXPIRE NX got %v, %v; want [%d]", tc.field, got, err, tc.wantNX)
+			}
+		}
+		for _, unit := range []string{"EX", "PX"} {
+			expect(t, "seed field", rdb.HSet(ctx, ns, unit, "old"), int64(1))
+			cmd := rdb.Do(ctx, "HSETEX", ns, "FXX", unit, 0, "FIELDS", 1, unit, "new")
+			if n, err := cmd.Int64(); err != nil || n != 1 {
+				t.Fatalf("HSETEX %s 0: got %d, %v", unit, n, err)
+			}
+			checkNil(t, "HGET after immediate expiry", rdb.HGet(ctx, ns, unit).Err())
+		}
+	})
+}
+
 // Writes acknowledged in async mode are visible to the very next command,
 // including DEL: a queued SET must not come back after it.
 func TestReadAfterWrite(t *testing.T) {
