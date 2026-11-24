@@ -263,6 +263,7 @@ async fn handle_connection(
     let max_request_size = state.cfg.max_request_size();
     let mut buffer = BytesMut::with_capacity(READ_CHUNK);
     let mut grown_to = READ_CHUNK;
+    let mut client_name = None;
 
     loop {
         // Run every complete request already buffered before reading more.
@@ -289,7 +290,9 @@ async fn handle_connection(
             match parse_command(request) {
                 Ok(command) => {
                     let quit = matches!(command, RedisCommand::Quit);
-                    if let Err(e) = handle_redis_command(&mut stream, &state, command).await {
+                    if let Err(e) =
+                        handle_redis_command(&mut stream, &state, &mut client_name, command).await
+                    {
                         tracing::error!("Error handling command: {}", e);
                         return Err(e);
                     }
@@ -366,12 +369,13 @@ struct ShardVacuumDispatchResult {
 async fn handle_redis_command(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
+    client_name: &mut Option<Bytes>,
     command: RedisCommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let timer = Timer::start();
     let cmd_name = command.name();
 
-    let result = handle_redis_command_inner(stream, state, command).await;
+    let result = handle_redis_command_inner(stream, state, client_name, command).await;
 
     // Record command metrics
     state.metrics.record_command(&cmd_name, timer.start);
@@ -410,6 +414,7 @@ async fn check_hash_route(state: &AppState, namespace: &str, key: &str) -> Resul
 async fn handle_redis_command_inner(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
+    client_name: &mut Option<Bytes>,
     command: RedisCommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match command {
@@ -446,6 +451,12 @@ async fn handle_redis_command_inner(
         }
         RedisCommand::Info { section } => {
             handle_info(stream, state, section).await?;
+        }
+        RedisCommand::CommandCount => {
+            // Count top-level commands in parse_command_array, including BLOBASAUR.VACUUM.
+            stream
+                .write_all(&serialize_frame(&BytesFrame::Integer(21)))
+                .await?;
         }
         RedisCommand::Command => {
             handle_command(stream).await?;
@@ -533,6 +544,16 @@ async fn handle_redis_command_inner(
         }
         RedisCommand::Hello { protover } => {
             handle_hello(stream, protover).await?;
+        }
+        RedisCommand::ClientGetName => {
+            let reply = client_name
+                .clone()
+                .map_or(BytesFrame::Null, BytesFrame::BulkString);
+            stream.write_all(&serialize_frame(&reply)).await?;
+        }
+        RedisCommand::ClientSetName(name) => {
+            *client_name = (!name.is_empty()).then_some(name);
+            stream.write_all(b"+OK\r\n").await?;
         }
         RedisCommand::Client { subcommand } => {
             handle_client(stream, &subcommand).await?;
@@ -4730,7 +4751,9 @@ mod tests {
         let frame = respond_with(&ctx, |state, stream| {
             Box::pin(async move {
                 let mut stream = stream;
-                let _ = handle_redis_command_inner(&mut stream, &state, RedisCommand::Quit).await;
+                let _ =
+                    handle_redis_command_inner(&mut stream, &state, &mut None, RedisCommand::Quit)
+                        .await;
                 Ok(())
             })
         });
@@ -4749,6 +4772,7 @@ mod tests {
                 handle_redis_command_inner(
                     &mut stream,
                     &state,
+                    &mut None,
                     RedisCommand::BlobasaurVacuum {
                         target: VacuumShardTarget::All,
                         mode: VacuumCommandMode::Incremental,
@@ -4797,6 +4821,7 @@ mod tests {
                 handle_redis_command_inner(
                     &mut stream,
                     &state,
+                    &mut None,
                     RedisCommand::BlobasaurVacuum {
                         target: VacuumShardTarget::Shard(99),
                         mode: VacuumCommandMode::Incremental,
@@ -5234,7 +5259,7 @@ mod tests {
         respond_with(ctx, |state, stream| {
             Box::pin(async move {
                 let mut stream = stream;
-                handle_redis_command(&mut stream, &state, command).await
+                handle_redis_command(&mut stream, &state, &mut None, command).await
             })
         })
         .await

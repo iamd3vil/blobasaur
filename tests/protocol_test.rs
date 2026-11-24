@@ -190,6 +190,47 @@ async fn quit_replies_ok_and_closes_without_running_the_rest() {
 }
 
 #[tokio::test]
+async fn client_name_is_scoped_to_the_connection() {
+    let server = start(None).await;
+    let mut client = server.connect().await;
+    client
+        .send(&request(&[b"CLIENT", b"SETNAME", b"worker"]))
+        .await;
+    assert_eq!(client.line().await.as_deref(), Some("+OK"));
+    client.send(&request(&[b"CLIENT", b"GETNAME"])).await;
+    assert_eq!(client.bulk().await, b"worker");
+    assert_eq!(
+        server.call(&[b"CLIENT", b"GETNAME"]).await.as_deref(),
+        Some("$-1")
+    );
+    client.send(&request(&[b"CLIENT", b"SETNAME", b""])).await;
+    assert_eq!(client.line().await.as_deref(), Some("+OK"));
+    client.send(&request(&[b"CLIENT", b"GETNAME"])).await;
+    assert_eq!(client.line().await.as_deref(), Some("$-1"));
+}
+
+#[tokio::test]
+async fn command_count_and_ping_check_their_arguments() {
+    let server = start(None).await;
+    assert_eq!(
+        server.call(&[b"COMMAND", b"COUNT"]).await.as_deref(),
+        Some(":21")
+    );
+    for args in [
+        [b"COMMAND".as_slice(), b"COUNT", b"extra"],
+        [b"PING", b"a", b"b"],
+    ] {
+        assert!(
+            server
+                .call(&args)
+                .await
+                .unwrap()
+                .starts_with("-ERR wrong number of arguments")
+        );
+    }
+}
+
+#[tokio::test]
 async fn hsetex_fnx_and_fxx_write_all_fields_or_none() {
     let server = start(None).await;
     assert_eq!(

@@ -109,6 +109,7 @@ pub enum RedisCommand {
         section: Option<String>,
     },
     Command,
+    CommandCount,
     // Cluster commands
     ClusterNodes,
     ClusterInfo,
@@ -141,6 +142,8 @@ pub enum RedisCommand {
     Client {
         subcommand: String,
     },
+    ClientGetName,
+    ClientSetName(Bytes),
     Quit,
     Unknown(String),
 }
@@ -162,7 +165,7 @@ impl RedisCommand {
             RedisCommand::HExpireAt { .. } => "HEXPIREAT".to_string(),
             RedisCommand::Ping { .. } => "PING".to_string(),
             RedisCommand::Info { .. } => "INFO".to_string(),
-            RedisCommand::Command => "COMMAND".to_string(),
+            RedisCommand::Command | RedisCommand::CommandCount => "COMMAND".to_string(),
             RedisCommand::ClusterNodes => "CLUSTER NODES".to_string(),
             RedisCommand::ClusterInfo => "CLUSTER INFO".to_string(),
             RedisCommand::ClusterSlots => "CLUSTER SLOTS".to_string(),
@@ -173,7 +176,9 @@ impl RedisCommand {
             RedisCommand::Expire { .. } => "EXPIRE".to_string(),
             RedisCommand::BlobasaurVacuum { .. } => "BLOBASAUR.VACUUM".to_string(),
             RedisCommand::Hello { .. } => "HELLO".to_string(),
-            RedisCommand::Client { .. } => "CLIENT".to_string(),
+            RedisCommand::Client { .. }
+            | RedisCommand::ClientGetName
+            | RedisCommand::ClientSetName(_) => "CLIENT".to_string(),
             RedisCommand::Quit => "QUIT".to_string(),
             RedisCommand::Unknown(cmd) => cmd.clone(),
         }
@@ -403,6 +408,11 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
             Ok(RedisCommand::Exists { key })
         }
         "PING" => {
+            if elements.len() > 2 {
+                return Err(ParseError::Invalid(
+                    "wrong number of arguments for 'ping' command".into(),
+                ));
+            }
             let message = if elements.len() > 1 {
                 Some(extract_string(&elements[1])?)
             } else {
@@ -418,7 +428,20 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
             };
             Ok(RedisCommand::Info { section })
         }
-        "COMMAND" => Ok(RedisCommand::Command),
+        "COMMAND" => {
+            if let Some(subcommand) = elements.get(1)
+                && extract_string(subcommand)?.eq_ignore_ascii_case("COUNT")
+            {
+                if elements.len() != 2 {
+                    return Err(ParseError::Invalid(
+                        "wrong number of arguments for 'command|count' command".into(),
+                    ));
+                }
+                Ok(RedisCommand::CommandCount)
+            } else {
+                Ok(RedisCommand::Command)
+            }
+        }
         "HGET" => {
             if elements.len() != 3 {
                 return Err(ParseError::Invalid(
@@ -774,7 +797,24 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
             } else {
                 String::new()
             };
-            Ok(RedisCommand::Client { subcommand })
+            match subcommand.as_str() {
+                "GETNAME" if elements.len() == 2 => Ok(RedisCommand::ClientGetName),
+                "SETNAME" if elements.len() == 3 => {
+                    let name = extract_bytes(&elements[2])?;
+                    if !name.iter().all(u8::is_ascii_graphic) {
+                        return Err(ParseError::Invalid(
+                            "Client names cannot contain spaces, newlines or special characters."
+                                .into(),
+                        ));
+                    }
+                    Ok(RedisCommand::ClientSetName(name))
+                }
+                "SETNAME" | "GETNAME" => Err(ParseError::Invalid(format!(
+                    "wrong number of arguments for 'client|{}' command",
+                    subcommand.to_ascii_lowercase()
+                ))),
+                _ => Ok(RedisCommand::Client { subcommand }),
+            }
         }
         "QUIT" => Ok(RedisCommand::Quit),
         _ => Ok(RedisCommand::Unknown(command_name)),
