@@ -1,6 +1,7 @@
 use config::Config;
 use miette::{IntoDiagnostic, Result};
 
+use crate::cluster::REDIS_CLUSTER_SLOTS;
 use crate::compression;
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -96,6 +97,42 @@ pub struct ClusterConfig {
     #[allow(dead_code)]
     pub gossip_interval_ms: Option<u64>,
     pub advertise_addr: Option<String>,
+}
+
+impl ClusterConfig {
+    /// Rejects values that would otherwise panic a task at startup (a zero
+    /// gossip interval, an inverted slot range) or advertise slots no client
+    /// can address.
+    pub fn validate(&self) -> Result<()> {
+        if self.gossip_interval_ms == Some(0) {
+            return Err(miette::miette!(
+                "cluster.gossip_interval_ms must be greater than 0"
+            ));
+        }
+
+        for &slot in self.slots.iter().flatten() {
+            if slot >= REDIS_CLUSTER_SLOTS {
+                return Err(miette::miette!(
+                    "cluster.slots: slot {} is out of range (0-{})",
+                    slot,
+                    REDIS_CLUSTER_SLOTS - 1
+                ));
+            }
+        }
+
+        for range in self.slot_ranges.iter().flatten() {
+            if range.start > range.end || range.end >= REDIS_CLUSTER_SLOTS {
+                return Err(miette::miette!(
+                    "cluster.slot_ranges: invalid range {}-{}, need start <= end <= {}",
+                    range.start,
+                    range.end,
+                    REDIS_CLUSTER_SLOTS - 1
+                ));
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, serde::Deserialize, PartialEq)]
@@ -198,6 +235,12 @@ impl Cfg {
             return Err(miette::miette!(
                 "cleanup_interval_secs must be greater than 0"
             ));
+        }
+
+        if let Some(ref cluster) = cfg.cluster
+            && cluster.enabled
+        {
+            cluster.validate()?;
         }
 
         println!("Data directory: {}", cfg.data_dir);
@@ -449,5 +492,79 @@ impl Cfg {
             .unwrap_or(2);
 
         configured.max(1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cluster_config() -> ClusterConfig {
+        ClusterConfig {
+            enabled: true,
+            node_id: "node1".to_string(),
+            seeds: vec![],
+            port: 7000,
+            slots: Some(vec![0, 16383]),
+            slot_ranges: Some(vec![SlotRange { start: 1, end: 100 }]),
+            gossip_interval_ms: Some(1000),
+            advertise_addr: None,
+        }
+    }
+
+    fn load_with_cluster(cluster: &str) -> Result<Cfg> {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            format!("data_dir = \"data\"\nnum_shards = 1\n\n[cluster]\n{cluster}"),
+        )
+        .unwrap();
+        Cfg::load(cfg_path.to_str().unwrap())
+    }
+
+    #[test]
+    fn cluster_validate_accepts_valid_config() {
+        assert!(cluster_config().validate().is_ok());
+    }
+
+    #[test]
+    fn cluster_validate_rejects_zero_gossip_interval() {
+        let mut cfg = cluster_config();
+        cfg.gossip_interval_ms = Some(0);
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn cluster_validate_rejects_out_of_range_slot() {
+        let mut cfg = cluster_config();
+        cfg.slots = Some(vec![16384]);
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn cluster_validate_rejects_bad_slot_ranges() {
+        let mut cfg = cluster_config();
+        cfg.slot_ranges = Some(vec![SlotRange {
+            start: 100,
+            end: 50,
+        }]);
+        assert!(cfg.validate().is_err());
+
+        cfg.slot_ranges = Some(vec![SlotRange {
+            start: 0,
+            end: 16384,
+        }]);
+        assert!(cfg.validate().is_err());
+
+        cfg.slot_ranges = Some(vec![SlotRange { start: 5, end: 5 }]);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn load_validates_enabled_cluster_only() {
+        let bad = "node_id = \"node1\"\nseeds = []\nport = 7000\ngossip_interval_ms = 0\n";
+        assert!(load_with_cluster(&format!("enabled = true\n{bad}")).is_err());
+        assert!(load_with_cluster(&format!("enabled = false\n{bad}")).is_ok());
     }
 }
