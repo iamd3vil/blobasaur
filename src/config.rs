@@ -193,7 +193,10 @@ impl Cfg {
             return Err(miette::miette!("data_dir cannot be empty"));
         }
 
-        if let Some(ref comp) = cfg.storage_compression {
+        // A disabled section is never used, so its level isn't checked.
+        if let Some(ref comp) = cfg.storage_compression
+            && comp.enabled
+        {
             compression::validate_config(comp)?;
         }
 
@@ -566,5 +569,33 @@ mod tests {
         let bad = "node_id = \"node1\"\nseeds = []\nport = 7000\ngossip_interval_ms = 0\n";
         assert!(load_with_cluster(&format!("enabled = true\n{bad}")).is_err());
         assert!(load_with_cluster(&format!("enabled = false\n{bad}")).is_ok());
+    }
+
+    fn load_with_compression(compression: &str) -> Result<Cfg> {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            format!("data_dir = \"data\"\nnum_shards = 1\n\n[storage_compression]\n{compression}"),
+        )
+        .unwrap();
+        Cfg::load(cfg_path.to_str().unwrap())
+    }
+
+    #[test]
+    fn load_accepts_compression_without_a_level() {
+        for algorithm in ["gzip", "zstd", "lz4", "brotli", "none"] {
+            let cfg =
+                load_with_compression(&format!("enabled = true\nalgorithm = \"{algorithm}\"\n"))
+                    .unwrap_or_else(|e| panic!("{algorithm} without a level was rejected: {e}"));
+            assert_eq!(cfg.storage_compression.unwrap().level, None);
+        }
+    }
+
+    #[test]
+    fn load_validates_enabled_compression_only() {
+        let bad = "algorithm = \"zstd\"\nlevel = 99\n";
+        assert!(load_with_compression(&format!("enabled = true\n{bad}")).is_err());
+        assert!(load_with_compression(&format!("enabled = false\n{bad}")).is_ok());
     }
 }

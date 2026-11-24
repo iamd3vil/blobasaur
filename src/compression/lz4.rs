@@ -16,11 +16,16 @@ impl Lz4Compressor {
             level: level.unwrap_or(4), // Default LZ4 level
         }
     }
+    /// Checks `level` if one is set; without one, `new` uses the default. LZ4
+    /// tops out at 12: async-compression caps higher levels to 12, so 13-16
+    /// would be accepted but behave as 12.
     pub fn validate(config: &CompressionConfig) -> Result<(), miette::Error> {
-        let level = config.level.unwrap_or(0);
-        if !(1..=16).contains(&level) {
+        if let Some(level) = config.level
+            && !(1..=12).contains(&level)
+        {
             return Err(miette::miette!(
-                "Compression level must be between 1 and 16"
+                "lz4 compression level must be between 1 and 12, got {}",
+                level
             ));
         }
         Ok(())
