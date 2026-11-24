@@ -193,8 +193,13 @@ pub struct ShardWriter {
 /// queued op, so clearing after commit only removes the entry that op recorded.
 #[derive(Clone, Debug)]
 pub enum Pending {
-    /// A queued SET/HSET/HSETEX.
-    Value { data: Bytes, token: u64 },
+    /// A queued SET/HSET/HSETEX. `expires_at` is the expiry the op commits
+    /// (`None` for none, and for HSET, which keeps a field's live expiry).
+    Value {
+        data: Bytes,
+        expires_at: Option<i64>,
+        token: u64,
+    },
     /// A queued DEL/HDEL: the key reads as absent.
     Deleted(u64),
 }
@@ -820,13 +825,18 @@ pub fn next_pending_token() -> u64 {
     NEXT_TOKEN.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Whether `expires_at` has passed, by the same rule the DB queries use.
+pub fn is_expired(expires_at: Option<i64>) -> bool {
+    expires_at.is_some_and(|t| t <= Utc::now().timestamp())
+}
+
 /// Whether a queued async op decides `key`'s existence: `Some(true)` for a
-/// write, `Some(false)` for a delete, `None` if nothing is queued (ask the DB).
+/// live write, `Some(false)` for a delete or an already-expired write, `None`
+/// if nothing is queued (ask the DB).
 pub async fn pending_exists(cache: &Cache<String, Pending>, key: &str) -> Option<bool> {
-    cache
-        .get(key)
-        .await
-        .map(|pending| matches!(pending, Pending::Value { .. }))
+    cache.get(key).await.map(
+        |pending| matches!(pending, Pending::Value { expires_at, .. } if !is_expired(expires_at)),
+    )
 }
 
 /// Removes `key`'s entry if it still carries `token`: a newer op on the same
@@ -2533,7 +2543,11 @@ mod tests {
             cache,
             sender,
             key.to_string(),
-            Pending::Value { data, token },
+            Pending::Value {
+                data,
+                expires_at: None,
+                token,
+            },
             op,
         )
         .await
@@ -2686,6 +2700,7 @@ mod tests {
             "ns:f".to_string(),
             Pending::Value {
                 data: Bytes::new(),
+                expires_at: None,
                 token: h0,
             },
             ShardWriteOperation::HSetAsync {
@@ -2704,6 +2719,7 @@ mod tests {
             "ns:f".to_string(),
             Pending::Value {
                 data: Bytes::from_static(b"a"),
+                expires_at: None,
                 token: h1,
             },
             ShardWriteOperation::HSetAsync {
@@ -2722,6 +2738,7 @@ mod tests {
             "ns:f".to_string(),
             Pending::Value {
                 data: Bytes::new(),
+                expires_at: None,
                 token: last_h_token,
             },
             ShardWriteOperation::HSetExAsync {
@@ -2767,21 +2784,21 @@ mod tests {
         assert!(
             matches!(
                 cache.get("k").await,
-                Some(Pending::Value { data, token }) if data.is_empty() && token == last_k_token
+                Some(Pending::Value { data, token, .. }) if data.is_empty() && token == last_k_token
             ),
             "newer empty SET was cleared by older empty SET"
         );
         assert!(
             matches!(
                 cache.get("s").await,
-                Some(Pending::Value { data, token }) if data == shared && token == last_s_token
+                Some(Pending::Value { data, token, .. }) if data == shared && token == last_s_token
             ),
             "newer aliased SET was cleared by older aliased SET"
         );
         assert!(
             matches!(
                 hcache.get("ns:f").await,
-                Some(Pending::Value { data, token }) if data.is_empty() && token == last_h_token
+                Some(Pending::Value { data, token, .. }) if data.is_empty() && token == last_h_token
             ),
             "newer empty HSETEX was cleared by older empty HSET"
         );

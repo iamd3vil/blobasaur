@@ -590,7 +590,9 @@ async fn handle_get(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // First check inflight cache for pending writes
     match state.inflight_cache.get(&key).await {
-        Some(Pending::Value { data, .. }) => {
+        Some(Pending::Value {
+            data, expires_at, ..
+        }) if !shard_manager::is_expired(expires_at) => {
             state.metrics.record_read("get", "inflight", "hit");
             // Decompress if needed
             let data = decompress_if_enabled(state, data).await?;
@@ -599,7 +601,8 @@ async fn handle_get(
             write_bulk(stream, &data).await?;
             return Ok(());
         }
-        Some(Pending::Deleted(_)) => {
+        // A queued DEL, or a queued SET that has already expired.
+        Some(_) => {
             state.metrics.record_read("get", "inflight", "miss");
             stream
                 .write_all(&serialize_frame(&BytesFrame::Null))
@@ -678,7 +681,11 @@ async fn handle_set(
             expires_at,
             token,
         };
-        let pending = Pending::Value { data: value, token };
+        let pending = Pending::Value {
+            data: value,
+            expires_at,
+            token,
+        };
 
         if shard_manager::queue_pending(&state.inflight_cache, sender, key, pending, operation)
             .await
@@ -1112,7 +1119,9 @@ async fn handle_hget(
     // First check inflight cache for pending writes
     let namespaced_key = state.namespaced_key(&namespace, &key);
     match state.inflight_hcache.get(&namespaced_key).await {
-        Some(Pending::Value { data, .. }) => {
+        Some(Pending::Value {
+            data, expires_at, ..
+        }) if !shard_manager::is_expired(expires_at) => {
             state.metrics.record_read("hget", "inflight", "hit");
             // Decompress if needed
             let data = decompress_if_enabled(state, data).await?;
@@ -1124,7 +1133,8 @@ async fn handle_hget(
             write_bulk(stream, &data).await?;
             return Ok(());
         }
-        Some(Pending::Deleted(_)) => {
+        // A queued HDEL, or a queued HSETEX that has already expired.
+        Some(_) => {
             state.metrics.record_read("hget", "inflight", "miss");
             stream
                 .write_all(&serialize_frame(&BytesFrame::Null))
@@ -1257,7 +1267,11 @@ async fn hset_reply(
             data: value.clone(),
             token,
         };
-        let pending = Pending::Value { data: value, token };
+        let pending = Pending::Value {
+            data: value,
+            expires_at: None,
+            token,
+        };
 
         if shard_manager::queue_pending(
             &state.inflight_hcache,
@@ -1422,6 +1436,7 @@ async fn hsetex_reply(
             let token = shard_manager::next_pending_token();
             let pending = Pending::Value {
                 data: compressed_value.clone(),
+                expires_at,
                 token,
             };
             let operation = if let Some(exp) = expires_at {
@@ -2002,18 +2017,28 @@ async fn handle_ttl(
     state: &Arc<AppState>,
     key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // A queued DEL means the key is gone. (A queued SET's expiry isn't in the
-    // cache, so TTL still reads the DB for those.)
-    if shard_manager::pending_exists(&state.inflight_cache, &key).await == Some(false) {
+    let now = chrono::Utc::now().timestamp();
+
+    // A queued SET or DEL decides it, as it does for GET.
+    if let Some(pending) = state.inflight_cache.get(&key).await {
+        let ttl = match pending {
+            Pending::Value {
+                expires_at: None, ..
+            } => -1,
+            Pending::Value {
+                expires_at: Some(t),
+                ..
+            } if t > now => t - now,
+            _ => -2,
+        };
         stream
-            .write_all(&serialize_frame(&BytesFrame::Integer(-2)))
+            .write_all(&serialize_frame(&BytesFrame::Integer(ttl)))
             .await?;
         return Ok(());
     }
 
     let shard_index = state.get_shard(&key);
     let pool = &state.db_pools[shard_index];
-    let now = chrono::Utc::now().timestamp();
 
     match sqlx::query_as::<_, (Option<i64>,)>(
         "SELECT expires_at FROM blobs WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
@@ -3968,6 +3993,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn async_reads_honor_expiry_of_writes_still_queued() {
+        let ctx = TestContext::new(true).await;
+        let now = chrono::Utc::now().timestamp();
+        // Queued writes, not committed: one already expired, one with a TTL.
+        let pending = |expires_at| Pending::Value {
+            data: Bytes::from_static(b"v"),
+            expires_at,
+            token: shard_manager::next_pending_token(),
+        };
+        let cache = &ctx.state.inflight_cache;
+        cache.insert("gone".to_string(), pending(Some(1))).await;
+        cache
+            .insert("live".to_string(), pending(Some(now + 100)))
+            .await;
+        let hcache = &ctx.state.inflight_hcache;
+        hcache
+            .insert(ctx.state.namespaced_key("ns", "f"), pending(Some(1)))
+            .await;
+
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move { handle_get(&mut stream, &state, "gone".to_string()).await })
+        })
+        .await;
+        assert_null(frame);
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move { handle_exists(&mut stream, &state, "gone".to_string()).await })
+        })
+        .await;
+        assert_integer_response(frame, 0);
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move { handle_ttl(&mut stream, &state, "gone".to_string()).await })
+        })
+        .await;
+        assert_integer_response(frame, -2);
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move { handle_ttl(&mut stream, &state, "live".to_string()).await })
+        })
+        .await;
+        match frame {
+            BytesFrame::Integer(ttl) => assert!((99..=100).contains(&ttl), "ttl {ttl}"),
+            other => panic!("Expected integer TTL, got {other:?}"),
+        }
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_hget(&mut stream, &state, "ns".to_string(), "f".to_string()).await
+            })
+        })
+        .await;
+        assert_null(frame);
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_hexists(&mut stream, &state, "ns".to_string(), "f".to_string()).await
+            })
+        })
+        .await;
+        assert_integer_response(frame, 0);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn async_del_and_exists_count_writes_still_queued() {
         let ctx = TestContext::new(true).await;
         // An acked async SET/HSET whose op hasn't committed yet: in the inflight
@@ -3979,6 +4065,7 @@ mod tests {
                 "queued".to_string(),
                 Pending::Value {
                     data: value.clone(),
+                    expires_at: None,
                     token: shard_manager::next_pending_token(),
                 },
             )
@@ -3989,6 +4076,7 @@ mod tests {
                 ctx.state.namespaced_key("ns", "field"),
                 Pending::Value {
                     data: value,
+                    expires_at: None,
                     token: shard_manager::next_pending_token(),
                 },
             )
