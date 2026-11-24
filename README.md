@@ -174,8 +174,10 @@ just build-linux
    ```toml
    data_dir = "./data"
    num_shards = 4
-   addr = "0.0.0.0:6379"
+   addr = "127.0.0.1:6379"
    ```
+
+   Blobasaur has no authentication or ACLs and is meant for trusted internal networks only. See [SECURITY.md](SECURITY.md) before binding to a non-loopback interface.
 
 2. **Run the server:**
    ```bash

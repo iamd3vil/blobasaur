@@ -190,6 +190,44 @@ async fn quit_replies_ok_and_closes_without_running_the_rest() {
 }
 
 #[tokio::test]
+async fn oversized_hash_field_count_is_rejected_and_server_survives() {
+    let server = start(None).await;
+
+    for args in [
+        &[
+            b"HEXPIRE".as_slice(),
+            b"k",
+            b"10",
+            b"FIELDS",
+            b"1000000000000000",
+            b"f",
+        ][..],
+        &[b"HEXPIRE", b"k", b"10", b"FIELDS", b"2147483647", b"f"],
+        &[
+            b"HEXPIREAT",
+            b"k",
+            b"4102444800",
+            b"FIELDS",
+            b"1000000000000000",
+            b"f",
+        ],
+        &[
+            b"HEXPIREAT",
+            b"k",
+            b"4102444800",
+            b"FIELDS",
+            b"2147483647",
+            b"f",
+        ],
+    ] {
+        let reply = server.call(args).await.expect("error reply");
+        assert!(reply.starts_with("-ERR "), "{reply}");
+    }
+
+    assert_eq!(server.call(&[b"PING"]).await.as_deref(), Some("+PONG"));
+}
+
+#[tokio::test]
 async fn client_name_is_scoped_to_the_connection() {
     let server = start(None).await;
     let mut client = server.connect().await;

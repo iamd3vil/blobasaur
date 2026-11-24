@@ -533,17 +533,20 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
                                 "HSETEX requires field count after FIELDS".to_string(),
                             ));
                         }
-                        let num_fields = field_count(&elements[idx], "invalid number of fields")?;
+                        let num_fields =
+                            field_count(&elements[idx], "invalid number of fields")? as usize;
                         idx += 1;
 
+                        // Validate against remaining args before allocating.
+                        if num_fields > (elements.len() - idx) / 2 {
+                            return Err(ParseError::Invalid(
+                                "Not enough field-value pairs".to_string(),
+                            ));
+                        }
+
                         // Parse field-value pairs
-                        let mut pairs = Vec::new();
+                        let mut pairs = Vec::with_capacity(num_fields);
                         for _ in 0..num_fields {
-                            if idx + 1 >= elements.len() {
-                                return Err(ParseError::Invalid(
-                                    "Not enough field-value pairs".to_string(),
-                                ));
-                            }
                             let field = extract_string(&elements[idx])?;
                             let value = extract_bytes(&elements[idx + 1])?;
                             pairs.push((field, value));
@@ -972,17 +975,19 @@ fn parse_hexpire_args(
                 let num_fields = field_count(
                     &elements[idx],
                     "Parameter `numFields` should be greater than 0",
-                )?;
+                )? as usize;
                 idx += 1;
 
+                // Validate against remaining args before allocating.
+                if num_fields > elements.len() - idx {
+                    return Err(ParseError::Invalid(
+                        "Not enough fields provided".to_string(),
+                    ));
+                }
+
                 // Parse field names
-                let mut names = Vec::new();
+                let mut names = Vec::with_capacity(num_fields);
                 for _ in 0..num_fields {
-                    if idx >= elements.len() {
-                        return Err(ParseError::Invalid(
-                            "Not enough fields provided".to_string(),
-                        ));
-                    }
                     names.push(extract_string(&elements[idx])?);
                     idx += 1;
                 }
@@ -2145,6 +2150,39 @@ mod tests {
         assert_parse_error(
             &["HEXPIRE", "ns", "10", "FIELDS", "1", "f", "NX", "extra"],
             "unknown argument: extra",
+        );
+    }
+
+    #[test]
+    fn hash_field_commands_reject_oversized_field_counts_without_allocating() {
+        for huge in ["1000000000000000", "2147483648"] {
+            assert_parse_error(
+                &["HEXPIRE", "k", "10", "FIELDS", huge, "f"],
+                "greater than 0",
+            );
+            assert_parse_error(
+                &["HEXPIREAT", "k", "4102444800", "FIELDS", huge, "f"],
+                "greater than 0",
+            );
+            assert_parse_error(
+                &["HSETEX", "k", "FIELDS", huge, "f", "v"],
+                "invalid number of fields",
+            );
+        }
+
+        // Within i32::MAX, but larger than the remaining arguments.
+        let max_i32 = i32::MAX.to_string();
+        assert_parse_error(
+            &["HEXPIRE", "k", "10", "FIELDS", &max_i32, "f"],
+            "Not enough fields provided",
+        );
+        assert_parse_error(
+            &["HEXPIREAT", "k", "4102444800", "FIELDS", &max_i32, "f"],
+            "Not enough fields provided",
+        );
+        assert_parse_error(
+            &["HSETEX", "k", "FIELDS", &max_i32, "f", "v"],
+            "Not enough field-value pairs",
         );
     }
 
