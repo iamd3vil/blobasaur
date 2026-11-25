@@ -643,12 +643,16 @@ fn validate_shard_count(data_dir: &str, expected_shards: usize) -> Result<()> {
     // Report any mismatches
     if actual_shards != expected_shards || !extra_shards.is_empty() {
         let mut error_msg = format!(
-            "Shard count mismatch: expected {} shards, but found {} existing shards",
+            "Shard count mismatch: expected {} shards, found {} of them",
             expected_shards, actual_shards
         );
 
         if !extra_shards.is_empty() {
-            error_msg.push_str(&format!(". Found extra shard files: {:?}", extra_shards));
+            extra_shards.sort_unstable();
+            error_msg.push_str(&format!(
+                ". Found shard files beyond num_shards: {:?} (change the shard count with `blobasaur shard migrate`)",
+                extra_shards
+            ));
         }
 
         if actual_shards < expected_shards {
@@ -915,6 +919,22 @@ mod tests {
         assert!(
             result.is_err(),
             "startup must fail fast when legacy auto_vacuum upgrade fails"
+        );
+    }
+
+    #[test]
+    fn shard_count_mismatch_lists_extra_shards_in_order() {
+        let dir = TempDir::new().unwrap();
+        for shard_id in [0, 1, 2, 4, 3] {
+            fs::write(dir.path().join(format!("shard_{shard_id}.db")), b"").unwrap();
+        }
+
+        let err = validate_shard_count(dir.path().to_str().unwrap(), 3).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Shard count mismatch: expected 3 shards, found 3 of them. Found shard files beyond \
+             num_shards: [3, 4] (change the shard count with `blobasaur shard migrate`)"
         );
     }
 }
