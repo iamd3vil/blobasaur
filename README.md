@@ -344,7 +344,8 @@ Blobasaur implements core Redis commands for blob operations:
   # Returns:
   # -1 if key exists but has no expiration
   # -2 if key does not exist or has expired
-  # positive number: remaining TTL in seconds
+  # 0 or a positive number: remaining TTL in whole seconds, rounded down
+  # (0 during the key's last second)
   ```
 
 - **`EXPIRE key seconds`**: Set expiration time for an existing key
