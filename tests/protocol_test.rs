@@ -440,36 +440,61 @@ async fn ttl_is_not_cut_short_by_whole_second_storage() {
         Some(":1")
     );
 
-    // Both writes must land late in the same second; retry if a slow run
-    // pushes them past it.
-    let second = loop {
+    // Both writes must land late in the same second; retry with fresh keys if a
+    // slow run pushes them past the boundary.
+    const MAX_ATTEMPTS: usize = 10;
+    let mut landed = None;
+    for attempt in 0..MAX_ATTEMPTS {
         sleep_until_subsec(900).await;
-        let second = unix_millis() / 1000;
+        let start = unix_millis();
+        if start % 1000 < 900 {
+            continue;
+        }
+        let second = start / 1000;
+        let key = format!("k{attempt}");
+        let field = format!("f{attempt}");
         assert_eq!(
             server
-                .call(&[b"SET", b"k", b"v", b"EX", b"1"])
+                .call(&[b"SET", key.as_bytes(), b"v", b"EX", b"1"])
                 .await
                 .as_deref(),
             Some("+OK")
         );
         assert_eq!(
             server
-                .call(&[b"HSETEX", b"ns", b"EX", b"1", b"FIELDS", b"1", b"f", b"v"])
+                .call(&[
+                    b"HSETEX",
+                    b"ns",
+                    b"EX",
+                    b"1",
+                    b"FIELDS",
+                    b"1",
+                    field.as_bytes(),
+                    b"v",
+                ])
                 .await
                 .as_deref(),
             Some(":1")
         );
         if unix_millis() / 1000 == second {
-            break second;
+            landed = Some((second, key, field));
+            break;
         }
-    };
+    }
+    let (second, key, field) = landed.expect("writes never landed within the late-second window");
 
     // Just past the next whole second, well under the 1s asked for.
     let wait = (second * 1000 + 1150).saturating_sub(unix_millis());
     tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
-    assert_eq!(server.call(&[b"EXISTS", b"k"]).await.as_deref(), Some(":1"));
     assert_eq!(
-        server.call(&[b"HEXISTS", b"ns", b"f"]).await.as_deref(),
+        server.call(&[b"EXISTS", key.as_bytes()]).await.as_deref(),
+        Some(":1")
+    );
+    assert_eq!(
+        server
+            .call(&[b"HEXISTS", b"ns", field.as_bytes()])
+            .await
+            .as_deref(),
         Some(":1")
     );
 }
