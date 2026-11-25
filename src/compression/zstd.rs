@@ -16,11 +16,14 @@ impl ZstdCompressor {
             level: level.map(|l| l as i32).unwrap_or(3),
         }
     }
+    /// Checks `level` if one is set; without one, `new` uses the default.
     pub fn validate(config: &CompressionConfig) -> Result<(), miette::Error> {
-        let level = config.level.unwrap_or(0);
-        if !(1..=22).contains(&level) {
+        if let Some(level) = config.level
+            && !(1..=22).contains(&level)
+        {
             return Err(miette::miette!(
-                "Compression level must be between 1 and 22"
+                "zstd compression level must be between 1 and 22, got {}",
+                level
             ));
         }
         Ok(())
@@ -61,6 +64,11 @@ mod tests {
     fn test_new_with_custom_level() {
         let compressor = ZstdCompressor::new(Some(10));
         assert_eq!(compressor.level, 10);
+    }
+
+    #[test]
+    fn test_new_without_level_uses_default() {
+        assert_eq!(ZstdCompressor::new(None).level, 3);
     }
 
     #[tokio::test]

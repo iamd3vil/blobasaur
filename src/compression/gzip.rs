@@ -16,10 +16,15 @@ impl GzipCompressor {
             level: level.unwrap_or(6), // Default compression level
         }
     }
+    /// Checks `level` if one is set; without one, `new` uses the default.
     pub fn validate(config: &CompressionConfig) -> Result<(), miette::Error> {
-        let level = config.level.unwrap_or(0);
-        if !(1..=9).contains(&level) {
-            return Err(miette::miette!("Compression level must be between 1 and 9"));
+        if let Some(level) = config.level
+            && !(1..=9).contains(&level)
+        {
+            return Err(miette::miette!(
+                "gzip compression level must be between 1 and 9, got {}",
+                level
+            ));
         }
         Ok(())
     }

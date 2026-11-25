@@ -40,3 +40,61 @@ pub fn validate_config(config: &CompressionConfig) -> Result<(), miette::Error> 
         CompressionType::Brotli => BrotliCompressor::validate(config),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(algorithm: CompressionType, level: Option<u32>) -> CompressionConfig {
+        CompressionConfig {
+            enabled: true,
+            algorithm,
+            level,
+        }
+    }
+
+    #[test]
+    fn validate_accepts_a_missing_level() {
+        for algorithm in [
+            CompressionType::None,
+            CompressionType::Gzip,
+            CompressionType::Zstd,
+            CompressionType::Lz4,
+            CompressionType::Brotli,
+        ] {
+            assert!(
+                validate_config(&config(algorithm, None)).is_ok(),
+                "{algorithm:?} without a level must use its default"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_checks_a_level_that_is_set() {
+        let cases = [
+            (CompressionType::Zstd, 1, true),
+            (CompressionType::Zstd, 22, true),
+            (CompressionType::Zstd, 0, false),
+            (CompressionType::Zstd, 23, false),
+            (CompressionType::Lz4, 1, true),
+            (CompressionType::Lz4, 12, true),
+            (CompressionType::Lz4, 0, false),
+            // async-compression caps LZ4 at 12, so 13-16 would silently act as 12.
+            (CompressionType::Lz4, 13, false),
+            (CompressionType::Gzip, 1, true),
+            (CompressionType::Gzip, 9, true),
+            (CompressionType::Gzip, 0, false),
+            (CompressionType::Gzip, 10, false),
+            (CompressionType::Brotli, 0, true),
+            (CompressionType::Brotli, 11, true),
+            (CompressionType::Brotli, 12, false),
+        ];
+        for (algorithm, level, valid) in cases {
+            assert_eq!(
+                validate_config(&config(algorithm, Some(level))).is_ok(),
+                valid,
+                "{algorithm:?} level {level}"
+            );
+        }
+    }
+}

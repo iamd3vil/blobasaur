@@ -16,10 +16,15 @@ impl BrotliCompressor {
             level: level.unwrap_or(6),
         }
     }
+    /// Checks `level` if one is set; without one, `new` uses the default.
     pub fn validate(config: &CompressionConfig) -> Result<(), miette::Error> {
-        let level = config.level.unwrap_or(0);
-        if level > 11 {
-            return Err(miette::miette!("Compression level less than 11"));
+        if let Some(level) = config.level
+            && level > 11
+        {
+            return Err(miette::miette!(
+                "brotli compression level must be between 0 and 11, got {}",
+                level
+            ));
         }
         Ok(())
     }
