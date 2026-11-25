@@ -1,16 +1,37 @@
-use miette::{Context, Result};
+use crate::shard_manager::shard_file_options;
+use miette::{Context, IntoDiagnostic, Result};
 use mpchash::HashRing;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Connection, Row, SqliteConnection, SqlitePool};
 use std::collections::{HashMap, HashSet};
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::path::Path;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const SQLITE_AUTO_VACUUM_NONE: i64 = 0;
 const SQLITE_AUTO_VACUUM_FULL: i64 = 1;
 const SQLITE_AUTO_VACUUM_INCREMENTAL: i64 = 2;
+
+const PENDING_SHRINK: &str = ".blobasaur-shrink.pending";
+
+pub(crate) fn pending_shrink(data_dir: &Path) -> Result<Option<String>> {
+    match fs::read_to_string(data_dir.join(PENDING_SHRINK)) {
+        Ok(counts) => Ok(Some(counts)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).into_diagnostic().wrap_err("reading pending shrink"),
+    }
+}
+
+// Persist directory changes in order across a power failure on Unix.
+fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    fs::File::open(path)
+        .and_then(|dir| dir.sync_all())
+        .into_diagnostic()?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
 
 // Helper function to convert sqlx errors to miette errors
 fn sqlx_to_miette(err: sqlx::Error, context: &str) -> miette::Error {
@@ -96,8 +117,7 @@ impl MigrationManager {
 
         // Use recommended SQLite settings for migration operations
         // See: https://kerkour.com/sqlite-for-servers
-        let connect_options = SqliteConnectOptions::from_str(&format!("sqlite:{}", db_path))
-            .map_err(|e| sqlx_to_miette(e, "Failed to parse connection string"))?
+        let connect_options = shard_file_options(&db_path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .busy_timeout(std::time::Duration::from_millis(5000))
@@ -114,8 +134,7 @@ impl MigrationManager {
 
     async fn create_readonly_pool(&self, shard_id: usize) -> Result<SqlitePool> {
         let db_path = format!("{}/shard_{}.db", self.data_dir, shard_id);
-        let connect_options = SqliteConnectOptions::from_str(&format!("sqlite:{}", db_path))
-            .map_err(|e| sqlx_to_miette(e, "Failed to parse connection string"))?
+        let connect_options = shard_file_options(&db_path)
             .read_only(true)
             .busy_timeout(std::time::Duration::from_millis(5000));
 
@@ -151,8 +170,7 @@ impl MigrationManager {
         // Default rollback journal mode avoids creating -wal/-shm sidecars
         // before publishing; create_connection_pool switches to WAL once
         // the shard is published.
-        let connect_options = SqliteConnectOptions::from_str(&format!("sqlite:{}", tmp_path))
-            .map_err(|e| sqlx_to_miette(e, "Failed to parse temp shard connection string"))?
+        let connect_options = shard_file_options(&tmp_path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Delete)
             .busy_timeout(std::time::Duration::from_millis(5000))
@@ -317,20 +335,35 @@ impl MigrationManager {
         // verification so a second reshard cannot interleave between them.
         let _migration_lock = self.acquire_migration_lock()?;
 
+        let data_dir = Path::new(&self.data_dir);
+        let counts = format!("{} {}", self.old_shard_count, self.new_shard_count);
+        let pending = pending_shrink(data_dir)?;
+        if let Some(previous) = &pending
+            && previous != &counts
+        {
+            return Err(miette::miette!(
+                "Finish the pending shrink with `blobasaur shard migrate {previous}` first"
+            ));
+        }
+
         // Preflight all source shards and any already-existing destination shards
         // before modifying any file. Uses probe_shard_schema_version so a hot
         // rollback journal can recover without switching journal_mode to WAL.
         let mut schema_version: Option<(usize, i64)> = None;
         let mut v0_namespace_spellings: HashMap<String, (usize, String)> = HashMap::new();
         let max_shards = self.old_shard_count.max(self.new_shard_count);
+        let mut source_shards = Vec::new();
         for i in 0..max_shards {
             let db_path = format!("{}/shard_{}.db", self.data_dir, i);
-            let exists = Path::new(&db_path).exists();
-            if i < self.old_shard_count && !exists {
-                return Err(miette::miette!("Old shard file {} does not exist", db_path));
-            }
-            if !exists {
+            if !Path::new(&db_path).try_exists().into_diagnostic()? {
+                if i < self.old_shard_count && (pending.is_none() || i < self.new_shard_count) {
+                    return Err(miette::miette!("Old shard file {} does not exist", db_path));
+                }
                 continue;
+            }
+
+            if i < self.old_shard_count {
+                source_shards.push(i);
             }
 
             let version = crate::shard_manager::probe_shard_schema_version(&db_path, i, 5000)
@@ -456,7 +489,7 @@ impl MigrationManager {
         }
 
         // Migrate data from old shards to new shards
-        for old_shard_id in 0..self.old_shard_count {
+        for &old_shard_id in &source_shards {
             tracing::info!("Processing old shard {}", old_shard_id);
 
             let old_pool = self
@@ -507,16 +540,36 @@ impl MigrationManager {
             old_pool.close().await;
         }
 
-        tracing::info!("Shard migration completed successfully");
-
         if verify {
             self.verify_migration_unlocked().await?;
         }
 
-        // Shards past the new count are empty now. The server refuses to start
-        // while they exist, so remove them, after verification if it was asked for.
-        self.remove_drained_shards().await?;
+        if self.old_shard_count > self.new_shard_count {
+            let marker = data_dir.join(PENDING_SHRINK);
+            if pending.is_none() {
+                // Publish the counts atomically before the first source file disappears.
+                let tmp = marker.with_extension("tmp");
+                {
+                    use std::io::Write;
+                    let mut file = fs::File::create(&tmp).into_diagnostic()?;
+                    file.write_all(counts.as_bytes()).into_diagnostic()?;
+                    file.sync_all().into_diagnostic()?;
+                }
+                fs::rename(tmp, &marker).into_diagnostic()?;
+            }
+            sync_directory(data_dir)?;
+            for shard_id in source_shards
+                .into_iter()
+                .filter(|&id| id >= self.new_shard_count)
+            {
+                self.remove_drained_shard(shard_id).await?;
+            }
+            sync_directory(data_dir)?;
+            fs::remove_file(marker).into_diagnostic()?;
+            sync_directory(data_dir)?;
+        }
 
+        tracing::info!("Shard migration completed successfully");
         tracing::info!(
             "You can now update your configuration to use {} shards",
             self.new_shard_count
@@ -525,72 +578,66 @@ impl MigrationManager {
         Ok(())
     }
 
-    /// Removes the shard files a migration to fewer shards has emptied
-    /// (`shard_{new_shard_count}.db` and up). A shard that still has a row
-    /// is an error and is left in place.
-    async fn remove_drained_shards(&self) -> Result<()> {
-        for shard_id in self.new_shard_count..self.old_shard_count {
-            let db_path = format!("{}/shard_{}.db", self.data_dir, shard_id);
+    async fn remove_drained_shard(&self, shard_id: usize) -> Result<()> {
+        let db_path = format!("{}/shard_{}.db", self.data_dir, shard_id);
 
-            // Leaving WAL mode checkpoints the WAL and deletes the -wal and
-            // -shm files, so the shard is one file and removing it can't
-            // leave a stale WAL behind for a later shard with this number.
-            let connect_options = SqliteConnectOptions::from_str(&format!("sqlite:{}", db_path))
-                .map_err(|e| sqlx_to_miette(e, "Failed to parse connection string"))?
-                .journal_mode(SqliteJournalMode::Delete)
-                .busy_timeout(std::time::Duration::from_millis(5000));
-            let pool = SqlitePoolOptions::new()
-                .max_connections(1)
-                .connect_with(connect_options)
+        // Leaving WAL mode checkpoints the WAL and deletes the -wal and
+        // -shm files, so the shard is one file and removing it can't
+        // leave a stale WAL behind for a later shard with this number.
+        let connect_options = shard_file_options(&db_path)
+            .journal_mode(SqliteJournalMode::Delete)
+            .busy_timeout(std::time::Duration::from_millis(5000));
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(connect_options)
+            .await
+            .map_err(|e| {
+                sqlx_to_miette(e, &format!("Failed to open drained shard {}", shard_id))
+            })?;
+
+        let mut remaining: i64 = 0;
+        for table_name in self.get_all_tables(&pool).await? {
+            let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {}", table_name))
+                .fetch_one(&pool)
                 .await
                 .map_err(|e| {
-                    sqlx_to_miette(e, &format!("Failed to open drained shard {}", shard_id))
+                    sqlx_to_miette(
+                        e,
+                        &format!(
+                            "Failed to count records in table {} of shard {}",
+                            table_name, shard_id
+                        ),
+                    )
                 })?;
-
-            let mut remaining: i64 = 0;
-            for table_name in self.get_all_tables(&pool).await? {
-                let count: i64 =
-                    sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {}", table_name))
-                        .fetch_one(&pool)
-                        .await
-                        .map_err(|e| {
-                            sqlx_to_miette(
-                                e,
-                                &format!(
-                                    "Failed to count records in table {} of shard {}",
-                                    table_name, shard_id
-                                ),
-                            )
-                        })?;
-                remaining += count;
-            }
-            pool.close().await;
-
-            if remaining > 0 {
-                return Err(miette::miette!(
-                    "Shard {} still has {} records after migration; left {} in place",
-                    shard_id,
-                    remaining,
-                    db_path
-                ));
-            }
-            // SQLite keeps the old journal mode, without an error, when it
-            // can't change it. Removing the main file would then orphan the WAL.
-            let wal_path = format!("{}-wal", db_path);
-            if Path::new(&wal_path).exists() {
-                return Err(miette::miette!(
-                    "Shard {} is still in WAL mode ({} exists); left {} in place",
-                    shard_id,
-                    wal_path,
-                    db_path
-                ));
-            }
-
-            std::fs::remove_file(&db_path).map_err(|e| {
-                miette::miette!("Failed to remove drained shard file {}: {}", db_path, e)
-            })?;
-            tracing::info!("Removed drained shard file {}", db_path);
+            remaining += count;
         }
+        pool.close().await;
+
+        if remaining > 0 {
+            return Err(miette::miette!(
+                "Shard {} still has {} records after migration; left {} in place",
+                shard_id,
+                remaining,
+                db_path
+            ));
+        }
+
+        // SQLite keeps the old journal mode, without an error, when it
+        // can't change it. Removing the main file would then orphan the WAL.
+        let wal_path = format!("{}-wal", db_path);
+        if Path::new(&wal_path).try_exists().into_diagnostic()? {
+            return Err(miette::miette!(
+                "Shard {} is still in WAL mode ({} exists); left {} in place",
+                shard_id,
+                wal_path,
+                db_path
+            ));
+        }
+
+        std::fs::remove_file(&db_path).map_err(|e| {
+            miette::miette!("Failed to remove drained shard file {}: {}", db_path, e)
+        })?;
+        tracing::info!("Removed drained shard file {}", db_path);
 
         Ok(())
     }
@@ -1222,12 +1269,13 @@ impl MigrationManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::sqlite::SqliteConnectOptions;
     use tempfile::TempDir;
 
     async fn wal_shard(dir: &TempDir, shard_id: usize, rows: usize) -> SqlitePool {
         let path = dir.path().join(format!("shard_{shard_id}.db"));
-        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
-            .unwrap()
+        let options = SqliteConnectOptions::new()
+            .filename(path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal);
         let pool = SqlitePool::connect_with(options).await.unwrap();
@@ -1254,7 +1302,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         wal_shard(&dir, 2, 0).await.close().await;
 
-        manager(&dir).remove_drained_shards().await.unwrap();
+        manager(&dir).remove_drained_shard(2).await.unwrap();
 
         for suffix in ["", "-wal", "-shm", "-journal"] {
             assert!(!dir.path().join(format!("shard_2.db{suffix}")).exists());
@@ -1266,7 +1314,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         wal_shard(&dir, 2, 1).await.close().await;
 
-        let err = manager(&dir).remove_drained_shards().await.unwrap_err();
+        let err = manager(&dir).remove_drained_shard(2).await.unwrap_err();
 
         assert!(err.to_string().contains("still has 1 records"), "{err}");
         assert!(dir.path().join("shard_2.db").exists());
@@ -1278,7 +1326,7 @@ mod tests {
         // Left open, so the shard can't leave WAL mode.
         let _pool = wal_shard(&dir, 2, 0).await;
 
-        let err = manager(&dir).remove_drained_shards().await.unwrap_err();
+        let err = manager(&dir).remove_drained_shard(2).await.unwrap_err();
 
         assert!(err.to_string().contains("database is locked"), "{err}");
         assert!(dir.path().join("shard_2.db").exists());

@@ -21,7 +21,8 @@ struct ShardNode(u64);
 async fn create_test_pool(path: &str) -> Result<SqlitePool, sqlx::Error> {
     // Use recommended SQLite settings even in tests
     // See: https://kerkour.com/sqlite-for-servers
-    let connect_options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path))?
+    let connect_options = SqliteConnectOptions::new()
+        .filename(path)
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
         .busy_timeout(std::time::Duration::from_millis(5000))
@@ -1026,5 +1027,62 @@ async fn test_migration_rejects_mismatched_destination_future_version_and_ambigu
         drop(lock_file);
     }
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn shrink_uses_literal_directory() -> Result<(), Box<dyn std::error::Error>> {
+    let root = TempDir::new()?;
+    let literal = tempfile::Builder::new()
+        .prefix("copy%20here")
+        .rand_bytes(0)
+        .tempdir_in(&root)?;
+    let sibling = tempfile::Builder::new()
+        .prefix("copy here")
+        .rand_bytes(0)
+        .tempdir_in(&root)?;
+    create_test_data(&literal, 3, &["literal"]).await?;
+    create_test_data(&sibling, 3, &["sibling"]).await?;
+
+    let mgr = blobasaur::MigrationManager::new(3, 1, literal.path().display().to_string())?;
+    mgr.run_migration_with_verify(true).await?;
+    assert!(verify_data_integrity(&literal, 1, &["literal"], "blobs", "data_for_").await?);
+    assert!(verify_data_integrity(&sibling, 3, &["sibling"], "blobs", "data_for_").await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn shrink_retries_after_cleanup_lock() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new()?;
+    create_test_data(&dir, 3, &["a", "b", "c"]).await?;
+    let path = dir.path().join("shard_2.db");
+    let held = create_test_pool(path.to_str().unwrap()).await?;
+    let mgr = blobasaur::MigrationManager::new(3, 1, dir.path().display().to_string())?;
+    let err = mgr.run_migration().await.unwrap_err();
+    assert!(err.to_string().contains("locked"), "{err}");
+    assert!(!dir.path().join("shard_1.db").exists());
+    held.close().await;
+    let other = blobasaur::MigrationManager::new(3, 2, dir.path().display().to_string())?;
+    let err = other.run_migration().await.unwrap_err();
+    assert!(err.to_string().contains("shard migrate 3 1"), "{err}");
+
+    mgr.run_migration_with_verify(true).await?;
+    assert!(!path.exists());
+    assert!(!dir.path().join("shard_1.db").exists());
+    assert!(verify_data_integrity(&dir, 1, &["a", "b", "c"], "blobs", "data_for_").await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn shrink_requires_all_sources_before_cleanup() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new()?;
+    create_test_data(&dir, 2, &["a"]).await?;
+    let mgr = blobasaur::MigrationManager::new(3, 1, dir.path().display().to_string())?;
+    let err = mgr.run_migration().await.unwrap_err();
+    assert!(
+        err.to_string().contains("shard_2.db does not exist"),
+        "{err}"
+    );
+    assert!(verify_data_integrity(&dir, 2, &["a"], "blobs", "data_for_").await?);
     Ok(())
 }

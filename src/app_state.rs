@@ -6,7 +6,6 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Connection, SqliteConnection, SqlitePool};
 use std::fs;
 use std::hash::{BuildHasher, RandomState};
-use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::{Mutex, MutexGuard, Semaphore, mpsc};
 use tokio::task::JoinSet;
@@ -385,8 +384,7 @@ fn build_sqlite_connect_options(cfg: &Cfg, shard_id: usize) -> SqliteConnectOpti
     let synchronous = cfg.sqlite_synchronous();
     let mmap_size = cfg.sqlite_mmap_per_connection_bytes();
 
-    let mut connect_options = SqliteConnectOptions::from_str(&format!("sqlite:{}", db_path))
-        .unwrap_or_else(|_| panic!("Failed to parse connection string for shard {}", shard_id))
+    let mut connect_options = crate::shard_manager::shard_file_options(&db_path)
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
         .busy_timeout(std::time::Duration::from_millis(busy_timeout_ms));
@@ -602,6 +600,12 @@ fn validate_shard_count(data_dir: &str, expected_shards: usize) -> Result<()> {
     // If the directory doesn't exist yet, that's fine - it will be created
     if !data_path.exists() {
         return Ok(());
+    }
+
+    if let Some(counts) = crate::migration::pending_shrink(data_path)? {
+        return Err(miette!(
+            "Shard cleanup is pending. Finish it with `blobasaur shard migrate {counts}` before starting the server"
+        ));
     }
 
     // If the directory is empty, that's also fine - no validation needed

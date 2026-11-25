@@ -11,7 +11,6 @@ use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Connection, Sqlite, SqliteConnection, SqlitePool, pool::PoolConnection};
 use std::collections::{HashSet, VecDeque};
 use std::fmt::Write as _;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, interval, timeout_at};
@@ -323,6 +322,11 @@ fn is_readonly_recovery_error(error: &sqlx::Error) -> bool {
         .is_some_and(|code| matches!(code, 264 | 776 | 1288))
 }
 
+pub(crate) fn shard_file_options(path: &str) -> SqliteConnectOptions {
+    // SQLite also interprets relative names starting with "file:" as URIs.
+    SqliteConnectOptions::new().filename(std::path::Path::new(".").join(path))
+}
+
 /// Probes `PRAGMA user_version` for an existing shard DB without changing its
 /// journal mode or running any application DDL.
 ///
@@ -336,14 +340,7 @@ pub async fn probe_shard_schema_version(
     shard_id: usize,
     busy_timeout_ms: u64,
 ) -> MietteResult<i64> {
-    let ro_options = SqliteConnectOptions::from_str(&format!("sqlite:{db_path}"))
-        .map_err(|e| {
-            miette!(
-                "failed to parse connection string for shard {}: {}",
-                shard_id,
-                e
-            )
-        })?
+    let ro_options = shard_file_options(db_path)
         .read_only(true)
         .busy_timeout(Duration::from_millis(busy_timeout_ms));
 
@@ -378,14 +375,7 @@ pub async fn probe_shard_schema_version(
     // Hot journal recovery needed: open without create_if_missing, without
     // changing journal_mode, and without any DDL, so SQLite recovers the
     // journal cleanly before reading PRAGMA user_version.
-    let recovery_options = SqliteConnectOptions::from_str(&format!("sqlite:{db_path}"))
-        .map_err(|e| {
-            miette!(
-                "failed to parse connection string for shard {}: {}",
-                shard_id,
-                e
-            )
-        })?
+    let recovery_options = shard_file_options(db_path)
         .create_if_missing(false)
         .busy_timeout(Duration::from_millis(busy_timeout_ms));
     let mut conn = SqliteConnection::connect_with(&recovery_options)

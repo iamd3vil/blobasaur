@@ -464,7 +464,7 @@ blobasaur --config /path/to/config.toml shard migrate 4 8
 2. **Preparation**: Creates new SQLite databases for target configuration
 3. **Data Transfer**: Migrates data in batches using new hash ring
 4. **Verification** (optional): Compares data integrity between old and new shards
-5. **Cleanup**: When reducing the shard count, removes the shard files past the new count (for example `shard_3.db` and `shard_4.db` when going from 5 to 3 shards) once they are empty. The server refuses to start while they exist. If one still has records, the migration fails and leaves it in place
+5. **Cleanup**: A shrink removes each retired shard once its `blobs` and namespace tables are empty. If cleanup fails, resolve the reported error and rerun the same migration command. For example, release a lock on `shard_4.db` and rerun `blobasaur shard migrate 5 3 --verify`. The server refuses to start until cleanup finishes.
 
 ### Best Practices
 
