@@ -386,6 +386,36 @@ async fn test_migration_scale_down() -> Result<(), Box<dyn std::error::Error>> {
         "Data should only exist in new shard structure"
     );
 
+    // The drained shards are removed, sidecars included, so a server with the
+    // new count starts.
+    for shard_id in new_shard_count..old_shard_count {
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let file = temp_dir.path().join(format!("shard_{shard_id}.db{suffix}"));
+            assert!(!file.exists(), "{} should be removed", file.display());
+        }
+    }
+    let cfg = blobasaur::config::Cfg {
+        data_dir: temp_dir.path().to_str().unwrap().to_string(),
+        num_shards: new_shard_count,
+        storage_compression: None,
+        async_write: Some(false),
+        batch_size: None,
+        batch_timeout_ms: None,
+        write_queue_capacity: None,
+        addr: None,
+        cluster: None,
+        metrics: None,
+        sqlite: None,
+        shutdown_timeout_secs: None,
+        max_request_size_mb: None,
+        cleanup_chunk_size: None,
+        cleanup_interval_secs: None,
+    };
+    let mut receivers = Vec::new();
+    blobasaur::app_state::AppState::new(cfg, &mut receivers)
+        .await
+        .map_err(|e| format!("server should start on the migrated data dir: {e:?}"))?;
+
     Ok(())
 }
 
