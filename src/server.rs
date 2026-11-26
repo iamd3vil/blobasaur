@@ -9,7 +9,7 @@ use crate::redis::{
 use crate::shard_manager::{
     self, Pending, ShardWriteOperation, ShardWriter, VacuumMode, VacuumResult, VacuumStats,
 };
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use futures::FutureExt;
 use redis_protocol::resp2::types::BytesFrame;
 use std::sync::Arc;
@@ -258,14 +258,38 @@ fn release_large_buffer(buffer: &mut BytesMut, grown_to: &mut usize) {
     }
 }
 
+/// Responses larger than this are flushed before the next command runs, so a
+/// pipeline of large values can't grow the output buffer without bound and
+/// socket backpressure still applies within a batch.
+const FLUSH_THRESHOLD: usize = 256 * 1024;
+
+/// Sends everything in the connection's output buffer in one write. Responses
+/// are buffered per connection and flushed once per drain pass — after every
+/// complete request already read has run — instead of hitting the socket once
+/// per command, so a pipeline of N commands costs one write syscall, not N.
+async fn flush_out(stream: &mut TcpStream, out: &mut BytesMut) -> std::io::Result<()> {
+    if !out.is_empty() {
+        stream.write_all(&out[..]).await?;
+        out.clear();
+        // A large response leaves its capacity behind; don't pin it for the
+        // connection's lifetime.
+        if out.capacity() > FLUSH_THRESHOLD {
+            *out = BytesMut::with_capacity(READ_CHUNK);
+        }
+    }
+    Ok(())
+}
+
 async fn handle_connection(
     mut stream: TcpStream,
     state: Arc<AppState>,
     shutdown: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    stream.set_nodelay(true)?;
     let max_request_size = state.cfg.max_request_size();
     let mut buffer = BytesMut::with_capacity(READ_CHUNK);
     let mut grown_to = READ_CHUNK;
+    let mut out = BytesMut::with_capacity(READ_CHUNK);
     let mut client_name = None;
 
     loop {
@@ -273,6 +297,7 @@ async fn handle_connection(
         loop {
             // Shutting down: close instead of starting the next pipelined command.
             if shutdown.is_cancelled() {
+                flush_out(&mut stream, &mut out).await?;
                 return Ok(());
             }
             let request = match decode_request(&mut buffer, max_request_size) {
@@ -284,7 +309,8 @@ async fn handle_connection(
                     tracing::warn!("Protocol error, closing connection: {}", e);
                     state.metrics.record_error("protocol");
                     let error_resp = BytesFrame::Error(format!("ERR Protocol error: {}", e).into());
-                    stream.write_all(&serialize_frame(&error_resp)).await?;
+                    write_frame(&mut out, &error_resp);
+                    flush_out(&mut stream, &mut out).await?;
                     return Ok(());
                 }
             };
@@ -293,29 +319,51 @@ async fn handle_connection(
             match parse_command(request) {
                 Ok(command) => {
                     let quit = matches!(command, RedisCommand::Quit);
-                    if let Err(e) =
-                        handle_redis_command(&mut stream, &state, &mut client_name, command).await
-                    {
-                        tracing::error!("Error handling command: {}", e);
-                        return Err(e);
+                    let cmd_result = handle_redis_command(
+                        &stream,
+                        &mut out,
+                        &state,
+                        &mut client_name,
+                        command,
+                    )
+                    .await
+                    // Stringified here: a Box<dyn Error> is not Send, so it must
+                    // not live across the flush await below.
+                    .map_err(|e| e.to_string());
+                    let err_msg = match cmd_result {
+                        Ok(()) => None,
+                        Err(e) => {
+                            tracing::error!("Error handling command: {}", e);
+                            Some(e)
+                        }
+                    };
+                    if let Some(msg) = err_msg {
+                        // Replies to earlier pipelined commands still go out.
+                        let _ = flush_out(&mut stream, &mut out).await;
+                        return Err(msg.into());
                     }
                     if quit {
+                        flush_out(&mut stream, &mut out).await?;
                         return Ok(());
                     }
                 }
                 Err(ParseError::Invalid(msg)) => {
                     tracing::warn!("Invalid command: {}", msg);
                     let error_resp = BytesFrame::Error(format!("ERR {}", msg).into());
-                    stream.write_all(&serialize_frame(&error_resp)).await?;
+                    write_frame(&mut out, &error_resp);
                 }
                 Err(e) => {
                     tracing::error!("Command parse error: {}", e);
                     let error_resp = BytesFrame::Error("ERR protocol error".into());
-                    stream.write_all(&serialize_frame(&error_resp)).await?;
+                    write_frame(&mut out, &error_resp);
                 }
+            }
+            if out.len() >= FLUSH_THRESHOLD {
+                flush_out(&mut stream, &mut out).await?;
             }
         }
 
+        flush_out(&mut stream, &mut out).await?;
         buffer.reserve(READ_CHUNK);
         // After growing, the data starts at the front, so this is the allocation.
         grown_to = grown_to.max(buffer.capacity());
@@ -370,7 +418,8 @@ struct ShardVacuumDispatchResult {
 }
 
 async fn handle_redis_command(
-    stream: &mut TcpStream,
+    stream: &TcpStream,
+    out: &mut BytesMut,
     state: &Arc<AppState>,
     client_name: &mut Option<Bytes>,
     command: RedisCommand,
@@ -378,7 +427,7 @@ async fn handle_redis_command(
     let timer = Timer::start();
     let cmd_name = command.name();
 
-    let result = handle_redis_command_inner(stream, state, client_name, command).await;
+    let result = handle_redis_command_inner(stream, out, state, client_name, command).await;
 
     // Record command metrics
     state.metrics.record_command(&cmd_name, timer.start);
@@ -415,7 +464,8 @@ async fn check_hash_route(state: &AppState, namespace: &str, key: &str) -> Resul
 }
 
 async fn handle_redis_command_inner(
-    stream: &mut TcpStream,
+    stream: &TcpStream,
+    out: &mut BytesMut,
     state: &Arc<AppState>,
     client_name: &mut Option<Bytes>,
     command: RedisCommand,
@@ -423,10 +473,10 @@ async fn handle_redis_command_inner(
     match command {
         RedisCommand::Get { key } => {
             if let Err(response) = check_key_route(state, &key).await {
-                stream.write_all(&serialize_frame(&response)).await?;
+                write_frame(out, &response);
                 return Ok(());
             }
-            handle_get(stream, state, key).await?;
+            handle_get(out, state, key).await?;
         }
         RedisCommand::Set {
             key,
@@ -434,45 +484,43 @@ async fn handle_redis_command_inner(
             ttl_seconds,
         } => {
             if let Err(response) = check_key_route(state, &key).await {
-                stream.write_all(&serialize_frame(&response)).await?;
+                write_frame(out, &response);
                 return Ok(());
             }
-            handle_set(stream, state, key, value, ttl_seconds).await?;
+            handle_set(out, state, key, value, ttl_seconds).await?;
         }
         RedisCommand::Del { keys } => {
-            handle_del_multiple(stream, state, keys).await?;
+            handle_del_multiple(out, state, keys).await?;
         }
         RedisCommand::Exists { key } => {
             if let Err(response) = check_key_route(state, &key).await {
-                stream.write_all(&serialize_frame(&response)).await?;
+                write_frame(out, &response);
                 return Ok(());
             }
-            handle_exists(stream, state, key).await?;
+            handle_exists(out, state, key).await?;
         }
         RedisCommand::Ping { message } => {
-            handle_ping(stream, message).await?;
+            handle_ping(out, message).await?;
         }
         RedisCommand::Info { section } => {
-            handle_info(stream, state, section).await?;
+            handle_info(out, state, section).await?;
         }
         RedisCommand::CommandCount => {
             // Count top-level commands in parse_command_array, including BLOBASAUR.VACUUM.
-            stream
-                .write_all(&serialize_frame(&BytesFrame::Integer(21)))
-                .await?;
+            write_frame(out, &BytesFrame::Integer(21));
         }
         RedisCommand::Command => {
-            handle_command(stream).await?;
+            handle_command(out).await?;
         }
         RedisCommand::HGet { namespace, key } => {
-            handle_hget(stream, state, namespace, key).await?;
+            handle_hget(out, state, namespace, key).await?;
         }
         RedisCommand::HSet {
             namespace,
             key,
             value,
         } => {
-            handle_hset(stream, state, namespace, key, value).await?;
+            handle_hset(out, state, namespace, key, value).await?;
         }
         RedisCommand::HSetEx {
             key,
@@ -481,13 +529,13 @@ async fn handle_redis_command_inner(
             expire_option,
             fields,
         } => {
-            handle_hsetex(stream, state, key, fnx, fxx, expire_option, fields).await?;
+            handle_hsetex(out, state, key, fnx, fxx, expire_option, fields).await?;
         }
         RedisCommand::HDel { namespace, key } => {
-            handle_hdel(stream, state, namespace, key).await?;
+            handle_hdel(out, state, namespace, key).await?;
         }
         RedisCommand::HExists { namespace, key } => {
-            handle_hexists(stream, state, namespace, key).await?;
+            handle_hexists(out, state, namespace, key).await?;
         }
         RedisCommand::HExpire {
             key,
@@ -495,7 +543,7 @@ async fn handle_redis_command_inner(
             condition,
             fields,
         } => {
-            handle_hexpire(stream, state, key, seconds, condition, fields).await?;
+            handle_hexpire(out, state, key, seconds, condition, fields).await?;
         }
         RedisCommand::HExpireAt {
             key,
@@ -503,39 +551,39 @@ async fn handle_redis_command_inner(
             condition,
             fields,
         } => {
-            handle_hexpireat(stream, state, key, unix_time_seconds, condition, fields).await?;
+            handle_hexpireat(out, state, key, unix_time_seconds, condition, fields).await?;
         }
         RedisCommand::ClusterNodes => {
-            handle_cluster_nodes(stream, state).await?;
+            handle_cluster_nodes(out, state).await?;
         }
         RedisCommand::ClusterInfo => {
-            handle_cluster_info(stream, state).await?;
+            handle_cluster_info(out, state).await?;
         }
         RedisCommand::ClusterSlots => {
-            handle_cluster_slots(stream, state).await?;
+            handle_cluster_slots(out, state).await?;
         }
         RedisCommand::ClusterAddSlots { slots } => {
-            handle_cluster_addslots(stream, state, slots).await?;
+            handle_cluster_addslots(out, state, slots).await?;
         }
         RedisCommand::ClusterDelSlots { slots } => {
-            handle_cluster_delslots(stream, state, slots).await?;
+            handle_cluster_delslots(out, state, slots).await?;
         }
         RedisCommand::ClusterKeySlot { key } => {
-            handle_cluster_keyslot(stream, key).await?;
+            handle_cluster_keyslot(out, key).await?;
         }
         RedisCommand::Ttl { key } => {
             if let Err(response) = check_key_route(state, &key).await {
-                stream.write_all(&serialize_frame(&response)).await?;
+                write_frame(out, &response);
                 return Ok(());
             }
-            handle_ttl(stream, state, key).await?;
+            handle_ttl(out, state, key).await?;
         }
         RedisCommand::Expire { key, seconds } => {
             if let Err(response) = check_key_route(state, &key).await {
-                stream.write_all(&serialize_frame(&response)).await?;
+                write_frame(out, &response);
                 return Ok(());
             }
-            handle_expire(stream, state, key, seconds).await?;
+            handle_expire(out, state, key, seconds).await?;
         }
         RedisCommand::BlobasaurVacuum {
             target,
@@ -543,33 +591,33 @@ async fn handle_redis_command_inner(
             budget_mb,
             dry_run,
         } => {
-            handle_blobasaur_vacuum(stream, state, target, mode, budget_mb, dry_run).await?;
+            handle_blobasaur_vacuum(stream, out, state, target, mode, budget_mb, dry_run).await?;
         }
         RedisCommand::Hello { protover } => {
-            handle_hello(stream, protover).await?;
+            handle_hello(out, protover).await?;
         }
         RedisCommand::ClientGetName => {
             let reply = client_name
                 .clone()
                 .map_or(BytesFrame::Null, BytesFrame::BulkString);
-            stream.write_all(&serialize_frame(&reply)).await?;
+            write_frame(out, &reply);
         }
         RedisCommand::ClientSetName(name) => {
             *client_name = (!name.is_empty()).then_some(name);
-            stream.write_all(b"+OK\r\n").await?;
+            out.extend_from_slice(b"+OK\r\n");
         }
         RedisCommand::Client { subcommand } => {
-            handle_client(stream, &subcommand).await?;
+            handle_client(out, &subcommand).await?;
         }
         RedisCommand::Quit => {
             // handle_connection closes the connection after this reply.
             let response = BytesFrame::SimpleString("OK".into());
-            stream.write_all(&serialize_frame(&response)).await?;
+            write_frame(out, &response);
         }
         RedisCommand::Unknown(cmd) => {
             tracing::warn!("Unknown command: {}", cmd);
             let response = BytesFrame::Error(format!("ERR unknown command '{}'", cmd).into());
-            stream.write_all(&serialize_frame(&response)).await?;
+            write_frame(out, &response);
         }
     }
     Ok(())
@@ -599,16 +647,22 @@ async fn decompress_if_enabled(
     Ok(data)
 }
 
-/// Writes `data` as a bulk string reply. Unlike `serialize_frame`, this doesn't
-/// copy the value into a frame buffer first.
-async fn write_bulk(stream: &mut TcpStream, data: &[u8]) -> std::io::Result<()> {
-    let header = format!("${}\r\n", data.len());
-    let mut reply = Buf::chain(header.as_bytes(), data).chain(&b"\r\n"[..]);
-    stream.write_all_buf(&mut reply).await
+/// Appends a response frame to the connection's output buffer; see
+/// [`flush_out`] for when the buffer reaches the socket.
+fn write_frame(out: &mut BytesMut, frame: &BytesFrame) {
+    out.extend_from_slice(&serialize_frame(frame));
+}
+
+/// Appends `data` as a bulk string reply. Unlike `serialize_frame`, this
+/// doesn't copy the value into a frame buffer first.
+fn write_bulk(out: &mut BytesMut, data: &[u8]) {
+    out.extend_from_slice(format!("${}\r\n", data.len()).as_bytes());
+    out.extend_from_slice(data);
+    out.extend_from_slice(b"\r\n");
 }
 
 async fn handle_get(
-    stream: &mut TcpStream,
+    out: &mut BytesMut,
     state: &Arc<AppState>,
     key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -628,15 +682,13 @@ async fn handle_get(
             let data = decompress_if_enabled(state, data).await?;
 
             state.metrics.value_size_get_bytes.record(data.len() as f64);
-            write_bulk(stream, &data).await?;
+            write_bulk(out, &data);
             return Ok(());
         }
         // A queued DEL, or a queued SET that has already expired.
         Some(_) => {
             state.metrics.record_read("get", "inflight", "miss");
-            stream
-                .write_all(&serialize_frame(&BytesFrame::Null))
-                .await?;
+            write_frame(out, &BytesFrame::Null);
             return Ok(());
         }
         None => {}
@@ -664,18 +716,18 @@ async fn handle_get(
             let data = decompress_if_enabled(state, row.0.into()).await?;
 
             state.metrics.value_size_get_bytes.record(data.len() as f64);
-            write_bulk(stream, &data).await?;
+            write_bulk(out, &data);
         }
         Ok(None) => {
             state.metrics.record_read("get", "sqlite", "miss");
             let response = BytesFrame::Null;
-            stream.write_all(&serialize_frame(&response)).await?;
+            write_frame(out, &response);
         }
         Err(e) => {
             state.metrics.record_read("get", "sqlite", "error");
             tracing::error!("Failed to GET key {}: {}", key, e);
             let response = BytesFrame::Error("ERR database error".into());
-            stream.write_all(&serialize_frame(&response)).await?;
+            write_frame(out, &response);
             state.metrics.record_error("storage");
         }
     }
@@ -684,7 +736,7 @@ async fn handle_get(
 }
 
 async fn handle_set(
-    stream: &mut TcpStream,
+    out: &mut BytesMut,
     state: &Arc<AppState>,
     key: String,
     value: Bytes,
@@ -726,13 +778,13 @@ async fn handle_set(
                 shard_index
             );
             let response = BytesFrame::Error("ERR internal error".into());
-            stream.write_all(&serialize_frame(&response)).await?;
+            write_frame(out, &response);
             state.metrics.record_error("storage");
         } else {
             state.metrics.value_size_set_bytes.record(value_len);
             state.metrics.stored_value_size_set_bytes.record(stored_len);
             let response = BytesFrame::SimpleString("OK".into());
-            stream.write_all(&serialize_frame(&response)).await?;
+            write_frame(out, &response);
             state.metrics.record_storage_operation();
         }
     } else {
@@ -752,7 +804,7 @@ async fn handle_set(
         if sender.send(operation).await.is_err() {
             tracing::error!("Failed to send SET operation to shard {}", shard_index);
             let response = BytesFrame::Error("ERR internal error".into());
-            stream.write_all(&serialize_frame(&response)).await?;
+            write_frame(out, &response);
             state.metrics.record_error("storage");
         } else {
             match responder_rx.await {
@@ -760,19 +812,19 @@ async fn handle_set(
                     state.metrics.value_size_set_bytes.record(value_len);
                     state.metrics.stored_value_size_set_bytes.record(stored_len);
                     let response = BytesFrame::SimpleString("OK".into());
-                    stream.write_all(&serialize_frame(&response)).await?;
+                    write_frame(out, &response);
                     state.metrics.record_storage_operation();
                 }
                 Ok(Err(e)) => {
                     tracing::error!("Shard writer failed for SET: {}", e);
                     let response = BytesFrame::Error("ERR database error".into());
-                    stream.write_all(&serialize_frame(&response)).await?;
+                    write_frame(out, &response);
                     state.metrics.record_error("storage");
                 }
                 Err(_) => {
                     tracing::error!("Shard writer task cancelled or panicked for SET");
                     let response = BytesFrame::Error("ERR internal error".into());
-                    stream.write_all(&serialize_frame(&response)).await?;
+                    write_frame(out, &response);
                     state.metrics.record_error("storage");
                 }
             }
@@ -783,12 +835,12 @@ async fn handle_set(
 }
 
 async fn handle_del_multiple(
-    stream: &mut TcpStream,
+    out: &mut BytesMut,
     state: &Arc<AppState>,
     keys: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let response = del_reply(state, keys).await;
-    stream.write_all(&serialize_frame(&response)).await?;
+    write_frame(out, &response);
     Ok(())
 }
 
@@ -897,7 +949,7 @@ async fn del_reply(state: &Arc<AppState>, mut keys: Vec<String>) -> BytesFrame {
 }
 
 async fn handle_exists(
-    stream: &mut TcpStream,
+    out: &mut BytesMut,
     state: &Arc<AppState>,
     key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -907,9 +959,7 @@ async fn handle_exists(
     if let Some(exists) =
         shard_manager::pending_exists_at(&state.inflight_cache, &key, read_ts).await
     {
-        stream
-            .write_all(&serialize_frame(&BytesFrame::Integer(exists as i64)))
-            .await?;
+        write_frame(out, &BytesFrame::Integer(exists as i64));
         return Ok(());
     }
 
@@ -926,16 +976,16 @@ async fn handle_exists(
     {
         Ok(Some(_)) => {
             let response = BytesFrame::Integer(1);
-            stream.write_all(&serialize_frame(&response)).await?;
+            write_frame(out, &response);
         }
         Ok(None) => {
             let response = BytesFrame::Integer(0);
-            stream.write_all(&serialize_frame(&response)).await?;
+            write_frame(out, &response);
         }
         Err(e) => {
             tracing::error!("Failed to check EXISTS for key {}: {}", key, e);
             let response = BytesFrame::Error("ERR database error".into());
-            stream.write_all(&serialize_frame(&response)).await?;
+            write_frame(out, &response);
         }
     }
 
@@ -943,14 +993,14 @@ async fn handle_exists(
 }
 
 async fn handle_ping(
-    stream: &mut TcpStream,
+    out: &mut BytesMut,
     message: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let response = match message {
         Some(msg) => BytesFrame::BulkString(msg.into_bytes().into()),
         None => BytesFrame::SimpleString("PONG".into()),
     };
-    stream.write_all(&serialize_frame(&response)).await?;
+    write_frame(out, &response);
     Ok(())
 }
 
@@ -959,7 +1009,7 @@ fn format_keyspace_info(total_keys: u64) -> String {
 }
 
 async fn handle_info(
-    stream: &mut TcpStream,
+    out: &mut BytesMut,
     state: &Arc<AppState>,
     section: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1028,20 +1078,20 @@ async fn handle_info(
     };
 
     let response = BytesFrame::BulkString(info.into_bytes().into());
-    stream.write_all(&serialize_frame(&response)).await?;
+    write_frame(out, &response);
     Ok(())
 }
 
-async fn handle_command(stream: &mut TcpStream) -> Result<(), Box<dyn std::error::Error>> {
+async fn handle_command(out: &mut BytesMut) -> Result<(), Box<dyn std::error::Error>> {
     // Return a minimal COMMAND response - just an empty array for now
     // A full implementation would return detailed command information
     let response = BytesFrame::Array(vec![]);
-    stream.write_all(&serialize_frame(&response)).await?;
+    write_frame(out, &response);
     Ok(())
 }
 
 async fn handle_hello(
-    stream: &mut TcpStream,
+    out: &mut BytesMut,
     protover: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Only RESP2 is supported. If the client requests a different protocol
@@ -1056,7 +1106,7 @@ async fn handle_hello(
             )
             .into(),
         );
-        stream.write_all(&serialize_frame(&response)).await?;
+        write_frame(out, &response);
         return Ok(());
     }
 
@@ -1073,18 +1123,18 @@ async fn handle_hello(
         BytesFrame::BulkString("role".into()),
         BytesFrame::BulkString("master".into()),
     ]);
-    stream.write_all(&serialize_frame(&response)).await?;
+    write_frame(out, &response);
     Ok(())
 }
 
 async fn handle_client(
-    stream: &mut TcpStream,
+    out: &mut BytesMut,
     _subcommand: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Handle CLIENT subcommands (SETNAME, GETNAME, etc.)
     // Redis clients send CLIENT commands on connect for connection management
     let response = BytesFrame::SimpleString("OK".into());
-    stream.write_all(&serialize_frame(&response)).await?;
+    write_frame(out, &response);
     Ok(())
 }
 
@@ -1096,7 +1146,7 @@ fn is_valid_hash_namespace(namespace: &str) -> bool {
 }
 
 async fn validate_hash_namespace(
-    stream: &mut TcpStream,
+    out: &mut BytesMut,
     namespace: &str,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     if is_valid_hash_namespace(namespace) {
@@ -1106,7 +1156,7 @@ async fn validate_hash_namespace(
     let response = BytesFrame::Error(
         "ERR invalid hash namespace: must be non-empty and contain only [A-Za-z0-9_]".into(),
     );
-    stream.write_all(&serialize_frame(&response)).await?;
+    write_frame(out, &response);
     Ok(false)
 }
 
@@ -1188,18 +1238,18 @@ async fn hash_field_live_expires_at(
 }
 
 async fn handle_hget(
-    stream: &mut TcpStream,
+    out: &mut BytesMut,
     state: &Arc<AppState>,
     namespace: String,
     key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if !validate_hash_namespace(stream, &namespace).await? {
+    if !validate_hash_namespace(out, &namespace).await? {
         return Ok(());
     }
 
     // Check if we should handle this hash operation locally in a cluster
     if let Err(response) = check_hash_route(state, &namespace, &key).await {
-        stream.write_all(&serialize_frame(&response)).await?;
+        write_frame(out, &response);
         return Ok(());
     }
 
@@ -1219,15 +1269,13 @@ async fn handle_hget(
                 .metrics
                 .value_size_hget_bytes
                 .record(data.len() as f64);
-            write_bulk(stream, &data).await?;
+            write_bulk(out, &data);
             return Ok(());
         }
         // A queued HDEL, or a queued HSETEX that has already expired.
         Some(_) => {
             state.metrics.record_read("hget", "inflight", "miss");
-            stream
-                .write_all(&serialize_frame(&BytesFrame::Null))
-                .await?;
+            write_frame(out, &BytesFrame::Null);
             return Ok(());
         }
         None => {}
@@ -1262,24 +1310,22 @@ async fn handle_hget(
                 .metrics
                 .value_size_hget_bytes
                 .record(data.len() as f64);
-            write_bulk(stream, &data).await?;
+            write_bulk(out, &data);
         }
         Ok(None) => {
             state.metrics.record_read("hget", "sqlite", "miss");
             let response = BytesFrame::Null;
-            stream.write_all(&serialize_frame(&response)).await?;
+            write_frame(out, &response);
         }
         Err(e) if shard_manager::is_missing_table(&e, &table_name) => {
             state.metrics.record_read("hget", "sqlite", "miss");
-            stream
-                .write_all(&serialize_frame(&BytesFrame::Null))
-                .await?;
+            write_frame(out, &BytesFrame::Null);
         }
         Err(e) => {
             state.metrics.record_read("hget", "sqlite", "error");
             tracing::error!("Failed to HGET namespace {} key {}: {}", namespace, key, e);
             let response = BytesFrame::Error("ERR database error".into());
-            stream.write_all(&serialize_frame(&response)).await?;
+            write_frame(out, &response);
         }
     }
 
@@ -1287,17 +1333,17 @@ async fn handle_hget(
 }
 
 async fn handle_hset(
-    stream: &mut TcpStream,
+    out: &mut BytesMut,
     state: &Arc<AppState>,
     namespace: String,
     key: String,
     value: Bytes,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if !validate_hash_namespace(stream, &namespace).await? {
+    if !validate_hash_namespace(out, &namespace).await? {
         return Ok(());
     }
     let response = hset_reply(state, namespace, key, value).await?;
-    stream.write_all(&serialize_frame(&response)).await?;
+    write_frame(out, &response);
     Ok(())
 }
 
@@ -1416,7 +1462,7 @@ async fn hset_reply(
 }
 
 async fn handle_hsetex(
-    stream: &mut TcpStream,
+    out: &mut BytesMut,
     state: &Arc<AppState>,
     key: String,
     fnx: bool,
@@ -1427,12 +1473,12 @@ async fn handle_hsetex(
     // In Blobasaur, the hash key is the namespace, and fields are the actual keys
     let namespace = key;
 
-    if !validate_hash_namespace(stream, &namespace).await? {
+    if !validate_hash_namespace(out, &namespace).await? {
         return Ok(());
     }
 
     let response = hsetex_reply(state, namespace, fnx, fxx, expire_option, fields).await?;
-    stream.write_all(&serialize_frame(&response)).await?;
+    write_frame(out, &response);
     Ok(())
 }
 
@@ -1645,16 +1691,16 @@ async fn hsetex_reply(
 }
 
 async fn handle_hdel(
-    stream: &mut TcpStream,
+    out: &mut BytesMut,
     state: &Arc<AppState>,
     namespace: String,
     key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if !validate_hash_namespace(stream, &namespace).await? {
+    if !validate_hash_namespace(out, &namespace).await? {
         return Ok(());
     }
     let response = hdel_reply(state, namespace, key).await;
-    stream.write_all(&serialize_frame(&response)).await?;
+    write_frame(out, &response);
     Ok(())
 }
 
@@ -1763,18 +1809,18 @@ async fn delete_hash_field(
 }
 
 async fn handle_hexists(
-    stream: &mut TcpStream,
+    out: &mut BytesMut,
     state: &Arc<AppState>,
     namespace: String,
     key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if !validate_hash_namespace(stream, &namespace).await? {
+    if !validate_hash_namespace(out, &namespace).await? {
         return Ok(());
     }
 
     // Check if we should handle this hash operation locally in a cluster
     if let Err(response) = check_hash_route(state, &namespace, &key).await {
-        stream.write_all(&serialize_frame(&response)).await?;
+        write_frame(out, &response);
         return Ok(());
     }
 
@@ -1788,9 +1834,7 @@ async fn handle_hexists(
     )
     .await
     {
-        stream
-            .write_all(&serialize_frame(&BytesFrame::Integer(exists as i64)))
-            .await?;
+        write_frame(out, &BytesFrame::Integer(exists as i64));
         return Ok(());
     }
 
@@ -1811,16 +1855,14 @@ async fn handle_hexists(
     {
         Ok(Some(_)) => {
             let response = BytesFrame::Integer(1);
-            stream.write_all(&serialize_frame(&response)).await?;
+            write_frame(out, &response);
         }
         Ok(None) => {
             let response = BytesFrame::Integer(0);
-            stream.write_all(&serialize_frame(&response)).await?;
+            write_frame(out, &response);
         }
         Err(e) if shard_manager::is_missing_table(&e, &table_name) => {
-            stream
-                .write_all(&serialize_frame(&BytesFrame::Integer(0)))
-                .await?;
+            write_frame(out, &BytesFrame::Integer(0));
         }
         Err(e) => {
             tracing::error!(
@@ -1830,7 +1872,7 @@ async fn handle_hexists(
                 e
             );
             let response = BytesFrame::Error("ERR database error".into());
-            stream.write_all(&serialize_frame(&response)).await?;
+            write_frame(out, &response);
         }
     }
 
@@ -1838,7 +1880,7 @@ async fn handle_hexists(
 }
 
 async fn handle_hexpire(
-    stream: &mut TcpStream,
+    out: &mut BytesMut,
     state: &Arc<AppState>,
     key: String,
     seconds: i64,
@@ -1846,11 +1888,11 @@ async fn handle_hexpire(
     fields: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Deadline::In(seconds);
-    handle_hexpire_internal(stream, state, key, deadline, condition, fields).await
+    handle_hexpire_internal(out, state, key, deadline, condition, fields).await
 }
 
 async fn handle_hexpireat(
-    stream: &mut TcpStream,
+    out: &mut BytesMut,
     state: &Arc<AppState>,
     key: String,
     unix_time_seconds: i64,
@@ -1858,7 +1900,7 @@ async fn handle_hexpireat(
     fields: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Deadline::At(unix_time_seconds);
-    handle_hexpire_internal(stream, state, key, deadline, condition, fields).await
+    handle_hexpire_internal(out, state, key, deadline, condition, fields).await
 }
 
 /// When an expiry set by a command falls: `In` seconds from when the command
@@ -1906,7 +1948,7 @@ impl Deadline {
 
 /// Shared implementation for HEXPIRE and HEXPIREAT.
 async fn handle_hexpire_internal(
-    stream: &mut TcpStream,
+    out: &mut BytesMut,
     state: &Arc<AppState>,
     key: String,
     deadline: Deadline,
@@ -1916,7 +1958,7 @@ async fn handle_hexpire_internal(
     // In Blobasaur, the hash key is the namespace, and fields are the actual keys
     let namespace = key;
 
-    if !validate_hash_namespace(stream, &namespace).await? {
+    if !validate_hash_namespace(out, &namespace).await? {
         return Ok(());
     }
 
@@ -1924,7 +1966,7 @@ async fn handle_hexpire_internal(
     if matches!(response, BytesFrame::Array(_)) {
         state.metrics.record_storage_operation();
     }
-    stream.write_all(&serialize_frame(&response)).await?;
+    write_frame(out, &response);
     Ok(())
 }
 
@@ -1997,38 +2039,38 @@ async fn hexpire_reply(
 
 // Cluster command handlers
 async fn handle_cluster_nodes(
-    stream: &mut TcpStream,
+    out: &mut BytesMut,
     state: &Arc<AppState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     tracing::debug!("Handling CLUSTER NODES command");
     if let Some(ref cluster_manager) = state.cluster_manager {
         let nodes_info = cluster_manager.get_cluster_nodes().await;
         let response = BytesFrame::BulkString(nodes_info.into());
-        stream.write_all(&serialize_frame(&response)).await?;
+        write_frame(out, &response);
     } else {
         let response = BytesFrame::Error("ERR This instance has cluster support disabled".into());
-        stream.write_all(&serialize_frame(&response)).await?;
+        write_frame(out, &response);
     }
     Ok(())
 }
 
 async fn handle_cluster_info(
-    stream: &mut TcpStream,
+    out: &mut BytesMut,
     state: &Arc<AppState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ref cluster_manager) = state.cluster_manager {
         let cluster_info = cluster_manager.get_cluster_info().await;
         let response = BytesFrame::BulkString(cluster_info.into());
-        stream.write_all(&serialize_frame(&response)).await?;
+        write_frame(out, &response);
     } else {
         let response = BytesFrame::Error("ERR This instance has cluster support disabled".into());
-        stream.write_all(&serialize_frame(&response)).await?;
+        write_frame(out, &response);
     }
     Ok(())
 }
 
 async fn handle_cluster_slots(
-    stream: &mut TcpStream,
+    out: &mut BytesMut,
     state: &Arc<AppState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ref cluster_manager) = state.cluster_manager {
@@ -2103,16 +2145,16 @@ async fn handle_cluster_slots(
         }
 
         let response = BytesFrame::Array(slot_ranges);
-        stream.write_all(&serialize_frame(&response)).await?;
+        write_frame(out, &response);
     } else {
         let response = BytesFrame::Error("ERR This instance has cluster support disabled".into());
-        stream.write_all(&serialize_frame(&response)).await?;
+        write_frame(out, &response);
     }
     Ok(())
 }
 
 async fn handle_cluster_addslots(
-    stream: &mut TcpStream,
+    out: &mut BytesMut,
     state: &Arc<AppState>,
     slots: Vec<u16>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -2120,23 +2162,23 @@ async fn handle_cluster_addslots(
         match cluster_manager.add_slots(slots).await {
             Ok(()) => {
                 let response = BytesFrame::SimpleString("OK".into());
-                stream.write_all(&serialize_frame(&response)).await?;
+                write_frame(out, &response);
             }
             Err(e) => {
                 tracing::error!("Failed to add slots: {}", e);
                 let response = BytesFrame::Error("ERR failed to add slots".into());
-                stream.write_all(&serialize_frame(&response)).await?;
+                write_frame(out, &response);
             }
         }
     } else {
         let response = BytesFrame::Error("ERR This instance has cluster support disabled".into());
-        stream.write_all(&serialize_frame(&response)).await?;
+        write_frame(out, &response);
     }
     Ok(())
 }
 
 async fn handle_cluster_delslots(
-    stream: &mut TcpStream,
+    out: &mut BytesMut,
     state: &Arc<AppState>,
     slots: Vec<u16>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -2144,33 +2186,33 @@ async fn handle_cluster_delslots(
         match cluster_manager.remove_slots(slots).await {
             Ok(()) => {
                 let response = BytesFrame::SimpleString("OK".into());
-                stream.write_all(&serialize_frame(&response)).await?;
+                write_frame(out, &response);
             }
             Err(e) => {
                 tracing::error!("Failed to remove slots: {}", e);
                 let response = BytesFrame::Error("ERR failed to remove slots".into());
-                stream.write_all(&serialize_frame(&response)).await?;
+                write_frame(out, &response);
             }
         }
     } else {
         let response = BytesFrame::Error("ERR This instance has cluster support disabled".into());
-        stream.write_all(&serialize_frame(&response)).await?;
+        write_frame(out, &response);
     }
     Ok(())
 }
 
 async fn handle_cluster_keyslot(
-    stream: &mut TcpStream,
+    out: &mut BytesMut,
     key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let slot = ClusterManager::calculate_slot(&key);
     let response = BytesFrame::Integer(slot as i64);
-    stream.write_all(&serialize_frame(&response)).await?;
+    write_frame(out, &response);
     Ok(())
 }
 
 async fn handle_ttl(
-    stream: &mut TcpStream,
+    out: &mut BytesMut,
     state: &Arc<AppState>,
     key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -2188,9 +2230,7 @@ async fn handle_ttl(
             } if expires_at > now.timestamp() => expires_at - whole_secs_up(now),
             _ => -2,
         };
-        stream
-            .write_all(&serialize_frame(&BytesFrame::Integer(ttl)))
-            .await?;
+        write_frame(out, &BytesFrame::Integer(ttl));
         return Ok(());
     }
 
@@ -2213,17 +2253,17 @@ async fn handle_ttl(
                 None => -1, // Key exists but has no expiration
             };
             let response = BytesFrame::Integer(ttl);
-            stream.write_all(&serialize_frame(&response)).await?;
+            write_frame(out, &response);
         }
         Ok(None) => {
             // Key doesn't exist or is expired
             let response = BytesFrame::Integer(-2);
-            stream.write_all(&serialize_frame(&response)).await?;
+            write_frame(out, &response);
         }
         Err(e) => {
             tracing::error!("TTL query error for key {}: {}", key, e);
             let response = BytesFrame::Error("ERR internal error".into());
-            stream.write_all(&serialize_frame(&response)).await?;
+            write_frame(out, &response);
             state.metrics.record_error("storage");
         }
     }
@@ -2232,13 +2272,13 @@ async fn handle_ttl(
 }
 
 async fn handle_expire(
-    stream: &mut TcpStream,
+    out: &mut BytesMut,
     state: &Arc<AppState>,
     key: String,
     seconds: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let response = expire_reply(state, key, seconds).await;
-    stream.write_all(&serialize_frame(&response)).await?;
+    write_frame(out, &response);
     Ok(())
 }
 
@@ -2501,7 +2541,8 @@ fn client_disconnected(stream: &TcpStream) -> bool {
 }
 
 async fn handle_blobasaur_vacuum(
-    stream: &mut TcpStream,
+    stream: &TcpStream,
+    out: &mut BytesMut,
     state: &Arc<AppState>,
     target: VacuumShardTarget,
     mode: VacuumCommandMode,
@@ -2559,7 +2600,7 @@ async fn handle_blobasaur_vacuum(
         BytesFrame::Array(shard_results),
     ]);
 
-    stream.write_all(&serialize_frame(&response)).await?;
+    write_frame(out, &response);
     Ok(())
 }
 
@@ -2800,17 +2841,25 @@ mod tests {
         frame
     }
 
+    /// Parses one response frame off the front of a handler's output buffer.
+    fn pop_frame(out: &mut BytesMut) -> BytesFrame {
+        let (frame, rest) = parse_resp_with_remaining(&out[..]).expect("parse response");
+        let consumed = out.len() - rest.len();
+        let _ = out.split_to(consumed);
+        frame
+    }
+
     async fn respond_with<F>(ctx: &TestContext, f: F) -> BytesFrame
     where
-        F: FnOnce(
+        F: for<'a> FnOnce(
             Arc<AppState>,
-            TcpStream,
-        ) -> BoxFuture<'static, Result<(), Box<dyn std::error::Error>>>,
+            &'a mut BytesMut,
+        ) -> BoxFuture<'a, Result<(), Box<dyn std::error::Error>>>,
     {
-        let (server_stream, client_stream) = tcp_pair().await;
+        let mut out = BytesMut::new();
         let state = ctx.state.clone();
-        f(state, server_stream).await.unwrap();
-        read_response(client_stream).await
+        f(state, &mut out).await.unwrap();
+        pop_frame(&mut out)
     }
 
     fn assert_integer_response(frame: BytesFrame, expected: i64) {
@@ -2899,9 +2948,9 @@ mod tests {
     async fn hset_returns_added_field_count() {
         let ctx = TestContext::new(false).await;
 
-        let (mut server_stream, client_stream) = tcp_pair().await;
+        let mut out = BytesMut::new();
         handle_hset(
-            &mut server_stream,
+            &mut out,
             &ctx.state,
             "users".to_string(),
             "alice".to_string(),
@@ -2909,12 +2958,11 @@ mod tests {
         )
         .await
         .unwrap();
-        server_stream.shutdown().await.unwrap();
-        assert_integer_response(read_response(client_stream).await, 1);
+        assert_integer_response(pop_frame(&mut out), 1);
 
-        let (mut server_stream, client_stream) = tcp_pair().await;
+        let mut out = BytesMut::new();
         handle_hset(
-            &mut server_stream,
+            &mut out,
             &ctx.state,
             "users".to_string(),
             "alice".to_string(),
@@ -2922,8 +2970,7 @@ mod tests {
         )
         .await
         .unwrap();
-        server_stream.shutdown().await.unwrap();
-        assert_integer_response(read_response(client_stream).await, 0);
+        assert_integer_response(pop_frame(&mut out), 0);
 
         ctx.shutdown().await;
     }
@@ -2932,9 +2979,9 @@ mod tests {
     async fn hsetex_replies_1_whether_fields_are_new_or_updated() {
         let ctx = TestContext::new(false).await;
 
-        let (mut server_stream, client_stream) = tcp_pair().await;
+        let mut out = BytesMut::new();
         handle_hsetex(
-            &mut server_stream,
+            &mut out,
             &ctx.state,
             "sessions".to_string(),
             false,
@@ -2947,12 +2994,11 @@ mod tests {
         )
         .await
         .unwrap();
-        server_stream.shutdown().await.unwrap();
-        assert_integer_response(read_response(client_stream).await, 1);
+        assert_integer_response(pop_frame(&mut out), 1);
 
-        let (mut server_stream, client_stream) = tcp_pair().await;
+        let mut out = BytesMut::new();
         handle_hsetex(
-            &mut server_stream,
+            &mut out,
             &ctx.state,
             "sessions".to_string(),
             false,
@@ -2965,13 +3011,12 @@ mod tests {
         )
         .await
         .unwrap();
-        server_stream.shutdown().await.unwrap();
-        assert_integer_response(read_response(client_stream).await, 1);
+        assert_integer_response(pop_frame(&mut out), 1);
 
         // Only existing fields, without FXX.
-        let (mut server_stream, client_stream) = tcp_pair().await;
+        let mut out = BytesMut::new();
         handle_hsetex(
-            &mut server_stream,
+            &mut out,
             &ctx.state,
             "sessions".to_string(),
             false,
@@ -2984,8 +3029,7 @@ mod tests {
         )
         .await
         .unwrap();
-        server_stream.shutdown().await.unwrap();
-        assert_integer_response(read_response(client_stream).await, 1);
+        assert_integer_response(pop_frame(&mut out), 1);
 
         ctx.shutdown().await;
     }
@@ -2998,7 +3042,11 @@ mod tests {
     async fn concurrent_integer_replies(
         ctx: &TestContext,
         clients: usize,
-        command: impl Fn(usize, Arc<AppState>, TcpStream) -> CommandFuture,
+        command: impl for<'a> Fn(
+            usize,
+            Arc<AppState>,
+            &'a mut BytesMut,
+        ) -> BoxFuture<'a, Result<(), Box<dyn std::error::Error>>>,
     ) -> Vec<i64> {
         let command = &command;
         let replies = join_all(
@@ -3628,9 +3676,9 @@ mod tests {
     async fn hset_async_returns_integer_count() {
         let ctx = TestContext::new(true).await;
 
-        let (mut server_stream, client_stream) = tcp_pair().await;
+        let mut out = BytesMut::new();
         handle_hset(
-            &mut server_stream,
+            &mut out,
             &ctx.state,
             "flags".to_string(),
             "feature".to_string(),
@@ -3638,8 +3686,7 @@ mod tests {
         )
         .await
         .unwrap();
-        server_stream.shutdown().await.unwrap();
-        assert_integer_response(read_response(client_stream).await, 1);
+        assert_integer_response(pop_frame(&mut out), 1);
 
         ctx.shutdown().await;
     }
@@ -5068,9 +5115,15 @@ mod tests {
         let frame = respond_with(&ctx, |state, stream| {
             Box::pin(async move {
                 let mut stream = stream;
-                let _ =
-                    handle_redis_command_inner(&mut stream, &state, &mut None, RedisCommand::Quit)
-                        .await;
+                let (real_stream, _client) = tcp_pair().await;
+                let _ = handle_redis_command_inner(
+                    &real_stream,
+                    &mut stream,
+                    &state,
+                    &mut None,
+                    RedisCommand::Quit,
+                )
+                .await;
                 Ok(())
             })
         });
@@ -5086,7 +5139,9 @@ mod tests {
         let frame = respond_with(&ctx, |state, stream| {
             Box::pin(async move {
                 let mut stream = stream;
+                let (real_stream, _client) = tcp_pair().await;
                 handle_redis_command_inner(
+                    &real_stream,
                     &mut stream,
                     &state,
                     &mut None,
@@ -5135,7 +5190,9 @@ mod tests {
         let frame = respond_with(&ctx, |state, stream| {
             Box::pin(async move {
                 let mut stream = stream;
+                let (real_stream, _client) = tcp_pair().await;
                 handle_redis_command_inner(
+                    &real_stream,
                     &mut stream,
                     &state,
                     &mut None,
@@ -5576,7 +5633,8 @@ mod tests {
         respond_with(ctx, |state, stream| {
             Box::pin(async move {
                 let mut stream = stream;
-                handle_redis_command(&mut stream, &state, &mut None, command).await
+                let (real_stream, _client) = tcp_pair().await;
+                handle_redis_command(&real_stream, &mut stream, &state, &mut None, command).await
             })
         })
         .await
@@ -6391,12 +6449,13 @@ mod tests {
         // (miss) and then waits before running its SQLite query.
         let held_read_conn = ctx.state.db_pools[0].acquire().await.unwrap();
 
-        let (mut server_stream, client_stream) = tcp_pair().await;
+        let mut out = BytesMut::new();
         let state = ctx.state.clone();
         let get_task = tokio::spawn(async move {
-            handle_get(&mut server_stream, &state, "k".to_string())
+            handle_get(&mut out, &state, "k".to_string())
                 .await
                 .unwrap();
+            out
         });
 
         // Give handle_get time to capture read_ts, miss inflight_cache, and block on pool.
@@ -6421,8 +6480,8 @@ mod tests {
         }
 
         drop(held_read_conn);
-        get_task.await.unwrap();
-        let frame = read_response(client_stream).await;
+        let mut out = get_task.await.unwrap();
+        let frame = pop_frame(&mut out);
         assert_bulk_string(frame, b"v1");
 
         ctx.state.inflight_cache.invalidate("k").await;
