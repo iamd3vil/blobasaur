@@ -89,6 +89,8 @@ pub async fn run(
             write_pool.clone(),
             cfg.cleanup_interval_secs(),
             cfg.cleanup_chunk_size(),
+            state.inflight_cache.clone(),
+            state.inflight_hcache.clone(),
         )));
     }
 
