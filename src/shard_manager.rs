@@ -84,6 +84,10 @@ pub enum ShardWriteOperation {
     Expire {
         key: String,
         expires_at: i64,
+        /// Matches the [`Pending`] entry `queue_expire` recorded when an async
+        /// write for `key` was already in flight, so `clear_pending_entries`
+        /// removes it after commit.
+        token: Option<u64>,
         responder: oneshot::Sender<Result<bool, String>>,
     },
     HExpire {
@@ -194,8 +198,13 @@ pub struct ShardWriter {
 /// queued op, so clearing after commit only removes the entry that op recorded.
 #[derive(Clone, Debug)]
 pub enum Pending {
-    /// A queued SET/HSET/HSETEX.
-    Value { data: Bytes, token: u64 },
+    /// A queued SET/HSET/HSETEX. `expires_at` is the expiry the op commits
+    /// (`None` for no expiry).
+    Value {
+        data: Bytes,
+        expires_at: Option<i64>,
+        token: u64,
+    },
     /// A queued DEL/HDEL: the key reads as absent.
     Deleted(u64),
 }
@@ -246,6 +255,69 @@ pub async fn queue_pending(
             pending_writes.increment(1.0);
             permit.send(op);
             Op::Put(pending)
+        })
+        .await;
+    Ok(())
+}
+
+/// Queues a sync `EXPIRE` in `async_write` mode and updates `cache` atomically
+/// with the send when a live async `SET` for `key` is already in flight.
+///
+/// That lets `[SetAsync(k), Expire(k)]` share one batch without exposing a
+/// window between `tx.commit()` and `clear_pending_entries` where SQLite and
+/// `inflight_cache` disagree (e.g., `EXPIRE k 0` deleting `k` in SQLite while
+/// `inflight_cache` still serves `v`). When the queued `SET` already has a
+/// finite TTL and `expires_at` is in the future, it leaves the cache alone and
+/// lets [`conflicts_with_async_in_batch`] flush the `SET` first so a clock tick
+/// before commit cannot make SQLite and the cache diverge.
+pub async fn queue_expire(
+    cache: &Cache<String, Pending>,
+    sender: &ShardSender,
+    key: String,
+    expires_at: i64,
+    responder: oneshot::Sender<Result<bool, String>>,
+) -> Result<(), mpsc::error::SendError<()>> {
+    let permit = sender.reserve().await?;
+    let op_key = key.clone();
+    cache
+        .entry(key)
+        .and_compute_with(|entry| async move {
+            let next = match entry.map(|e| e.into_value()) {
+                Some(Pending::Value {
+                    data,
+                    expires_at: cur,
+                    ..
+                }) if !is_expired(cur) => {
+                    if is_expired(Some(expires_at)) {
+                        let token = next_pending_token();
+                        Some((token, Pending::Deleted(token)))
+                    } else if cur.is_none() {
+                        let token = next_pending_token();
+                        Some((
+                            token,
+                            Pending::Value {
+                                data,
+                                expires_at: Some(expires_at),
+                                token,
+                            },
+                        ))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            let (token, cache_op) = match next {
+                Some((token, pending)) => (Some(token), Op::Put(pending)),
+                None => (None, Op::Nop),
+            };
+            permit.send(ShardWriteOperation::Expire {
+                key: op_key,
+                expires_at,
+                token,
+                responder,
+            });
+            cache_op
         })
         .await;
     Ok(())
@@ -812,13 +884,18 @@ pub fn next_pending_token() -> u64 {
     NEXT_TOKEN.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Whether `expires_at` has passed, by the same rule the DB queries use.
+pub fn is_expired(expires_at: Option<i64>) -> bool {
+    expires_at.is_some_and(|t| t <= Utc::now().timestamp())
+}
+
 /// Whether a queued async op decides `key`'s existence: `Some(true)` for a
-/// write, `Some(false)` for a delete, `None` if nothing is queued (ask the DB).
+/// live write, `Some(false)` for a delete or an already-expired write, `None`
+/// if nothing is queued (ask the DB).
 pub async fn pending_exists(cache: &Cache<String, Pending>, key: &str) -> Option<bool> {
-    cache
-        .get(key)
-        .await
-        .map(|pending| matches!(pending, Pending::Value { .. }))
+    cache.get(key).await.map(
+        |pending| matches!(pending, Pending::Value { expires_at, .. } if !is_expired(expires_at)),
+    )
 }
 
 /// Removes `key`'s entry if it still carries `token`: a newer op on the same
@@ -833,6 +910,51 @@ async fn clear_pending_write(cache: &Cache<String, Pending>, key: &str, token: u
             }
         })
         .await;
+}
+
+/// Whether `batch` already holds an async op for the same key or hash field as
+/// `op`. Sync `Expire`/`HExpire` ops don't update the inflight caches, so they
+/// must not share a batch with a prior async op on the same key: otherwise
+/// SQLite commits the expiry before `clear_pending_entries` removes the stale
+/// cache entry.
+fn conflicts_with_async_in_batch(
+    batch: &VecDeque<ShardWriteOperation>,
+    op: &ShardWriteOperation,
+) -> bool {
+    match op {
+        // An Expire with `token: Some(_)` already updated `inflight_cache` at
+        // enqueue time to match what it will commit, so it can safely share a
+        // batch with a prior async op on the same key.
+        ShardWriteOperation::Expire {
+            key, token: None, ..
+        } => batch.iter().any(|queued| {
+            matches!(
+                queued,
+                ShardWriteOperation::SetAsync { key: qk, .. }
+                    | ShardWriteOperation::DeleteAsync { key: qk, .. }
+                    if qk == key
+            )
+        }),
+        ShardWriteOperation::HExpire { namespace, key, .. } => batch.iter().any(|queued| {
+            matches!(
+                queued,
+                ShardWriteOperation::HSetAsync {
+                    namespace: qns,
+                    key: qk,
+                    ..
+                } | ShardWriteOperation::HSetExAsync {
+                    namespace: qns,
+                    key: qk,
+                    ..
+                } | ShardWriteOperation::HDeleteAsync {
+                    namespace: qns,
+                    key: qk,
+                    ..
+                } if qns == namespace && qk == key
+            )
+        }),
+        _ => false,
+    }
 }
 
 // Enhanced consumer with batching support
@@ -862,11 +984,11 @@ pub async fn shard_writer_task(writer: ShardWriter) {
     );
 
     let mut batch: VecDeque<ShardWriteOperation> = VecDeque::with_capacity(batch_size);
-    let mut pending_maintenance_operation: Option<ShardWriteOperation> = None;
+    let mut deferred_operation: Option<ShardWriteOperation> = None;
 
     loop {
         // The next op starts a batch, unless it's a vacuum, which runs alone.
-        let next_operation = match pending_maintenance_operation.take() {
+        let next_operation = match deferred_operation.take() {
             Some(operation) => Some(operation),
             None => tokio::select! {
                 biased;
@@ -895,8 +1017,12 @@ pub async fn shard_writer_task(writer: ShardWriter) {
 
         // Fill the batch until it's full or batch_timeout has passed since its
         // first op: take what's queued, then wait for more. A vacuum is an
-        // ordering barrier, so it ends the batch and runs next. Shutdown ends
-        // the wait: this batch commits, then the drain below takes the rest.
+        // ordering barrier, so it ends the batch and runs next. Expire and
+        // HExpire don't update the inflight caches, so when the batch already
+        // holds an async op for the same key/field they start the next batch:
+        // that way the prior async op commits and clears its cache entry before
+        // SQLite exposes the expiry change. Shutdown ends the wait: this batch
+        // commits, then the drain below takes the rest.
         let deadline = tokio::time::Instant::now() + batch_timeout;
         while batch.len() < batch_size {
             let operation = match receiver.try_recv() {
@@ -916,8 +1042,10 @@ pub async fn shard_writer_task(writer: ShardWriter) {
                 }
             };
 
-            if matches!(operation, ShardWriteOperation::Vacuum { .. }) {
-                pending_maintenance_operation = Some(operation);
+            if matches!(operation, ShardWriteOperation::Vacuum { .. })
+                || conflicts_with_async_in_batch(&batch, &operation)
+            {
+                deferred_operation = Some(operation);
                 break;
             }
             batch.push_back(operation);
@@ -947,11 +1075,22 @@ pub async fn shard_writer_task(writer: ShardWriter) {
     receiver.close();
     let mut drained = 0;
     loop {
+        if let Some(operation) = deferred_operation.take()
+            && !matches!(operation, ShardWriteOperation::Vacuum { .. })
+        {
+            batch.push_back(operation);
+        }
         while batch.len() < batch_size {
             match receiver.recv().await {
                 // Dropping the responder reports the vacuum as cancelled.
                 Some(ShardWriteOperation::Vacuum { .. }) => {}
-                Some(operation) => batch.push_back(operation),
+                Some(operation) if conflicts_with_async_in_batch(&batch, &operation) => {
+                    deferred_operation = Some(operation);
+                    break;
+                }
+                Some(operation) => {
+                    batch.push_back(operation);
+                }
                 None => break,
             }
         }
@@ -1053,6 +1192,13 @@ async fn clear_pending_entries(
             } => {
                 let namespaced_key = namespaced_key(namespace, key);
                 clear_pending_write(inflight_hcache, &namespaced_key, *token).await;
+            }
+            ShardWriteOperation::Expire {
+                key,
+                token: Some(token),
+                ..
+            } => {
+                clear_pending_write(inflight_cache, key, *token).await;
             }
             _ => {}
         }
@@ -2536,7 +2682,11 @@ mod tests {
             cache,
             sender,
             key.to_string(),
-            Pending::Value { data, token },
+            Pending::Value {
+                data,
+                expires_at: None,
+                token,
+            },
             op,
         )
         .await
@@ -2689,6 +2839,7 @@ mod tests {
             "ns:f".to_string(),
             Pending::Value {
                 data: Bytes::new(),
+                expires_at: None,
                 token: h0,
             },
             ShardWriteOperation::HSetAsync {
@@ -2708,6 +2859,7 @@ mod tests {
             "ns:f".to_string(),
             Pending::Value {
                 data: Bytes::from_static(b"a"),
+                expires_at: None,
                 token: h1,
             },
             ShardWriteOperation::HSetAsync {
@@ -2727,6 +2879,7 @@ mod tests {
             "ns:f".to_string(),
             Pending::Value {
                 data: Bytes::new(),
+                expires_at: None,
                 token: last_h_token,
             },
             ShardWriteOperation::HSetExAsync {
@@ -2772,21 +2925,21 @@ mod tests {
         assert!(
             matches!(
                 cache.get("k").await,
-                Some(Pending::Value { data, token }) if data.is_empty() && token == last_k_token
+                Some(Pending::Value { data, token, .. }) if data.is_empty() && token == last_k_token
             ),
             "newer empty SET was cleared by older empty SET"
         );
         assert!(
             matches!(
                 cache.get("s").await,
-                Some(Pending::Value { data, token }) if data == shared && token == last_s_token
+                Some(Pending::Value { data, token, .. }) if data == shared && token == last_s_token
             ),
             "newer aliased SET was cleared by older aliased SET"
         );
         assert!(
             matches!(
                 hcache.get("ns:f").await,
-                Some(Pending::Value { data, token }) if data.is_empty() && token == last_h_token
+                Some(Pending::Value { data, token, .. }) if data.is_empty() && token == last_h_token
             ),
             "newer empty HSETEX was cleared by older empty HSET"
         );
@@ -4058,5 +4211,288 @@ mod tests {
         validate_v1_shard_metadata(&mut conn, 0)
             .await
             .expect("shard must remain valid for restart after failed HSET");
+    }
+
+    #[tokio::test]
+    async fn expire_and_hexpire_flush_prior_async_ops_before_running() {
+        // Test both the normal writer loop and the shutdown drain loop: when an
+        // async write and a sync Expire/HExpire are queued together with
+        // batch_size > 1, the async write must commit and clear its inflight
+        // entry in an earlier transaction before Expire/HExpire executes.
+        for drain_immediately in [false, true] {
+            // 1. SetAsync followed by Expire 0
+            {
+                let (_temp_dir, pool) = create_test_pool().await;
+                // Force Expire to fail at COMMIT via a deferred FK violation.
+                // If it shared a transaction with SetAsync, SetAsync would roll
+                // back too.
+                sqlx::query(
+                    "CREATE TABLE fk_parent (id INTEGER PRIMARY KEY);
+                     CREATE TABLE fk_child (parent_id INTEGER REFERENCES fk_parent(id) \
+                     DEFERRABLE INITIALLY DEFERRED);",
+                )
+                .execute(&pool)
+                .await
+                .unwrap();
+                sqlx::query(
+                    "CREATE TRIGGER fail_expire AFTER UPDATE OF expires_at ON blobs \
+                     WHEN NEW.key = 'k' AND NEW.expires_at IS NOT NULL \
+                     BEGIN INSERT INTO fk_child VALUES (1); END",
+                )
+                .execute(&pool)
+                .await
+                .unwrap();
+
+                let cache: Cache<String, Pending> = Cache::builder().build();
+                let hcache: Cache<String, Pending> = Cache::builder().build();
+                let (sender, receiver) = test_channel(16);
+
+                queue_set(&cache, &sender, "k", Bytes::from_static(b"v")).await;
+                let (expire_tx, expire_rx) = oneshot::channel();
+                sender
+                    .send(ShardWriteOperation::Expire {
+                        key: "k".to_string(),
+                        expires_at: Utc::now().timestamp(),
+                        token: None,
+                        responder: expire_tx,
+                    })
+                    .await
+                    .unwrap();
+
+                let shutdown = CancellationToken::new();
+                if drain_immediately {
+                    shutdown.cancel();
+                }
+
+                let writer = tokio::spawn(shard_writer_task(ShardWriter {
+                    shard_id: 0,
+                    pool: pool.clone(),
+                    receiver,
+                    batch_size: 16,
+                    batch_timeout_ms: 0,
+                    inflight_cache: cache.clone(),
+                    inflight_hcache: hcache,
+                    metrics: Metrics::new(),
+                    shutdown,
+                }));
+
+                assert!(
+                    expire_rx.await.unwrap().is_err(),
+                    "Expire should fail its own commit (drain={drain_immediately})"
+                );
+
+                drop(sender);
+                writer.await.unwrap();
+
+                let blob: (Vec<u8>, Option<i64>) =
+                    sqlx::query_as("SELECT data, expires_at FROM blobs WHERE key = 'k'")
+                        .fetch_one(&pool)
+                        .await
+                        .expect("SetAsync must have committed before Expire");
+                assert_eq!(blob, (b"v".to_vec(), None));
+                assert!(cache.get("k").await.is_none());
+            }
+
+            // 2. HSetAsync followed by HExpire 0
+            {
+                let (_temp_dir, pool) = create_test_pool().await;
+                let ns_table = namespace_table("ns");
+                sqlx::query(CREATE_BLOB_NAMESPACES_TABLE)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                sqlx::query(&format!(
+                    "CREATE TABLE {ns_table} (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL, \
+                     updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)"
+                ))
+                .execute(&pool)
+                .await
+                .unwrap();
+                sqlx::query("INSERT INTO blob_namespaces (namespace, table_name) VALUES ('ns', ?)")
+                    .bind(&ns_table)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                sqlx::query(
+                    "CREATE TABLE fk_parent (id INTEGER PRIMARY KEY);
+                     CREATE TABLE fk_child (parent_id INTEGER REFERENCES fk_parent(id) \
+                     DEFERRABLE INITIALLY DEFERRED);",
+                )
+                .execute(&pool)
+                .await
+                .unwrap();
+                sqlx::query(&format!(
+                    "CREATE TRIGGER fail_hexpire AFTER DELETE ON {ns_table} \
+                     WHEN OLD.key = 'f' \
+                     BEGIN INSERT INTO fk_child VALUES (1); END"
+                ))
+                .execute(&pool)
+                .await
+                .unwrap();
+
+                let cache: Cache<String, Pending> = Cache::builder().build();
+                let hcache: Cache<String, Pending> = Cache::builder().build();
+                let (sender, receiver) = test_channel(16);
+
+                let htok = next_pending_token();
+                queue_pending(
+                    &hcache,
+                    &sender,
+                    "ns:f".to_string(),
+                    Pending::Value {
+                        data: Bytes::from_static(b"hv"),
+                        expires_at: None,
+                        token: htok,
+                    },
+                    ShardWriteOperation::HSetAsync {
+                        namespace: "ns".to_string(),
+                        keep_ttl: false,
+                        key: "f".to_string(),
+                        data: Bytes::from_static(b"hv"),
+                        token: htok,
+                    },
+                )
+                .await
+                .unwrap();
+                let (hexpire_tx, hexpire_rx) = oneshot::channel();
+                sender
+                    .send(ShardWriteOperation::HExpire {
+                        namespace: "ns".to_string(),
+                        key: "f".to_string(),
+                        expires_at: Utc::now().timestamp(),
+                        condition: None,
+                        responder: hexpire_tx,
+                    })
+                    .await
+                    .unwrap();
+
+                let shutdown = CancellationToken::new();
+                if drain_immediately {
+                    shutdown.cancel();
+                }
+
+                let writer = tokio::spawn(shard_writer_task(ShardWriter {
+                    shard_id: 0,
+                    pool: pool.clone(),
+                    receiver,
+                    batch_size: 16,
+                    batch_timeout_ms: 0,
+                    inflight_cache: cache,
+                    inflight_hcache: hcache.clone(),
+                    metrics: Metrics::new(),
+                    shutdown,
+                }));
+
+                assert!(
+                    hexpire_rx.await.unwrap().is_err(),
+                    "HExpire should fail its own commit (drain={drain_immediately})"
+                );
+
+                drop(sender);
+                writer.await.unwrap();
+
+                let hblob: (Vec<u8>, Option<i64>) = sqlx::query_as(&format!(
+                    "SELECT data, expires_at FROM {ns_table} WHERE key = 'f'"
+                ))
+                .fetch_one(&pool)
+                .await
+                .expect("HSetAsync must have committed before HExpire");
+                assert_eq!(hblob, (b"hv".to_vec(), None));
+                assert!(hcache.get("ns:f").await.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_expire_updates_inflight_cache_and_clears_by_token() {
+        let cache: Cache<String, Pending> = Cache::builder().build();
+        let hcache: Cache<String, Pending> = Cache::builder().build();
+        let (sender, mut receiver) = test_channel(16);
+        let now = Utc::now().timestamp();
+
+        // 1. Queued SET followed by EXPIRE 0 replaces Pending::Value with
+        // Pending::Deleted immediately, before the batch even runs.
+        queue_set(&cache, &sender, "del_k", Bytes::from_static(b"v")).await;
+        let (tx1, _rx1) = oneshot::channel();
+        queue_expire(&cache, &sender, "del_k".to_string(), now, tx1)
+            .await
+            .unwrap();
+        assert!(matches!(
+            cache.get("del_k").await,
+            Some(Pending::Deleted(_))
+        ));
+
+        // 2. Queued persistent SET followed by positive EXPIRE updates the
+        // cached expires_at so GET and TTL match SQLite while in flight.
+        queue_set(&cache, &sender, "ttl_k", Bytes::from_static(b"v")).await;
+        let (tx2, _rx2) = oneshot::channel();
+        queue_expire(&cache, &sender, "ttl_k".to_string(), now + 60, tx2)
+            .await
+            .unwrap();
+        assert!(matches!(
+            cache.get("ttl_k").await,
+            Some(Pending::Value {
+                data,
+                expires_at: Some(exp),
+                ..
+            }) if data == Bytes::from_static(b"v") && exp == now + 60
+        ));
+
+        // 3. A newer SET queued after EXPIRE overwrites the cache and must NOT
+        // be cleared when the earlier [SET, EXPIRE] batch finishes.
+        let newer_tok = queue_set(&cache, &sender, "ttl_k", Bytes::from_static(b"v2")).await;
+
+        let mut batch = VecDeque::new();
+        for _ in 0..4 {
+            batch.push_back(receiver.try_recv().unwrap());
+        }
+        clear_pending_entries(&batch, &cache, &hcache).await;
+        assert!(cache.get("del_k").await.is_none());
+        assert!(matches!(
+            cache.get("ttl_k").await,
+            Some(Pending::Value {
+                data,
+                expires_at: None,
+                token,
+            }) if data == Bytes::from_static(b"v2") && token == newer_tok
+        ));
+
+        // 4. Positive EXPIRE over a queued SET that already has a finite TTL
+        // leaves token = None so conflicts_with_async_in_batch flushes the SET
+        // first.
+        let tok_ex = next_pending_token();
+        queue_pending(
+            &cache,
+            &sender,
+            "finite_k".to_string(),
+            Pending::Value {
+                data: Bytes::from_static(b"v"),
+                expires_at: Some(now + 10),
+                token: tok_ex,
+            },
+            ShardWriteOperation::SetAsync {
+                key: "finite_k".to_string(),
+                data: Bytes::from_static(b"v"),
+                expires_at: Some(now + 10),
+                token: tok_ex,
+            },
+        )
+        .await
+        .unwrap();
+        let (tx3, _rx3) = oneshot::channel();
+        queue_expire(&cache, &sender, "finite_k".to_string(), now + 100, tx3)
+            .await
+            .unwrap();
+        let _newer_set = receiver.try_recv().unwrap();
+        let finite_set = receiver.try_recv().unwrap();
+        let finite_exp = receiver.try_recv().unwrap();
+        assert!(matches!(
+            finite_exp,
+            ShardWriteOperation::Expire { token: None, .. }
+        ));
+        assert!(conflicts_with_async_in_batch(
+            &VecDeque::from([finite_set]),
+            &finite_exp
+        ));
     }
 }
