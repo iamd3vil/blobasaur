@@ -261,15 +261,16 @@ pub async fn queue_pending(
 }
 
 /// Queues a sync `EXPIRE` in `async_write` mode and updates `cache` atomically
-/// with the send when a live async `SET` for `key` is already in flight.
+/// with the send when a persistent async `SET` for `key` is already in flight.
 ///
 /// That lets `[SetAsync(k), Expire(k)]` share one batch without exposing a
 /// window between `tx.commit()` and `clear_pending_entries` where SQLite and
 /// `inflight_cache` disagree (e.g., `EXPIRE k 0` deleting `k` in SQLite while
 /// `inflight_cache` still serves `v`). When the queued `SET` already has a
-/// finite TTL and `expires_at` is in the future, it leaves the cache alone and
-/// lets [`conflicts_with_async_in_batch`] flush the `SET` first so a clock tick
-/// before commit cannot make SQLite and the cache diverge.
+/// finite TTL, it leaves the cache alone and lets
+/// [`conflicts_with_async_in_batch`] flush the `SET` first: otherwise a clock
+/// tick before commit could expire the `SET` so SQLite replies `0` after
+/// readers already observed the cached update.
 pub async fn queue_expire(
     cache: &Cache<String, Pending>,
     sender: &ShardSender,
@@ -285,14 +286,13 @@ pub async fn queue_expire(
             let next = match entry.map(|e| e.into_value()) {
                 Some(Pending::Value {
                     data,
-                    expires_at: cur,
+                    expires_at: None,
                     ..
-                }) if !is_expired(cur) => {
+                }) => {
+                    let token = next_pending_token();
                     if is_expired(Some(expires_at)) {
-                        let token = next_pending_token();
                         Some((token, Pending::Deleted(token)))
-                    } else if cur.is_none() {
-                        let token = next_pending_token();
+                    } else {
                         Some((
                             token,
                             Pending::Value {
@@ -301,8 +301,6 @@ pub async fn queue_expire(
                                 token,
                             },
                         ))
-                    } else {
-                        None
                     }
                 }
                 _ => None,
@@ -4457,9 +4455,11 @@ mod tests {
             }) if data == Bytes::from_static(b"v2") && token == newer_tok
         ));
 
-        // 4. Positive EXPIRE over a queued SET that already has a finite TTL
-        // leaves token = None so conflicts_with_async_in_batch flushes the SET
-        // first.
+        // 4. Any EXPIRE (both positive and immediate EXPIRE 0) over a queued
+        // SET that already has a finite TTL leaves token = None and keeps the
+        // cache untouched, so conflicts_with_async_in_batch flushes the SET
+        // first and a clock tick before commit cannot make EXPIRE reply 0 after
+        // readers already saw Pending::Deleted.
         let tok_ex = next_pending_token();
         queue_pending(
             &cache,
@@ -4483,16 +4483,38 @@ mod tests {
         queue_expire(&cache, &sender, "finite_k".to_string(), now + 100, tx3)
             .await
             .unwrap();
+        let (tx4, _rx4) = oneshot::channel();
+        queue_expire(&cache, &sender, "finite_k".to_string(), now, tx4)
+            .await
+            .unwrap();
+        assert!(matches!(
+            cache.get("finite_k").await,
+            Some(Pending::Value {
+                expires_at: Some(exp),
+                token,
+                ..
+            }) if exp == now + 10 && token == tok_ex
+        ));
         let _newer_set = receiver.try_recv().unwrap();
         let finite_set = receiver.try_recv().unwrap();
-        let finite_exp = receiver.try_recv().unwrap();
+        let finite_exp_pos = receiver.try_recv().unwrap();
+        let finite_exp_zero = receiver.try_recv().unwrap();
         assert!(matches!(
-            finite_exp,
+            finite_exp_pos,
             ShardWriteOperation::Expire { token: None, .. }
         ));
+        assert!(matches!(
+            finite_exp_zero,
+            ShardWriteOperation::Expire { token: None, .. }
+        ));
+        let finite_batch = VecDeque::from([finite_set]);
         assert!(conflicts_with_async_in_batch(
-            &VecDeque::from([finite_set]),
-            &finite_exp
+            &finite_batch,
+            &finite_exp_pos
+        ));
+        assert!(conflicts_with_async_in_batch(
+            &finite_batch,
+            &finite_exp_zero
         ));
     }
 }
