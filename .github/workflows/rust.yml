@@ -30,3 +30,16 @@ jobs:
       run: cargo clippy --all-targets --locked -- -D warnings
     - name: Run tests
       run: cargo test --locked --verbose
+
+  tla:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Cache tla2tools.jar
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/tla2tools
+        key: tla2tools-v1.7.4
+    - name: Run TLC model checks
+      run: ./specs/check.sh
