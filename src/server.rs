@@ -366,15 +366,14 @@ async fn handle_connection(
                 }
                 Ok(command) => {
                     let quit = matches!(command, RedisCommand::Quit);
-                    if let Err(e) =
-                        handle_redis_command(
-                            &mut stream,
-                            &state,
-                            &mut client_name,
-                            command,
-                            &mut conn_readonly,
-                        )
-                        .await
+                    if let Err(e) = handle_redis_command(
+                        &mut stream,
+                        &state,
+                        &mut client_name,
+                        command,
+                        &mut conn_readonly,
+                    )
+                    .await
                     {
                         tracing::error!("Error handling command: {}", e);
                         return Err(e);
@@ -1251,9 +1250,9 @@ async fn handle_command(
             BytesFrame::Array(COMMANDS.iter().map(command_info_frame).collect())
         }
         "COUNT" if args.len() == 1 => BytesFrame::Integer(COMMANDS.len() as i64),
-        "COUNT" => BytesFrame::Error(
-            "ERR wrong number of arguments for 'command|count' command".into(),
-        ),
+        "COUNT" => {
+            BytesFrame::Error("ERR wrong number of arguments for 'command|count' command".into())
+        }
         "DOCS" => BytesFrame::Array(vec![]),
         "INFO" => BytesFrame::Array(
             args[1..]
@@ -1340,12 +1339,6 @@ async fn validate_hash_namespace(
     );
     stream.write_all(&serialize_frame(&response)).await?;
     Ok(false)
-}
-
-/// Namespace tables are created per shard on the first HSET routed there, so a
-/// read can hit a shard without the table. That's a miss, not an error.
-pub(crate) fn is_missing_table(error: &sqlx::Error) -> bool {
-    matches!(error, sqlx::Error::Database(db) if db.message().starts_with("no such table"))
 }
 
 /// Whether a live hash field exists, for the commands that check before
@@ -3383,7 +3376,7 @@ mod tests {
     async fn hget_value(ctx: &TestContext, namespace: &str, field: &str) -> BytesFrame {
         let (namespace, field) = (namespace.to_string(), field.to_string());
         respond_with(ctx, |state, mut stream| {
-            Box::pin(async move { handle_hget(&mut stream, &state, namespace, field).await })
+            Box::pin(async move { handle_hget(&mut stream, &state, false, namespace, field).await })
         })
         .await
     }
@@ -3685,14 +3678,14 @@ mod tests {
             // HEXISTS and HEXPIRE stay isolated too.
             let frame = respond_with(&ctx, |state, mut stream| {
                 Box::pin(async move {
-                    handle_hexists(&mut stream, &state, "users".into(), "alice".into()).await
+                    handle_hexists(&mut stream, &state, false, "users".into(), "alice".into()).await
                 })
             })
             .await;
             assert_integer_response(frame, 0);
             let frame = respond_with(&ctx, |state, mut stream| {
                 Box::pin(async move {
-                    handle_hexists(&mut stream, &state, "Users".into(), "alice".into()).await
+                    handle_hexists(&mut stream, &state, false, "Users".into(), "alice".into()).await
                 })
             })
             .await;
@@ -5505,15 +5498,14 @@ mod tests {
         let frame = respond_with(&ctx, |state, stream| {
             Box::pin(async move {
                 let mut stream = stream;
-                let _ =
-                    handle_redis_command_inner(
-                        &mut stream,
-                        &state,
-                        &mut None,
-                        RedisCommand::Quit,
-                        &mut false,
-                    )
-                        .await;
+                let _ = handle_redis_command_inner(
+                    &mut stream,
+                    &state,
+                    &mut None,
+                    RedisCommand::Quit,
+                    &mut false,
+                )
+                .await;
                 Ok(())
             })
         });
@@ -5967,7 +5959,7 @@ mod tests {
         set_expires_at(&ctx, "blobs", "k", past()).await;
 
         assert_integer_response(run!(ctx, handle_expire("k".into(), 100)), 0);
-        assert_null(run!(ctx, handle_get("k".into())));
+        assert_null(run!(ctx, handle_get("k".into(), None)));
         assert_integer_response(run!(ctx, handle_del_multiple(vec!["k".into()])), 0);
         ctx.shutdown().await;
     }
@@ -6035,7 +6027,7 @@ mod tests {
         respond_with(ctx, |state, stream| {
             Box::pin(async move {
                 let mut stream = stream;
-                handle_redis_command(&mut stream, &state, &mut None, command).await
+                handle_redis_command(&mut stream, &state, &mut None, command, &mut false).await
             })
         })
         .await
@@ -6335,6 +6327,8 @@ mod tests {
                 max_request_size_mb: None,
                 cleanup_chunk_size: None,
                 cleanup_interval_secs: None,
+                new_replid: false,
+                replication: None,
                 sqlite: Some(SqliteConfig {
                     cache_size_mb: None,
                     busy_timeout_ms: Some(10_000),
@@ -6388,7 +6382,7 @@ mod tests {
                 let frame = respond_with(&ctx, |state, stream| {
                     Box::pin(async move {
                         let mut stream = stream;
-                        handle_get(&mut stream, &state, key).await
+                        handle_get(&mut stream, &state, key, None).await
                     })
                 })
                 .await;
@@ -6429,7 +6423,7 @@ mod tests {
                 let frame = respond_with(&ctx, |state, stream| {
                     Box::pin(async move {
                         let mut stream = stream;
-                        handle_hget(&mut stream, &state, "ns".to_string(), field).await
+                        handle_hget(&mut stream, &state, false, "ns".to_string(), field).await
                     })
                 })
                 .await;
@@ -6478,17 +6472,19 @@ mod tests {
         assert_simple_string(frame, "OK");
 
         let frame = respond_with(&ctx, |state, mut stream| {
-            Box::pin(async move { handle_get(&mut stream, &state, "new".to_string()).await })
+            Box::pin(async move { handle_get(&mut stream, &state, "new".to_string(), None).await })
         })
         .await;
         assert_bulk_string(frame, b"v");
         let frame = respond_with(&ctx, |state, mut stream| {
-            Box::pin(async move { handle_exists(&mut stream, &state, "new".to_string()).await })
+            Box::pin(
+                async move { handle_exists(&mut stream, &state, "new".to_string(), None).await },
+            )
         })
         .await;
         assert_integer_response(frame, 1);
         let frame = respond_with(&ctx, |state, mut stream| {
-            Box::pin(async move { handle_ttl(&mut stream, &state, "new".to_string()).await })
+            Box::pin(async move { handle_ttl(&mut stream, &state, "new".to_string(), None).await })
         })
         .await;
         match frame {
@@ -6512,7 +6508,7 @@ mod tests {
         .await;
         assert_simple_string(frame, "OK");
         let frame = respond_with(&ctx, |state, mut stream| {
-            Box::pin(async move { handle_ttl(&mut stream, &state, "old".to_string()).await })
+            Box::pin(async move { handle_ttl(&mut stream, &state, "old".to_string(), None).await })
         })
         .await;
         assert_integer_response(frame, -1);
@@ -6542,17 +6538,19 @@ mod tests {
             .await;
 
         let frame = respond_with(&ctx, |state, mut stream| {
-            Box::pin(async move { handle_get(&mut stream, &state, "gone".to_string()).await })
+            Box::pin(async move { handle_get(&mut stream, &state, "gone".to_string(), None).await })
         })
         .await;
         assert_null(frame);
         let frame = respond_with(&ctx, |state, mut stream| {
-            Box::pin(async move { handle_exists(&mut stream, &state, "gone".to_string()).await })
+            Box::pin(
+                async move { handle_exists(&mut stream, &state, "gone".to_string(), None).await },
+            )
         })
         .await;
         assert_integer_response(frame, 0);
         let frame = respond_with(&ctx, |state, mut stream| {
-            Box::pin(async move { handle_ttl(&mut stream, &state, "gone".to_string()).await })
+            Box::pin(async move { handle_ttl(&mut stream, &state, "gone".to_string(), None).await })
         })
         .await;
         assert_integer_response(frame, -2);
@@ -6566,14 +6564,28 @@ mod tests {
 
         let frame = respond_with(&ctx, |state, mut stream| {
             Box::pin(async move {
-                handle_hget(&mut stream, &state, "ns".to_string(), "gone_f".to_string()).await
+                handle_hget(
+                    &mut stream,
+                    &state,
+                    false,
+                    "ns".to_string(),
+                    "gone_f".to_string(),
+                )
+                .await
             })
         })
         .await;
         assert_null(frame);
         let frame = respond_with(&ctx, |state, mut stream| {
             Box::pin(async move {
-                handle_hexists(&mut stream, &state, "ns".to_string(), "gone_f".to_string()).await
+                handle_hexists(
+                    &mut stream,
+                    &state,
+                    false,
+                    "ns".to_string(),
+                    "gone_f".to_string(),
+                )
+                .await
             })
         })
         .await;
@@ -6656,7 +6668,7 @@ mod tests {
         wait_for_commit(&ctx.state.inflight_cache, "old").await;
 
         let frame = respond_with(&ctx, |state, mut stream| {
-            Box::pin(async move { handle_ttl(&mut stream, &state, "new".to_string()).await })
+            Box::pin(async move { handle_ttl(&mut stream, &state, "new".to_string(), None).await })
         })
         .await;
         match frame {
@@ -6664,7 +6676,7 @@ mod tests {
             other => panic!("Expected integer TTL, got {other:?}"),
         }
         let frame = respond_with(&ctx, |state, mut stream| {
-            Box::pin(async move { handle_ttl(&mut stream, &state, "old".to_string()).await })
+            Box::pin(async move { handle_ttl(&mut stream, &state, "old".to_string(), None).await })
         })
         .await;
         assert_integer_response(frame, -1);
@@ -6741,17 +6753,17 @@ mod tests {
         assert!(ctx.state.inflight_cache.get("k").await.is_none());
 
         let frame = respond_with(&ctx, |state, mut stream| {
-            Box::pin(async move { handle_get(&mut stream, &state, "k".to_string()).await })
+            Box::pin(async move { handle_get(&mut stream, &state, "k".to_string(), None).await })
         })
         .await;
         assert_null(frame);
         let frame = respond_with(&ctx, |state, mut stream| {
-            Box::pin(async move { handle_exists(&mut stream, &state, "k".to_string()).await })
+            Box::pin(async move { handle_exists(&mut stream, &state, "k".to_string(), None).await })
         })
         .await;
         assert_integer_response(frame, 0);
         let frame = respond_with(&ctx, |state, mut stream| {
-            Box::pin(async move { handle_ttl(&mut stream, &state, "k".to_string()).await })
+            Box::pin(async move { handle_ttl(&mut stream, &state, "k".to_string(), None).await })
         })
         .await;
         assert_integer_response(frame, -2);
@@ -6795,7 +6807,14 @@ mod tests {
         );
         let frame = respond_with(&ctx, |state, mut stream| {
             Box::pin(async move {
-                handle_hget(&mut stream, &state, "ns".to_string(), "f".to_string()).await
+                handle_hget(
+                    &mut stream,
+                    &state,
+                    false,
+                    "ns".to_string(),
+                    "f".to_string(),
+                )
+                .await
             })
         })
         .await;
@@ -6824,7 +6843,9 @@ mod tests {
         .await;
         assert_integer_response(frame, 1);
         let frame = respond_with(&ctx, |state, mut stream| {
-            Box::pin(async move { handle_ttl(&mut stream, &state, "k_ttl".to_string()).await })
+            Box::pin(
+                async move { handle_ttl(&mut stream, &state, "k_ttl".to_string(), None).await },
+            )
         })
         .await;
         match frame {
@@ -6860,7 +6881,7 @@ mod tests {
         let (mut server_stream, client_stream) = tcp_pair().await;
         let state = ctx.state.clone();
         let get_task = tokio::spawn(async move {
-            handle_get(&mut server_stream, &state, "k".to_string())
+            handle_get(&mut server_stream, &state, "k".to_string(), None)
                 .await
                 .unwrap();
         });
@@ -6956,7 +6977,14 @@ mod tests {
         // Before commit, HGET already observes the field as expired (nil).
         let frame = respond_with(&ctx, |state, mut stream| {
             Box::pin(async move {
-                handle_hget(&mut stream, &state, "ns".to_string(), "f".to_string()).await
+                handle_hget(
+                    &mut stream,
+                    &state,
+                    false,
+                    "ns".to_string(),
+                    "f".to_string(),
+                )
+                .await
             })
         })
         .await;
@@ -6973,7 +7001,14 @@ mod tests {
 
         let frame = respond_with(&ctx, |state, mut stream| {
             Box::pin(async move {
-                handle_hget(&mut stream, &state, "ns".to_string(), "f".to_string()).await
+                handle_hget(
+                    &mut stream,
+                    &state,
+                    false,
+                    "ns".to_string(),
+                    "f".to_string(),
+                )
+                .await
             })
         })
         .await;

@@ -254,7 +254,7 @@ async fn command_count_and_ping_check_their_arguments() {
     let server = start(None).await;
     assert_eq!(
         server.call(&[b"COMMAND", b"COUNT"]).await.as_deref(),
-        Some(":21")
+        Some(":24")
     );
     for args in [
         [b"COMMAND".as_slice(), b"COUNT", b"extra"],

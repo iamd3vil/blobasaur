@@ -411,6 +411,8 @@ async fn test_migration_scale_down() -> Result<(), Box<dyn std::error::Error>> {
         max_request_size_mb: None,
         cleanup_chunk_size: None,
         cleanup_interval_secs: None,
+        new_replid: false,
+        replication: None,
     };
     let mut receivers = Vec::new();
     blobasaur::app_state::AppState::new(cfg, &mut receivers)

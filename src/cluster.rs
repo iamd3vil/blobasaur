@@ -1620,9 +1620,11 @@ mod tests {
             nodes: Arc::new(RwLock::new(HashMap::new())),
             local_slots: Arc::new(RwLock::new(local_slots.into_iter().collect())),
             config,
-            chitchat_handle: Arc::new(None),
+            chitchat: None,
+            running: Arc::new(Mutex::new(None)),
             local_addr: "127.0.0.1:6401".parse().unwrap(),
             namespace_strategy: NamespaceDistributionStrategy::default(),
+            replica: None,
         }
     }
 
@@ -1632,10 +1634,14 @@ mod tests {
         let peer_addr: SocketAddr = "127.0.0.1:6402".parse().unwrap();
 
         // Before gossip converges: non-local slots have no known owner.
-        assert_eq!(manager.route(5061).await, Route::Local);
-        assert_eq!(manager.route(9706).await, Route::ClusterDown);
+        assert_eq!(manager.route(5061, false, false).await, Route::Local);
+        assert_eq!(manager.route(9706, false, false).await, Route::ClusterDown);
         assert_eq!(
-            manager.route(9706).await.into_error().as_deref(),
+            manager
+                .route(9706, false, false)
+                .await
+                .into_error()
+                .as_deref(),
             Some(CLUSTERDOWN_HASH_SLOT_NOT_SERVED)
         );
 
@@ -1647,26 +1653,36 @@ mod tests {
                 addr: peer_addr,
                 slots: (8192..=16383).collect(),
                 _state: "master".to_string(),
+                role: NodeRole::Primary,
+                primary: None,
             },
         );
         assert_eq!(
-            manager.route(9706).await,
+            manager.route(9706, false, false).await,
             Route::Moved(format!("MOVED 9706 {}", peer_addr))
         );
         assert_eq!(
-            manager.route(9706).await.into_error().as_deref(),
+            manager
+                .route(9706, false, false)
+                .await
+                .into_error()
+                .as_deref(),
             Some("MOVED 9706 127.0.0.1:6402")
         );
 
         // When the peer leaves gossip (e.g. after dead_node_grace_period),
         // its slots must become ClusterDown rather than falling through locally.
         manager.nodes.write().await.remove("node-b");
-        assert_eq!(manager.route(9706).await, Route::ClusterDown);
+        assert_eq!(manager.route(9706, false, false).await, Route::ClusterDown);
         assert_eq!(
-            manager.route(9706).await.into_error().as_deref(),
+            manager
+                .route(9706, false, false)
+                .await
+                .into_error()
+                .as_deref(),
             Some(CLUSTERDOWN_HASH_SLOT_NOT_SERVED)
         );
-        assert_eq!(manager.route(5061).await, Route::Local);
+        assert_eq!(manager.route(5061, false, false).await, Route::Local);
     }
 
     #[tokio::test]
@@ -1678,24 +1694,34 @@ mod tests {
         assert_eq!(ClusterManager::calculate_slot("layout:user42"), 9706);
 
         assert_eq!(
-            manager.route(ClusterManager::calculate_slot("bar")).await,
+            manager
+                .route(ClusterManager::calculate_slot("bar"), false, false)
+                .await,
             Route::Local
         );
         assert_eq!(
             manager
-                .route(ClusterManager::calculate_slot("layout:user42"))
+                .route(
+                    ClusterManager::calculate_slot("layout:user42"),
+                    false,
+                    false
+                )
                 .await,
             Route::ClusterDown
         );
         assert_eq!(
             manager
-                .route(manager.calculate_slot_for_hash("ns", "bar"))
+                .route(manager.calculate_slot_for_hash("ns", "bar"), false, false)
                 .await,
             Route::Local
         );
         assert_eq!(
             manager
-                .route(manager.calculate_slot_for_hash("ns", "layout:user42"))
+                .route(
+                    manager.calculate_slot_for_hash("ns", "layout:user42"),
+                    false,
+                    false
+                )
                 .await,
             Route::ClusterDown
         );
@@ -1719,9 +1745,10 @@ mod tests {
         };
         let gossip_bind_addr: SocketAddr = format!("127.0.0.1:{gossip_port}").parse().unwrap();
         let redis_addr: SocketAddr = "127.0.0.1:6499".parse().unwrap();
-        let manager = ClusterManager::new(&config, gossip_bind_addr, redis_addr)
+        let manager = ClusterManager::new(&config, gossip_bind_addr, redis_addr, None, 1)
             .await
             .expect("cluster manager");
+        manager.claim_slots().await.expect("claim initial slots");
 
         // Interleave concurrent add_slots/remove_slots on the same slot while
         // briefly contending on the chitchat lock, which previously let an
@@ -1734,9 +1761,8 @@ mod tests {
             let t1 = tokio::spawn(async move { m1.remove_slots(vec![slot]).await.unwrap() });
             let t2 = tokio::spawn(async move { m2.add_slots(vec![slot]).await.unwrap() });
             let t3 = tokio::spawn(async move {
-                if let Some(handle) = m3.chitchat_handle.as_ref() {
-                    let chitchat_arc = handle.chitchat();
-                    let _guard = chitchat_arc.lock().await;
+                if let Some(chitchat) = m3.chitchat.as_ref() {
+                    let _guard = chitchat.lock().await;
                     tokio::task::yield_now().await;
                 }
             });
@@ -1748,19 +1774,14 @@ mod tests {
 
         let local_slots = manager.get_local_slots().await;
         let published: HashSet<u16> = {
-            let handle = manager
-                .chitchat_handle
-                .as_ref()
-                .as_ref()
-                .expect("chitchat handle");
-            let chitchat_arc = handle.chitchat();
-            let mut guard = chitchat_arc.lock().await;
+            let chitchat = manager.chitchat.as_ref().expect("chitchat");
+            let mut guard = chitchat.lock().await;
             let raw = guard
                 .self_node_state()
                 .get("node_info")
                 .expect("published node_info");
             let data: NodeGossipData = serde_json::from_str(raw).expect("valid gossip json");
-            data.slots.into_iter().collect()
+            data.owned_slots()
         };
         assert_eq!(
             published, local_slots,

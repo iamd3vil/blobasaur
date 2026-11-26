@@ -28,7 +28,7 @@ pub const ALL_KEY_TABLES_QUERY: &str = "SELECT name FROM sqlite_master \
     ORDER BY name";
 
 /// Lists only namespaced `blobs_*` tables with a literal underscore.
-const NAMESPACED_TABLES_QUERY: &str = "SELECT name FROM sqlite_master \
+pub(crate) const NAMESPACED_TABLES_QUERY: &str = "SELECT name FROM sqlite_master \
     WHERE type = 'table' \
       AND LOWER(name) LIKE 'blobs\\_%' ESCAPE '\\' \
     ORDER BY name";
@@ -1069,7 +1069,8 @@ pub async fn shard_writer_task(writer: ShardWriter) {
                 continue;
             }
             Some(ShardWriteOperation::Apply { frames, responder }) => {
-                let result = replication::apply(&pool, &mut known_tables, &frames).await;
+                let result =
+                    replication::apply(&pool, &mut known_tables, &frames, &key_count).await;
                 let _ = responder.send(result.map(|lsn| {
                     if let Some(lsn) = lsn {
                         replication::publish(&commit_watch, lsn);
@@ -1078,7 +1079,7 @@ pub async fn shard_writer_task(writer: ShardWriter) {
                 continue;
             }
             Some(ShardWriteOperation::Reset { replid, responder }) => {
-                let _ = responder.send(replication::reset(&pool, &replid).await);
+                let _ = responder.send(replication::reset(&pool, &replid, &key_count).await);
                 continue;
             }
             Some(ShardWriteOperation::Barrier { responder }) => {
@@ -1470,7 +1471,7 @@ pub(crate) async fn process_batch(
                 let table_name = namespace_table(namespace);
 
                 // Ensure table exists
-                if let Err(e) = ensure_namespaced_table_exists_for_namespace(
+                if let Err(e) = ensure_namespaced_table_exists(
                     &mut tx,
                     namespace,
                     known_tables,
@@ -1482,6 +1483,7 @@ pub(crate) async fn process_batch(
                     Err(e)
                 } else {
                     let now = Utc::now().timestamp();
+                    let log_table = format!("blobs_{namespace}");
 
                     // Check if record exists to determine if this is an insert or update
                     let query = format!("SELECT 1 FROM {} WHERE key = ?", table_name);
@@ -1500,7 +1502,7 @@ pub(crate) async fn process_batch(
                                 .bind(key)
                                 .execute(&mut *tx)
                                 .await
-                                .map(|_| Some((Cow::Owned(table_name), key.as_str(), false)))
+                                .map(|_| Some((Cow::Owned(log_table), key.as_str(), false)))
                                 .map_err(|e| {
                                     tracing::error!(
                                         "[Shard {}] HSET UPDATE error for namespace {} key {}: {}",
@@ -1527,7 +1529,7 @@ pub(crate) async fn process_batch(
                                 .await
                                 .map(|res| {
                                     op_delta += res.rows_affected() as i64;
-                                    Some((Cow::Owned(table_name), key.as_str(), false))
+                                    Some((Cow::Owned(log_table), key.as_str(), false))
                                 })
                                 .map_err(|e| {
                                     tracing::error!(
@@ -1572,7 +1574,7 @@ pub(crate) async fn process_batch(
                 let table_name = namespace_table(namespace);
 
                 // Ensure table exists
-                if let Err(e) = ensure_namespaced_table_exists_for_namespace(
+                if let Err(e) = ensure_namespaced_table_exists(
                     &mut tx,
                     namespace,
                     known_tables,
@@ -1584,6 +1586,7 @@ pub(crate) async fn process_batch(
                     Err(e)
                 } else {
                     let now = Utc::now().timestamp();
+                    let log_table = format!("blobs_{namespace}");
 
                     // Check if record exists to determine if this is an insert or update
                     let query = format!("SELECT 1 FROM {} WHERE key = ?", table_name);
@@ -1601,7 +1604,7 @@ pub(crate) async fn process_batch(
                                 .bind(key)
                                 .execute(&mut *tx)
                                 .await
-                                .map(|_| Some((Cow::Owned(table_name), key.as_str(), false)))
+                                .map(|_| Some((Cow::Owned(log_table), key.as_str(), false)))
                                 .map_err(|e| {
                                     tracing::error!(
                                         "[Shard {}] HSETEX UPDATE error for namespace {} key {}: {}",
@@ -1629,7 +1632,7 @@ pub(crate) async fn process_batch(
                                 .await
                                 .map(|res| {
                                     op_delta += res.rows_affected() as i64;
-                                    Some((Cow::Owned(table_name), key.as_str(), false))
+                                    Some((Cow::Owned(log_table), key.as_str(), false))
                                 })
                                 .map_err(|e| {
                                     tracing::error!(
@@ -1671,7 +1674,7 @@ pub(crate) async fn process_batch(
                     Ok(res) => {
                         op_delta -= res.rows_affected() as i64;
                         Ok((res.rows_affected() > 0).then_some((
-                            Cow::Owned(table_name),
+                            Cow::Owned(format!("blobs_{namespace}")),
                             key.as_str(),
                             true,
                         )))
@@ -1738,7 +1741,7 @@ pub(crate) async fn process_batch(
                 hexpire_results.push((idx, result_code));
                 // TTL set: live; field deleted: tombstone; nothing changed: no entry.
                 operation_result.map(|()| {
-                    let table = Cow::Owned(namespace_table(namespace));
+                    let table = Cow::Owned(format!("blobs_{namespace}"));
                     match result_code {
                         1 => Some((table, key.as_str(), false)),
                         2 => Some((table, key.as_str(), true)),
@@ -2488,36 +2491,14 @@ pub(crate) async fn load_existing_tables(pool: &SqlitePool, shard_id: usize) -> 
 /// Ensures `namespace`'s table exists, creating it if necessary. A table it
 /// creates is added to `known_tables` and to `created`, so the caller can
 /// forget it again if the transaction or savepoint doesn't commit.
-async fn ensure_namespaced_table_exists_for_namespace(
+pub(crate) async fn ensure_namespaced_table_exists(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     namespace: &str,
     known_tables: &mut HashSet<String>,
     created: &mut Vec<String>,
 ) -> Result<(), String> {
     let table_name = namespace_table(namespace);
-    ensure_namespaced_table_inner(tx, &table_name, Some(namespace), known_tables, created).await
-}
-
-/// Ensures a namespaced table already identified by its SQLite `table_name`
-/// exists (used by replication apply). A table it creates is added to
-/// `known_tables` and `created` so the caller can forget it if the transaction
-/// doesn't commit.
-pub(crate) async fn ensure_namespaced_table_exists(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    table_name: &str,
-    known_tables: &mut HashSet<String>,
-    created: &mut Vec<String>,
-) -> Result<(), String> {
-    ensure_namespaced_table_inner(tx, table_name, None, known_tables, created).await
-}
-
-async fn ensure_namespaced_table_inner(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    table_name: &str,
-    namespace: Option<&str>,
-    known_tables: &mut HashSet<String>,
-    created: &mut Vec<String>,
-) -> Result<(), String> {
+    let table_name = table_name.as_str();
     if known_tables.contains(table_name) {
         return Ok(());
     }
@@ -2562,31 +2543,29 @@ async fn ensure_namespaced_table_inner(
             return Err(format!("Failed to create index: {}", e));
         }
 
-        if let Some(namespace) = namespace {
-            if let Err(e) = sqlx::query(CREATE_BLOB_NAMESPACES_TABLE)
-                .execute(&mut *sp)
-                .await
-            {
-                tracing::error!("Failed to ensure blob_namespaces table: {}", e);
-                return Err(format!("Failed to create blob_namespaces table: {}", e));
-            }
-
-            if let Err(e) = sqlx::query(
-                "INSERT OR IGNORE INTO blob_namespaces (namespace, table_name) VALUES (?, ?)",
-            )
-            .bind(namespace)
-            .bind(table_name)
+        if let Err(e) = sqlx::query(CREATE_BLOB_NAMESPACES_TABLE)
             .execute(&mut *sp)
             .await
-            {
-                tracing::error!(
-                    "Failed to record namespace {} -> {} in blob_namespaces: {}",
-                    namespace,
-                    table_name,
-                    e
-                );
-                return Err(format!("Failed to record namespace metadata: {}", e));
-            }
+        {
+            tracing::error!("Failed to ensure blob_namespaces table: {}", e);
+            return Err(format!("Failed to create blob_namespaces table: {}", e));
+        }
+
+        if let Err(e) = sqlx::query(
+            "INSERT OR IGNORE INTO blob_namespaces (namespace, table_name) VALUES (?, ?)",
+        )
+        .bind(namespace)
+        .bind(table_name)
+        .execute(&mut *sp)
+        .await
+        {
+            tracing::error!(
+                "Failed to record namespace {} -> {} in blob_namespaces: {}",
+                namespace,
+                table_name,
+                e
+            );
+            return Err(format!("Failed to record namespace metadata: {}", e));
         }
 
         Ok(())
@@ -2606,7 +2585,7 @@ async fn ensure_namespaced_table_inner(
             known_tables.insert(table_name.to_string());
             created.push(table_name.to_string());
             tracing::info!(
-                "Created namespaced table and expires_at index: {} (namespace: {:?})",
+                "Created namespaced table and expires_at index: {} (namespace: {})",
                 table_name,
                 namespace
             );
@@ -2692,8 +2671,12 @@ pub(crate) async fn delete_expired(
             }
             let keys = query.bind(now).fetch_all(&mut *tx).await?;
             if commit_watch.is_some() {
+                let log_table = match namespace {
+                    Some(ns) => Cow::Owned(format!("blobs_{ns}")),
+                    None => Cow::Borrowed(table),
+                };
                 for key in &keys {
-                    last_lsn = Some(log_change(&mut tx, table, key, true).await?);
+                    last_lsn = Some(log_change(&mut tx, &log_table, key, true).await?);
                 }
             }
             chunk_deleted += keys.len() as u64;
@@ -2974,6 +2957,7 @@ mod tests {
             &hcache,
             &ShardMetrics::new(0),
             &AtomicI64::new(0),
+            true,
         )
         .await;
 
@@ -3145,7 +3129,7 @@ mod tests {
             &cache,
             None,
             &key_count,
-            &watch::channel(0).0,
+            Some(&watch::channel(0).0),
             &CancellationToken::new(),
         )
         .await
@@ -3195,7 +3179,7 @@ mod tests {
             &hcache,
             Some("ns"),
             &ns_key_count,
-            &watch::channel(0).0,
+            Some(&watch::channel(0).0),
             &CancellationToken::new(),
         )
         .await
@@ -3520,6 +3504,7 @@ mod tests {
             &hcache,
             &shard_metrics,
             &key_count,
+            true,
         )
         .await;
 
@@ -3558,6 +3543,7 @@ mod tests {
             &hcache,
             &shard_metrics,
             &key_count,
+            true,
         )
         .await;
         assert!(!cache.contains_key("k"));
@@ -3929,6 +3915,7 @@ mod tests {
             metrics: Metrics::new(),
             key_count: Arc::new(AtomicI64::new(0)),
             commit_watch: Arc::new(watch::channel(0).0),
+            replication: true,
             shutdown: CancellationToken::new(),
         }));
 
@@ -3983,6 +3970,7 @@ mod tests {
             metrics: Metrics::new(),
             key_count: key_count.clone(),
             commit_watch: Arc::new(watch::channel(0).0),
+            replication: true,
             shutdown: CancellationToken::new(),
         }));
 
@@ -4031,6 +4019,7 @@ mod tests {
             metrics: Metrics::new(),
             key_count: Arc::new(AtomicI64::new(0)),
             commit_watch: Arc::new(watch::channel(0).0),
+            replication: true,
             shutdown,
         }));
         (sender, writer)
@@ -4180,6 +4169,7 @@ mod tests {
             inflight_cache: Cache::new(128),
             inflight_hcache: Cache::new(128),
             metrics: Metrics::new(),
+            key_count: Arc::new(AtomicI64::new(0)),
             commit_watch: Arc::new(watch::channel(0).0),
             replication: true,
             shutdown: CancellationToken::new(),
@@ -4190,6 +4180,7 @@ mod tests {
                     key: format!("key-{i}"),
                     data: Bytes::from_static(b"v"),
                     expires_at: None,
+                    token: next_pending_token(),
                 })
                 .await
                 .unwrap();
@@ -4908,6 +4899,7 @@ mod tests {
             &Cache::new(16),
             &ShardMetrics::new(0),
             &key_count,
+            true,
         )
         .await;
 
@@ -4996,6 +4988,7 @@ mod tests {
                     metrics: Metrics::new(),
                     key_count: Arc::new(AtomicI64::new(0)),
                     commit_watch: Arc::new(watch::channel(0).0),
+                    replication: true,
                     shutdown,
                 }));
 
@@ -5105,6 +5098,7 @@ mod tests {
                     metrics: Metrics::new(),
                     key_count: Arc::new(AtomicI64::new(0)),
                     commit_watch: Arc::new(watch::channel(0).0),
+                    replication: true,
                     shutdown,
                 }));
 
@@ -5340,6 +5334,7 @@ mod tests {
             &hcache,
             &shard_metrics,
             &key_count,
+            true,
         )
         .await;
         // Remaining rows: blobs(a), blobs_ns(f1, f3) => 3
@@ -5373,6 +5368,7 @@ mod tests {
             &hcache,
             &shard_metrics,
             &key_count,
+            true,
         )
         .await;
         assert_eq!(rx1.await.unwrap(), Ok(1));
@@ -5489,6 +5485,7 @@ mod tests {
             &hcache,
             &shard_metrics,
             &key_count,
+            true,
         )
         .await;
 
@@ -5571,6 +5568,7 @@ mod tests {
             &hcache,
             &shard_metrics,
             &key_count,
+            true,
         )
         .await;
         assert_eq!(rx_next_set.await.unwrap(), Ok(()));
@@ -5660,6 +5658,7 @@ mod tests {
             &hcache,
             &shard_metrics,
             &key_count,
+            true,
         )
         .await;
         assert!(rx_bad.await.unwrap().is_err());
@@ -5703,6 +5702,7 @@ mod tests {
             &hcache,
             &shard_metrics,
             &key_count,
+            true,
         )
         .await;
         assert_eq!(rx_ok.await.unwrap(), Ok(()));
@@ -5840,7 +5840,6 @@ mod tests {
     async fn writes_keep_one_log_row_per_key_with_increasing_lsns() {
         let (_dir, pool) = create_test_pool().await;
         let known = &mut blobs_only();
-        let ns_table = namespace_table("ns");
 
         let first = run_batch(
             &pool,
@@ -5854,7 +5853,7 @@ mod tests {
             lsn_of(&pool, "blobs", "b").await.unwrap(),
         );
         assert!(b < a, "a was rewritten after b");
-        assert_eq!(first as i64, lsn_of(&pool, &ns_table, "f").await.unwrap());
+        assert_eq!(first as i64, lsn_of(&pool, "blobs_ns", "f").await.unwrap());
 
         let second = run_batch(&pool, known, vec![set("b").0]).await.unwrap();
         assert!(second > first);
@@ -5867,7 +5866,6 @@ mod tests {
     async fn deletes_log_a_tombstone_only_when_a_row_was_deleted() {
         let (_dir, pool) = create_test_pool().await;
         let known = &mut blobs_only();
-        let ns_table = namespace_table("ns");
         run_batch(&pool, known, vec![set("a").0, hset("ns", "f").0]).await;
 
         run_batch(
@@ -5884,14 +5882,14 @@ mod tests {
         .await;
         assert_eq!(
             repl_log(&pool).await,
-            vec![row("blobs", "a", true), row(&ns_table, "f", true)]
+            vec![row("blobs", "a", true), row("blobs_ns", "f", true)]
         );
 
         // A tombstone is replaced by a live row when the key comes back.
         run_batch(&pool, known, vec![set("a").0]).await;
         assert_eq!(
             repl_log(&pool).await,
-            vec![row(&ns_table, "f", true), row("blobs", "a", false)]
+            vec![row("blobs_ns", "f", true), row("blobs", "a", false)]
         );
     }
 
@@ -5924,10 +5922,9 @@ mod tests {
     async fn hexpire_results_map_to_log_entries() {
         let (_dir, pool) = create_test_pool().await;
         let known = &mut blobs_only();
-        let ns_table = namespace_table("ns");
         let far = 4_000_000_000;
         run_batch(&pool, known, vec![hset("ns", "f").0]).await;
-        let mut lsn = lsn_of(&pool, &ns_table, "f").await.unwrap();
+        let mut lsn = lsn_of(&pool, "blobs_ns", "f").await.unwrap();
 
         // (op, expected result, whether the log changes)
         let steps = [
@@ -5942,8 +5939,8 @@ mod tests {
             match logged {
                 Some(deleted) => {
                     assert!(committed.unwrap() as i64 > lsn);
-                    lsn = lsn_of(&pool, &ns_table, "f").await.unwrap();
-                    assert_eq!(repl_log(&pool).await, vec![row(&ns_table, "f", deleted)]);
+                    lsn = lsn_of(&pool, "blobs_ns", "f").await.unwrap();
+                    assert_eq!(repl_log(&pool).await, vec![row("blobs_ns", "f", deleted)]);
                 }
                 None => assert_eq!(committed, None, "result {code} must not log"),
             }
@@ -5982,11 +5979,11 @@ mod tests {
         assert_eq!(keys(&pool, &ns1_table).await, vec!["next"]);
         assert_eq!(
             repl_log(&pool).await,
-            vec![row("blobs", "good", false), row(&ns1_table, "next", false)]
+            vec![row("blobs", "good", false), row("blobs_ns1", "next", false)]
         );
         assert_eq!(
             committed.unwrap() as i64,
-            lsn_of(&pool, &ns1_table, "next").await.unwrap()
+            lsn_of(&pool, "blobs_ns1", "next").await.unwrap()
         );
         assert!(known.contains(&ns1_table));
     }
@@ -6056,13 +6053,12 @@ mod tests {
         assert_eq!(run_batch(&pool, known, vec![op]).await, None);
         assert!(rx.await.unwrap().is_err());
         assert_eq!(*known, blobs_only());
-        let tables: Vec<String> = sqlx::query_scalar(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
-        )
-        .bind(&ns1_table)
-        .fetch_all(&pool)
-        .await
-        .unwrap();
+        let tables: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
+                .bind(&ns1_table)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
         assert!(tables.is_empty());
     }
 
@@ -6140,7 +6136,7 @@ mod tests {
         let known = &mut blobs_only();
         let ns_table = namespace_table("ns");
         run_batch(&pool, known, vec![set("live").0, hset("ns", "old").0]).await;
-        for table in ["blobs", ns_table.as_str()] {
+        for (table, log_table) in [("blobs", "blobs"), (ns_table.as_str(), "blobs_ns")] {
             for key in ["old1", "old2", "old3"] {
                 sqlx::query(&format!(
                     "INSERT INTO {table} (key, data, created_at, updated_at, expires_at)
@@ -6153,7 +6149,7 @@ mod tests {
                 sqlx::query(
                     "INSERT OR REPLACE INTO repl_log (tbl, key, deleted, at) VALUES (?, ?, 0, 0)",
                 )
-                .bind(table)
+                .bind(log_table)
                 .bind(key)
                 .execute(&pool)
                 .await
@@ -6208,16 +6204,16 @@ mod tests {
         )
         .await;
         assert_eq!(deleted.unwrap(), 3);
-        assert!(lsn_of(&pool, &ns_table, "old1").await.is_some());
+        assert!(lsn_of(&pool, "blobs_ns", "old1").await.is_some());
         assert!(
             repl_log(&pool)
                 .await
-                .contains(&row(&ns_table, "old3", true))
+                .contains(&row("blobs_ns", "old3", true))
         );
         assert!(
             repl_log(&pool)
                 .await
-                .contains(&row(&ns_table, "old", false))
+                .contains(&row("blobs_ns", "old", false))
         );
     }
 

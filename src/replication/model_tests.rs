@@ -56,8 +56,8 @@
 use super::*;
 use crate::app_state::{CREATE_BLOBS_TABLE, CREATE_REPL_LOG, CREATE_REPL_STATE};
 use crate::shard_manager::{
-    Pending, ShardSender, delete_expired, load_existing_tables, next_delete_token, process_batch,
-    queue_pending,
+    NAMESPACED_TABLES_QUERY, Pending, ShardSender, delete_expired, load_existing_tables,
+    next_pending_token, process_batch, queue_pending,
 };
 use metrics::Counter;
 use moka::future::Cache;
@@ -194,7 +194,18 @@ type Queued = (bool, String, Pending);
 
 fn same(a: &Pending, b: &Pending) -> bool {
     match (a, b) {
-        (Pending::Value(a), Pending::Value(b)) => a == b,
+        (
+            Pending::Value {
+                data: da,
+                expires_at: ea,
+                token: ta,
+            },
+            Pending::Value {
+                data: db,
+                expires_at: eb,
+                token: tb,
+            },
+        ) => da == db && ea == eb && ta == tb,
         (Pending::Deleted(a), Pending::Deleted(b)) => a == b,
         _ => false,
     }
@@ -216,6 +227,8 @@ struct Sim {
     replica_known: HashSet<String>,
     primary_commits: watch::Sender<u64>,
     replica_commits: watch::Sender<u64>,
+    primary_key_count: AtomicI64,
+    replica_key_count: AtomicI64,
     /// The primary's inflight caches and write queue, which async writes go through.
     inflight_cache: Cache<String, Pending>,
     inflight_hcache: Cache<String, Pending>,
@@ -245,7 +258,12 @@ async fn open(dir: &TempDir, name: &str) -> (SqliteConnectOptions, SqlitePool) {
         .connect_with(options.clone())
         .await
         .unwrap();
-    for ddl in [CREATE_BLOBS_TABLE, CREATE_REPL_LOG, CREATE_REPL_STATE] {
+    for ddl in [
+        CREATE_BLOBS_TABLE,
+        crate::shard_manager::CREATE_BLOB_NAMESPACES_TABLE,
+        CREATE_REPL_LOG,
+        CREATE_REPL_STATE,
+    ] {
         sqlx::query(ddl).execute(&pool).await.unwrap();
     }
     (options, pool)
@@ -254,12 +272,10 @@ async fn open(dir: &TempDir, name: &str) -> (SqliteConnectOptions, SqlitePool) {
 async fn tables(pool: &SqlitePool) -> Vec<String> {
     let mut tables = vec!["blobs".to_string()];
     tables.extend(
-        sqlx::query_scalar::<_, String>(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'blobs_%'",
-        )
-        .fetch_all(pool)
-        .await
-        .unwrap(),
+        sqlx::query_scalar::<_, String>(NAMESPACED_TABLES_QUERY)
+            .fetch_all(pool)
+            .await
+            .unwrap(),
     );
     tables
 }
@@ -319,6 +335,8 @@ impl Sim {
             replica_known: HashSet::from(["blobs".to_string()]),
             primary_commits: watch::channel(0).0,
             replica_commits: watch::channel(0).0,
+            primary_key_count: AtomicI64::new(0),
+            replica_key_count: AtomicI64::new(0),
             // Big enough that nothing is evicted: the checks need every entry.
             inflight_cache: Cache::new(1024),
             inflight_hcache: Cache::new(1024),
@@ -337,7 +355,13 @@ impl Sim {
         match action {
             Action::Write(ops) => self.write(ops).await?,
             Action::Cleanup => {
-                cleanup(&self.primary, PRIMARY_NOW, &self.primary_commits).await;
+                cleanup(
+                    &self.primary,
+                    PRIMARY_NOW,
+                    &self.primary_key_count,
+                    &self.primary_commits,
+                )
+                .await;
             }
             Action::Trim { age } => {
                 if *age {
@@ -373,7 +397,13 @@ impl Sim {
                     .unwrap();
             }
             Action::ReplicaCleanup => {
-                cleanup(&self.replica, REPLICA_NOW, &self.replica_commits).await;
+                cleanup(
+                    &self.replica,
+                    REPLICA_NOW,
+                    &self.replica_key_count,
+                    &self.replica_commits,
+                )
+                .await;
             }
         }
         self.check().await
@@ -431,6 +461,7 @@ impl Sim {
                 },
                 Write::HSet(n, f) => ShardWriteOperation::HSet {
                     namespace: name("n", *n),
+                    keep_ttl: false,
                     key: name("f", *f),
                     data,
                     responder,
@@ -443,6 +474,7 @@ impl Sim {
                 Write::Expire(k, ttl) => ShardWriteOperation::Expire {
                     key: name("k", *k),
                     expires_at: ttl.at(),
+                    token: None,
                     responder: result,
                 },
                 Write::HExpire(n, f, ttl) => ShardWriteOperation::HExpire {
@@ -454,17 +486,24 @@ impl Sim {
                 },
                 Write::SetAsync(k, ttl) => {
                     let key = name("k", *k);
+                    let expires_at = ttl.map(Ttl::at);
+                    let token = next_pending_token();
                     let op = ShardWriteOperation::SetAsync {
                         key: key.clone(),
                         data: data.clone(),
-                        expires_at: ttl.map(Ttl::at),
+                        expires_at,
+                        token,
                     };
-                    let pending = Pending::Value(data);
+                    let pending = Pending::Value {
+                        data,
+                        expires_at,
+                        token,
+                    };
                     self.queue_async(false, key, pending, op, &mut queued).await
                 }
                 Write::DelAsync(k) => {
                     let key = name("k", *k);
-                    let token = next_delete_token();
+                    let token = next_pending_token();
                     let op = ShardWriteOperation::DeleteAsync {
                         key: key.clone(),
                         token,
@@ -475,32 +514,46 @@ impl Sim {
                 Write::HSetAsync(n, f) => {
                     let (namespace, key) = (name("n", *n), name("f", *f));
                     let cache_key = format!("{namespace}:{key}");
+                    let token = next_pending_token();
                     let op = ShardWriteOperation::HSetAsync {
                         namespace,
+                        keep_ttl: false,
                         key,
                         data: data.clone(),
+                        token,
                     };
-                    let pending = Pending::Value(data);
+                    let pending = Pending::Value {
+                        data,
+                        expires_at: None,
+                        token,
+                    };
                     self.queue_async(true, cache_key, pending, op, &mut queued)
                         .await
                 }
                 Write::HSetExAsync(n, f, ttl) => {
                     let (namespace, key) = (name("n", *n), name("f", *f));
                     let cache_key = format!("{namespace}:{key}");
+                    let expires_at = ttl.at();
+                    let token = next_pending_token();
                     let op = ShardWriteOperation::HSetExAsync {
                         namespace,
                         key,
                         data: data.clone(),
-                        expires_at: ttl.at(),
+                        expires_at,
+                        token,
                     };
-                    let pending = Pending::Value(data);
+                    let pending = Pending::Value {
+                        data,
+                        expires_at: Some(expires_at),
+                        token,
+                    };
                     self.queue_async(true, cache_key, pending, op, &mut queued)
                         .await
                 }
                 Write::HDelAsync(n, f) => {
                     let (namespace, key) = (name("n", *n), name("f", *f));
                     let cache_key = format!("{namespace}:{key}");
-                    let token = next_delete_token();
+                    let token = next_pending_token();
                     let op = ShardWriteOperation::HDeleteAsync {
                         namespace,
                         key,
@@ -535,6 +588,7 @@ impl Sim {
             &self.inflight_cache,
             &self.inflight_hcache,
             &ShardMetrics::new(0),
+            &self.primary_key_count,
             true,
         )
         .await;
@@ -588,7 +642,9 @@ impl Sim {
             }
             drop(pins);
             // RESYNC: reset to the primary's history and connect again from 0.
-            reset(&self.replica, &primary_replid).await.unwrap();
+            reset(&self.replica, &primary_replid, &self.replica_key_count)
+                .await
+                .unwrap();
             self.reset_pending = true;
         }
     }
@@ -649,7 +705,14 @@ impl Sim {
         if group.is_empty() {
             return Ok(false);
         }
-        if let Err(e) = apply(&self.replica, &mut self.replica_known, &group).await {
+        if let Err(e) = apply(
+            &self.replica,
+            &mut self.replica_known,
+            &group,
+            &self.replica_key_count,
+        )
+        .await
+        {
             return Err(format!("apply failed: {e}"));
         }
         let Some(Frame::Watermark { watermark, .. }) = group.last() else {
@@ -736,14 +799,30 @@ impl Sim {
 }
 
 /// The cleanup task's per-table loop, at the node's clock `now`.
-async fn cleanup(pool: &SqlitePool, now: i64, commits: &watch::Sender<u64>) {
+async fn cleanup(pool: &SqlitePool, now: i64, key_count: &AtomicI64, commits: &watch::Sender<u64>) {
+    let empty_cache: Cache<String, Pending> = Cache::builder().build();
+    let ns_map: std::collections::HashMap<String, String> =
+        sqlx::query_as::<_, (String, String)>("SELECT table_name, namespace FROM blob_namespaces")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
     for table in tables(pool).await {
+        let namespace = if table == "blobs" {
+            None
+        } else {
+            ns_map.get(&table).map(String::as_str)
+        };
         delete_expired(
             pool,
             &table,
             now,
             CLEANUP_CHUNK,
             &Counter::noop(),
+            &empty_cache,
+            namespace,
+            key_count,
             Some(commits),
             &CancellationToken::new(),
         )

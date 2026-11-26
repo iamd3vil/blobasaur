@@ -7,18 +7,23 @@
 use crate::app_state::AppState;
 use crate::metrics::ShardMetrics;
 use crate::redis::serialize_frame;
-use crate::shard_manager::{ShardWriteOperation, ensure_namespaced_table_exists, log_change};
+use crate::shard_manager::{
+    NAMESPACED_TABLES_QUERY, ShardWriteOperation, ensure_namespaced_table_exists, is_missing_table,
+    log_change, namespace_table,
+};
 use bytes::{Bytes, BytesMut};
 use chrono::Utc;
 use miette::{Result, miette};
 use redis_protocol::resp2::{decode::decode_bytes_mut, encode::extend_encode, types::BytesFrame};
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Connection, Sqlite, SqliteConnection, SqlitePool, Transaction};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, RandomState};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -135,21 +140,36 @@ pub async fn init_shard(
             .execute(&mut *tx)
             .await
             .map_err(|e| miette!("failed to clear trimmed_through: {}", e))?;
+        let ns_map: HashMap<String, String> = sqlx::query_as::<_, (String, String)>(
+            "SELECT table_name, namespace FROM blob_namespaces",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(table, ns)| (table.to_ascii_lowercase(), ns))
+        .collect();
         let mut tables = vec!["blobs".to_string()];
         tables.extend(
-            sqlx::query_scalar::<_, String>(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'blobs_%'",
-            )
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|e| miette!("failed to list tables for backfill: {}", e))?,
+            sqlx::query_scalar::<_, String>(NAMESPACED_TABLES_QUERY)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| miette!("failed to list tables for backfill: {}", e))?,
         );
         for table in tables {
+            let log_tbl = if table == "blobs" {
+                "blobs".to_string()
+            } else {
+                ns_map
+                    .get(&table.to_ascii_lowercase())
+                    .map(|ns| format!("blobs_{ns}"))
+                    .unwrap_or_else(|| table.clone())
+            };
             sqlx::query(&format!(
                 "INSERT OR IGNORE INTO repl_log (tbl, key, deleted, at)
                  SELECT ?, key, 0, ? FROM {table}"
             ))
-            .bind(&table)
+            .bind(&log_tbl)
             .bind(Utc::now().timestamp())
             .execute(&mut *tx)
             .await
@@ -493,7 +513,7 @@ async fn watermark(conn: &mut SqliteConnection) -> Result<i64, sqlx::Error> {
     Ok(seq.unwrap_or(0))
 }
 
-/// `tbl` goes into SQL text, so accept only the names the writer itself creates.
+/// `tbl` is the logical table name (`"blobs"` or `"blobs_<namespace>"`).
 fn check_table(tbl: &str) -> Result<(), String> {
     let valid = tbl == "blobs"
         || tbl.strip_prefix("blobs_").is_some_and(|ns| {
@@ -504,15 +524,26 @@ fn check_table(tbl: &str) -> Result<(), String> {
         .ok_or_else(|| format!("invalid table {tbl:?}"))
 }
 
+/// Resolves a logical replication table name (`"blobs"` or `"blobs_<namespace>"`)
+/// to its physical SQLite table name and optional hash namespace.
+fn resolve_table(tbl: &str) -> Result<(Cow<'_, str>, Option<&str>), String> {
+    check_table(tbl)?;
+    match tbl.strip_prefix("blobs_") {
+        Some(ns) => Ok((Cow::Owned(namespace_table(ns)), Some(ns))),
+        None => Ok((Cow::Borrowed("blobs"), None)),
+    }
+}
+
 /// Replica: applies `frames` in one transaction, all or nothing. Returns the
 /// replica's highest own LSN written, if any.
 pub(crate) async fn apply(
     pool: &SqlitePool,
     known_tables: &mut HashSet<String>,
     frames: &[Frame],
+    key_count: &AtomicI64,
 ) -> Result<Option<u64>, String> {
     let mut added = Vec::new();
-    let result = apply_frames(pool, known_tables, &mut added, frames).await;
+    let result = apply_frames(pool, known_tables, &mut added, frames, key_count).await;
     if result.is_err() {
         for table in added {
             known_tables.remove(&table);
@@ -526,6 +557,7 @@ async fn apply_frames(
     known_tables: &mut HashSet<String>,
     added: &mut Vec<String>,
     frames: &[Frame],
+    key_count: &AtomicI64,
 ) -> Result<Option<u64>, String> {
     let sql = |e: sqlx::Error| e.to_string();
     let state = |e: miette::Report| e.to_string();
@@ -533,6 +565,7 @@ async fn apply_frames(
     let mut last_log = None;
     let mut applied = None;
     let mut caught_up = None;
+    let mut delta: i64 = 0;
     for frame in frames {
         match frame {
             Frame::Row {
@@ -545,10 +578,18 @@ async fn apply_frames(
                 version,
                 data,
             } => {
-                check_table(tbl)?;
-                ensure_namespaced_table_exists(&mut tx, tbl, known_tables, added).await?;
+                let (physical, ns) = resolve_table(tbl)?;
+                if let Some(ns) = ns {
+                    ensure_namespaced_table_exists(&mut tx, ns, known_tables, added).await?;
+                }
+                let existed = sqlx::query(&format!("SELECT 1 FROM {physical} WHERE key = ?"))
+                    .bind(key)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(sql)?
+                    .is_some();
                 sqlx::query(&format!(
-                    "INSERT OR REPLACE INTO {tbl}
+                    "INSERT OR REPLACE INTO {physical}
                      (key, data, created_at, updated_at, expires_at, version)
                      VALUES (?, ?, ?, ?, ?, ?)"
                 ))
@@ -561,17 +602,23 @@ async fn apply_frames(
                 .execute(&mut *tx)
                 .await
                 .map_err(sql)?;
+                if !existed {
+                    delta += 1;
+                }
                 last_log = Some(log_change(&mut tx, tbl, key, false).await.map_err(sql)?);
                 applied = Some(*lsn);
             }
             Frame::Delete { lsn, tbl, key } => {
-                check_table(tbl)?;
-                ensure_namespaced_table_exists(&mut tx, tbl, known_tables, added).await?;
-                sqlx::query(&format!("DELETE FROM {tbl} WHERE key = ?"))
+                let (physical, ns) = resolve_table(tbl)?;
+                if let Some(ns) = ns {
+                    ensure_namespaced_table_exists(&mut tx, ns, known_tables, added).await?;
+                }
+                let res = sqlx::query(&format!("DELETE FROM {physical} WHERE key = ?"))
                     .bind(key)
                     .execute(&mut *tx)
                     .await
                     .map_err(sql)?;
+                delta -= res.rows_affected() as i64;
                 last_log = Some(log_change(&mut tx, tbl, key, true).await.map_err(sql)?);
                 applied = Some(*lsn);
             }
@@ -593,23 +640,28 @@ async fn apply_frames(
         }
     }
     tx.commit().await.map_err(sql)?;
+    if delta != 0 {
+        key_count.fetch_add(delta, Ordering::Relaxed);
+    }
     Ok(last_log.map(|lsn| lsn as u64))
 }
 
 /// Replica: empties the shard and its change index and adopts `replid`, the
 /// replication history of the primary it is about to copy.
-pub(crate) async fn reset(pool: &SqlitePool, replid: &str) -> Result<(), String> {
+pub(crate) async fn reset(
+    pool: &SqlitePool,
+    replid: &str,
+    key_count: &AtomicI64,
+) -> Result<(), String> {
     let sql = |e: sqlx::Error| e.to_string();
     let state = |e: miette::Report| e.to_string();
     let mut tx = pool.begin().await.map_err(sql)?;
     let mut tables = vec!["blobs".to_string()];
     tables.extend(
-        sqlx::query_scalar::<_, String>(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'blobs_%'",
-        )
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(sql)?,
+        sqlx::query_scalar::<_, String>(NAMESPACED_TABLES_QUERY)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(sql)?,
     );
     for table in tables {
         sqlx::query(&format!("DELETE FROM {table}"))
@@ -628,7 +680,9 @@ pub(crate) async fn reset(pool: &SqlitePool, replid: &str) -> Result<(), String>
     for (k, v) in [("applied_lsn", "0"), ("replid", replid), ("synced", "0")] {
         set_state(&mut tx, k, v).await.map_err(state)?;
     }
-    tx.commit().await.map_err(sql)
+    tx.commit().await.map_err(sql)?;
+    key_count.store(0, Ordering::Relaxed);
+    Ok(())
 }
 
 /// What a replica asks for in `BLOBASAUR.SYNC`.
@@ -890,14 +944,17 @@ async fn current_row(
     tbl: &str,
     key: &str,
 ) -> Result<Option<RowImage>, sqlx::Error> {
+    let Ok((physical, _)) = resolve_table(tbl) else {
+        return Ok(None);
+    };
     let row = sqlx::query_as(&format!(
-        "SELECT created_at, updated_at, expires_at, version, data FROM {tbl} WHERE key = ?"
+        "SELECT created_at, updated_at, expires_at, version, data FROM {physical} WHERE key = ?"
     ))
     .bind(key)
     .fetch_optional(&mut **tx)
     .await;
     match row {
-        Err(e) if crate::server::is_missing_table(&e) => Ok(None),
+        Err(e) if is_missing_table(&e, &physical) => Ok(None),
         row => row,
     }
 }
@@ -1255,7 +1312,12 @@ mod tests {
             .filename(dir.path().join("shard_0.db"))
             .create_if_missing(true);
         let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
-        for ddl in [CREATE_BLOBS_TABLE, CREATE_REPL_LOG, CREATE_REPL_STATE] {
+        for ddl in [
+            CREATE_BLOBS_TABLE,
+            crate::shard_manager::CREATE_BLOB_NAMESPACES_TABLE,
+            CREATE_REPL_LOG,
+            CREATE_REPL_STATE,
+        ] {
             sqlx::query(ddl).execute(&mut conn).await.unwrap();
         }
         (options, conn)
@@ -1575,19 +1637,22 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let pool = replica_pool(&dir).await;
         let mut known = HashSet::from(["blobs".to_string()]);
+        let key_count = AtomicI64::new(0);
 
+        let ns_table = namespace_table("ns");
         // The last frame fails after earlier ones wrote and created a table.
         let frames = [
             row(5, "blobs_ns", "a"),
             row(6, "blobs", "b"),
             row(7, "blobs; DROP TABLE blobs", "c"),
         ];
-        assert!(apply(&pool, &mut known, &frames).await.is_err());
+        assert!(apply(&pool, &mut known, &frames, &key_count).await.is_err());
+        assert_eq!(key_count.load(Ordering::Relaxed), 0);
         assert_eq!(known, HashSet::from(["blobs".to_string()]));
         assert_eq!(count(&pool, "blobs").await, 0);
         assert_eq!(count(&pool, "repl_log").await, 0);
         assert_eq!(
-            count(&pool, "sqlite_master WHERE name = 'blobs_ns'").await,
+            count(&pool, &format!("sqlite_master WHERE name = '{ns_table}'")).await,
             0
         );
         assert_eq!(pool_state(&pool, "applied_lsn").await, None);
@@ -1607,15 +1672,25 @@ mod tests {
             },
         ];
         // The replica's own LSNs: three entries, the last for the delete.
-        assert_eq!(apply(&pool, &mut known, &frames).await.unwrap(), Some(3));
-        assert!(known.contains("blobs_ns"));
-        let stored: (i64, i64, Option<i64>, i64) = sqlx::query_as(
-            "SELECT created_at, updated_at, expires_at, version FROM blobs_ns WHERE key = 'a'",
-        )
+        assert_eq!(
+            apply(&pool, &mut known, &frames, &key_count).await.unwrap(),
+            Some(3)
+        );
+        assert_eq!(key_count.load(Ordering::Relaxed), 1);
+        assert!(known.contains(&ns_table));
+        let stored: (i64, i64, Option<i64>, i64) = sqlx::query_as(&format!(
+            "SELECT created_at, updated_at, expires_at, version FROM {ns_table} WHERE key = 'a'"
+        ))
         .fetch_one(&pool)
         .await
         .unwrap();
         assert_eq!(stored, (10, 20, Some(30), 4));
+        let mapped: Vec<(String, String)> =
+            sqlx::query_as("SELECT namespace, table_name FROM blob_namespaces")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(mapped, vec![("ns".to_string(), ns_table.clone())]);
         assert_eq!(count(&pool, "blobs").await, 0);
         let log: Vec<(String, String, bool)> =
             sqlx::query_as("SELECT tbl, key, deleted FROM repl_log ORDER BY lsn")
@@ -1639,8 +1714,9 @@ mod tests {
         }
 
         // A reset empties it all and adopts the new replid, not synced.
-        reset(&pool, "new-history").await.unwrap();
-        assert_eq!(count(&pool, "blobs_ns").await, 0);
+        reset(&pool, "new-history", &key_count).await.unwrap();
+        assert_eq!(key_count.load(Ordering::Relaxed), 0);
+        assert_eq!(count(&pool, &ns_table).await, 0);
         assert_eq!(count(&pool, "repl_log").await, 0);
         for (k, v) in [
             ("applied_lsn", Some("0")),
@@ -1769,6 +1845,7 @@ mod tests {
             async_write: None,
             batch_size: Some(1),
             batch_timeout_ms: Some(0),
+            write_queue_capacity: None,
             addr: None,
             replication: None,
             cluster: None,
@@ -1798,6 +1875,7 @@ mod tests {
             inflight_cache: state.inflight_cache.clone(),
             inflight_hcache: state.inflight_hcache.clone(),
             metrics: Metrics::new(),
+            key_count: state.shard_key_counts[0].clone(),
             commit_watch: state.commit_watch[0].clone(),
             replication: true,
             shutdown: shutdown.clone(),

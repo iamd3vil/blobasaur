@@ -641,7 +641,11 @@ struct Target {
 impl Target {
     fn ident(&self) -> String {
         match self.ns {
-            Some(ns) => format!("blobs_{ns}/{}", self.name),
+            Some(ns) => format!(
+                "{}/{}",
+                blobasaur::shard_manager::namespace_table(ns),
+                self.name
+            ),
             None => format!("blobs/{}", self.name),
         }
     }
@@ -1056,7 +1060,11 @@ async fn assert_cursor_matches_rows(primary: &Path, replica: &Path) {
                 .await
                 .unwrap();
         for (tbl, key, lsn) in logged {
-            let sql = format!("SELECT data, expires_at FROM {tbl} WHERE key = ?");
+            let physical = match tbl.strip_prefix("blobs_") {
+                Some(ns) => blobasaur::shard_manager::namespace_table(ns),
+                None => tbl.clone(),
+            };
+            let sql = format!("SELECT data, expires_at FROM {physical} WHERE key = ?");
             let on_primary: Option<Row> = sqlx::query_as(&sql)
                 .bind(&key)
                 .fetch_optional(&mut *snapshot)

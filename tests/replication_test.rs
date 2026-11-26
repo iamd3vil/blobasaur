@@ -119,6 +119,7 @@ fn cfg(dir: &Path, o: &Opts, addr: SocketAddr, gossip_port: u16) -> Cfg {
         async_write: Some(o.async_write),
         batch_size: None,
         batch_timeout_ms: None,
+        write_queue_capacity: None,
         addr: Some(addr.to_string()),
         cluster: Some(ClusterConfig {
             enabled: true,
@@ -467,11 +468,16 @@ async fn replica_converges_with_primary() {
         converged(pdir.path(), rdir.path(), SHARDS)
     })
     .await;
+    let ns_table = blobasaur::shard_manager::namespace_table("ns");
+    let other_table = blobasaur::shard_manager::namespace_table("other");
     let rows = snapshot(rdir.path(), SHARDS).await;
-    assert!(rows.iter().any(|r| r.contains(&format!("/blobs_ns/{f2}/"))));
     assert!(
         rows.iter()
-            .any(|r| r.contains(&format!("/blobs_other/{f1}/")))
+            .any(|r| r.contains(&format!("/{ns_table}/{f2}/")))
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.contains(&format!("/{other_table}/{f1}/")))
     );
     assert!(
         rows.iter()
@@ -480,7 +486,7 @@ async fn replica_converges_with_primary() {
     assert!(
         !rows
             .iter()
-            .any(|r| r.contains(&format!("/{gone}/")) || r.contains(&format!("/blobs_ns/{f3}/")))
+            .any(|r| r.contains(&format!("/{gone}/")) || r.contains(&format!("/{ns_table}/{f3}/")))
     );
     assert!(
         rows.iter()
