@@ -119,6 +119,42 @@ func TestTTL(t *testing.T) {
 	})
 }
 
+// go-redis sends SetNX without a TTL as the SETNX command, which blobasaur
+// doesn't have, so these use SetArgs for that case.
+func TestSetOptions(t *testing.T) {
+	forEachProtocol(t, func(t *testing.T, rdb *redis.Client, p string) {
+		nx, xx := redis.SetArgs{Mode: "NX"}, redis.SetArgs{Mode: "XX"}
+		expect(t, "SET NX new", rdb.SetArgs(ctx, p+"k", "v", nx), "OK")
+		checkNil(t, "SET NX existing", rdb.SetArgs(ctx, p+"k", "v2", nx).Err())
+		expect(t, "GET after SET NX", rdb.Get(ctx, p+"k"), "v")
+
+		checkNil(t, "SET XX missing", rdb.SetArgs(ctx, p+"missing", "v", xx).Err())
+		expect(t, "EXISTS after SET XX", rdb.Exists(ctx, p+"missing"), int64(0))
+		expect(t, "SetXX existing", rdb.SetXX(ctx, p+"k", "v3", 0), true)
+		expect(t, "GET after SetXX", rdb.Get(ctx, p+"k"), "v3")
+
+		expect(t, "SetArgs GET", rdb.SetArgs(ctx, p+"k", "v4", redis.SetArgs{Get: true}), "v3")
+		checkNil(t, "SetArgs GET missing", rdb.SetArgs(ctx, p+"new", "v", redis.SetArgs{Get: true}).Err())
+		expect(t, "GET after SetArgs GET", rdb.Get(ctx, p+"new"), "v")
+		expect(t, "SetArgs NX GET existing",
+			rdb.SetArgs(ctx, p+"k", "v5", redis.SetArgs{Mode: "NX", Get: true}), "v4")
+		expect(t, "GET after NX GET", rdb.Get(ctx, p+"k"), "v4")
+
+		// A lock: SetNX with a TTL sends SET ... EX 30 NX.
+		expect(t, "SetNX lock", rdb.SetNX(ctx, p+"lock", "a", 30*time.Second), true)
+		expect(t, "SetNX lock held", rdb.SetNX(ctx, p+"lock", "b", 30*time.Second), false)
+		expect(t, "GET lock", rdb.Get(ctx, p+"lock"), "a")
+		waitFor(t, "TTL of lock", func() bool {
+			ttl := rdb.TTL(ctx, p+"lock").Val()
+			return ttl > 25*time.Second && ttl <= 30*time.Second
+		})
+
+		if err := rdb.Do(ctx, "SET", p+"k", "v", "NX", "XX").Err(); err == nil {
+			t.Fatal("SET NX XX should be rejected")
+		}
+	})
+}
+
 func TestHashes(t *testing.T) {
 	forEachProtocol(t, func(t *testing.T, rdb *redis.Client, p string) {
 		ns := namespace(p)
@@ -210,8 +246,8 @@ func TestCommandErrorsKeepConnection(t *testing.T) {
 		if err := rdb.Do(ctx, "NOSUCHCMD", "x").Err(); err == nil {
 			t.Fatal("unknown command should fail")
 		}
-		if err := rdb.Do(ctx, "SET", p+"k", "v", "NX").Err(); err == nil {
-			t.Fatal("unsupported SET option should fail")
+		if err := rdb.Do(ctx, "SET", p+"k", "v", "FOO").Err(); err == nil {
+			t.Fatal("unknown SET option should fail")
 		}
 		expect(t, "PING after errors", rdb.Ping(ctx), "PONG")
 	})

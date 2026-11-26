@@ -80,7 +80,9 @@ async fn test_set_command_integration() {
         RedisCommand::Set {
             key: "mykey".to_string(),
             value: Bytes::from_static(b"hello world"),
-            ttl_seconds: None
+            ttl_seconds: None,
+            condition: None,
+            get: false,
         }
     );
 }
@@ -223,6 +225,7 @@ async fn test_multiple_commands_pipelined() {
                 key,
                 value,
                 ttl_seconds,
+                ..
             } => {
                 assert_eq!(key, "key2");
                 assert_eq!(value, Bytes::from_static(b"value"));
@@ -249,6 +252,7 @@ async fn test_binary_data_handling() {
             key,
             value,
             ttl_seconds,
+            ..
         } => {
             assert_eq!(key, "binary");
             assert_eq!(value, Bytes::copy_from_slice(binary_data));
@@ -280,6 +284,7 @@ async fn test_large_key_and_value() {
             key,
             value,
             ttl_seconds,
+            ..
         } => {
             assert_eq!(key, large_key);
             assert_eq!(value, Bytes::from(large_value.into_bytes()));
@@ -301,6 +306,7 @@ async fn test_empty_values() {
             key,
             value,
             ttl_seconds,
+            ..
         } => {
             assert_eq!(key, "empty");
             assert_eq!(value, Bytes::new());
@@ -444,6 +450,7 @@ async fn test_set_with_ttl_integration() {
             key,
             value,
             ttl_seconds,
+            ..
         } => {
             assert_eq!(key, "ttl_test");
             assert_eq!(value, Bytes::from_static(b"value"));
@@ -462,6 +469,7 @@ async fn test_set_with_ttl_integration() {
             key,
             value,
             ttl_seconds,
+            ..
         } => {
             assert_eq!(key, "ttl_test");
             assert_eq!(value, Bytes::from_static(b"value"));
