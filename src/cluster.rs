@@ -570,14 +570,14 @@ impl ClusterManager {
         &self,
         slots: Vec<u16>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Hold the write lock across gossip publication so concurrent
+        // ADDSLOTS/DELSLOTS calls cannot publish stale snapshots out of order.
         let mut local_slots = self.local_slots.write().await;
         for slot in &slots {
             local_slots.insert(*slot);
         }
+        self.update_gossip_data(&local_slots).await;
         drop(local_slots);
-
-        // Update gossip data
-        self.update_gossip_data().await;
 
         info!("Added slots {:?} to local node", slots);
         Ok(())
@@ -588,23 +588,25 @@ impl ClusterManager {
         &self,
         slots: Vec<u16>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Hold the write lock across gossip publication so concurrent
+        // ADDSLOTS/DELSLOTS calls cannot publish stale snapshots out of order.
         let mut local_slots = self.local_slots.write().await;
         for slot in &slots {
             local_slots.remove(slot);
         }
+        self.update_gossip_data(&local_slots).await;
         drop(local_slots);
-
-        // Update gossip data
-        self.update_gossip_data().await;
 
         info!("Removed slots {:?} from local node", slots);
         Ok(())
     }
 
-    /// Update gossip data with current slot assignments
-    async fn update_gossip_data(&self) {
+    /// Update gossip data with current slot assignments. Caller must hold
+    /// `local_slots`'s write lock so `node_info` updates stay ordered with
+    /// slot mutations.
+    async fn update_gossip_data(&self, local_slots: &HashSet<u16>) {
         if let Some(handle) = self.chitchat_handle.as_ref() {
-            let updated_slots: Vec<u16> = self.local_slots.read().await.iter().copied().collect();
+            let updated_slots: Vec<u16> = local_slots.iter().copied().collect();
             let gossip_data = NodeGossipData {
                 addr: if let Some(ref advertise_addr) = self.config.advertise_addr {
                     advertise_addr.clone()
@@ -986,5 +988,73 @@ mod tests {
             manager.route_hash("ns", "layout:user42").await,
             SlotRoute::Unserved
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_add_and_remove_slots_keep_gossip_in_sync_with_local_slots() {
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("ephemeral udp port");
+        let gossip_port = sock.local_addr().unwrap().port();
+        drop(sock);
+
+        let config = ClusterConfig {
+            enabled: true,
+            node_id: "node-race".to_string(),
+            seeds: vec![],
+            port: gossip_port,
+            slots: Some(vec![1]),
+            slot_ranges: None,
+            gossip_interval_ms: Some(1000),
+            advertise_addr: Some("127.0.0.1:6499".to_string()),
+        };
+        let gossip_bind_addr: SocketAddr = format!("127.0.0.1:{gossip_port}").parse().unwrap();
+        let redis_addr: SocketAddr = "127.0.0.1:6499".parse().unwrap();
+        let manager = ClusterManager::new(&config, gossip_bind_addr, redis_addr)
+            .await
+            .expect("cluster manager");
+
+        // Interleave concurrent add_slots/remove_slots on the same slot while
+        // briefly contending on the chitchat lock, which previously let an
+        // older snapshot overwrite a newer one in gossip.
+        for round in 0..30 {
+            let m1 = manager.clone();
+            let m2 = manager.clone();
+            let m3 = manager.clone();
+            let slot = (round % 3) as u16;
+            let t1 = tokio::spawn(async move { m1.remove_slots(vec![slot]).await.unwrap() });
+            let t2 = tokio::spawn(async move { m2.add_slots(vec![slot]).await.unwrap() });
+            let t3 = tokio::spawn(async move {
+                if let Some(handle) = m3.chitchat_handle.as_ref() {
+                    let chitchat_arc = handle.chitchat();
+                    let _guard = chitchat_arc.lock().await;
+                    tokio::task::yield_now().await;
+                }
+            });
+            let (r1, r2, r3) = tokio::join!(t1, t2, t3);
+            r1.unwrap();
+            r2.unwrap();
+            r3.unwrap();
+        }
+
+        let local_slots = manager.get_local_slots().await;
+        let published: HashSet<u16> = {
+            let handle = manager
+                .chitchat_handle
+                .as_ref()
+                .as_ref()
+                .expect("chitchat handle");
+            let chitchat_arc = handle.chitchat();
+            let mut guard = chitchat_arc.lock().await;
+            let raw = guard
+                .self_node_state()
+                .get("node_info")
+                .expect("published node_info");
+            let data: NodeGossipData = serde_json::from_str(raw).expect("valid gossip json");
+            data.slots.into_iter().collect()
+        };
+        assert_eq!(
+            published, local_slots,
+            "published gossip slots diverged from local_slots"
+        );
+        manager.shutdown().await;
     }
 }

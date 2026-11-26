@@ -261,15 +261,16 @@ pub async fn queue_pending(
 }
 
 /// Queues a sync `EXPIRE` in `async_write` mode and updates `cache` atomically
-/// with the send when a live async `SET` for `key` is already in flight.
+/// with the send when a persistent async `SET` for `key` is already in flight.
 ///
 /// That lets `[SetAsync(k), Expire(k)]` share one batch without exposing a
 /// window between `tx.commit()` and `clear_pending_entries` where SQLite and
 /// `inflight_cache` disagree (e.g., `EXPIRE k 0` deleting `k` in SQLite while
 /// `inflight_cache` still serves `v`). When the queued `SET` already has a
-/// finite TTL and `expires_at` is in the future, it leaves the cache alone and
-/// lets [`conflicts_with_async_in_batch`] flush the `SET` first so a clock tick
-/// before commit cannot make SQLite and the cache diverge.
+/// finite TTL, it leaves the cache alone and lets
+/// [`conflicts_with_async_in_batch`] flush the `SET` first: otherwise a clock
+/// tick before commit could expire the `SET` so SQLite replies `0` after
+/// readers already observed the cached update.
 pub async fn queue_expire(
     cache: &Cache<String, Pending>,
     sender: &ShardSender,
@@ -285,14 +286,13 @@ pub async fn queue_expire(
             let next = match entry.map(|e| e.into_value()) {
                 Some(Pending::Value {
                     data,
-                    expires_at: cur,
+                    expires_at: None,
                     ..
-                }) if !is_expired(cur) => {
+                }) => {
+                    let token = next_pending_token();
                     if is_expired(Some(expires_at)) {
-                        let token = next_pending_token();
                         Some((token, Pending::Deleted(token)))
-                    } else if cur.is_none() {
-                        let token = next_pending_token();
+                    } else {
                         Some((
                             token,
                             Pending::Value {
@@ -301,8 +301,6 @@ pub async fn queue_expire(
                                 token,
                             },
                         ))
-                    } else {
-                        None
                     }
                 }
                 _ => None,
@@ -884,18 +882,30 @@ pub fn next_pending_token() -> u64 {
     NEXT_TOKEN.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Whether `expires_at` has passed, by the same rule the DB queries use.
-pub fn is_expired(expires_at: Option<i64>) -> bool {
-    expires_at.is_some_and(|t| t <= Utc::now().timestamp())
+/// Whether `expires_at` has passed at `now`, by the same rule the DB queries use.
+pub fn is_expired_at(expires_at: Option<i64>, now: i64) -> bool {
+    expires_at.is_some_and(|t| t <= now)
 }
 
-/// Whether a queued async op decides `key`'s existence: `Some(true)` for a
-/// live write, `Some(false)` for a delete or an already-expired write, `None`
-/// if nothing is queued (ask the DB).
-pub async fn pending_exists(cache: &Cache<String, Pending>, key: &str) -> Option<bool> {
-    cache.get(key).await.map(
-        |pending| matches!(pending, Pending::Value { expires_at, .. } if !is_expired(expires_at)),
-    )
+/// Whether `expires_at` has passed, by the same rule the DB queries use.
+pub fn is_expired(expires_at: Option<i64>) -> bool {
+    is_expired_at(expires_at, Utc::now().timestamp())
+}
+
+/// Whether a queued async op decides `key`'s existence at `now`: `Some(true)`
+/// for a live write, `Some(false)` for a delete or an already-expired write,
+/// `None` if nothing is queued (ask the DB).
+pub async fn pending_exists_at(
+    cache: &Cache<String, Pending>,
+    key: &str,
+    now: i64,
+) -> Option<bool> {
+    cache.get(key).await.map(|pending| {
+        matches!(
+            pending,
+            Pending::Value { expires_at, .. } if !is_expired_at(expires_at, now)
+        )
+    })
 }
 
 /// Removes `key`'s entry if it still carries `token`: a newer op on the same
@@ -2263,35 +2273,75 @@ async fn ensure_namespaced_table_exists(
     }
 }
 
-/// Deletes expired rows from `table` in chunks of `chunk_size`. The
-/// cleanup shares the shard's single writer connection, so each chunk is its own
-/// statement: the pool hands out connections in FIFO order, letting a waiting
-/// writer batch run between chunks instead of stalling behind one long DELETE.
-/// Each chunk's rows are added to `deleted` as they go, so a later failing
-/// chunk doesn't lose the count.
+/// Deletes expired rows from `table` in chunks of `chunk_size`, skipping any
+/// key currently present in `inflight_cache` so a stalled reader cannot miss an
+/// intermediate expired row while a newer async write for the same key is still
+/// queued. The cleanup shares the shard's single writer connection, so each
+/// chunk acquires and releases it: the pool hands out connections in FIFO order,
+/// letting a waiting writer batch run between chunks instead of stalling behind
+/// one long DELETE. Each chunk's rows are added to `deleted` as they go, so a
+/// later failing chunk doesn't lose the count.
 async fn delete_expired(
     pool: &SqlitePool,
     table: &str,
     now: i64,
     chunk_size: u32,
     deleted_counter: &Counter,
+    inflight_cache: &Cache<String, Pending>,
+    namespace: Option<&str>,
 ) -> Result<u64, sqlx::Error> {
-    let query = format!(
-        "DELETE FROM {table} WHERE rowid IN (
-            SELECT rowid FROM {table} WHERE expires_at IS NOT NULL AND expires_at <= ? LIMIT ?
-        )"
+    const MAX_IN_PARAMS: usize = 500;
+    let select_query = format!(
+        "SELECT rowid, key FROM {table}
+         WHERE expires_at IS NOT NULL AND expires_at <= ? AND rowid > ?
+         ORDER BY rowid
+         LIMIT ?"
     );
     let mut total = 0;
+    let mut last_rowid: i64 = 0;
     loop {
-        let deleted = sqlx::query(&query)
+        let mut conn = pool.acquire().await?;
+        let candidates: Vec<(i64, String)> = sqlx::query_as(&select_query)
             .bind(now)
+            .bind(last_rowid)
             .bind(chunk_size)
-            .execute(pool)
-            .await?
-            .rows_affected();
-        deleted_counter.increment(deleted);
-        total += deleted;
-        if deleted < u64::from(chunk_size) {
+            .fetch_all(&mut *conn)
+            .await?;
+
+        let fetched = candidates.len();
+        if fetched == 0 {
+            return Ok(total);
+        }
+        last_rowid = candidates[fetched - 1].0;
+
+        let mut to_delete: Vec<i64> = Vec::with_capacity(fetched);
+        for (rowid, key) in candidates {
+            let is_inflight = match namespace {
+                Some(ns) => inflight_cache.contains_key(&namespaced_key(ns, &key)),
+                None => inflight_cache.contains_key(&key),
+            };
+            if !is_inflight {
+                to_delete.push(rowid);
+            }
+        }
+
+        for batch in to_delete.chunks(MAX_IN_PARAMS) {
+            let placeholders = vec!["?"; batch.len()].join(", ");
+            let delete_query = format!(
+                "DELETE FROM {table} WHERE rowid IN ({placeholders}) AND expires_at IS NOT NULL AND expires_at <= ?"
+            );
+            let mut query = sqlx::query(&delete_query);
+            for rowid in batch {
+                query = query.bind(*rowid);
+            }
+            let deleted = query.bind(now).execute(&mut *conn).await?.rows_affected();
+            deleted_counter.increment(deleted);
+            total += deleted;
+        }
+
+        drop(conn);
+
+        if fetched < chunk_size as usize {
             return Ok(total);
         }
     }
@@ -2303,6 +2353,8 @@ pub async fn shard_cleanup_task(
     pool: SqlitePool,
     cleanup_interval_secs: u64,
     chunk_size: u32,
+    inflight_cache: Cache<String, Pending>,
+    inflight_hcache: Cache<String, Pending>,
 ) {
     let mut interval = interval(Duration::from_secs(cleanup_interval_secs));
     let shard_metrics = ShardMetrics::new(shard_id);
@@ -2320,15 +2372,32 @@ pub async fn shard_cleanup_task(
         let mut ok = true;
         let now = chrono::Utc::now().timestamp();
 
-        // The main blobs table plus every namespaced "blobs_*" table
-        let mut tables = vec!["blobs".to_string()];
+        // The main blobs table plus every namespaced "blobs_*" table with its
+        // original namespace name (when mapped in blob_namespaces) so we can
+        // skip fields that still have a pending write in inflight_hcache.
+        let mut tables: Vec<(String, Option<String>)> = vec![("blobs".to_string(), None)];
+        let ns_map: std::collections::HashMap<String, String> =
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT table_name, namespace FROM blob_namespaces",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+
         match sqlx::query_as::<_, (String,)>(
             "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'blobs\\_%' ESCAPE '\\'",
         )
         .fetch_all(&pool)
         .await
         {
-            Ok(names) => tables.extend(names.into_iter().map(|(name,)| name)),
+            Ok(names) => {
+                for (name,) in names {
+                    let ns = ns_map.get(&name).cloned();
+                    tables.push((name, ns));
+                }
+            }
             Err(e) => {
                 tracing::error!(
                     "[Shard {}] Error querying table names for cleanup: {}",
@@ -2340,9 +2409,24 @@ pub async fn shard_cleanup_task(
             }
         }
 
-        for table_name in tables {
+        for (table_name, namespace) in tables {
             let deleted = &shard_metrics.cleanup_deleted_keys_total;
-            match delete_expired(&pool, &table_name, now, chunk_size, deleted).await {
+            let cache = if table_name == "blobs" {
+                &inflight_cache
+            } else {
+                &inflight_hcache
+            };
+            match delete_expired(
+                &pool,
+                &table_name,
+                now,
+                chunk_size,
+                deleted,
+                cache,
+                namespace.as_deref(),
+            )
+            .await
+            {
                 Ok(deleted_count) => {
                     if deleted_count > 0 {
                         tracing::info!(
@@ -2597,9 +2681,18 @@ mod tests {
         .await
         .unwrap();
 
-        let deleted = delete_expired(&pool, "blobs", now, chunk_size, &Counter::noop())
-            .await
-            .unwrap();
+        let cache: Cache<String, Pending> = Cache::builder().build();
+        let deleted = delete_expired(
+            &pool,
+            "blobs",
+            now,
+            chunk_size,
+            &Counter::noop(),
+            &cache,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(deleted, u64::from(expired));
 
         let keys: Vec<(String,)> = sqlx::query_as("SELECT key FROM blobs ORDER BY key")
@@ -2607,6 +2700,90 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(keys, vec![("forever".into(),), ("live".into(),)]);
+    }
+
+    #[tokio::test]
+    async fn delete_expired_skips_keys_present_in_inflight_caches() {
+        let (_dir, pool) = create_test_pool().await;
+        let now = 1_000;
+        let cache: Cache<String, Pending> = Cache::builder().build();
+        let hcache: Cache<String, Pending> = Cache::builder().build();
+
+        // Main blobs table: 3 expired rows; middle one has a newer write queued.
+        sqlx::query(
+            "INSERT INTO blobs (key, data, created_at, updated_at, expires_at)
+             VALUES ('a', x'00', 0, 0, 100), ('inflight', x'00', 0, 0, 100), ('z', x'00', 0, 0, 100)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        cache
+            .insert(
+                "inflight".to_string(),
+                Pending::Value {
+                    data: Bytes::from_static(b"v2"),
+                    expires_at: None,
+                    token: next_pending_token(),
+                },
+            )
+            .await;
+
+        // Chunk size 1 exercises pagination past the skipped row without looping.
+        let deleted = delete_expired(&pool, "blobs", now, 1, &Counter::noop(), &cache, None)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 2);
+        let remaining: Vec<(String,)> = sqlx::query_as("SELECT key FROM blobs ORDER BY key")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining, vec![("inflight".into(),)]);
+
+        // Namespaced table: skips fields present in inflight_hcache.
+        let ns_table = namespace_table("ns");
+        sqlx::query(&format!(
+            "CREATE TABLE {ns_table} (key TEXT PRIMARY KEY, data BLOB, created_at INTEGER NOT NULL, \
+             updated_at INTEGER NOT NULL, expires_at INTEGER, version INTEGER NOT NULL DEFAULT 0)"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(&format!(
+            "INSERT INTO {ns_table} (key, data, created_at, updated_at, expires_at)
+             VALUES ('gone', x'00', 0, 0, 100), ('queued_f', x'00', 0, 0, 100)"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        hcache
+            .insert(
+                namespaced_key("ns", "queued_f"),
+                Pending::Value {
+                    data: Bytes::from_static(b"v2"),
+                    expires_at: None,
+                    token: next_pending_token(),
+                },
+            )
+            .await;
+
+        let deleted = delete_expired(
+            &pool,
+            &ns_table,
+            now,
+            1,
+            &Counter::noop(),
+            &hcache,
+            Some("ns"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(deleted, 1);
+        let remaining: Vec<(String,)> =
+            sqlx::query_as(&format!("SELECT key FROM {ns_table} ORDER BY key"))
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(remaining, vec![("queued_f".into(),)]);
     }
 
     #[test]
@@ -3147,14 +3324,16 @@ mod tests {
             .await
             .unwrap();
             let counter = ShardMetrics::new(0).cleanup_deleted_keys_total;
+            let cache: Cache<String, Pending> = Cache::builder().build();
             // Chunk size 1: the count accumulates per chunk.
             assert_eq!(
-                delete_expired(&pool, "blobs", 10, 1, &counter)
+                delete_expired(&pool, "blobs", 10, 1, &counter, &cache, None)
                     .await
                     .unwrap(),
                 2
             );
-            let missing = delete_expired(&pool, "blobs_missing", 10, 1, &counter).await;
+            let missing =
+                delete_expired(&pool, "blobs_missing", 10, 1, &counter, &cache, None).await;
             assert!(missing.is_err());
             crate::metrics::rendered_value(
                 &recorder.handle().render(),
@@ -4457,9 +4636,11 @@ mod tests {
             }) if data == Bytes::from_static(b"v2") && token == newer_tok
         ));
 
-        // 4. Positive EXPIRE over a queued SET that already has a finite TTL
-        // leaves token = None so conflicts_with_async_in_batch flushes the SET
-        // first.
+        // 4. Any EXPIRE (both positive and immediate EXPIRE 0) over a queued
+        // SET that already has a finite TTL leaves token = None and keeps the
+        // cache untouched, so conflicts_with_async_in_batch flushes the SET
+        // first and a clock tick before commit cannot make EXPIRE reply 0 after
+        // readers already saw Pending::Deleted.
         let tok_ex = next_pending_token();
         queue_pending(
             &cache,
@@ -4483,16 +4664,38 @@ mod tests {
         queue_expire(&cache, &sender, "finite_k".to_string(), now + 100, tx3)
             .await
             .unwrap();
+        let (tx4, _rx4) = oneshot::channel();
+        queue_expire(&cache, &sender, "finite_k".to_string(), now, tx4)
+            .await
+            .unwrap();
+        assert!(matches!(
+            cache.get("finite_k").await,
+            Some(Pending::Value {
+                expires_at: Some(exp),
+                token,
+                ..
+            }) if exp == now + 10 && token == tok_ex
+        ));
         let _newer_set = receiver.try_recv().unwrap();
         let finite_set = receiver.try_recv().unwrap();
-        let finite_exp = receiver.try_recv().unwrap();
+        let finite_exp_pos = receiver.try_recv().unwrap();
+        let finite_exp_zero = receiver.try_recv().unwrap();
         assert!(matches!(
-            finite_exp,
+            finite_exp_pos,
             ShardWriteOperation::Expire { token: None, .. }
         ));
+        assert!(matches!(
+            finite_exp_zero,
+            ShardWriteOperation::Expire { token: None, .. }
+        ));
+        let finite_batch = VecDeque::from([finite_set]);
         assert!(conflicts_with_async_in_batch(
-            &VecDeque::from([finite_set]),
-            &finite_exp
+            &finite_batch,
+            &finite_exp_pos
+        ));
+        assert!(conflicts_with_async_in_batch(
+            &finite_batch,
+            &finite_exp_zero
         ));
     }
 }

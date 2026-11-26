@@ -89,6 +89,8 @@ pub async fn run(
             write_pool.clone(),
             cfg.cleanup_interval_secs(),
             cfg.cleanup_chunk_size(),
+            state.inflight_cache.clone(),
+            state.inflight_hcache.clone(),
         )));
     }
 
@@ -608,11 +610,17 @@ async fn handle_get(
     state: &Arc<AppState>,
     key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Capture before checking inflight_cache so a reader that missed the cache
+    // evaluates SQLite expiry at the same point in time, preventing an
+    // intermediate SET EX row from reading as expired after a newer persistent
+    // SET already overwrote it in inflight_cache.
+    let read_ts = chrono::Utc::now().timestamp();
+
     // First check inflight cache for pending writes
     match state.inflight_cache.get(&key).await {
         Some(Pending::Value {
             data, expires_at, ..
-        }) if !shard_manager::is_expired(expires_at) => {
+        }) if !shard_manager::is_expired_at(expires_at, read_ts) => {
             state.metrics.record_read("get", "inflight", "hit");
             // Decompress if needed
             let data = decompress_if_enabled(state, data).await?;
@@ -639,7 +647,7 @@ async fn handle_get(
         "SELECT data FROM blobs WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
     )
     .bind(&key)
-    .bind(chrono::Utc::now().timestamp());
+    .bind(read_ts);
     let shard_metrics = &state.shard_senders[shard_index].metrics;
     match async {
         query
@@ -810,23 +818,25 @@ async fn del_reply(state: &Arc<AppState>, mut keys: Vec<String>) -> BytesFrame {
         // afterwards and bring the key back. A queued DEL means it's gone.
         // Otherwise check the DB. A failed check (e.g. the shard file is
         // locked or unreadable) must not be reported as "key not found".
-        let exists = match shard_manager::pending_exists(&state.inflight_cache, &key).await {
-            Some(exists) => exists,
-            None => match sqlx::query(
-                "SELECT 1 FROM blobs WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
-            )
-            .bind(&key)
-            .bind(chrono::Utc::now().timestamp())
-            .fetch_optional(pool)
-            .await
-            {
-                Ok(row) => row.is_some(),
-                Err(e) => {
-                    tracing::error!("Failed to check DEL existence for key {}: {}", key, e);
-                    return BytesFrame::Error("ERR database error".into());
-                }
-            },
-        };
+        let read_ts = chrono::Utc::now().timestamp();
+        let exists =
+            match shard_manager::pending_exists_at(&state.inflight_cache, &key, read_ts).await {
+                Some(exists) => exists,
+                None => match sqlx::query(
+                    "SELECT 1 FROM blobs WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
+                )
+                .bind(&key)
+                .bind(read_ts)
+                .fetch_optional(pool)
+                .await
+                {
+                    Ok(row) => row.is_some(),
+                    Err(e) => {
+                        tracing::error!("Failed to check DEL existence for key {}: {}", key, e);
+                        return BytesFrame::Error("ERR database error".into());
+                    }
+                },
+            };
 
         if !exists {
             continue; // Key doesn't exist, skip
@@ -889,8 +899,12 @@ async fn handle_exists(
     state: &Arc<AppState>,
     key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let read_ts = chrono::Utc::now().timestamp();
+
     // A queued async SET or DEL decides it, as it does for GET.
-    if let Some(exists) = shard_manager::pending_exists(&state.inflight_cache, &key).await {
+    if let Some(exists) =
+        shard_manager::pending_exists_at(&state.inflight_cache, &key, read_ts).await
+    {
         stream
             .write_all(&serialize_frame(&BytesFrame::Integer(exists as i64)))
             .await?;
@@ -904,7 +918,7 @@ async fn handle_exists(
         "SELECT 1 FROM blobs WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
     )
     .bind(&key)
-    .bind(chrono::Utc::now().timestamp())
+    .bind(read_ts)
     .fetch_optional(pool)
     .await
     {
@@ -1096,9 +1110,10 @@ async fn hash_field_live(
     namespace: &str,
     key: &str,
 ) -> Result<bool, sqlx::Error> {
+    let read_ts = chrono::Utc::now().timestamp();
     let namespaced_key = state.namespaced_key(namespace, key);
     if let Some(exists) =
-        shard_manager::pending_exists(&state.inflight_hcache, &namespaced_key).await
+        shard_manager::pending_exists_at(&state.inflight_hcache, &namespaced_key, read_ts).await
     {
         return Ok(exists);
     }
@@ -1110,7 +1125,7 @@ async fn hash_field_live(
     );
     match sqlx::query(&query)
         .bind(key)
-        .bind(chrono::Utc::now().timestamp())
+        .bind(read_ts)
         .fetch_optional(pool)
         .await
     {
@@ -1130,10 +1145,13 @@ async fn hash_field_live_expires_at(
     namespace: &str,
     key: &str,
 ) -> Result<Option<i64>, sqlx::Error> {
+    let read_ts = chrono::Utc::now().timestamp();
     let namespaced_key = state.namespaced_key(namespace, key);
     if let Some(pending) = state.inflight_hcache.get(&namespaced_key).await {
         return Ok(match pending {
-            Pending::Value { expires_at, .. } if !shard_manager::is_expired(expires_at) => {
+            Pending::Value { expires_at, .. }
+                if !shard_manager::is_expired_at(expires_at, read_ts) =>
+            {
                 expires_at
             }
             _ => None,
@@ -1146,7 +1164,7 @@ async fn hash_field_live_expires_at(
     );
     match sqlx::query_as::<_, (Option<i64>,)>(&query)
         .bind(key)
-        .bind(chrono::Utc::now().timestamp())
+        .bind(read_ts)
         .fetch_optional(pool)
         .await
     {
@@ -1173,12 +1191,14 @@ async fn handle_hget(
         return Ok(());
     }
 
+    let read_ts = chrono::Utc::now().timestamp();
+
     // First check inflight cache for pending writes
     let namespaced_key = state.namespaced_key(&namespace, &key);
     match state.inflight_hcache.get(&namespaced_key).await {
         Some(Pending::Value {
             data, expires_at, ..
-        }) if !shard_manager::is_expired(expires_at) => {
+        }) if !shard_manager::is_expired_at(expires_at, read_ts) => {
             state.metrics.record_read("hget", "inflight", "hit");
             // Decompress if needed
             let data = decompress_if_enabled(state, data).await?;
@@ -1212,7 +1232,7 @@ async fn handle_hget(
 
     let query = sqlx::query_as::<_, (Vec<u8>,)>(&query)
         .bind(&key)
-        .bind(chrono::Utc::now().timestamp());
+        .bind(read_ts);
     let shard_metrics = &state.shard_senders[shard_index].metrics;
     match async {
         query
@@ -1522,7 +1542,11 @@ async fn hsetex_reply(
                 expires_at: pending_expires_at,
                 token,
             };
-            let operation = if let Some(exp) = expires_at {
+            // Commit the exact resolved expiry that `inflight_hcache` advertises
+            // (including KEEPTTL): re-evaluating `expires_at > now` at commit time
+            // would turn an already-passed deadline into NULL (permanent) after
+            // async reads had already returned nil.
+            let operation = if let Some(exp) = pending_expires_at {
                 ShardWriteOperation::HSetExAsync {
                     namespace: namespace.clone(),
                     key: field_key,
@@ -1533,7 +1557,7 @@ async fn hsetex_reply(
             } else {
                 ShardWriteOperation::HSetAsync {
                     namespace: namespace.clone(),
-                    keep_ttl,
+                    keep_ttl: false,
                     key: field_key,
                     data: compressed_value,
                     token,
@@ -1742,10 +1766,13 @@ async fn handle_hexists(
         return Ok(());
     }
 
+    let read_ts = chrono::Utc::now().timestamp();
+
     // A queued async HSET or HDEL decides it, as it does for HGET.
-    if let Some(exists) = shard_manager::pending_exists(
+    if let Some(exists) = shard_manager::pending_exists_at(
         &state.inflight_hcache,
         &state.namespaced_key(&namespace, &key),
+        read_ts,
     )
     .await
     {
@@ -1766,7 +1793,7 @@ async fn handle_hexists(
 
     match sqlx::query(&query)
         .bind(&key)
-        .bind(chrono::Utc::now().timestamp())
+        .bind(read_ts)
         .fetch_optional(pool)
         .await
     {
@@ -6237,6 +6264,153 @@ mod tests {
             BytesFrame::Integer(ttl) => assert!((99..=100).contains(&ttl), "ttl {ttl}"),
             other => panic!("Expected integer TTL, got {other:?}"),
         }
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn get_uses_read_timestamp_captured_before_cache_miss() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let mut cfg = single_read_connection_cfg(&temp_dir, true);
+        cfg.sqlite.as_mut().unwrap().busy_timeout_ms = Some(2_000);
+        let ctx = TestContext::from_cfg(temp_dir, cfg).await;
+
+        // Seed an intermediate committed row whose expiry is 1 second ahead.
+        let exp = chrono::Utc::now().timestamp() + 1;
+        sqlx::query(
+            "INSERT INTO blobs (key, data, created_at, updated_at, expires_at) VALUES ('k', ?, 0, 0, ?)",
+        )
+        .bind(b"v1".as_slice())
+        .bind(exp)
+        .execute(&ctx.state.write_db_pools[0])
+        .await
+        .unwrap();
+
+        // Hold the sole read-pool connection so handle_get checks inflight_cache
+        // (miss) and then waits before running its SQLite query.
+        let held_read_conn = ctx.state.db_pools[0].acquire().await.unwrap();
+
+        let (mut server_stream, client_stream) = tcp_pair().await;
+        let state = ctx.state.clone();
+        let get_task = tokio::spawn(async move {
+            handle_get(&mut server_stream, &state, "k".to_string())
+                .await
+                .unwrap();
+        });
+
+        // Give handle_get time to capture read_ts, miss inflight_cache, and block on pool.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Simulate a newer persistent SET overwriting the key in inflight_cache
+        // while the clock advances past the committed intermediate row's expiry.
+        ctx.state
+            .inflight_cache
+            .insert(
+                "k".to_string(),
+                Pending::Value {
+                    data: Bytes::from_static(b"v2"),
+                    expires_at: None,
+                    token: shard_manager::next_pending_token(),
+                },
+            )
+            .await;
+
+        while chrono::Utc::now().timestamp() <= exp {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        drop(held_read_conn);
+        get_task.await.unwrap();
+        let frame = read_response(client_stream).await;
+        assert_bulk_string(frame, b"v1");
+
+        ctx.state.inflight_cache.invalidate("k").await;
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn async_hsetex_keepttl_does_not_resurrect_after_expiry_before_commit() {
+        let mut ctx = TestContext::new_paused(true).await;
+
+        // Queue HSETEX with a 1-second TTL, then overwrite with HSETEX KEEPTTL
+        // while still queued (before commit).
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_hsetex(
+                    &mut stream,
+                    &state,
+                    "ns".to_string(),
+                    false,
+                    false,
+                    Some(crate::redis::protocol::ExpireOption::Ex(1)),
+                    vec![("f".to_string(), Bytes::from_static(b"v1"))],
+                )
+                .await
+            })
+        })
+        .await;
+        assert_integer_response(frame, 1);
+
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_hsetex(
+                    &mut stream,
+                    &state,
+                    "ns".to_string(),
+                    false,
+                    false,
+                    Some(crate::redis::protocol::ExpireOption::KeepTtl),
+                    vec![("f".to_string(), Bytes::from_static(b"v2"))],
+                )
+                .await
+            })
+        })
+        .await;
+        assert_integer_response(frame, 1);
+
+        let exp = match ctx
+            .state
+            .inflight_hcache
+            .get(&ctx.state.namespaced_key("ns", "f"))
+            .await
+        {
+            Some(Pending::Value {
+                expires_at: Some(exp),
+                ..
+            }) => exp,
+            other => panic!("expected Pending::Value with expires_at, got {other:?}"),
+        };
+
+        // Wait until the deadline has passed before the writer commits.
+        while chrono::Utc::now().timestamp() < exp {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Before commit, HGET already observes the field as expired (nil).
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_hget(&mut stream, &state, "ns".to_string(), "f".to_string()).await
+            })
+        })
+        .await;
+        assert_null(frame);
+
+        // Once the writer commits, the field must stay expired — not turn into
+        // a persistent row with expires_at = NULL.
+        ctx.resume();
+        wait_for_commit(
+            &ctx.state.inflight_hcache,
+            &ctx.state.namespaced_key("ns", "f"),
+        )
+        .await;
+
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_hget(&mut stream, &state, "ns".to_string(), "f".to_string()).await
+            })
+        })
+        .await;
+        assert_null(frame);
 
         ctx.shutdown().await;
     }
