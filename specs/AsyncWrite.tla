@@ -8,6 +8,8 @@
  *     commit -> clear_pending_entries window, batch failure mode, and shutdown drain
  *   - GET and TTL two-step read paths (inflight_cache first, then SQLite WAL)
  *   - Logical clock ticks for expiry consistency (#46, #55, #65)
+ *   - Background expiry cleanup (src/shard_manager.rs: delete_expired) and
+ *     cached per-shard stored-row count (src/app_state.rs: shard_key_counts)
  *
  * Properties checked:
  *   Safety:
@@ -15,6 +17,7 @@
  *     - Linearizable (Herlihy & Wing refinement proof via ghost absDb + per-read LP window)
  *     - QuiescentConsistency (when idle & empty, cache is empty and db matches absDb)
  *     - LockSafety (keyLock only held by clients actively in DEL/EXPIRE)
+ *     - KeyCountAccurate (cached keyCount always equals SQLite stored-row count, >= 0)
  *   Liveness (under weak fairness on writer and in-progress client steps):
  *     - ExpireEventuallyReplies
  *     - PendingOpEventuallyCommits
@@ -23,6 +26,8 @@
  * Negative configs prove the model catches real bugs:
  *   - AsyncWrite_Bug65.cfg: AllowExpireInflightUpdate = FALSE, AllowExpireBatchBarrier = FALSE -> #65
  *   - AsyncWrite_Bug64.cfg: AllowBatchFailure = TRUE -> #64
+ *   - AsyncWrite_BugKeyCountRollback.cfg: AllowBatchFailure = TRUE, ApplyDeltaOnFailure = TRUE -> key_count drift
+ *   - AsyncWrite_BugCleanupInflight.cfg: EnableCleanup = TRUE, CleanupSkipsInflight = FALSE -> stale NIL read
  *)
 
 EXTENDS Integers, Sequences, FiniteSets, TLC
@@ -40,7 +45,10 @@ CONSTANTS
     AllowExpireBatchBarrier,    \* TRUE = conflicts_with_async_in_batch splits batch before uncached Expire
     AllowBatchFailure,          \* TRUE = writer can fail BEGIN/COMMIT and drop async ops (#64)
     ExpireUpdatesFiniteTtl,     \* TRUE = queue_expire replaces finite-TTL SET on EXPIRE 0 (Bug A on 303b939)
-    ReadTsAfterCacheMiss        \* TRUE = GET/TTL/DEL read Utc::now() after cache miss (Bug B on 303b939)
+    ReadTsAfterCacheMiss,       \* TRUE = GET/TTL/DEL read Utc::now() after cache miss (Bug B on 303b939)
+    EnableCleanup,              \* TRUE = background shard_cleanup_task deletes expired rows
+    CleanupSkipsInflight,       \* TRUE = delete_expired skips keys present in inflight_cache
+    ApplyDeltaOnFailure         \* TRUE = buggy writer applies batch_delta even on failed/rolled-back batch
 
 NIL  == "NIL"
 NONE == "NONE"
@@ -53,6 +61,7 @@ IdleClient == [pc |-> "idle", key |-> NONE, allowed |-> {}, expected |-> -1, rea
 
 VARIABLES
     db,             \* [Keys -> [val: AllValues, exp: ExpValues]]  Committed SQLite WAL state
+    keyCount,       \* Int                                         Cached shard_key_counts[shard]
     cache,          \* [Keys -> CacheEntry]                        inflight_cache
     queue,          \* Seq(Op)                                     mpsc channel to shard writer
     batch,          \* Seq(Op)                                     Current batch in process_batch
@@ -67,7 +76,7 @@ VARIABLES
     absDb,          \* Ghost: atomic sequential KV state for linearizability refinement
     linViolated     \* Ghost: set TRUE if any client reply violates linearizability
 
-vars == <<db, cache, queue, batch, deferred, writerPc, keyLock, client,
+vars == <<db, keyCount, cache, queue, batch, deferred, writerPc, keyLock, client,
           nextTok, opsIssued, now, shutdown, absDb, linViolated>>
 
 \* ---------------------------------------------------------------------------
@@ -99,6 +108,17 @@ CacheReadTtl(cEntry, t) ==
     ELSE IF cEntry.exp = INF THEN -1
     ELSE cEntry.exp - t
 
+\* Stored SQLite row count (includes expired rows until cleanup deletes them)
+StoredRowCount(dState) ==
+    Cardinality({k \in Keys : dState[k].val # NIL})
+
+\* Row delta produced by a single op inside process_batch (mirrors rows_affected())
+\* Note: SetAsync over an expired-but-uncleaned row executes UPDATE (delta 0).
+OpDelta(dState, op) ==
+    CASE op.kind = "SetAsync" -> IF dState[op.key].val = NIL THEN 1 ELSE 0
+      [] op.kind = "DelAsync" -> IF dState[op.key].val # NIL THEN -1 ELSE 0
+      [] op.kind = "Expire"   -> 0
+
 \* Apply a single op to a DB state at time t
 ApplyOp(state, op, t) ==
     CASE op.kind = "SetAsync" ->
@@ -128,16 +148,18 @@ ClearCacheForBatch(cMap, b) ==
         THEN NoCache
         ELSE cMap[k]]
 
-\* Update in-flight readers' allowed return sets when absDb or now changes
+\* Update in-flight readers' allowed return sets when absDb or now changes.
+\* A read spanning [readTs, t] may linearize at readTs (e.g., against an EXPIRE
+\* invoked at readTs that commits at t) or at the current wall-clock time t.
 UpdateReaders(cMap, newAbs, t) ==
     [c \in Clients |->
-        LET rt == IF ReadTsAfterCacheMiss THEN t ELSE cMap[c].readTs IN
+        LET rt == cMap[c].readTs IN
         CASE cMap[c].pc = "get_db" ->
-                [cMap[c] EXCEPT !.allowed = @ \cup {ReadVal(newAbs[cMap[c].key], rt)}]
+                [cMap[c] EXCEPT !.allowed = @ \cup {ReadVal(newAbs[cMap[c].key], rt), ReadVal(newAbs[cMap[c].key], t)}]
           [] cMap[c].pc = "ttl_db" ->
-                [cMap[c] EXCEPT !.allowed = @ \cup {ReadTtl(newAbs[cMap[c].key], rt)}]
+                [cMap[c] EXCEPT !.allowed = @ \cup {ReadTtl(newAbs[cMap[c].key], rt), ReadTtl(newAbs[cMap[c].key], t)}]
           [] cMap[c].pc = "del_db" ->
-                [cMap[c] EXCEPT !.allowed = @ \cup {IsLive(newAbs[cMap[c].key], rt)}]
+                [cMap[c] EXCEPT !.allowed = @ \cup {IsLive(newAbs[cMap[c].key], rt), IsLive(newAbs[cMap[c].key], t)}]
           [] OTHER -> cMap[c]]
 
 \* Linearize any unlinearized Expire ops for key k already queued ahead of a new
@@ -161,6 +183,7 @@ UpdateReadersAfterSeq(cMap, oldAbs, newAbs, t) ==
 
 Init ==
     /\ db          = [k \in Keys |-> [val |-> InitVal, exp |-> INF]]
+    /\ keyCount    = Cardinality(Keys)
     /\ cache       = [k \in Keys |-> NoCache]
     /\ queue       = <<>>
     /\ batch       = <<>>
@@ -204,7 +227,7 @@ ClientSet(c, k, v, exp) ==
        /\ opsIssued' = opsIssued + 1
        /\ absDb'     = newAbs
        /\ client'    = UpdateReadersAfterSeq(client, preAbs, newAbs, now)
-       /\ UNCHANGED <<db, writerPc, keyLock, now, shutdown, linViolated>>
+       /\ UNCHANGED <<db, keyCount, writerPc, keyLock, now, shutdown, linViolated>>
 
 \* DEL k step 1: acquire key_lock and check inflight_cache (src/server.rs:del_reply)
 ClientDelStart(c, k) ==
@@ -218,19 +241,19 @@ ClientDelStart(c, k) ==
                /\ opsIssued' = opsIssued + 1
                /\ client'    = [client EXCEPT ![c] = [pc |-> "del_queue", key |-> k,
                                                       allowed |-> {IsLive(absDb[k], now)}, expected |-> -1, readTs |-> now]]
-               /\ UNCHANGED <<db, cache, queue, batch, deferred, writerPc, nextTok,
+               /\ UNCHANGED <<db, keyCount, cache, queue, batch, deferred, writerPc, nextTok,
                               now, shutdown, absDb, linViolated>>
            ELSE
                /\ opsIssued'   = opsIssued + 1
                /\ linViolated' = (linViolated \/ IsLive(absDb[k], now))
-               /\ UNCHANGED <<db, cache, queue, batch, deferred, writerPc, keyLock,
+               /\ UNCHANGED <<db, keyCount, cache, queue, batch, deferred, writerPc, keyLock,
                               client, nextTok, now, shutdown, absDb>>
        ELSE
            /\ keyLock'   = [keyLock EXCEPT ![k] = c]
            /\ opsIssued' = opsIssued + 1
            /\ client'    = [client EXCEPT ![c] = [pc |-> "del_db", key |-> k,
                                                   allowed |-> {IsLive(absDb[k], now)}, expected |-> -1, readTs |-> now]]
-           /\ UNCHANGED <<db, cache, queue, batch, deferred, writerPc, nextTok,
+           /\ UNCHANGED <<db, keyCount, cache, queue, batch, deferred, writerPc, nextTok,
                           now, shutdown, absDb, linViolated>>
 
 \* DEL k step 2a: check SQLite while holding key_lock
@@ -243,13 +266,13 @@ ClientDelDb(c) ==
        IF exists THEN
            /\ client' = [client EXCEPT ![c].pc = "del_queue",
                                        ![c].allowed = @ \cup {IsLive(absDb[k], rt)}]
-           /\ UNCHANGED <<db, cache, queue, batch, deferred, writerPc, keyLock,
+           /\ UNCHANGED <<db, keyCount, cache, queue, batch, deferred, writerPc, keyLock,
                           nextTok, opsIssued, now, shutdown, absDb, linViolated>>
        ELSE
            /\ keyLock' = [keyLock EXCEPT ![k] = NONE]
            /\ client'  = [client EXCEPT ![c] = IdleClient]
            /\ linViolated' = (linViolated \/ (FALSE \notin client[c].allowed))
-           /\ UNCHANGED <<db, cache, queue, batch, deferred, writerPc, nextTok,
+           /\ UNCHANGED <<db, keyCount, cache, queue, batch, deferred, writerPc, nextTok,
                           opsIssued, now, shutdown, absDb>>
 
 \* DEL k step 2b: queue DeleteAsync and release key_lock
@@ -259,7 +282,7 @@ ClientDelQueue(c) ==
        IF shutdown THEN
            /\ keyLock' = [keyLock EXCEPT ![k] = NONE]
            /\ client'  = [client EXCEPT ![c] = IdleClient]
-           /\ UNCHANGED <<db, cache, queue, batch, deferred, writerPc, nextTok,
+           /\ UNCHANGED <<db, keyCount, cache, queue, batch, deferred, writerPc, nextTok,
                           opsIssued, now, shutdown, absDb, linViolated>>
        ELSE
            /\ Len(queue) < QueueCap
@@ -283,7 +306,7 @@ ClientDelQueue(c) ==
               /\ absDb'     = newAbs
               /\ client'    = [updatedClients EXCEPT ![c] = IdleClient]
               /\ linViolated' = (linViolated \/ (TRUE \notin (client[c].allowed \cup {IsLive(preAbs[k], now)})))
-              /\ UNCHANGED <<db, writerPc, opsIssued, now, shutdown>>
+              /\ UNCHANGED <<db, keyCount, writerPc, opsIssued, now, shutdown>>
 
 \* EXPIRE k newExp (sync, holds key_lock until responder replies; src/server.rs:expire_reply)
 ClientExpireStart(c, k, newExp) ==
@@ -318,7 +341,7 @@ ClientExpireStart(c, k, newExp) ==
        /\ client'    = [updatedClients EXCEPT ![c] =
                             [pc |-> "expire_wait", key |-> k, allowed |-> {},
                              expected |-> IF canUpdateCache THEN 1 ELSE -1, readTs |-> now]]
-       /\ UNCHANGED <<db, batch, deferred, writerPc, now, shutdown, linViolated>>
+       /\ UNCHANGED <<db, keyCount, batch, deferred, writerPc, now, shutdown, linViolated>>
 
 \* GET k step 1: check inflight_cache (src/server.rs:handle_get)
 ClientGetStart(c, k) ==
@@ -326,12 +349,12 @@ ClientGetStart(c, k) ==
     /\ IF HasCache(cache[k]) THEN
            LET res == CacheReadVal(cache[k], now) IN
            /\ linViolated' = (linViolated \/ (res # ReadVal(absDb[k], now)))
-           /\ UNCHANGED <<db, cache, queue, batch, deferred, writerPc, keyLock,
+           /\ UNCHANGED <<db, keyCount, cache, queue, batch, deferred, writerPc, keyLock,
                           client, nextTok, opsIssued, now, shutdown, absDb>>
        ELSE
            /\ client' = [client EXCEPT ![c] = [pc |-> "get_db", key |-> k,
                                                allowed |-> {ReadVal(absDb[k], now)}, expected |-> -1, readTs |-> now]]
-           /\ UNCHANGED <<db, cache, queue, batch, deferred, writerPc, keyLock,
+           /\ UNCHANGED <<db, keyCount, cache, queue, batch, deferred, writerPc, keyLock,
                           nextTok, opsIssued, now, shutdown, absDb, linViolated>>
 
 \* GET k step 2: read SQLite after cache miss
@@ -342,7 +365,7 @@ ClientGetDb(c) ==
        IN
        /\ linViolated' = (linViolated \/ (res \notin client[c].allowed))
        /\ client'      = [client EXCEPT ![c] = IdleClient]
-       /\ UNCHANGED <<db, cache, queue, batch, deferred, writerPc, keyLock,
+       /\ UNCHANGED <<db, keyCount, cache, queue, batch, deferred, writerPc, keyLock,
                       nextTok, opsIssued, now, shutdown, absDb>>
 
 \* TTL k step 1: check inflight_cache (src/server.rs:handle_ttl)
@@ -351,12 +374,12 @@ ClientTtlStart(c, k) ==
     /\ IF HasCache(cache[k]) THEN
            LET res == CacheReadTtl(cache[k], now) IN
            /\ linViolated' = (linViolated \/ (res # ReadTtl(absDb[k], now)))
-           /\ UNCHANGED <<db, cache, queue, batch, deferred, writerPc, keyLock,
+           /\ UNCHANGED <<db, keyCount, cache, queue, batch, deferred, writerPc, keyLock,
                           client, nextTok, opsIssued, now, shutdown, absDb>>
        ELSE
            /\ client' = [client EXCEPT ![c] = [pc |-> "ttl_db", key |-> k,
                                                allowed |-> {ReadTtl(absDb[k], now)}, expected |-> -1, readTs |-> now]]
-           /\ UNCHANGED <<db, cache, queue, batch, deferred, writerPc, keyLock,
+           /\ UNCHANGED <<db, keyCount, cache, queue, batch, deferred, writerPc, keyLock,
                           nextTok, opsIssued, now, shutdown, absDb, linViolated>>
 
 \* TTL k step 2: read SQLite after cache miss
@@ -367,7 +390,7 @@ ClientTtlDb(c) ==
        IN
        /\ linViolated' = (linViolated \/ (res \notin client[c].allowed))
        /\ client'      = [client EXCEPT ![c] = IdleClient]
-       /\ UNCHANGED <<db, cache, queue, batch, deferred, writerPc, keyLock,
+       /\ UNCHANGED <<db, keyCount, cache, queue, batch, deferred, writerPc, keyLock,
                       nextTok, opsIssued, now, shutdown, absDb>>
 
 \* ---------------------------------------------------------------------------
@@ -384,8 +407,9 @@ TakeBatch(b0, q, rem, def) ==
 
 RECURSIVE CommitBatchGhost(_, _, _, _, _)
 CommitBatchGhost(dState, aState, seq, t, cMap) ==
-    IF Len(seq) = 0 THEN << dState, aState, FALSE >>
+    IF Len(seq) = 0 THEN << dState, aState, FALSE, 0 >>
     ELSE LET op == Head(seq)
+             delta  == OpDelta(dState, op)
              nextDb == ApplyOp(dState, op, t)
              found  == IF IsLive(dState[op.key], t) THEN 1 ELSE 0
              badReply ==
@@ -397,9 +421,9 @@ CommitBatchGhost(dState, aState, seq, t, cMap) ==
                 THEN ApplyOp(aState, op, t)
                 ELSE aState
              rest == CommitBatchGhost(nextDb, nextAbs, Tail(seq), t, cMap)
-         IN << rest[1], rest[2], badReply \/ rest[3] >>
+         IN << rest[1], rest[2], badReply \/ rest[3], delta + rest[4] >>
 
-\* Phase 1 of process_batch: form batch and execute tx.commit()
+\* Phase 1 of process_batch: form batch, execute tx.commit(), and apply batch_delta to key_count
 WriterCommitBatch ==
     /\ writerPc = "idle"
     /\ (HasDeferred \/ Len(queue) > 0)
@@ -416,11 +440,13 @@ WriterCommitBatch ==
                newDb  == res[1]
                newAbs == res[2]
                badExp == res[3]
+               delta  == res[4]
            IN
            /\ batch'       = b
            /\ queue'       = remQ
            /\ deferred'    = newDef
            /\ db'          = newDb
+           /\ keyCount'    = keyCount + delta
            /\ absDb'       = newAbs
            /\ writerPc'    = "committed"
            /\ client'      = UpdateReaders(client, newAbs, now)
@@ -438,9 +464,10 @@ WriterClearAndReply ==
        /\ keyLock'  = [k \in Keys |-> IF k \in expireKeys THEN NONE ELSE keyLock[k]]
        /\ batch'    = <<>>
        /\ writerPc' = "idle"
-       /\ UNCHANGED <<db, queue, deferred, nextTok, opsIssued, now, shutdown, absDb, linViolated>>
+       /\ UNCHANGED <<db, keyCount, queue, deferred, nextTok, opsIssued, now, shutdown, absDb, linViolated>>
 
-\* Failed BEGIN or COMMIT (models #64: drops async ops, clears cache, replies ERR to sync ops)
+\* Failed BEGIN, implicit rollback, or failed COMMIT: drops async ops, clears cache, replies ERR.
+\* Real code keeps keyCount unchanged; ApplyDeltaOnFailure = TRUE models a broken counter update.
 WriterFailBatch ==
     /\ AllowBatchFailure
     /\ writerPc = "idle"
@@ -450,15 +477,29 @@ WriterFailBatch ==
                     ELSE << <<Head(queue)>>, Tail(queue), BatchSize - 1 >>
            formed == TakeBatch(start[1], start[2], start[3], NoOp)
            b      == formed[1]
+           delta  == CommitBatchGhost(db, absDb, b, now, client)[4]
            expireClients == {b[i].client : i \in {j \in 1..Len(b) : b[j].kind = "Expire"}}
            expireKeys    == {b[i].key    : i \in {j \in 1..Len(b) : b[j].kind = "Expire"}}
        IN
        /\ queue'    = formed[2]
        /\ deferred' = formed[3]
+       /\ keyCount' = IF ApplyDeltaOnFailure THEN keyCount + delta ELSE keyCount
        /\ cache'    = ClearCacheForBatch(cache, b)
        /\ client'   = [c \in Clients |-> IF c \in expireClients THEN IdleClient ELSE client[c]]
        /\ keyLock'  = [k \in Keys |-> IF k \in expireKeys THEN NONE ELSE keyLock[k]]
        /\ UNCHANGED <<db, batch, writerPc, nextTok, opsIssued, now, shutdown, absDb, linViolated>>
+
+\* Background shard_cleanup_task -> delete_expired (shares the shard's single writer connection)
+CleanupExpired(k) ==
+    /\ EnableCleanup
+    /\ writerPc = "idle"
+    /\ db[k].val # NIL
+    /\ db[k].exp <= now
+    /\ (CleanupSkipsInflight => ~HasCache(cache[k]))
+    /\ db'       = [db EXCEPT ![k] = EmptyEntry]
+    /\ keyCount' = keyCount - 1
+    /\ UNCHANGED <<cache, queue, batch, deferred, writerPc, keyLock, client,
+                   nextTok, opsIssued, now, shutdown, absDb, linViolated>>
 
 \* ---------------------------------------------------------------------------
 \* Clock Tick & Graceful Shutdown
@@ -469,13 +510,13 @@ Tick ==
     /\ LET nextNow == now + 1 IN
        /\ now'    = nextNow
        /\ client' = UpdateReaders(client, absDb, nextNow)
-       /\ UNCHANGED <<db, cache, queue, batch, deferred, writerPc, keyLock,
+       /\ UNCHANGED <<db, keyCount, cache, queue, batch, deferred, writerPc, keyLock,
                       nextTok, opsIssued, shutdown, absDb, linViolated>>
 
 TriggerShutdown ==
     /\ ~shutdown
     /\ shutdown' = TRUE
-    /\ UNCHANGED <<db, cache, queue, batch, deferred, writerPc, keyLock, client,
+    /\ UNCHANGED <<db, keyCount, cache, queue, batch, deferred, writerPc, keyLock, client,
                    nextTok, opsIssued, now, absDb, linViolated>>
 
 WriterStop ==
@@ -484,7 +525,7 @@ WriterStop ==
     /\ Len(queue) = 0
     /\ ~HasDeferred
     /\ writerPc' = "stopped"
-    /\ UNCHANGED <<db, cache, queue, batch, deferred, keyLock, client,
+    /\ UNCHANGED <<db, keyCount, cache, queue, batch, deferred, keyLock, client,
                    nextTok, opsIssued, now, shutdown, absDb, linViolated>>
 
 \* ---------------------------------------------------------------------------
@@ -507,6 +548,7 @@ WriterStep ==
     \/ WriterCommitBatch
     \/ WriterClearAndReply
     \/ WriterFailBatch
+    \/ \E k \in Keys : CleanupExpired(k)
     \/ WriterStop
 
 Next ==
@@ -529,6 +571,7 @@ Spec == Init /\ [][Next]_vars /\ Fairness
 
 TypeOK ==
     /\ writerPc \in {"idle", "committed", "stopped"}
+    /\ keyCount \in Int
     /\ now \in 0..MaxTime
     /\ opsIssued \in 0..MaxOps
     /\ Len(queue) <= QueueCap
@@ -537,6 +580,10 @@ TypeOK ==
     /\ linViolated \in BOOLEAN
 
 Linearizable == ~linViolated
+
+KeyCountAccurate ==
+    /\ keyCount >= 0
+    /\ keyCount = StoredRowCount(db)
 
 QuiescentConsistency ==
     (writerPc \in {"idle", "stopped"} /\ Len(queue) = 0 /\ Len(batch) = 0 /\ ~HasDeferred)

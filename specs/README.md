@@ -13,10 +13,11 @@ Models the `async_write = true` read/write/expiry path across `src/server.rs` an
   - `conflicts_with_async_in_batch` per-key batch barrier (`AllowExpireBatchBarrier`), which also represents the `HEXPIRE` path.
 - **Two-phase batch commit**: separates SQLite `tx.commit()` (`WriterCommitBatch`) from `clear_pending_entries` + sync responder replies (`WriterClearAndReply`), exposing the visibility window behind #65.
 - **Logical clock (`now`) & expiry**: checks `GET`, `TTL`, `DEL`, `SET ... EX`, and `EXPIRE` across clock ticks.
+- **Background expiry cleanup & cached key count**: `CleanupExpired` (`delete_expired` skipping inflight keys) and `keyCount` (`shard_key_counts`, updated from per-batch `rows_affected` deltas only after commit and decremented per cleanup chunk).
 - **Graceful shutdown drain**: `TriggerShutdown` + draining `queue` and `deferred` before `WriterStop`.
 
 ### Properties verified
-- **Safety**: `TypeOK`, `Linearizable` (refinement proof via ghost `absDb` + per-read LP window), `QuiescentConsistency`, `LockSafety`, deadlock freedom.
+- **Safety**: `TypeOK`, `Linearizable` (refinement proof via ghost `absDb` + per-read LP window), `KeyCountAccurate` (`keyCount >= 0` and equals SQLite stored-row count), `QuiescentConsistency`, `LockSafety`, deadlock freedom.
 - **Liveness**: `PendingOpEventuallyCommits`, `ExpireEventuallyReplies`, `ShutdownEventuallyDrains`.
 
 ## 2. `ClusterGossip.tla`
@@ -40,6 +41,8 @@ Models Blobasaur's cluster routing and Chitchat gossip protocol (`src/cluster.rs
 | `AsyncWrite.tla` | `AsyncWrite_BarrierOnly.cfg` | Batch-barrier-only path (`HExpire` / finite-TTL `EXPIRE`) — safety + liveness | Pass |
 | `AsyncWrite.tla` | `AsyncWrite_Bug65.cfg` | Disables `EXPIRE` inflight update & batch barrier | Fails `Linearizable` (#65) |
 | `AsyncWrite.tla` | `AsyncWrite_Bug64.cfg` | Enables `BEGIN`/`COMMIT` failure dropping async ops | Fails `Linearizable` (#64) |
+| `AsyncWrite.tla` | `AsyncWrite_BugKeyCountRollback.cfg` | Applies `batch_delta` on a failed/rolled-back batch | Fails `KeyCountAccurate` |
+| `AsyncWrite.tla` | `AsyncWrite_BugCleanupInflight.cfg` | Disables inflight-cache skip in `delete_expired` | Fails `Linearizable` |
 | `ClusterGossip.tla` | `ClusterGossip.cfg` | 3-node cluster with crashes, partitions, slot handoffs — safety + liveness | Pass |
 | `ClusterGossip.tla` | `ClusterGossip_Bug35.cfg` | Enables pre-#35 local fallback on unserved slots | Fails `NoOrphanedWrites` (#35) |
 | `ClusterGossip.tla` | `ClusterGossip_BugPublishRace.cfg` | Enables unlocked `update_gossip_data()` race (`src/cluster.rs:573-628`) | Fails `GossipEventuallyConverges` |
