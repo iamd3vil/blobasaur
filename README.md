@@ -73,9 +73,9 @@ You can download pre-compiled binaries for Linux from the [GitHub Releases page]
 
 1.  **Download the latest release:**
 
-    For example, to download version `v1.0.0`:
+    For example, to download version `v0.10.0`:
     ```bash
-    wget https://github.com/iamd3vil/blobasaur/releases/download/v1.0.0/blobasaur-Linux-musl-x86_64.tar.gz
+    wget https://github.com/iamd3vil/blobasaur/releases/download/v0.10.0/blobasaur-Linux-musl-x86_64.tar.gz
     ```
 
 2.  **Extract the archive:**
@@ -110,8 +110,8 @@ docker run -d \
 
 Available tags:
 - `latest` - Latest stable release
-- `x.y.z` - Specific version (e.g., `1.0.0`)
-- `x.y` - Latest patch for minor version (e.g., `1.0`)
+- `x.y.z` - Specific version (e.g., `0.10.0`)
+- `x.y` - Latest patch for minor version (e.g., `0.10`)
 
 ### Prerequisites
 
