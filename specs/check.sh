@@ -54,17 +54,48 @@ expect_violation() {
   echo "OK: reproduced '$pattern' (exit $rc)"
 }
 
-# 1. Async write path (inflight cache, tokens, expiry, batching, cleanup, key_count, shutdown)
-expect_pass      "AsyncWrite.tla" "AsyncWrite.cfg"
-expect_pass      "AsyncWrite.tla" "AsyncWrite_BarrierOnly.cfg"
-expect_violation "AsyncWrite.tla" "AsyncWrite_Bug65.cfg" "Invariant Linearizable is violated"
-expect_violation "AsyncWrite.tla" "AsyncWrite_Bug64.cfg" "Invariant Linearizable is violated"
-expect_violation "AsyncWrite.tla" "AsyncWrite_BugKeyCountRollback.cfg" "Invariant KeyCountAccurate is violated"
-expect_violation "AsyncWrite.tla" "AsyncWrite_BugCleanupInflight.cfg" "Invariant Linearizable is violated"
+SUITE="${1:-all}"
 
-# 2. Cluster routing & Chitchat gossip (slot handoff, crashes, partitions, convergence)
-expect_pass      "ClusterGossip.tla" "ClusterGossip.cfg"
-expect_violation "ClusterGossip.tla" "ClusterGossip_Bug35.cfg" "Invariant NoOrphanedWrites is violated"
-expect_violation "ClusterGossip.tla" "ClusterGossip_BugPublishRace.cfg" "Temporal properties were violated"
+run_async_write() {
+  expect_pass "AsyncWrite.tla" "AsyncWrite.cfg"
+}
 
-echo "All TLA+ checks succeeded."
+run_async_barrier() {
+  expect_pass "AsyncWrite.tla" "AsyncWrite_BarrierOnly.cfg"
+}
+
+run_cluster_and_negatives() {
+  # AsyncWrite negative checks
+  expect_violation "AsyncWrite.tla" "AsyncWrite_Bug65.cfg" "Invariant Linearizable is violated"
+  expect_violation "AsyncWrite.tla" "AsyncWrite_Bug64.cfg" "Invariant Linearizable is violated"
+  expect_violation "AsyncWrite.tla" "AsyncWrite_BugKeyCountRollback.cfg" "Invariant KeyCountAccurate is violated"
+  expect_violation "AsyncWrite.tla" "AsyncWrite_BugCleanupInflight.cfg" "Invariant Linearizable is violated"
+
+  # Cluster routing & Chitchat gossip (slot handoff, crashes, partitions, convergence)
+  expect_pass      "ClusterGossip.tla" "ClusterGossip.cfg"
+  expect_violation "ClusterGossip.tla" "ClusterGossip_Bug35.cfg" "Invariant NoOrphanedWrites is violated"
+  expect_violation "ClusterGossip.tla" "ClusterGossip_BugPublishRace.cfg" "Temporal properties were violated"
+}
+
+case "$SUITE" in
+  all)
+    run_async_write
+    run_async_barrier
+    run_cluster_and_negatives
+    ;;
+  async-write)
+    run_async_write
+    ;;
+  async-barrier)
+    run_async_barrier
+    ;;
+  cluster-and-negatives)
+    run_cluster_and_negatives
+    ;;
+  *)
+    echo "Usage: $0 [all|async-write|async-barrier|cluster-and-negatives]" >&2
+    exit 2
+    ;;
+esac
+
+echo "TLA+ checks ($SUITE) succeeded."

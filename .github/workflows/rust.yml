@@ -33,6 +33,10 @@ jobs:
 
   tla:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [async-write, async-barrier, cluster-and-negatives]
 
     steps:
     - uses: actions/checkout@v4
@@ -41,5 +45,5 @@ jobs:
       with:
         path: ~/.cache/tla2tools
         key: tla2tools-v1.7.4
-    - name: Run TLC model checks
-      run: ./specs/check.sh
+    - name: Run TLC model checks (${{ matrix.suite }})
+      run: ./specs/check.sh "${{ matrix.suite }}"
