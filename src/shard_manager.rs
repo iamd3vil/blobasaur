@@ -882,18 +882,30 @@ pub fn next_pending_token() -> u64 {
     NEXT_TOKEN.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Whether `expires_at` has passed, by the same rule the DB queries use.
-pub fn is_expired(expires_at: Option<i64>) -> bool {
-    expires_at.is_some_and(|t| t <= Utc::now().timestamp())
+/// Whether `expires_at` has passed at `now`, by the same rule the DB queries use.
+pub fn is_expired_at(expires_at: Option<i64>, now: i64) -> bool {
+    expires_at.is_some_and(|t| t <= now)
 }
 
-/// Whether a queued async op decides `key`'s existence: `Some(true)` for a
-/// live write, `Some(false)` for a delete or an already-expired write, `None`
-/// if nothing is queued (ask the DB).
-pub async fn pending_exists(cache: &Cache<String, Pending>, key: &str) -> Option<bool> {
-    cache.get(key).await.map(
-        |pending| matches!(pending, Pending::Value { expires_at, .. } if !is_expired(expires_at)),
-    )
+/// Whether `expires_at` has passed, by the same rule the DB queries use.
+pub fn is_expired(expires_at: Option<i64>) -> bool {
+    is_expired_at(expires_at, Utc::now().timestamp())
+}
+
+/// Whether a queued async op decides `key`'s existence at `now`: `Some(true)`
+/// for a live write, `Some(false)` for a delete or an already-expired write,
+/// `None` if nothing is queued (ask the DB).
+pub async fn pending_exists_at(
+    cache: &Cache<String, Pending>,
+    key: &str,
+    now: i64,
+) -> Option<bool> {
+    cache.get(key).await.map(|pending| {
+        matches!(
+            pending,
+            Pending::Value { expires_at, .. } if !is_expired_at(expires_at, now)
+        )
+    })
 }
 
 /// Removes `key`'s entry if it still carries `token`: a newer op on the same
