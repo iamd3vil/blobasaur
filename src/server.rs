@@ -969,7 +969,7 @@ async fn handle_info(
         Some("server") | None => {
             format!(
                 "# Server\r\n\
-                 redis_version:blobasaur-0.1.0\r\n\
+                 redis_version:blobasaur-{}\r\n\
                  redis_mode:standalone\r\n\
                  process_id:{}\r\n\
                  tcp_port:6379\r\n\
@@ -984,6 +984,7 @@ async fn handle_info(
                  batch_size:{}\r\n\
                  batch_timeout_ms:{}\r\n\
                  write_queue_capacity:{}\r\n",
+                env!("CARGO_PKG_VERSION"),
                 std::process::id(),
                 state.cfg.num_shards,
                 state.cfg.data_dir,
@@ -5037,7 +5038,14 @@ mod tests {
             })
         });
         match frame.await {
-            BytesFrame::BulkString(_) => {}
+            BytesFrame::BulkString(bytes) => {
+                let text = std::str::from_utf8(&bytes).unwrap();
+                let expected = format!("redis_version:blobasaur-{}\r\n", env!("CARGO_PKG_VERSION"));
+                assert!(
+                    text.contains(&expected),
+                    "expected INFO to contain {expected:?}, got:\n{text}"
+                );
+            }
             other => panic!("Expected bulk string from INFO, got {:?}", other),
         }
 
