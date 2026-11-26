@@ -36,7 +36,7 @@ pub struct AppState {
     pub shard_senders: Vec<ShardSender>,
     pub db_pools: Vec<SqlitePool>,
     pub write_db_pools: Vec<SqlitePool>,
-    /// Existence checks HSET, HDEL and DEL make before queueing a write. Kept
+    /// Existence checks SET, HSET, HDEL and DEL make before queueing a write. Kept
     /// off the writer pool, whose one connection the writer holds for a whole
     /// batch, and off the read pool, so reads can't stall writes either.
     pub check_db_pools: Vec<SqlitePool>,

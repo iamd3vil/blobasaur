@@ -307,7 +307,7 @@ level = 1
 
 Blobasaur implements core Redis commands for blob operations:
 
-- **`SET key value [EX seconds] [PX milliseconds]`**: Store or replace a blob with optional TTL
+- **`SET key value [NX | XX] [GET] [EX seconds | PX milliseconds]`**: Store or replace a blob with optional TTL. `NX` sets only a missing key and `XX` only an existing one; either replies nil when it doesn't set. `GET` replies with the old value (nil if there was none) instead of `OK`. A SET without `EX`/`PX` clears the key's TTL, as in Redis.
   ```bash
   # Basic SET
   redis-cli SET mykey "Hello, World!"
@@ -317,6 +317,12 @@ Blobasaur implements core Redis commands for blob operations:
 
   # SET with TTL in milliseconds
   redis-cli SET mykey "Hello, World!" PX 30000
+
+  # Take a lock for 30 seconds, only if nobody holds it
+  redis-cli SET lock:job worker-1 NX EX 30
+
+  # Replace a value and get the old one back
+  redis-cli SET mykey "new value" GET
   ```
 
 - **`GET key`**: Retrieve a blob (excludes expired keys)

@@ -24,6 +24,15 @@ pub enum ExpireOption {
     KeepTtl,
 }
 
+/// SET's NX/XX condition
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetCondition {
+    /// Set only if the key doesn't exist
+    Nx,
+    /// Set only if the key exists
+    Xx,
+}
+
 /// Condition options for HEXPIRE command
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HExpireCondition {
@@ -59,6 +68,9 @@ pub enum RedisCommand {
         key: String,
         value: Bytes,
         ttl_seconds: Option<u64>,
+        condition: Option<SetCondition>,
+        /// Reply with the old value instead of OK.
+        get: bool,
     },
     Del {
         keys: Vec<String>,
@@ -334,30 +346,50 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
             Ok(RedisCommand::Get { key })
         }
         "SET" => {
-            if elements.len() < 3 || elements.len() > 5 {
+            if elements.len() < 3 {
                 return Err(ParseError::Invalid(
-                    "SET requires 2-4 arguments".to_string(),
+                    "wrong number of arguments for 'set' command".to_string(),
                 ));
             }
             let key = extract_string(&elements[1])?;
             let value = extract_bytes(&elements[2])?;
 
-            let mut ttl_seconds = None;
+            let mut condition = None;
+            let mut get = false;
+            // The option (EX or PX) and its value, checked after the loop:
+            // like Redis, a syntax error wins over a bad expire time.
+            let mut ttl: Option<(String, &BytesFrame)> = None;
 
-            // Parse optional TTL arguments (EX seconds or PX milliseconds)
             let mut i = 3;
             while i < elements.len() {
                 let option = extract_string(&elements[i])?.to_uppercase();
                 match option.as_str() {
+                    // Repeating an option is fine, as in Redis; mixing
+                    // NX with XX, or EX with PX, is not.
+                    "NX" | "XX" => {
+                        let parsed = if option == "NX" {
+                            SetCondition::Nx
+                        } else {
+                            SetCondition::Xx
+                        };
+                        if condition.is_some_and(|c| c != parsed) {
+                            return Err(syntax_error());
+                        }
+                        condition = Some(parsed);
+                        i += 1;
+                    }
+                    "GET" => {
+                        get = true;
+                        i += 1;
+                    }
                     "EX" | "PX" => {
                         if i + 1 >= elements.len() {
                             return Err(ParseError::Invalid(format!("{option} requires a value")));
                         }
-                        let ttl = redis_integer(&elements[i + 1])?;
-                        if ttl <= 0 {
-                            return Err(invalid_expire_time("set"));
+                        if ttl.as_ref().is_some_and(|(prev, _)| *prev != option) {
+                            return Err(syntax_error());
                         }
-                        ttl_seconds = Some(ttl_secs(ttl as u64, option == "PX", "set")?);
+                        ttl = Some((option, &elements[i + 1]));
                         i += 2;
                     }
                     _ => {
@@ -369,10 +401,23 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
                 }
             }
 
+            let ttl_seconds = match ttl {
+                Some((option, value)) => {
+                    let ttl = redis_integer(value)?;
+                    if ttl <= 0 {
+                        return Err(invalid_expire_time("set"));
+                    }
+                    Some(ttl_secs(ttl as u64, option == "PX", "set")?)
+                }
+                None => None,
+            };
+
             Ok(RedisCommand::Set {
                 key,
                 value,
                 ttl_seconds,
+                condition,
+                get,
             })
         }
         "DEL" => {
@@ -933,6 +978,10 @@ fn invalid_expire_time(command: &str) -> ParseError {
     ParseError::Invalid(format!("invalid expire time in '{}' command", command))
 }
 
+fn syntax_error() -> ParseError {
+    ParseError::Invalid("syntax error".to_string())
+}
+
 fn unknown_argument(arg: &str) -> ParseError {
     ParseError::Invalid(format!("unknown argument: {}", arg))
 }
@@ -1312,7 +1361,9 @@ mod tests {
             RedisCommand::Set {
                 key: "mykey".to_string(),
                 value: Bytes::from_static(b"hello world"),
-                ttl_seconds: None
+                ttl_seconds: None,
+                condition: None,
+                get: false,
             }
         );
     }
@@ -1328,7 +1379,9 @@ mod tests {
             RedisCommand::Set {
                 key: "mykey".to_string(),
                 value: Bytes::from_static(b"hello world"),
-                ttl_seconds: Some(60)
+                ttl_seconds: Some(60),
+                condition: None,
+                get: false,
             }
         );
     }
@@ -1344,7 +1397,9 @@ mod tests {
             RedisCommand::Set {
                 key: "mykey".to_string(),
                 value: Bytes::from_static(b"hello world"),
-                ttl_seconds: Some(60)
+                ttl_seconds: Some(60),
+                condition: None,
+                get: false,
             }
         );
     }
@@ -1427,7 +1482,7 @@ mod tests {
 
     #[test]
     fn test_parse_set_command_unknown_option() {
-        let input = b"*5\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$5\r\nvalue\r\n$2\r\nXX\r\n$2\r\n60\r\n";
+        let input = b"*5\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$5\r\nvalue\r\n$3\r\nFOO\r\n$2\r\n60\r\n";
         let (resp, _) = parse_resp_with_remaining(input).unwrap();
         let result = parse_command(resp);
         assert!(result.is_err());
@@ -1435,8 +1490,78 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("Unknown SET option: XX")
+                .contains("Unknown SET option: FOO")
         );
+    }
+
+    #[test]
+    fn set_parses_nx_xx_and_get_in_any_order() {
+        let set = |parts: &[&str]| match parse(parts).unwrap() {
+            RedisCommand::Set {
+                key,
+                value,
+                ttl_seconds,
+                condition,
+                get,
+            } => {
+                assert_eq!((key.as_str(), value.as_ref()), ("k", &b"v"[..]));
+                (ttl_seconds, condition, get)
+            }
+            other => panic!("unexpected {other:?}"),
+        };
+        use SetCondition::{Nx, Xx};
+        assert_eq!(set(&["SET", "k", "v"]), (None, None, false));
+        assert_eq!(set(&["SET", "k", "v", "NX"]), (None, Some(Nx), false));
+        assert_eq!(set(&["SET", "k", "v", "xx"]), (None, Some(Xx), false));
+        assert_eq!(set(&["SET", "k", "v", "Get"]), (None, None, true));
+        assert_eq!(set(&["SET", "k", "v", "NX", "GET"]), (None, Some(Nx), true));
+        // The lock idiom, and every order of the same options.
+        for parts in [
+            ["SET", "k", "v", "NX", "EX", "30"],
+            ["SET", "k", "v", "EX", "30", "NX"],
+            ["SET", "k", "v", "nx", "ex", "30"],
+        ] {
+            assert_eq!(set(&parts), (Some(30), Some(Nx), false), "{parts:?}");
+        }
+        for parts in [
+            ["SET", "k", "v", "XX", "GET", "PX", "1500"],
+            ["SET", "k", "v", "PX", "1500", "GET", "XX"],
+            ["SET", "k", "v", "GET", "PX", "1500", "XX"],
+        ] {
+            assert_eq!(set(&parts), (Some(2), Some(Xx), true), "{parts:?}");
+        }
+        // Repeating an option is allowed; for EX/PX the last value wins.
+        assert_eq!(
+            set(&["SET", "k", "v", "NX", "NX", "GET", "GET"]),
+            (None, Some(Nx), true)
+        );
+        assert_eq!(
+            set(&["SET", "k", "v", "EX", "10", "EX", "20"]),
+            (Some(20), None, false)
+        );
+    }
+
+    #[test]
+    fn set_rejects_conflicting_options() {
+        for parts in [
+            ["SET", "k", "v", "NX", "XX"].as_slice(),
+            &["SET", "k", "v", "XX", "GET", "NX"],
+            &["SET", "k", "v", "EX", "10", "PX", "100"],
+            &["SET", "k", "v", "PX", "100", "EX", "10"],
+            // As in Redis, a syntax error wins over a bad expire time.
+            &["SET", "k", "v", "EX", "0", "NX", "XX"],
+            &["SET", "k", "v", "NX", "XX", "EX", "0"],
+        ] {
+            assert_parse_error(parts, "syntax error");
+        }
+        assert_parse_error(&["SET", "k", "v", "EX", "0", "NX"], "invalid expire time");
+        assert_parse_error(&["SET", "k", "v", "EX", "abc", "NX"], "not an integer");
+        assert_parse_error(&["SET", "k", "v", "NX", "EX"], "EX requires a value");
+        assert_parse_error(
+            &["SET", "k", "v", "NX", "KEEPTTL"],
+            "Unknown SET option: KEEPTTL",
+        );
+        assert_parse_error(&["SET", "k"], "wrong number of arguments for 'set' command");
     }
 
     #[test]

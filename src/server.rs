@@ -3,7 +3,7 @@ use crate::cluster::ClusterManager;
 use crate::config::Cfg;
 use crate::metrics::Timer;
 use crate::redis::{
-    HExpireCondition, ParseError, RedisCommand, VacuumCommandMode, VacuumShardTarget,
+    HExpireCondition, ParseError, RedisCommand, SetCondition, VacuumCommandMode, VacuumShardTarget,
     decode_request, parse_command, serialize_frame,
 };
 use crate::shard_manager::{
@@ -428,12 +428,14 @@ async fn handle_redis_command_inner(
             key,
             value,
             ttl_seconds,
+            condition,
+            get,
         } => {
             if let Err(response) = check_key_route(state, &key).await {
                 stream.write_all(&serialize_frame(&response)).await?;
                 return Ok(());
             }
-            handle_set(stream, state, key, value, ttl_seconds).await?;
+            handle_set(stream, state, key, value, ttl_seconds, condition, get).await?;
         }
         RedisCommand::Del { keys } => {
             handle_del_multiple(stream, state, keys).await?;
@@ -679,19 +681,85 @@ async fn handle_set(
     key: String,
     value: Bytes,
     ttl_seconds: Option<u64>,
+    condition: Option<SetCondition>,
+    get: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let response = set_reply(state, key, value, ttl_seconds, condition, get).await?;
+    match response {
+        BytesFrame::BulkString(old) => write_bulk(stream, &old).await?,
+        response => stream.write_all(&serialize_frame(&response)).await?,
+    }
+    Ok(())
+}
+
+/// SET's reply; it releases its key lock before the reply is written, as DEL.
+async fn set_reply(
+    state: &Arc<AppState>,
+    key: String,
+    value: Bytes,
+    ttl_seconds: Option<u64>,
+    condition: Option<SetCondition>,
+    get: bool,
+) -> Result<BytesFrame, Box<dyn std::error::Error>> {
     let shard_index = state.get_shard(&key);
     let sender = &state.shard_senders[shard_index];
+    let pool = &state.check_db_pools[shard_index];
 
     let value_len = value.len() as f64;
     let value = compress_if_enabled(state, value).await?;
     let stored_len = value.len() as f64;
 
-    // Check if async_write is enabled
-    if state.cfg.async_write.unwrap_or(false) {
-        // Calculate expires_at timestamp if TTL is provided
-        let expires_at = ttl_seconds.map(|ttl| expiry_in(ttl as i64));
+    // Held until the write is queued or committed, so no other SET, DEL or
+    // EXPIRE of the key lands between NX/XX/GET's check and the write. A
+    // plain SET takes it too: otherwise it could land there and be
+    // overwritten by an NX that found no key.
+    let _guard = state.key_locks.lock_keys(&[key.as_str()]).await;
 
+    // GET needs the old value; NX and XX only whether there is one.
+    let old_value = if get {
+        match live_blob(state, pool, &key).await {
+            Ok(old) => Some(old),
+            Err(e) => {
+                tracing::error!("Failed to read SET GET value for key {}: {}", key, e);
+                return Ok(BytesFrame::Error("ERR database error".into()));
+            }
+        }
+    } else {
+        None
+    };
+    let write = match condition {
+        None => true,
+        Some(condition) => {
+            let exists = match &old_value {
+                Some(old) => old.is_some(),
+                None => match blob_live(state, pool, &key).await {
+                    Ok(exists) => exists,
+                    Err(e) => {
+                        tracing::error!("Failed to check SET existence for key {}: {}", key, e);
+                        return Ok(BytesFrame::Error("ERR database error".into()));
+                    }
+                },
+            };
+            exists == (condition == SetCondition::Xx)
+        }
+    };
+    // Decompressed before writing, so a value that can't be read fails the
+    // command without replacing it.
+    let reply = match old_value {
+        Some(Some(old)) => BytesFrame::BulkString(decompress_if_enabled(state, old).await?),
+        Some(None) => BytesFrame::Null,
+        None if write => BytesFrame::SimpleString("OK".into()),
+        None => BytesFrame::Null,
+    };
+    if !write {
+        return Ok(reply);
+    }
+
+    // Resolved only now, so time spent waiting for the lock doesn't shorten
+    // the TTL.
+    let expires_at = ttl_seconds.map(|ttl| expiry_in(ttl as i64));
+
+    if state.cfg.async_write.unwrap_or(false) {
         // Async mode: respond immediately after queueing. The inflight cache
         // serves the value until it commits.
         let token = shard_manager::next_pending_token();
@@ -715,20 +783,10 @@ async fn handle_set(
                 "Failed to send ASYNC SET operation to shard {}",
                 shard_index
             );
-            let response = BytesFrame::Error("ERR internal error".into());
-            stream.write_all(&serialize_frame(&response)).await?;
             state.metrics.record_error("storage");
-        } else {
-            state.metrics.value_size_set_bytes.record(value_len);
-            state.metrics.stored_value_size_set_bytes.record(stored_len);
-            let response = BytesFrame::SimpleString("OK".into());
-            stream.write_all(&serialize_frame(&response)).await?;
-            state.metrics.record_storage_operation();
+            return Ok(BytesFrame::Error("ERR internal error".into()));
         }
     } else {
-        // Calculate expires_at timestamp if TTL is provided
-        let expires_at = ttl_seconds.map(|ttl| expiry_in(ttl as i64));
-
         // Sync mode: wait for completion
         let (responder_tx, responder_rx) = oneshot::channel();
 
@@ -741,35 +799,71 @@ async fn handle_set(
 
         if sender.send(operation).await.is_err() {
             tracing::error!("Failed to send SET operation to shard {}", shard_index);
-            let response = BytesFrame::Error("ERR internal error".into());
-            stream.write_all(&serialize_frame(&response)).await?;
             state.metrics.record_error("storage");
-        } else {
-            match responder_rx.await {
-                Ok(Ok(())) => {
-                    state.metrics.value_size_set_bytes.record(value_len);
-                    state.metrics.stored_value_size_set_bytes.record(stored_len);
-                    let response = BytesFrame::SimpleString("OK".into());
-                    stream.write_all(&serialize_frame(&response)).await?;
-                    state.metrics.record_storage_operation();
-                }
-                Ok(Err(e)) => {
-                    tracing::error!("Shard writer failed for SET: {}", e);
-                    let response = BytesFrame::Error("ERR database error".into());
-                    stream.write_all(&serialize_frame(&response)).await?;
-                    state.metrics.record_error("storage");
-                }
-                Err(_) => {
-                    tracing::error!("Shard writer task cancelled or panicked for SET");
-                    let response = BytesFrame::Error("ERR internal error".into());
-                    stream.write_all(&serialize_frame(&response)).await?;
-                    state.metrics.record_error("storage");
-                }
+            return Ok(BytesFrame::Error("ERR internal error".into()));
+        }
+        match responder_rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::error!("Shard writer failed for SET: {}", e);
+                state.metrics.record_error("storage");
+                return Ok(BytesFrame::Error("ERR database error".into()));
+            }
+            Err(_) => {
+                tracing::error!("Shard writer task cancelled or panicked for SET");
+                state.metrics.record_error("storage");
+                return Ok(BytesFrame::Error("ERR internal error".into()));
             }
         }
     }
 
-    Ok(())
+    state.metrics.value_size_set_bytes.record(value_len);
+    state.metrics.stored_value_size_set_bytes.record(stored_len);
+    state.metrics.record_storage_operation();
+    Ok(reply)
+}
+
+/// Whether `key` holds a live value. A queued async SET or DEL decides it,
+/// since it isn't in the DB yet; otherwise the DB does.
+async fn blob_live(
+    state: &AppState,
+    pool: &sqlx::SqlitePool,
+    key: &str,
+) -> Result<bool, sqlx::Error> {
+    if let Some(exists) = shard_manager::pending_exists(&state.inflight_cache, key).await {
+        return Ok(exists);
+    }
+    let row =
+        sqlx::query("SELECT 1 FROM blobs WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)")
+            .bind(key)
+            .bind(chrono::Utc::now().timestamp())
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.is_some())
+}
+
+/// `key`'s live value as stored (still compressed), or `None`. Checked in
+/// the same order as [`blob_live`].
+async fn live_blob(
+    state: &AppState,
+    pool: &sqlx::SqlitePool,
+    key: &str,
+) -> Result<Option<Bytes>, sqlx::Error> {
+    match state.inflight_cache.get(key).await {
+        Some(Pending::Value {
+            data, expires_at, ..
+        }) if !shard_manager::is_expired(expires_at) => return Ok(Some(data)),
+        Some(_) => return Ok(None),
+        None => {}
+    }
+    let row = sqlx::query_as::<_, (Vec<u8>,)>(
+        "SELECT data FROM blobs WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
+    )
+    .bind(key)
+    .bind(chrono::Utc::now().timestamp())
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(data,)| data.into()))
 }
 
 async fn handle_del_multiple(
@@ -810,22 +904,12 @@ async fn del_reply(state: &Arc<AppState>, mut keys: Vec<String>) -> BytesFrame {
         // afterwards and bring the key back. A queued DEL means it's gone.
         // Otherwise check the DB. A failed check (e.g. the shard file is
         // locked or unreadable) must not be reported as "key not found".
-        let exists = match shard_manager::pending_exists(&state.inflight_cache, &key).await {
-            Some(exists) => exists,
-            None => match sqlx::query(
-                "SELECT 1 FROM blobs WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
-            )
-            .bind(&key)
-            .bind(chrono::Utc::now().timestamp())
-            .fetch_optional(pool)
-            .await
-            {
-                Ok(row) => row.is_some(),
-                Err(e) => {
-                    tracing::error!("Failed to check DEL existence for key {}: {}", key, e);
-                    return BytesFrame::Error("ERR database error".into());
-                }
-            },
+        let exists = match blob_live(state, pool, &key).await {
+            Ok(exists) => exists,
+            Err(e) => {
+                tracing::error!("Failed to check DEL existence for key {}: {}", key, e);
+                return BytesFrame::Error("ERR database error".into());
+            }
         };
 
         if !exists {
@@ -3147,9 +3231,9 @@ mod tests {
                 let key = format!("k{round}");
                 let frame = respond_with(&ctx, |state, mut stream| {
                     let key = key.clone();
-                    Box::pin(
-                        async move { handle_set(&mut stream, &state, key, "v".into(), None).await },
-                    )
+                    Box::pin(async move {
+                        handle_set(&mut stream, &state, key, "v".into(), None, None, false).await
+                    })
                 })
                 .await;
                 assert_simple_string(frame, "OK");
@@ -3182,7 +3266,8 @@ mod tests {
                     let key = key.clone();
                     let frame = respond_with(&ctx, |state, mut stream| {
                         Box::pin(async move {
-                            handle_set(&mut stream, &state, key, "v".into(), None).await
+                            handle_set(&mut stream, &state, key, "v".into(), None, None, false)
+                                .await
                         })
                     })
                     .await;
@@ -3733,6 +3818,8 @@ mod tests {
                     "k1".to_string(),
                     Bytes::from_static(b"v1"),
                     None,
+                    None,
+                    false,
                 )
                 .await
             })
@@ -3816,6 +3903,8 @@ mod tests {
                     "delete-me".to_string(),
                     Bytes::from_static(b"value"),
                     None,
+                    None,
+                    false,
                 )
                 .await
             })
@@ -3885,6 +3974,8 @@ mod tests {
                     "k".to_string(),
                     Bytes::from_static(b"v"),
                     None,
+                    None,
+                    false,
                 )
                 .await
             })
@@ -4702,6 +4793,8 @@ mod tests {
                     "to_delete".to_string(),
                     Bytes::from_static(b"v"),
                     None,
+                    None,
+                    false,
                 )
                 .await
             })
@@ -4837,6 +4930,8 @@ mod tests {
                     "ttl_key".to_string(),
                     Bytes::from_static(b"val"),
                     None,
+                    None,
+                    false,
                 )
                 .await
             })
@@ -5376,7 +5471,7 @@ mod tests {
     #[tokio::test]
     async fn expire_and_del_treat_expired_key_as_missing() {
         let ctx = TestContext::new(false).await;
-        run!(ctx, handle_set("k".into(), v(b"old"), None));
+        run!(ctx, handle_set("k".into(), v(b"old"), None, None, false));
         set_expires_at(&ctx, "blobs", "k", past()).await;
 
         assert_integer_response(run!(ctx, handle_expire("k".into(), 100)), 0);
@@ -5511,6 +5606,309 @@ mod tests {
         assert_eq!(codes(reply), [BytesFrame::Integer(1)]);
         assert_eq!(expires_at("g").await, Some(4102444800));
         ctx.shutdown().await;
+    }
+
+    /// Runs SET with options from a request, as a client would.
+    async fn set(ctx: &TestContext, parts: &[&str]) -> BytesFrame {
+        let mut request = vec!["SET"];
+        request.extend_from_slice(parts);
+        run_request(ctx, &request).await
+    }
+
+    async fn get(ctx: &TestContext, key: &str) -> BytesFrame {
+        run_request(ctx, &["GET", key]).await
+    }
+
+    async fn ttl(ctx: &TestContext, key: &str) -> i64 {
+        // TTL reads only the DB, so wait out a queued async write first.
+        wait_for_commit(&ctx.state.inflight_cache, key).await;
+        match run_request(ctx, &["TTL", key]).await {
+            BytesFrame::Integer(ttl) => ttl,
+            other => panic!("Expected integer TTL, got {other:?}"),
+        }
+    }
+
+    // Each reply was checked against Redis 8.12.0.
+    #[tokio::test]
+    async fn set_nx_xx_and_get_reply_like_redis() {
+        for async_write in [false, true] {
+            let ctx = TestContext::new(async_write).await;
+
+            assert_simple_string(set(&ctx, &["k", "v", "NX"]).await, "OK");
+            assert_null(set(&ctx, &["k", "v2", "NX"]).await);
+            assert_bulk_string(get(&ctx, "k").await, b"v");
+
+            assert_null(set(&ctx, &["missing", "v", "XX"]).await);
+            assert_null(get(&ctx, "missing").await);
+            assert_simple_string(set(&ctx, &["k", "v3", "XX"]).await, "OK");
+            assert_bulk_string(get(&ctx, "k").await, b"v3");
+
+            assert_bulk_string(set(&ctx, &["k", "v4", "GET"]).await, b"v3");
+            assert_bulk_string(set(&ctx, &["k", "v5", "NX", "GET"]).await, b"v4");
+            assert_bulk_string(get(&ctx, "k").await, b"v4");
+            assert_bulk_string(set(&ctx, &["k", "v6", "XX", "GET"]).await, b"v4");
+            assert_bulk_string(get(&ctx, "k").await, b"v6");
+
+            // GET of a missing key replies nil, and sets it unless XX.
+            assert_null(set(&ctx, &["a", "v", "XX", "GET"]).await);
+            assert_null(get(&ctx, "a").await);
+            assert_null(set(&ctx, &["a", "v", "GET"]).await);
+            assert_bulk_string(get(&ctx, "a").await, b"v");
+            assert_null(set(&ctx, &["b", "v", "get", "ex", "100", "nx"]).await);
+            assert_bulk_string(get(&ctx, "b").await, b"v");
+
+            // An empty old value is a value, not nil.
+            assert_simple_string(set(&ctx, &["e", ""]).await, "OK");
+            assert_null(set(&ctx, &["e", "v", "NX"]).await);
+            assert_bulk_string(set(&ctx, &["e", "v", "GET"]).await, b"");
+            ctx.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn set_options_keep_or_clear_the_ttl_like_redis() {
+        for async_write in [false, true] {
+            let ctx = TestContext::new(async_write).await;
+            assert_simple_string(set(&ctx, &["t", "v", "EX", "100"]).await, "OK");
+            // An NX that doesn't set leaves the TTL alone...
+            assert_null(set(&ctx, &["t", "w", "NX"]).await);
+            assert!((99..=100).contains(&ttl(&ctx, "t").await));
+            // ...while one that sets without EX/PX clears it, like a plain SET.
+            assert_simple_string(set(&ctx, &["t", "w", "XX"]).await, "OK");
+            assert_eq!(ttl(&ctx, "t").await, -1);
+            assert_simple_string(set(&ctx, &["t", "v", "EX", "100"]).await, "OK");
+            assert_bulk_string(set(&ctx, &["t", "w", "GET"]).await, b"v");
+            assert_eq!(ttl(&ctx, "t").await, -1);
+            assert_bulk_string(set(&ctx, &["t", "x", "XX", "GET", "EX", "50"]).await, b"w");
+            assert!((49..=50).contains(&ttl(&ctx, "t").await));
+            assert_simple_string(set(&ctx, &["n", "v", "NX", "PX", "100000"]).await, "OK");
+            assert!((99..=100).contains(&ttl(&ctx, "n").await));
+            ctx.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn set_options_see_async_writes_still_queued() {
+        let mut ctx = TestContext::new_paused(true).await;
+        assert_simple_string(set(&ctx, &["q", "v"]).await, "OK");
+        assert_null(set(&ctx, &["q", "v2", "NX"]).await);
+        assert_bulk_string(set(&ctx, &["q", "v3", "GET"]).await, b"v");
+        assert_simple_string(set(&ctx, &["q", "v4", "XX"]).await, "OK");
+
+        // A queued DEL makes the key missing.
+        assert_integer_response(run_request(&ctx, &["DEL", "q"]).await, 1);
+        assert_null(set(&ctx, &["q", "v5", "XX", "GET"]).await);
+        assert_null(set(&ctx, &["q", "v6", "NX", "GET"]).await);
+
+        // So does a queued write that has expired by now.
+        ctx.state
+            .inflight_cache
+            .insert(
+                "x".into(),
+                Pending::Value {
+                    data: v(b"old"),
+                    expires_at: Some(past()),
+                    token: shard_manager::next_pending_token(),
+                },
+            )
+            .await;
+        assert_null(set(&ctx, &["x", "v", "XX"]).await);
+        assert_null(set(&ctx, &["x", "v", "GET"]).await);
+
+        ctx.resume();
+        for key in ["q", "x"] {
+            wait_for_commit(&ctx.state.inflight_cache, key).await;
+        }
+        assert_bulk_string(get(&ctx, "q").await, b"v6");
+        assert_bulk_string(get(&ctx, "x").await, b"v");
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn set_options_treat_expired_key_as_missing() {
+        let ctx = TestContext::new(false).await;
+        for key in ["nx", "xx", "get"] {
+            assert_simple_string(set(&ctx, &[key, "old"]).await, "OK");
+            set_expires_at(&ctx, "blobs", key, past()).await;
+        }
+        assert_simple_string(set(&ctx, &["nx", "v", "NX"]).await, "OK");
+        assert_bulk_string(get(&ctx, "nx").await, b"v");
+        assert_null(set(&ctx, &["xx", "v", "XX"]).await);
+        assert_null(get(&ctx, "xx").await);
+        assert_null(set(&ctx, &["get", "v", "GET"]).await);
+        assert_bulk_string(get(&ctx, "get").await, b"v");
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_set_nx_has_one_winner() {
+        for async_write in [false, true] {
+            let ctx = TestContext::new(async_write).await;
+            for round in 0..ROUNDS {
+                let key = format!("lock{round}");
+                let replies = join_all((0..CLIENTS).map(|i| {
+                    let key = key.clone();
+                    respond_with(&ctx, move |state, mut stream| {
+                        Box::pin(async move {
+                            let value = Bytes::from(format!("client{i}"));
+                            handle_set(
+                                &mut stream,
+                                &state,
+                                key,
+                                value,
+                                Some(100),
+                                Some(SetCondition::Nx),
+                                false,
+                            )
+                            .await
+                        })
+                    })
+                }))
+                .await;
+                let winners: Vec<usize> = (0..CLIENTS)
+                    .filter(|&i| replies[i] != BytesFrame::Null)
+                    .collect();
+                assert_eq!(winners.len(), 1, "async_write={async_write}: {replies:?}");
+                assert_simple_string(replies[winners[0]].clone(), "OK");
+                let expected = format!("client{}", winners[0]);
+                assert_bulk_string(get(&ctx, &key).await, expected.as_bytes());
+            }
+            ctx.shutdown().await;
+        }
+    }
+
+    /// Concurrent SET ... GETs must each replace the value the previous one
+    /// wrote, so every value is returned exactly once.
+    #[tokio::test]
+    async fn concurrent_set_get_returns_each_old_value_once() {
+        for async_write in [false, true] {
+            let ctx = TestContext::new(async_write).await;
+            for round in 0..ROUNDS {
+                let key = format!("k{round}");
+                assert_simple_string(set(&ctx, &[&key, "initial"]).await, "OK");
+                let replies = join_all((0..CLIENTS).map(|i| {
+                    let key = key.clone();
+                    respond_with(&ctx, move |state, mut stream| {
+                        Box::pin(async move {
+                            let value = Bytes::from(format!("client{i}"));
+                            handle_set(&mut stream, &state, key, value, None, None, true).await
+                        })
+                    })
+                }))
+                .await;
+                let mut seen: Vec<String> = replies
+                    .iter()
+                    .chain([&get(&ctx, &key).await])
+                    .map(|frame| {
+                        bulk_str(frame).unwrap_or_else(|| panic!("Expected a value, got {frame:?}"))
+                    })
+                    .collect();
+                seen.sort();
+                let mut expected: Vec<String> = (0..CLIENTS)
+                    .map(|i| format!("client{i}"))
+                    .chain(["initial".to_string()])
+                    .collect();
+                expected.sort();
+                assert_eq!(seen, expected, "async_write={async_write}");
+            }
+            ctx.shutdown().await;
+        }
+    }
+
+    /// A plain SET takes the key lock too: one that didn't could land between
+    /// an NX's check and its write. Its TTL counts from when it gets the lock.
+    #[tokio::test]
+    async fn plain_set_waits_for_the_key_lock() {
+        const TTL: u64 = 100;
+        for async_write in [false, true] {
+            let ctx = TestContext::new(async_write).await;
+            let guard = ctx.state.key_locks.lock_keys(&["k"]).await;
+            let set = respond_with(&ctx, |state, mut stream| {
+                Box::pin(async move {
+                    handle_set(
+                        &mut stream,
+                        &state,
+                        "k".into(),
+                        v(b"v"),
+                        Some(TTL),
+                        None,
+                        false,
+                    )
+                    .await
+                })
+            });
+            // Held across a second boundary, as in
+            // waiting_for_a_key_lock_doesnt_shorten_a_relative_ttl.
+            let release = async {
+                tokio::time::sleep(Duration::from_millis(1200)).await;
+                let released_at = chrono::Utc::now().timestamp();
+                drop(guard);
+                released_at
+            };
+            let (frame, released_at) = tokio::join!(set, release);
+            assert_simple_string(frame, "OK");
+            wait_for_commit(&ctx.state.inflight_cache, "k").await;
+            let (expires_at,): (i64,) =
+                sqlx::query_as("SELECT expires_at FROM blobs WHERE key = 'k'")
+                    .fetch_one(&ctx.state.db_pools[0])
+                    .await
+                    .unwrap();
+            assert!(
+                expires_at >= released_at + TTL as i64,
+                "async_write={async_write}: expiry {expires_at} counts from before the lock \
+                 was released at {released_at}"
+            );
+            ctx.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn set_options_return_error_when_existence_check_fails() {
+        let ctx = TestContext::new(false).await;
+        assert_simple_string(set(&ctx, &["k", "old"]).await, "OK");
+        // Simulates the existence check failing.
+        ctx.state.check_db_pools[0].close().await;
+
+        for options in [["NX"].as_slice(), &["XX"], &["GET"], &["XX", "GET"]] {
+            let mut parts = vec!["k", "new"];
+            parts.extend_from_slice(options);
+            assert_error_contains(set(&ctx, &parts).await, "database error");
+        }
+        assert_bulk_string(get(&ctx, "k").await, b"old");
+        // A plain SET doesn't check, so it still works.
+        assert_simple_string(set(&ctx, &["k", "new"]).await, "OK");
+        assert_bulk_string(get(&ctx, "k").await, b"new");
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn set_get_returns_the_decompressed_old_value() {
+        let old = "compressible ".repeat(100);
+        for async_write in [false, true] {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let mut cfg = single_read_connection_cfg(&temp_dir, async_write);
+            cfg.sqlite = None;
+            cfg.storage_compression = Some(crate::config::CompressionConfig {
+                enabled: true,
+                algorithm: crate::config::CompressionType::Zstd,
+                level: None,
+            });
+            // Async writes stay queued, so GET reads the old value from the
+            // inflight cache; sync ones read it from the DB.
+            let mut ctx = TestContext::paused_from_cfg(temp_dir, cfg).await;
+            if !async_write {
+                ctx.resume();
+            }
+            assert!(ctx.state.compressor.is_some());
+            assert_simple_string(set(&ctx, &["k", &old]).await, "OK");
+            assert_bulk_string(set(&ctx, &["k", "new", "GET"]).await, old.as_bytes());
+            assert_bulk_string(set(&ctx, &["k", "newer", "XX", "GET"]).await, b"new");
+            if async_write {
+                ctx.resume();
+            }
+            assert_bulk_string(get(&ctx, "k").await, b"newer");
+            ctx.shutdown().await;
+        }
     }
 
     #[tokio::test]
@@ -5777,7 +6175,7 @@ mod tests {
                 let frame = respond_with(&ctx, |state, stream| {
                     Box::pin(async move {
                         let mut stream = stream;
-                        handle_set(&mut stream, &state, key, val, None).await
+                        handle_set(&mut stream, &state, key, val, None, None, false).await
                     })
                 })
                 .await;
@@ -5876,6 +6274,8 @@ mod tests {
                     "new".to_string(),
                     Bytes::from_static(b"v"),
                     Some(100),
+                    None,
+                    false,
                 )
                 .await
             })
@@ -5911,6 +6311,8 @@ mod tests {
                     "old".to_string(),
                     Bytes::from_static(b"v2"),
                     None,
+                    None,
+                    false,
                 )
                 .await
             })
@@ -6095,6 +6497,8 @@ mod tests {
                     "k".to_string(),
                     Bytes::from_static(b"old"),
                     None,
+                    None,
+                    false,
                 )
                 .await
             })
@@ -6133,6 +6537,8 @@ mod tests {
                     "k".to_string(),
                     Bytes::from_static(b"v"),
                     None,
+                    None,
+                    false,
                 )
                 .await
             })
@@ -6216,6 +6622,8 @@ mod tests {
                     "k_ttl".to_string(),
                     Bytes::from_static(b"v"),
                     None,
+                    None,
+                    false,
                 )
                 .await
             })
