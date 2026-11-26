@@ -1540,7 +1540,11 @@ async fn hsetex_reply(
                 expires_at: pending_expires_at,
                 token,
             };
-            let operation = if let Some(exp) = expires_at {
+            // Commit the exact resolved expiry that `inflight_hcache` advertises
+            // (including KEEPTTL): re-evaluating `expires_at > now` at commit time
+            // would turn an already-passed deadline into NULL (permanent) after
+            // async reads had already returned nil.
+            let operation = if let Some(exp) = pending_expires_at {
                 ShardWriteOperation::HSetExAsync {
                     namespace: namespace.clone(),
                     key: field_key,
@@ -1551,7 +1555,7 @@ async fn hsetex_reply(
             } else {
                 ShardWriteOperation::HSetAsync {
                     namespace: namespace.clone(),
-                    keep_ttl,
+                    keep_ttl: false,
                     key: field_key,
                     data: compressed_value,
                     token,
@@ -6319,6 +6323,93 @@ mod tests {
         assert_bulk_string(frame, b"v1");
 
         ctx.state.inflight_cache.invalidate("k").await;
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn async_hsetex_keepttl_does_not_resurrect_after_expiry_before_commit() {
+        let mut ctx = TestContext::new_paused(true).await;
+
+        // Queue HSETEX with a 1-second TTL, then overwrite with HSETEX KEEPTTL
+        // while still queued (before commit).
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_hsetex(
+                    &mut stream,
+                    &state,
+                    "ns".to_string(),
+                    false,
+                    false,
+                    Some(crate::redis::protocol::ExpireOption::Ex(1)),
+                    vec![("f".to_string(), Bytes::from_static(b"v1"))],
+                )
+                .await
+            })
+        })
+        .await;
+        assert_integer_response(frame, 1);
+
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_hsetex(
+                    &mut stream,
+                    &state,
+                    "ns".to_string(),
+                    false,
+                    false,
+                    Some(crate::redis::protocol::ExpireOption::KeepTtl),
+                    vec![("f".to_string(), Bytes::from_static(b"v2"))],
+                )
+                .await
+            })
+        })
+        .await;
+        assert_integer_response(frame, 1);
+
+        let exp = match ctx
+            .state
+            .inflight_hcache
+            .get(&ctx.state.namespaced_key("ns", "f"))
+            .await
+        {
+            Some(Pending::Value {
+                expires_at: Some(exp),
+                ..
+            }) => exp,
+            other => panic!("expected Pending::Value with expires_at, got {other:?}"),
+        };
+
+        // Wait until the deadline has passed before the writer commits.
+        while chrono::Utc::now().timestamp() < exp {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Before commit, HGET already observes the field as expired (nil).
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_hget(&mut stream, &state, "ns".to_string(), "f".to_string()).await
+            })
+        })
+        .await;
+        assert_null(frame);
+
+        // Once the writer commits, the field must stay expired — not turn into
+        // a persistent row with expires_at = NULL.
+        ctx.resume();
+        wait_for_commit(
+            &ctx.state.inflight_hcache,
+            &ctx.state.namespaced_key("ns", "f"),
+        )
+        .await;
+
+        let frame = respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_hget(&mut stream, &state, "ns".to_string(), "f".to_string()).await
+            })
+        })
+        .await;
+        assert_null(frame);
+
         ctx.shutdown().await;
     }
 }
