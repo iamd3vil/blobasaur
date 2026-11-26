@@ -261,6 +261,10 @@ async fn handle_connection(
     state: Arc<AppState>,
     shutdown: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Responses are typically small and written one per command; without this
+    // Nagle holds each segment back and clients on real networks pay a
+    // delayed-ACK stall per reply.
+    stream.set_nodelay(true)?;
     let max_request_size = state.cfg.max_request_size();
     let mut buffer = BytesMut::with_capacity(READ_CHUNK);
     let mut grown_to = READ_CHUNK;
