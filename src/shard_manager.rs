@@ -2510,6 +2510,7 @@ pub async fn shard_cleanup_task(
             .await
             .unwrap_or_default()
             .into_iter()
+            .map(|(table, ns)| (table.to_ascii_lowercase(), ns))
             .collect();
 
         match sqlx::query_as::<_, (String,)>(NAMESPACED_TABLES_QUERY)
@@ -2518,7 +2519,7 @@ pub async fn shard_cleanup_task(
         {
             Ok(names) => {
                 for (name,) in names {
-                    let ns = ns_map.get(&name).cloned();
+                    let ns = ns_map.get(&name.to_ascii_lowercase()).cloned();
                     tables.push((name, ns));
                 }
             }
