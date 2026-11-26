@@ -71,6 +71,7 @@ pub async fn run(
                 inflight_cache: state.inflight_cache.clone(),
                 inflight_hcache: state.inflight_hcache.clone(),
                 metrics: state.metrics.clone(),
+                key_count: state.shard_key_counts[i].clone(),
                 shutdown: writers_shutdown.clone(),
             },
         )));
@@ -91,6 +92,7 @@ pub async fn run(
             cfg.cleanup_chunk_size(),
             state.inflight_cache.clone(),
             state.inflight_hcache.clone(),
+            state.shard_key_counts[i].clone(),
         )));
     }
 
@@ -952,12 +954,18 @@ async fn handle_ping(
     Ok(())
 }
 
+fn format_keyspace_info(total_keys: u64) -> String {
+    format!("# Keyspace\r\ndb0:keys={total_keys},expires=0,avg_ttl=0\r\n")
+}
+
 async fn handle_info(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
     section: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let info = match section.as_deref() {
+    let normalized_section = section.as_deref().map(str::to_ascii_lowercase);
+    let keyspace = format_keyspace_info(state.total_key_count());
+    let info = match normalized_section.as_deref() {
         Some("server") | None => {
             format!(
                 "# Server\r\n\
@@ -967,8 +975,7 @@ async fn handle_info(
                  tcp_port:6379\r\n\
                  uptime_in_seconds:unknown\r\n\
                  \r\n\
-                 # Keyspace\r\n\
-                 db0:keys=unknown,expires=0,avg_ttl=0\r\n\
+                 {keyspace}\
                  \r\n\
                  # Blobasaur\r\n\
                  shards:{}\r\n\
@@ -986,6 +993,7 @@ async fn handle_info(
                 state.cfg.write_queue_capacity()
             )
         }
+        Some("keyspace") => keyspace,
         Some("stats") => "# Stats\r\n\
              total_connections_received:unknown\r\n\
              total_commands_processed:unknown\r\n\
@@ -1012,7 +1020,10 @@ async fn handle_info(
              active_defrag_key_hits:0\r\n\
              active_defrag_key_misses:0\r\n"
             .to_string(),
-        Some(s) => format!("# {}\r\n(section not implemented)\r\n", s),
+        Some(_) => format!(
+            "# {}\r\n(section not implemented)\r\n",
+            section.as_deref().unwrap_or("")
+        ),
     };
 
     let response = BytesFrame::BulkString(info.into_bytes().into());
@@ -2720,6 +2731,7 @@ mod tests {
                             inflight_cache: state.inflight_cache.clone(),
                             inflight_hcache: state.inflight_hcache.clone(),
                             metrics: state.metrics.clone(),
+                            key_count: state.shard_key_counts[i].clone(),
                             shutdown: CancellationToken::new(),
                         },
                     )));
@@ -4712,6 +4724,87 @@ mod tests {
         assert_eq!(reads(&again, "sqlite", "hit"), 1.0);
         assert_eq!(reads(&again, "sqlite", "miss"), 2.0);
         assert_eq!(reads(&again, "inflight", "hit"), 1.0);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn application_metrics_and_info_report_cached_key_count() {
+        use crate::metrics::rendered_value;
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let ctx = TestContext::new(false).await;
+        let keys_gauge = || {
+            ctx.state.record_gauges();
+            rendered_value(&recorder.handle().render(), r#"blobasaur_keys{shard="0"}"#)
+        };
+
+        assert_eq!(keys_gauge(), 0.0);
+
+        // Insert a key, overwrite it, and insert a namespaced field.
+        for (k, v) in [("k1", b"v1"), ("k1", b"v2")] {
+            respond_with(&ctx, |state, mut stream| {
+                Box::pin(async move {
+                    handle_set(
+                        &mut stream,
+                        &state,
+                        k.to_string(),
+                        Bytes::from_static(v),
+                        None,
+                    )
+                    .await
+                })
+            })
+            .await;
+        }
+        respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_hset(
+                    &mut stream,
+                    &state,
+                    "ns".to_string(),
+                    "f1".to_string(),
+                    Bytes::from_static(b"hv"),
+                )
+                .await
+            })
+        })
+        .await;
+        assert_eq!(keys_gauge(), 2.0);
+
+        // Bare INFO and INFO keyspace (case-insensitive) reflect the same cached total.
+        for section in [None, Some("keyspace"), Some("KEYSPACE")] {
+            let section_owned = section.map(str::to_string);
+            let info = respond_with(&ctx, |state, mut stream| {
+                Box::pin(async move { handle_info(&mut stream, &state, section_owned).await })
+            })
+            .await;
+            match info {
+                BytesFrame::BulkString(bytes) => {
+                    let text = std::str::from_utf8(&bytes).unwrap();
+                    assert!(
+                        text.contains("# Keyspace\r\ndb0:keys=2,expires=0,avg_ttl=0\r\n"),
+                        "unexpected INFO ({section:?}) output:\n{text}"
+                    );
+                }
+                other => panic!("Expected bulk string from INFO ({section:?}), got {other:?}"),
+            }
+        }
+
+        // Delete both keys.
+        respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_del_multiple(&mut stream, &state, vec!["k1".to_string()]).await
+            })
+        })
+        .await;
+        respond_with(&ctx, |state, mut stream| {
+            Box::pin(async move {
+                handle_hdel(&mut stream, &state, "ns".to_string(), "f1".to_string()).await
+            })
+        })
+        .await;
+        assert_eq!(keys_gauge(), 0.0);
 
         ctx.shutdown().await;
     }
