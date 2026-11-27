@@ -135,6 +135,8 @@ fn cfg(dir: &Path, o: &Opts, addr: SocketAddr, gossip_port: u16) -> Cfg {
             gossip_interval_ms: Some(100),
             // Peers gossip to the advertised host, so it can't be left at 0.0.0.0.
             advertise_addr: Some(addr.to_string()),
+            node_timeout_ms: None,
+            replica_validity_factor: None,
         }),
         replication: (!o.plain).then(|| ReplicationConfig {
             replica_of: o.replica_of.map(str::to_string),
@@ -1448,9 +1450,11 @@ async fn planned_failover_promotes_the_replica_without_losing_writes() {
     .await;
     drop(client);
 
-    // Step 4: stop the primary, restart the replica as primary with its slots.
+    // Step 4: stop the primary, remove the replica's persisted cluster state so
+    // it re-bootstraps from the primary config, and restart it with the slots.
     primary.stop().await;
     replica.stop().await;
+    std::fs::remove_file(rdir.path().join(blobasaur::cluster::CLUSTER_STATE_FILE)).unwrap();
     let promoted = start(rdir.path(), &Opts::primary("r", SHARDS)).await;
     let mut client = Client::connect(promoted.addr).await;
     for i in 0..20 {

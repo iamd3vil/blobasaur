@@ -1,5 +1,5 @@
 use crate::AppState;
-use crate::cluster::{ClusterManager, Route, SlotRange};
+use crate::cluster::{ClusterManager, ClusterShard, Route, SlotRange};
 use crate::config::Cfg;
 use crate::metrics::Timer;
 use crate::redis::{
@@ -109,7 +109,7 @@ pub async fn run(
 
     // A replica keeps one stream per shard open to its primary. They stop with
     // the connections, before the writers drain.
-    let replicas: Vec<_> = if cfg.replica_of().is_some() {
+    let replicas: Vec<_> = if state.cfg.replication_enabled() && state.is_replica() {
         (0..cfg.num_shards)
             .map(|i| {
                 tokio::spawn(crate::replication::replica_sync_task(
@@ -640,6 +640,9 @@ async fn handle_redis_command_inner(
         } => {
             handle_hexpireat(stream, state, key, unix_time_seconds, condition, fields).await?;
         }
+        RedisCommand::ClusterMyId => {
+            handle_cluster_myid(stream, state).await?;
+        }
         RedisCommand::ClusterNodes => {
             handle_cluster_nodes(stream, state).await?;
         }
@@ -648,6 +651,9 @@ async fn handle_redis_command_inner(
         }
         RedisCommand::ClusterSlots => {
             handle_cluster_slots(stream, state).await?;
+        }
+        RedisCommand::ClusterShards => {
+            handle_cluster_shards(stream, state).await?;
         }
         RedisCommand::ClusterAddSlots { slots } => {
             handle_cluster_addslots(stream, state, slots).await?;
@@ -2243,6 +2249,19 @@ async fn hexpire_reply(
 }
 
 // Cluster command handlers
+async fn handle_cluster_myid(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = if let Some(ref cluster_manager) = state.cluster_manager {
+        BytesFrame::BulkString(cluster_manager.node_id().to_string().into())
+    } else {
+        BytesFrame::Error("ERR This instance has cluster support disabled".into())
+    };
+    stream.write_all(&serialize_frame(&response)).await?;
+    Ok(())
+}
+
 async fn handle_cluster_nodes(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
@@ -2311,6 +2330,65 @@ async fn handle_cluster_slots(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let response = if let Some(ref cluster_manager) = state.cluster_manager {
         cluster_slots_frame(&cluster_manager.get_cluster_slots().await)
+    } else {
+        BytesFrame::Error("ERR This instance has cluster support disabled".into())
+    };
+    stream.write_all(&serialize_frame(&response)).await?;
+    Ok(())
+}
+
+/// Redis 7 CLUSTER SHARDS reply in RESP2: array of alternating key/value arrays
+/// with `"slots"` (`[start, end, ...]`) and `"nodes"` (array of node maps).
+fn cluster_shards_frame(shards: &[ClusterShard]) -> BytesFrame {
+    let bulk = |s: &str| BytesFrame::BulkString(s.to_string().into());
+    BytesFrame::Array(
+        shards
+            .iter()
+            .map(|shard| {
+                let mut slot_items = Vec::with_capacity(shard.slots.len() * 2);
+                for &(start, end) in &shard.slots {
+                    slot_items.push(BytesFrame::Integer(start as i64));
+                    slot_items.push(BytesFrame::Integer(end as i64));
+                }
+                let node_items = shard
+                    .nodes
+                    .iter()
+                    .map(|node| {
+                        BytesFrame::Array(vec![
+                            bulk("id"),
+                            bulk(&node.id),
+                            bulk("port"),
+                            BytesFrame::Integer(node.port as i64),
+                            bulk("ip"),
+                            bulk(&node.ip),
+                            bulk("endpoint"),
+                            bulk(&node.endpoint),
+                            bulk("role"),
+                            bulk(node.role),
+                            bulk("replication-offset"),
+                            BytesFrame::Integer(node.replication_offset),
+                            bulk("health"),
+                            bulk(node.health),
+                        ])
+                    })
+                    .collect();
+                BytesFrame::Array(vec![
+                    bulk("slots"),
+                    BytesFrame::Array(slot_items),
+                    bulk("nodes"),
+                    BytesFrame::Array(node_items),
+                ])
+            })
+            .collect(),
+    )
+}
+
+async fn handle_cluster_shards(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = if let Some(ref cluster_manager) = state.cluster_manager {
+        cluster_shards_frame(&cluster_manager.get_cluster_shards().await)
     } else {
         BytesFrame::Error("ERR This instance has cluster support disabled".into())
     };
@@ -6285,6 +6363,22 @@ mod tests {
             Box::pin(async move {
                 let mut stream = stream;
                 handle_cluster_addslots(&mut stream, &state, vec![1, 2, 3]).await
+            })
+        });
+        assert_error_contains(frame.await, "cluster support disabled");
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_cluster_myid(&mut stream, &state).await
+            })
+        });
+        assert_error_contains(frame.await, "cluster support disabled");
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_cluster_shards(&mut stream, &state).await
             })
         });
         assert_error_contains(frame.await, "cluster support disabled");

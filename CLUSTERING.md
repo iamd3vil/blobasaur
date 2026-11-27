@@ -9,10 +9,10 @@ Blobasaur implements Redis cluster protocol compatibility, allowing Redis cluste
 ## Implementation Status
 
 ✅ **Fully Implemented:**
-- Redis cluster protocol commands (CLUSTER NODES, CLUSTER INFO, CLUSTER SLOTS, etc.)
+- Redis cluster protocol commands (`CLUSTER MYID`, `CLUSTER NODES`, `CLUSTER INFO`, `CLUSTER SLOTS`, `CLUSTER SHARDS`, `CLUSTER ADDSLOTS`, `CLUSTER DELSLOTS`, `CLUSTER KEYSLOT`)
 - Hash slot calculation using CRC16 (Redis-compatible)
-- Automatic slot assignment and management using slot ranges
-- MOVED redirection for keys not owned by current node
+- Persisted per-node cluster state (`<data_dir>/cluster-state.json`) with epoch-versioned slot table and Redis-style epoch collision resolution
+- MOVED redirection for keys owned by another live node, CLUSTERDOWN for unbound or offline slots
 - Gossip protocol implementation using chitchat for node discovery
 - Automatic node discovery and cluster membership management
 - Cross-node key operations with automatic redirects
@@ -112,6 +112,23 @@ start = 10923
 end = 16383
 ```
 
+### Persisted Cluster State and Epochs
+
+Each clustered node persists its cluster metadata to `<data_dir>/cluster-state.json` using atomic writes (write temp file, fsync, rename, fsync directory). The file stores:
+
+- `current_epoch`, `last_vote_epoch`, `last_vote_for`
+- `role` (`primary` or `replica`) and `primary` (replica only)
+- `config_epoch` (primary slot-claim version)
+- `slots` (the node's full slot table `slot -> (node_id, config_epoch)`, stored as contiguous ranges)
+
+The `slot_ranges`, `slots`, and `[replication].replica_of` settings in the config file are **bootstrap-only**. On first start (when `cluster-state.json` does not exist), Blobasaur initializes the state file from config (`config_epoch = 0` for a primary, after running the best-effort startup slot-conflict check). On subsequent restarts, `cluster-state.json` wins over the config file; if the config disagrees with the persisted role, primary, or slot assignment, Blobasaur logs a warning and uses the persisted state.
+
+Each primary gossips its `current_epoch` and `config_epoch` along with its slots. Every node adopts the maximum `current_epoch` it sees and updates its slot table only when a primary claims a slot with a strictly higher `config_epoch`. Bindings for nodes that go down stay in the slot table (requests to those slots return `-CLUSTERDOWN`), so a returning old primary at a lower epoch cannot reclaim slots it lost. When two primaries share the same `config_epoch` (such as after bootstrapping at epoch 0), the one with the lexicographically smaller `node_id` increments `current_epoch`, takes it as its new `config_epoch`, persists, and gossips until every primary has a distinct epoch.
+
+Two `[cluster]` failover configuration options are also available (used by automatic failover):
+- `node_timeout_ms` (default `15000`): failure-detection and minority fencing timeout in milliseconds.
+- `replica_validity_factor` (default `10`, `0` disables the check): multiplier on `node_timeout_ms` bounding how stale a replica may be when standing for election.
+
 ### Port Configuration
 
 Blobasaur uses two types of ports:
@@ -176,7 +193,10 @@ valkey-cli -c -p 6381 cluster nodes
 
 ### Basic Cluster Information
 ```bash
-# Get cluster status
+# Get this node's id
+valkey-cli -c -p 6381 CLUSTER MYID
+
+# Get cluster status (including cluster_current_epoch and cluster_my_epoch)
 valkey-cli -c -p 6381 CLUSTER INFO
 
 # List cluster nodes
@@ -184,6 +204,9 @@ valkey-cli -c -p 6381 CLUSTER NODES
 
 # Show slot assignments
 valkey-cli -c -p 6381 CLUSTER SLOTS
+
+# Show Redis 7 shard topology
+valkey-cli -c -p 6381 CLUSTER SHARDS
 ```
 
 ### Key Operations
@@ -292,7 +315,7 @@ Failover is manual and the operator fences the old primary. Nothing in the clust
 
 1. **Fence the old primary.** Make sure `node-1` is stopped and cannot restart with its old config: stop the unit, block its ports, or take the host down.
 2. **Wait for the cluster to see it as dead.** Run `valkey-cli -p 6384 CLUSTER NODES` (any live node) until `node-1` is no longer listed as live. Restarting the replica earlier fails: the startup guard refuses to start while a live node still claims the slots.
-3. **Promote the replica.** Edit `config.node1b.toml`: remove `[replication]`'s `replica_of` and add `node-1`'s slots, then restart it:
+3. **Promote the replica.** Stop the replica, remove `<data_dir>/cluster-state.json` (so it re-bootstraps from config rather than keeping its persisted replica role), edit `config.node1b.toml` to remove `[replication]`'s `replica_of` and add `node-1`'s slots, then start it:
    ```toml
    [replication]
    tombstone_retention_secs = 86400
@@ -302,8 +325,8 @@ Failover is manual and the operator fences the old primary. Nothing in the clust
    end = 5460
    ```
    On start it promotes (refusing if any shard never finished its first copy) and generates a new `replid`. Check `valkey-cli -p 6384 CLUSTER NODES` shows it as `master` with the slots.
-4. **Repoint other replicas.** For every other replica of `node-1`, set `replica_of = "node-1b"` and restart it. It gets a resync and copies everything again.
-5. **Bring `node-1` back (optional).** Give it `replica_of = "node-1b"`, remove its `slot_ranges`, and start it. It resyncs from `node-1b`; writes it never replicated are discarded.
+4. **Repoint other replicas.** For every other replica of `node-1`, stop it, remove its `<data_dir>/cluster-state.json`, set `replica_of = "node-1b"`, and start it. It gets a resync and copies everything again.
+5. **Bring `node-1` back (optional).** Remove its `<data_dir>/cluster-state.json`, give it `replica_of = "node-1b"`, remove its `slot_ranges`, and start it. It resyncs from `node-1b`; writes it never replicated are discarded.
 
 #### Planned (maintenance)
 

@@ -1,5 +1,15 @@
-use std::collections::{HashMap, HashSet};
+mod state;
+
+#[allow(unused_imports)]
+pub use state::{
+    CLUSTER_STATE_FILE, ClusterState, LoadedClusterState, MergeOutcome, PersistedRole, SlotBinding,
+    SlotRangeBinding, SlotTable, configured_slots, load_or_bootstrap,
+};
+
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -43,6 +53,8 @@ pub struct ClusterNode {
     pub role: NodeRole,
     /// The node id this node replicates, for a replica.
     pub primary: Option<String>,
+    pub current_epoch: u64,
+    pub config_epoch: u64,
 }
 
 /// What a node gossips about its place in replication.
@@ -88,6 +100,25 @@ pub struct SlotRange {
     pub port: u16,
     /// Live replicas in `replica` role as `(ip, port, node_id)`, by node id.
     pub replicas: Vec<(String, u16, String)>,
+}
+
+/// One node entry inside a `CLUSTER SHARDS` shard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterShardNode {
+    pub id: String,
+    pub port: u16,
+    pub ip: String,
+    pub endpoint: String,
+    pub role: &'static str,
+    pub replication_offset: i64,
+    pub health: &'static str,
+}
+
+/// One shard entry as reported by Redis 7 `CLUSTER SHARDS`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterShard {
+    pub slots: Vec<(u16, u16)>,
+    pub nodes: Vec<ClusterShardNode>,
 }
 
 /// The Redis ip and port this node advertises to clients and peers.
@@ -142,6 +173,8 @@ fn live_peers(chitchat: &Chitchat, self_id: &str) -> HashMap<String, ClusterNode
                             _state: gossip_data.state,
                             role: gossip_data.role,
                             primary: gossip_data.primary,
+                            current_epoch: gossip_data.current_epoch,
+                            config_epoch: gossip_data.config_epoch,
                         };
                         nodes_map.insert(chitchat_id.node_id.clone(), cluster_node);
                     } else {
@@ -187,6 +220,10 @@ struct NodeGossipData {
     pub role: NodeRole,
     #[serde(default)]
     pub primary: Option<String>,
+    #[serde(default)]
+    pub current_epoch: u64,
+    #[serde(default)]
+    pub config_epoch: u64,
 }
 
 impl NodeGossipData {
@@ -198,6 +235,8 @@ impl NodeGossipData {
         slots: &HashSet<u16>,
         role: NodeRole,
         primary: Option<String>,
+        current_epoch: u64,
+        config_epoch: u64,
     ) -> Result<Self, String> {
         let mut list: Vec<u16> = slots.iter().copied().collect();
         list.sort_unstable();
@@ -208,6 +247,8 @@ impl NodeGossipData {
             state: "master".to_string(),
             role,
             primary,
+            current_epoch,
+            config_epoch,
         };
         let size = |data: &Self| serde_json::to_string(data).map_or(usize::MAX, |json| json.len());
         if size(&both) <= GOSSIP_VALUE_MAX {
@@ -255,30 +296,24 @@ impl NodeGossipData {
     }
 }
 
-/// A replica's progress: the node it follows and which shards are fully copied.
-struct ReplicaState {
-    primary: String,
-    synced: Vec<bool>,
-}
-
-impl ReplicaState {
-    fn role(&self) -> NodeRole {
-        if self.synced.iter().all(|synced| *synced) {
-            NodeRole::Replica
-        } else {
-            NodeRole::ReplicaSyncing
-        }
-    }
-}
-
 /// The gossip server and the task reading its state.
 type Gossip = (ChitchatHandle, JoinHandle<()>);
 
 /// Manages cluster state and gossip protocol
 pub struct ClusterManager {
     node_id: String,
+    /// Live peers from gossip (newest generation per node id).
     nodes: Arc<RwLock<HashMap<String, ClusterNode>>>,
-    local_slots: Arc<RwLock<HashSet<u16>>>,
+    /// Last known Redis address of any peer seen live.
+    known_addrs: Arc<std::sync::RwLock<HashMap<String, SocketAddr>>>,
+    /// Persisted cluster state (role, primary, epochs, slot table).
+    state: Arc<std::sync::RwLock<ClusterState>>,
+    /// Path to `<data_dir>/cluster-state.json`; `None` only in tests without persistence.
+    state_path: Option<PathBuf>,
+    /// Serializes state mutations and disk persistence so writes never reorder.
+    write_lock: Arc<tokio::sync::Mutex<()>>,
+    /// True during first-boot bootstrap until `claim_slots` finishes and persists.
+    bootstrapping: Arc<AtomicBool>,
     config: ClusterConfig,
     /// Gossip state; `None` only in tests.
     chitchat: Option<Arc<tokio::sync::Mutex<Chitchat>>>,
@@ -286,30 +321,30 @@ pub struct ClusterManager {
     running: Arc<Mutex<Option<Gossip>>>,
     local_addr: SocketAddr,
     namespace_strategy: NamespaceDistributionStrategy,
-    /// Set on a replica; its role is derived from this.
-    replica: Option<Arc<Mutex<ReplicaState>>>,
+    /// Per-shard synced flags for a replica; role is `Replica` once all are true.
+    replica_synced: Arc<Mutex<Vec<bool>>>,
 }
 
 impl ClusterManager {
-    /// Create a new cluster manager. It owns and advertises no slots until
-    /// [`Self::claim_slots`]. A replica of `replica_of` starts out `replica-syncing`
-    /// with `num_shards` unsynced shards.
+    /// Create a new cluster manager from loaded or bootstrapped cluster state.
+    /// When bootstrapping (`!loaded.from_file`), it advertises no slots until
+    /// [`Self::claim_slots`]. When loaded from disk, its persisted slots and
+    /// epochs are active immediately.
     pub async fn new(
         config: &ClusterConfig,
         gossip_bind_addr: SocketAddr,
         redis_addr: SocketAddr,
-        replica_of: Option<&str>,
+        loaded: LoadedClusterState,
         num_shards: usize,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let local_slots = Arc::new(RwLock::new(HashSet::new()));
-        let replica = replica_of.map(|primary| {
-            Arc::new(Mutex::new(ReplicaState {
-                primary: primary.to_string(),
-                synced: vec![false; num_shards],
-            }))
-        });
-
+        let LoadedClusterState {
+            state: initial_state,
+            from_file,
+            path: state_path,
+        } = loaded;
         let nodes = Arc::new(RwLock::new(HashMap::new()));
+        let known_addrs = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let replica_synced = Arc::new(Mutex::new(vec![false; num_shards]));
 
         // Set up chitchat for gossip protocol
         let gossip_addr = SocketAddr::new(gossip_bind_addr.ip(), config.port);
@@ -351,12 +386,23 @@ impl ClusterManager {
             extra_liveness_predicate: None,
         };
 
-        // Create initial gossip data for this node
+        let initial_slots = if from_file && !initial_state.is_replica() {
+            initial_state.slots.slots_of(&config.node_id)
+        } else {
+            HashSet::new()
+        };
+        let initial_role = if initial_state.is_replica() {
+            NodeRole::ReplicaSyncing
+        } else {
+            NodeRole::Primary
+        };
         let initial_gossip_data = NodeGossipData::new(
             format!("{}:{}", local_ip, local_port),
-            &HashSet::new(),
-            replica_of.map_or(NodeRole::Primary, |_| NodeRole::ReplicaSyncing),
-            replica_of.map(str::to_string),
+            &initial_slots,
+            initial_role,
+            initial_state.primary.clone(),
+            initial_state.current_epoch,
+            initial_state.config_epoch,
         )?;
 
         let gossip_data_json = serde_json::to_string(&initial_gossip_data)
@@ -387,13 +433,17 @@ impl ClusterManager {
         let cluster_manager = Self {
             node_id: config.node_id.clone(),
             nodes,
-            local_slots,
+            known_addrs,
+            state: Arc::new(std::sync::RwLock::new(initial_state)),
+            state_path: Some(state_path),
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrapping: Arc::new(AtomicBool::new(!from_file)),
             config: config.clone(),
             chitchat: Some(chitchat_handle.chitchat()),
             running: Arc::new(Mutex::new(None)),
             local_addr: redis_addr,
             namespace_strategy: NamespaceDistributionStrategy::default(),
-            replica,
+            replica_synced,
         };
 
         // Start gossip processing task
@@ -406,6 +456,31 @@ impl ClusterManager {
         info!("Cluster manager initialized for node: {}", config.node_id);
 
         Ok(cluster_manager)
+    }
+
+    /// This node's cluster id (`CLUSTER MYID`).
+    pub fn node_id(&self) -> &str {
+        &self.node_id
+    }
+
+    /// Whether this node's runtime role is replica.
+    pub fn is_replica(&self) -> bool {
+        self.state.read().unwrap().is_replica()
+    }
+
+    /// The primary node id this node follows, if its runtime role is replica.
+    pub fn primary_id(&self) -> Option<String> {
+        self.state.read().unwrap().primary.clone()
+    }
+
+    async fn persist_state(&self, state: &ClusterState) -> Result<(), String> {
+        let Some(path) = self.state_path.clone() else {
+            return Ok(());
+        };
+        let snapshot = state.clone();
+        tokio::task::spawn_blocking(move || snapshot.save_atomic(&path))
+            .await
+            .map_err(|e| format!("cluster state persist task failed: {e}"))?
     }
 
     /// Background task to process gossip updates
@@ -444,80 +519,7 @@ impl ClusterManager {
 
                 drop(chitchat_guard);
 
-                // Update the nodes map and log topology changes
-                let mut nodes = self.nodes.write().await;
-
-                // Diff the new node set against the current one to detect
-                // added, removed, and updated (addr/slots/role changed) nodes
-                let mut added = Vec::new();
-                let mut updated = Vec::new();
-                let mut removed = Vec::new();
-
-                for (id, node) in &nodes_map {
-                    match nodes.get(id) {
-                        None => added.push((node.id.clone(), node.addr, node.slots.len())),
-                        Some(old)
-                            if old.addr != node.addr
-                                || old.slots != node.slots
-                                || old.role != node.role
-                                || old.primary != node.primary =>
-                        {
-                            updated.push((
-                                node.id.clone(),
-                                old.addr,
-                                node.addr,
-                                old.slots.len(),
-                                node.slots.len(),
-                                (old.role, node.role),
-                            ));
-                        }
-                        _ => {}
-                    }
-                }
-                for id in nodes.keys() {
-                    if !nodes_map.contains_key(id) {
-                        removed.push(id.clone());
-                    }
-                }
-
-                let topology_stable = added.is_empty()
-                    && updated.is_empty()
-                    && removed.is_empty()
-                    && !nodes_map.is_empty();
-                let node_count = nodes_map.len();
-                *nodes = nodes_map;
-                drop(nodes);
-
-                for (id, addr, slot_count) in added {
-                    info!(
-                        "Discovered cluster node: {} at {} with {} slots",
-                        id, addr, slot_count
-                    );
-                }
-                for (
-                    id,
-                    old_addr,
-                    new_addr,
-                    old_slot_count,
-                    new_slot_count,
-                    (old_role, new_role),
-                ) in updated
-                {
-                    info!(
-                        "Cluster node updated: {} (addr {} -> {}, slots {} -> {}, role {:?} -> {:?})",
-                        id, old_addr, new_addr, old_slot_count, new_slot_count, old_role, new_role
-                    );
-                }
-                for id in removed {
-                    info!("Cluster node left the cluster: {}", id);
-                }
-
-                if topology_stable {
-                    debug!(
-                        "Cluster topology stable for {}: {} nodes",
-                        self.node_id, node_count
-                    );
-                }
+                self.process_peers(nodes_map).await;
             } else {
                 warn!(
                     "Gossip task running without chitchat for node: {}",
@@ -527,103 +529,299 @@ impl ClusterManager {
         }
     }
 
-    /// Decide where a request for `slot` should run. A synced replica serves reads
-    /// of its primary's slots on connections that sent `READONLY`.
-    pub async fn route(&self, slot: u16, is_read: bool, conn_readonly: bool) -> Route {
-        // A replica owns no slots, so never runs a write itself.
-        if self.replica.is_none() && self.local_slots.read().await.contains(&slot) {
-            return Route::Local;
-        }
-        let nodes = self.nodes.read().await;
-        if is_read
-            && conn_readonly
-            && let Some(replica) = &self.replica
+    /// Apply a fresh snapshot of live gossip peers: update peer view, adopt
+    /// higher `current_epoch`, merge slot claims by the epoch rule, and resolve
+    /// `config_epoch` collisions.
+    async fn process_peers(&self, nodes_map: HashMap<String, ClusterNode>) {
         {
-            let replica = replica.lock().unwrap();
-            if replica.role() == NodeRole::Replica
-                && nodes
-                    .get(&replica.primary)
-                    .is_some_and(|primary| primary.slots.contains(&slot))
-            {
-                return Route::Local;
+            let mut addrs = self.known_addrs.write().unwrap();
+            for (id, node) in &nodes_map {
+                addrs.insert(id.clone(), node.addr);
             }
         }
-        match nodes.values().find(|node| node.slots.contains(&slot)) {
-            Some(node) => Route::Moved(format!("MOVED {} {}", slot, node.addr)),
-            None => Route::ClusterDown,
+
+        // Update the nodes map and log topology changes
+        let mut nodes = self.nodes.write().await;
+
+        let mut added = Vec::new();
+        let mut updated = Vec::new();
+        let mut removed = Vec::new();
+
+        for (id, node) in &nodes_map {
+            match nodes.get(id) {
+                None => added.push((node.id.clone(), node.addr, node.slots.len())),
+                Some(old)
+                    if old.addr != node.addr
+                        || old.slots != node.slots
+                        || old.role != node.role
+                        || old.primary != node.primary
+                        || old.config_epoch != node.config_epoch =>
+                {
+                    updated.push((
+                        node.id.clone(),
+                        old.addr,
+                        node.addr,
+                        old.slots.len(),
+                        node.slots.len(),
+                        (old.role, node.role),
+                    ));
+                }
+                _ => {}
+            }
         }
+        for id in nodes.keys() {
+            if !nodes_map.contains_key(id) {
+                removed.push(id.clone());
+            }
+        }
+
+        let topology_stable =
+            added.is_empty() && updated.is_empty() && removed.is_empty() && !nodes_map.is_empty();
+        let node_count = nodes_map.len();
+        *nodes = nodes_map.clone();
+        drop(nodes);
+
+        for (id, addr, slot_count) in added {
+            info!(
+                "Discovered cluster node: {} at {} with {} slots",
+                id, addr, slot_count
+            );
+        }
+        for (id, old_addr, new_addr, old_slot_count, new_slot_count, (old_role, new_role)) in
+            updated
+        {
+            info!(
+                "Cluster node updated: {} (addr {} -> {}, slots {} -> {}, role {:?} -> {:?})",
+                id, old_addr, new_addr, old_slot_count, new_slot_count, old_role, new_role
+            );
+        }
+        for id in removed {
+            info!("Cluster node left the cluster: {}", id);
+        }
+
+        if topology_stable {
+            debug!(
+                "Cluster topology stable for {}: {} nodes",
+                self.node_id, node_count
+            );
+        }
+
+        let _guard = self.write_lock.lock().await;
+        let is_bootstrapping = self.bootstrapping.load(Ordering::Acquire);
+        let mut state = self.state.read().unwrap().clone();
+        let had_own_slots =
+            state.role == PersistedRole::Primary && state.slots.has_slots_of(&self.node_id);
+
+        let mut changed = false;
+        let mut gossip_changed = false;
+
+        // Adopt the highest epoch seen across all peers.
+        let mut max_epoch = state.current_epoch;
+        for peer in nodes_map.values() {
+            max_epoch = max_epoch.max(peer.current_epoch).max(peer.config_epoch);
+        }
+        if max_epoch > state.current_epoch {
+            state.current_epoch = max_epoch;
+            changed = true;
+            gossip_changed = true;
+        }
+
+        // Merge live primaries' slot claims in deterministic node-id order.
+        let mut primary_peers: Vec<&ClusterNode> = nodes_map
+            .values()
+            .filter(|peer| peer.role == NodeRole::Primary)
+            .collect();
+        primary_peers.sort_by(|a, b| a.id.cmp(&b.id));
+
+        for peer in &primary_peers {
+            let outcome =
+                state
+                    .slots
+                    .merge_claim(&peer.id, peer.config_epoch, &peer.slots, &self.node_id);
+            if outcome.changed {
+                changed = true;
+            }
+            if outcome.lost_own_slots {
+                gossip_changed = true;
+            }
+        }
+
+        if !is_bootstrapping && had_own_slots && !state.slots.has_slots_of(&self.node_id) {
+            error!(
+                "Primary {} lost its last slot; serving no slots (runtime demotion not yet implemented)",
+                self.node_id
+            );
+        }
+
+        // Redis epoch collision rule: when two primaries share a config_epoch,
+        // the lexicographically smaller node id bumps current_epoch and takes it.
+        if !is_bootstrapping && state.role == PersistedRole::Primary {
+            let collides = primary_peers
+                .iter()
+                .any(|peer| peer.config_epoch == state.config_epoch && self.node_id < peer.id);
+            if collides {
+                let new_epoch = state.current_epoch + 1;
+                state.current_epoch = new_epoch;
+                state.config_epoch = new_epoch;
+                state.slots.rebind_owner_epoch(&self.node_id, new_epoch);
+                changed = true;
+                gossip_changed = true;
+                info!(
+                    "Resolved config_epoch collision on {}: bumped config_epoch to {}",
+                    self.node_id, new_epoch
+                );
+            }
+        }
+
+        if changed {
+            if !is_bootstrapping && let Err(e) = self.persist_state(&state).await {
+                error!("Failed to persist cluster state after gossip update: {}", e);
+                return;
+            }
+            *self.state.write().unwrap() = state;
+        }
+        drop(_guard);
+
+        if gossip_changed
+            && !is_bootstrapping
+            && let Err(e) = self.update_gossip_data().await
+        {
+            error!("Failed to gossip updated epochs/slots: {}", e);
+        }
+    }
+
+    /// Decide where a request for `slot` should run from the slot table.
+    /// A synced replica serves reads of its primary's slots on connections that
+    /// sent `READONLY`.
+    pub async fn route(&self, slot: u16, is_read: bool, conn_readonly: bool) -> Route {
+        let (role, primary, binding) = {
+            let state = self.state.read().unwrap();
+            (
+                state.role,
+                state.primary.clone(),
+                state.slots.get(slot).cloned(),
+            )
+        };
+        let Some(binding) = binding else {
+            return Route::ClusterDown;
+        };
+        if binding.node_id == self.node_id {
+            return if role == PersistedRole::Primary {
+                Route::Local
+            } else {
+                Route::ClusterDown
+            };
+        }
+        let nodes = self.nodes.read().await;
+        let Some(owner) = nodes.get(&binding.node_id) else {
+            return Route::ClusterDown;
+        };
+        if is_read
+            && conn_readonly
+            && role == PersistedRole::Replica
+            && self.role() == NodeRole::Replica
+            && primary.as_deref() == Some(binding.node_id.as_str())
+        {
+            return Route::Local;
+        }
+        Route::Moved(format!("MOVED {} {}", slot, owner.addr))
     }
 
     /// The role this node gossips.
     fn role(&self) -> NodeRole {
-        self.replica
-            .as_ref()
-            .map_or(NodeRole::Primary, |replica| replica.lock().unwrap().role())
+        if self.is_replica() {
+            if self.replica_synced.lock().unwrap().iter().all(|s| *s) {
+                NodeRole::Replica
+            } else {
+                NodeRole::ReplicaSyncing
+            }
+        } else {
+            NodeRole::Primary
+        }
     }
 
     /// Replica: records whether `shard` holds a full copy of its primary, and
     /// gossips the role change if that flips it.
     pub async fn set_shard_synced(&self, shard: usize, synced: bool) {
-        let Some(replica) = &self.replica else {
+        if !self.is_replica() {
             return;
-        };
+        }
         let changed = {
-            let mut replica = replica.lock().unwrap();
-            let before = replica.role();
-            replica.synced[shard] = synced;
-            before != replica.role()
+            let mut flags = self.replica_synced.lock().unwrap();
+            let before = flags.iter().all(|s| *s);
+            flags[shard] = synced;
+            before != flags.iter().all(|s| *s)
         };
         if changed && let Err(e) = self.update_gossip_data().await {
             error!("Failed to gossip the new role: {}", e);
         }
     }
 
-    /// Owns and advertises the configured slots, unless a live node already
-    /// claims any of them. A node that advertised them at once could silently
-    /// split slot ownership with a running primary, so first listen to gossip for
-    /// a few intervals. Best-effort conflict detection, not fencing: a partitioned
-    /// node, or two nodes starting at once, can both pass. Replicas own no slots.
+    /// Bootstrap step: when no state file existed on startup, claims configured
+    /// slots at `config_epoch = 0` after the best-effort startup conflict check
+    /// and writes `<data_dir>/cluster-state.json`. On restarts from an existing
+    /// state file this is a no-op.
     pub async fn claim_slots(&self) -> Result<(), String> {
-        let mut slots = HashSet::new();
-        slots.extend(self.config.slots.iter().flatten().copied());
-        for range in self.config.slot_ranges.iter().flatten() {
-            slots.extend(range.start..=range.end);
-        }
-        if slots.is_empty() {
+        if !self.bootstrapping.load(Ordering::Acquire) {
             return Ok(());
         }
-        if self.replica.is_some() {
+
+        let configured = configured_slots(&self.config);
+        let is_replica = self.is_replica();
+        if is_replica && !configured.is_empty() {
             warn!("Ignoring the configured slots: a replica owns none");
-            return Ok(());
         }
 
-        let wait = Duration::from_millis(self.config.gossip_interval_ms.unwrap_or(1000)) * 3;
-        info!(
-            "Listening to gossip for {:?} before claiming {} slots",
-            wait,
-            slots.len()
-        );
-        tokio::time::sleep(wait).await;
+        if !is_replica && !configured.is_empty() {
+            let wait = Duration::from_millis(self.config.gossip_interval_ms.unwrap_or(1000)) * 3;
+            info!(
+                "Listening to gossip for {:?} before claiming {} slots",
+                wait,
+                configured.len()
+            );
+            tokio::time::sleep(wait).await;
 
-        if let Some(chitchat) = &self.chitchat {
-            let chitchat = chitchat.lock().await;
-            for node in live_peers(&chitchat, &self.node_id).values() {
-                let overlap: HashSet<u16> = slots.intersection(&node.slots).copied().collect();
-                if !overlap.is_empty() {
-                    return Err(format!(
-                        "node {} already claims slots {} of this node's {}",
-                        node.id,
-                        Self::slots_to_ranges(&overlap),
-                        Self::slots_to_ranges(&slots)
-                    ));
+            if let Some(chitchat) = &self.chitchat {
+                let chitchat = chitchat.lock().await;
+                for node in live_peers(&chitchat, &self.node_id).values() {
+                    let overlap: HashSet<u16> =
+                        configured.intersection(&node.slots).copied().collect();
+                    if !overlap.is_empty() {
+                        return Err(format!(
+                            "node {} already claims slots {} of this node's {}",
+                            node.id,
+                            Self::slots_to_ranges(&overlap),
+                            Self::slots_to_ranges(&configured)
+                        ));
+                    }
                 }
             }
         }
 
-        let count = slots.len();
-        *self.local_slots.write().await = slots;
+        let _guard = self.write_lock.lock().await;
+        let mut state = self.state.read().unwrap().clone();
+        if !is_replica {
+            for &slot in &configured {
+                state
+                    .slots
+                    .set(slot, self.node_id.clone(), state.config_epoch);
+            }
+            let own_slots = state.slots.slots_of(&self.node_id);
+            self.gossip_data_for(&state, &own_slots)?;
+        }
+        self.persist_state(&state).await?;
+        *self.state.write().unwrap() = state;
+        self.bootstrapping.store(false, Ordering::Release);
+        drop(_guard);
+
         self.update_gossip_data().await?;
-        info!("Cluster node {} claimed {} slots", self.node_id, count);
+        if !is_replica && !configured.is_empty() {
+            info!(
+                "Cluster node {} claimed {} slots",
+                self.node_id,
+                configured.len()
+            );
+        }
         Ok(())
     }
 
@@ -686,52 +884,94 @@ impl ClusterManager {
     pub async fn get_cluster_nodes(&self) -> String {
         let mut result = Vec::new();
         let nodes = self.nodes.read().await;
-        let local_slots = self.local_slots.read().await;
+        let state = self.state.read().unwrap().clone();
+        let known_addrs = self.known_addrs.read().unwrap().clone();
 
-        // Add local node
-        let local_slots_ranges = Self::slots_to_ranges(&local_slots);
         let (local_ip, local_port) = local_endpoint(&self.config, self.local_addr);
 
-        // Replicas list the node they follow where primaries list `-`, and no slots.
-        let local_info = match self.replica_primary() {
-            Some(primary) => format!(
-                "{} {}:{} myself,slave {} 0 0 0 connected",
-                self.node_id, local_ip, local_port, primary
-            ),
-            None => format!(
-                "{} {}:{} myself,master - 0 0 0 connected {}",
-                self.node_id, local_ip, local_port, local_slots_ranges
-            ),
+        // Local node line.
+        let local_info = match state.role {
+            PersistedRole::Replica => {
+                let primary = state.primary.as_deref().unwrap_or("-");
+                format!(
+                    "{} {}:{} myself,slave {} 0 0 {} connected",
+                    self.node_id, local_ip, local_port, primary, state.config_epoch
+                )
+            }
+            PersistedRole::Primary => {
+                let own_slots = state.slots.slots_of(&self.node_id);
+                let ranges = Self::slots_to_ranges(&own_slots);
+                if ranges.is_empty() {
+                    format!(
+                        "{} {}:{} myself,master - 0 0 {} connected",
+                        self.node_id, local_ip, local_port, state.config_epoch
+                    )
+                } else {
+                    format!(
+                        "{} {}:{} myself,master - 0 0 {} connected {}",
+                        self.node_id, local_ip, local_port, state.config_epoch, ranges
+                    )
+                }
+            }
         };
         result.push(local_info);
 
-        // Add other nodes
-        for node in nodes.values() {
+        // Live peers sorted by node id.
+        let mut peers: Vec<&ClusterNode> = nodes.values().collect();
+        peers.sort_by(|a, b| a.id.cmp(&b.id));
+        for node in peers {
             let node_info = match (node.role, &node.primary) {
-                (NodeRole::Primary, _) | (_, None) => format!(
-                    "{} {}:{} master - 0 0 0 connected {}",
-                    node.id,
-                    node.addr.ip(),
-                    node.addr.port(),
-                    Self::slots_to_ranges(&node.slots)
-                ),
+                (NodeRole::Primary, _) | (_, None) => {
+                    let peer_slots = state.slots.slots_of(&node.id);
+                    let ranges = Self::slots_to_ranges(&peer_slots);
+                    if ranges.is_empty() {
+                        format!(
+                            "{} {}:{} master - 0 0 {} connected",
+                            node.id,
+                            node.addr.ip(),
+                            node.addr.port(),
+                            node.config_epoch
+                        )
+                    } else {
+                        format!(
+                            "{} {}:{} master - 0 0 {} connected {}",
+                            node.id,
+                            node.addr.ip(),
+                            node.addr.port(),
+                            node.config_epoch,
+                            ranges
+                        )
+                    }
+                }
                 (_, Some(primary)) => format!(
-                    "{} {}:{} slave {} 0 0 0 connected",
+                    "{} {}:{} slave {} 0 0 {} connected",
                     node.id,
                     node.addr.ip(),
                     node.addr.port(),
-                    primary
+                    primary,
+                    node.config_epoch
                 ),
             };
             result.push(node_info);
         }
 
-        format!("{}\n", result.join("\n"))
-    }
+        // Offline slot owners retained in the slot table stay listed with their slots.
+        for owner_id in state.slots.owners() {
+            if owner_id == self.node_id || nodes.contains_key(&owner_id) {
+                continue;
+            }
+            let addr = known_addrs
+                .get(&owner_id)
+                .map_or_else(|| "0.0.0.0:0".to_string(), ToString::to_string);
+            let epoch = state.slots.max_epoch_for(&owner_id);
+            let ranges = Self::slots_to_ranges(&state.slots.slots_of(&owner_id));
+            result.push(format!(
+                "{} {} master - 0 0 {} disconnected {}",
+                owner_id, addr, epoch, ranges
+            ));
+        }
 
-    /// The node id this node replicates, if it is a replica.
-    fn replica_primary(&self) -> Option<String> {
-        Some(self.replica.as_ref()?.lock().unwrap().primary.clone())
+        format!("{}\n", result.join("\n"))
     }
 
     /// Collapse a slot set into sorted, inclusive `(start, end)` runs
@@ -750,7 +990,7 @@ impl ClusterManager {
     }
 
     /// Convert slots set to Redis slot ranges format
-    fn slots_to_ranges(slots: &HashSet<u16>) -> String {
+    pub(crate) fn slots_to_ranges(slots: &HashSet<u16>) -> String {
         Self::slot_runs(slots)
             .into_iter()
             .map(|(start, end)| {
@@ -764,15 +1004,17 @@ impl ClusterManager {
             .join(" ")
     }
 
-    /// Get the slot ranges of every live node (local and remote) for CLUSTER SLOTS
+    /// Get the slot ranges from the slot table for CLUSTER SLOTS.
+    /// Lists only live slot owners; replicas are listed only once synced.
     pub async fn get_cluster_slots(&self) -> Vec<SlotRange> {
         let (local_ip, local_port) = local_endpoint(&self.config, self.local_addr);
         let nodes = self.nodes.read().await;
+        let state = self.state.read().unwrap().clone();
 
         // Replicas serving reads, by the primary they follow.
         let mut replicas: HashMap<String, Vec<(String, u16, String)>> = HashMap::new();
         if self.role() == NodeRole::Replica
-            && let Some(primary) = self.replica_primary()
+            && let Some(primary) = state.primary.clone()
         {
             replicas.entry(primary).or_default().push((
                 local_ip.clone(),
@@ -793,49 +1035,173 @@ impl ClusterManager {
             list.sort_by(|a, b| a.2.cmp(&b.2));
         }
 
-        let mut ranges: Vec<SlotRange> = Self::slot_runs(&*self.local_slots.read().await)
-            .into_iter()
-            .map(|(start, end)| SlotRange {
+        let mut ranges = Vec::new();
+        for (start, end, owner_id) in state.slots.runs_by_owner() {
+            let (ip, port) = if owner_id == self.node_id && state.role == PersistedRole::Primary {
+                (local_ip.clone(), local_port)
+            } else if let Some(peer) = nodes.get(&owner_id) {
+                (peer.addr.ip().to_string(), peer.addr.port())
+            } else {
+                // Owner is down: slot is currently CLUSTERDOWN, omit from CLUSTER SLOTS.
+                continue;
+            };
+            ranges.push(SlotRange {
                 start,
                 end,
-                node_id: self.node_id.clone(),
-                ip: local_ip.clone(),
-                port: local_port,
-                replicas: replicas.get(&self.node_id).cloned().unwrap_or_default(),
-            })
-            .collect();
+                replicas: replicas.get(&owner_id).cloned().unwrap_or_default(),
+                node_id: owner_id,
+                ip,
+                port,
+            });
+        }
+        ranges
+    }
 
-        for node in nodes.values() {
-            ranges.extend(
-                Self::slot_runs(&node.slots)
-                    .into_iter()
-                    .map(|(start, end)| SlotRange {
-                        start,
-                        end,
-                        node_id: node.id.clone(),
-                        ip: node.addr.ip().to_string(),
-                        port: node.addr.port(),
-                        replicas: replicas.get(&node.id).cloned().unwrap_or_default(),
-                    }),
-            );
+    /// Get cluster shards from the slot table for Redis 7 `CLUSTER SHARDS`.
+    pub async fn get_cluster_shards(&self) -> Vec<ClusterShard> {
+        let (local_ip, local_port) = local_endpoint(&self.config, self.local_addr);
+        let nodes = self.nodes.read().await;
+        let state = self.state.read().unwrap().clone();
+        let known_addrs = self.known_addrs.read().unwrap().clone();
+
+        let mut slots_by_owner: BTreeMap<String, Vec<(u16, u16)>> = BTreeMap::new();
+        for (start, end, owner_id) in state.slots.runs_by_owner() {
+            slots_by_owner
+                .entry(owner_id)
+                .or_default()
+                .push((start, end));
         }
 
-        ranges.sort_by_key(|range| range.start);
-        ranges
+        let mut replicas_by_primary: HashMap<String, Vec<ClusterShardNode>> = HashMap::new();
+        if state.role == PersistedRole::Replica
+            && let Some(primary) = state.primary.clone()
+        {
+            let health = if self.role() == NodeRole::Replica {
+                "online"
+            } else {
+                "loading"
+            };
+            replicas_by_primary
+                .entry(primary)
+                .or_default()
+                .push(ClusterShardNode {
+                    id: self.node_id.clone(),
+                    port: local_port,
+                    ip: local_ip.clone(),
+                    endpoint: local_ip.clone(),
+                    role: "replica",
+                    replication_offset: 0,
+                    health,
+                });
+        }
+        for node in nodes.values() {
+            if let Some(primary) = &node.primary
+                && node.role != NodeRole::Primary
+            {
+                let health = if node.role == NodeRole::Replica {
+                    "online"
+                } else {
+                    "loading"
+                };
+                let ip = node.addr.ip().to_string();
+                replicas_by_primary
+                    .entry(primary.clone())
+                    .or_default()
+                    .push(ClusterShardNode {
+                        id: node.id.clone(),
+                        port: node.addr.port(),
+                        endpoint: ip.clone(),
+                        ip,
+                        role: "replica",
+                        replication_offset: 0,
+                        health,
+                    });
+            }
+        }
+        for list in replicas_by_primary.values_mut() {
+            list.sort_by(|a, b| a.id.cmp(&b.id));
+        }
+
+        let mut shards = Vec::new();
+        for (owner_id, slot_ranges) in slots_by_owner {
+            let master = if owner_id == self.node_id && state.role == PersistedRole::Primary {
+                ClusterShardNode {
+                    id: self.node_id.clone(),
+                    port: local_port,
+                    ip: local_ip.clone(),
+                    endpoint: local_ip.clone(),
+                    role: "master",
+                    replication_offset: 0,
+                    health: "online",
+                }
+            } else if let Some(peer) = nodes.get(&owner_id) {
+                let ip = peer.addr.ip().to_string();
+                ClusterShardNode {
+                    id: peer.id.clone(),
+                    port: peer.addr.port(),
+                    endpoint: ip.clone(),
+                    ip,
+                    role: "master",
+                    replication_offset: 0,
+                    health: "online",
+                }
+            } else if let Some(addr) = known_addrs.get(&owner_id) {
+                let ip = addr.ip().to_string();
+                ClusterShardNode {
+                    id: owner_id.clone(),
+                    port: addr.port(),
+                    endpoint: ip.clone(),
+                    ip,
+                    role: "master",
+                    replication_offset: 0,
+                    health: "failed",
+                }
+            } else {
+                continue;
+            };
+
+            let mut shard_nodes = vec![master];
+            if let Some(replicas) = replicas_by_primary.remove(&owner_id) {
+                shard_nodes.extend(replicas);
+            }
+            shards.push(ClusterShard {
+                slots: slot_ranges,
+                nodes: shard_nodes,
+            });
+        }
+
+        shards.sort_by_key(|shard| shard.slots.first().map_or(u16::MAX, |&(start, _)| start));
+        shards
     }
 
     /// Get cluster info for CLUSTER INFO command
     pub async fn get_cluster_info(&self) -> String {
         let nodes = self.nodes.read().await;
-        let total_nodes = nodes.len() + 1; // +1 for local node
-        let local_slots = self.local_slots.read().await;
+        let state = self.state.read().unwrap().clone();
 
-        let mut total_assigned_slots = local_slots.len();
-        for node in nodes.values() {
-            total_assigned_slots += node.slots.len();
+        let slot_owners = state.slots.owners();
+        let assigned_slots = state.slots.slot_count();
+
+        let mut ok_slots = 0usize;
+        for (start, end, owner_id) in state.slots.runs_by_owner() {
+            let live = (owner_id == self.node_id && state.role == PersistedRole::Primary)
+                || nodes.contains_key(&owner_id);
+            if live {
+                ok_slots += (end - start) as usize + 1;
+            }
+        }
+        let fail_slots = assigned_slots.saturating_sub(ok_slots);
+
+        let mut known_nodes: BTreeSet<&str> = BTreeSet::new();
+        known_nodes.insert(&self.node_id);
+        for id in nodes.keys() {
+            known_nodes.insert(id.as_str());
+        }
+        for owner in &slot_owners {
+            known_nodes.insert(owner.as_str());
         }
 
-        let cluster_state = if total_assigned_slots == REDIS_CLUSTER_SLOTS as usize {
+        let cluster_state = if ok_slots == REDIS_CLUSTER_SLOTS as usize {
             "ok"
         } else {
             "fail"
@@ -846,33 +1212,59 @@ impl ClusterManager {
              cluster_slots_assigned:{}\n\
              cluster_slots_ok:{}\n\
              cluster_slots_pfail:0\n\
-             cluster_slots_fail:0\n\
+             cluster_slots_fail:{}\n\
              cluster_known_nodes:{}\n\
              cluster_size:{}\n\
-             cluster_current_epoch:1\n\
-             cluster_my_epoch:1\n\
+             cluster_current_epoch:{}\n\
+             cluster_my_epoch:{}\n\
              cluster_stats_messages_sent:0\n\
              cluster_stats_messages_received:0\n",
-            cluster_state, total_assigned_slots, total_assigned_slots, total_nodes, total_nodes
+            cluster_state,
+            assigned_slots,
+            ok_slots,
+            fail_slots,
+            known_nodes.len(),
+            slot_owners.len(),
+            state.current_epoch,
+            state.config_epoch
         )
     }
 
-    /// Add slots to this node
+    /// Add slots to this node at its current `config_epoch`.
     pub async fn add_slots(
         &self,
         slots: Vec<u16>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if self.replica.is_some() {
+        let _guard = self.write_lock.lock().await;
+        let mut candidate = self.state.read().unwrap().clone();
+        if candidate.is_replica() {
             return Err("ERR this node is a replica".into());
         }
-        // Checked before it is installed: a rejected change is never routed on.
-        let mut local_slots = self.local_slots.write().await;
-        let mut candidate = local_slots.clone();
-        candidate.extend(&slots);
-        self.gossip_data(&candidate)
+        for &slot in &slots {
+            if slot >= REDIS_CLUSTER_SLOTS {
+                return Err(format!("ERR invalid slot {}", slot).into());
+            }
+            if let Some(existing) = candidate.slots.get(slot)
+                && existing.node_id != self.node_id
+                && existing.epoch >= candidate.config_epoch
+            {
+                return Err(
+                    format!("ERR slot {} is already owned by {}", slot, existing.node_id).into(),
+                );
+            }
+            candidate
+                .slots
+                .set(slot, self.node_id.clone(), candidate.config_epoch);
+        }
+        let own_slots = candidate.slots.slots_of(&self.node_id);
+        // Checked before it is installed: a rejected change is never persisted or routed on.
+        self.gossip_data_for(&candidate, &own_slots)
             .map_err(|e| format!("ERR {}", e))?;
-        *local_slots = candidate;
-        drop(local_slots);
+        self.persist_state(&candidate)
+            .await
+            .map_err(|e| format!("ERR {}", e))?;
+        *self.state.write().unwrap() = candidate;
+        drop(_guard);
 
         self.update_gossip_data()
             .await
@@ -882,24 +1274,34 @@ impl ClusterManager {
         Ok(())
     }
 
-    /// Remove slots from this node
+    /// Remove slots from this node (unbinds locally in the slot table).
     pub async fn remove_slots(
         &self,
         slots: Vec<u16>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if self.replica.is_some() {
+        let _guard = self.write_lock.lock().await;
+        let mut candidate = self.state.read().unwrap().clone();
+        if candidate.is_replica() {
             return Err("ERR this node is a replica".into());
         }
-        // Checked before it is installed: a rejected change is never routed on.
-        let mut local_slots = self.local_slots.write().await;
-        let mut candidate = local_slots.clone();
-        for slot in &slots {
-            candidate.remove(slot);
+        for &slot in &slots {
+            if candidate
+                .slots
+                .get(slot)
+                .is_some_and(|b| b.node_id == self.node_id)
+            {
+                candidate.slots.clear(slot);
+            }
         }
-        self.gossip_data(&candidate)
+        let own_slots = candidate.slots.slots_of(&self.node_id);
+        // Checked before it is installed: a rejected change is never persisted or routed on.
+        self.gossip_data_for(&candidate, &own_slots)
             .map_err(|e| format!("ERR {}", e))?;
-        *local_slots = candidate;
-        drop(local_slots);
+        self.persist_state(&candidate)
+            .await
+            .map_err(|e| format!("ERR {}", e))?;
+        *self.state.write().unwrap() = candidate;
+        drop(_guard);
 
         self.update_gossip_data()
             .await
@@ -909,26 +1311,49 @@ impl ClusterManager {
         Ok(())
     }
 
-    /// This node's gossip value if it owned `slots`; errors if that can't be
-    /// encoded within a datagram.
-    fn gossip_data(&self, slots: &HashSet<u16>) -> Result<NodeGossipData, String> {
+    /// Build this node's gossip value for `state` and `own_slots`; errors if
+    /// that can't be encoded within a datagram.
+    fn gossip_data_for(
+        &self,
+        state: &ClusterState,
+        own_slots: &HashSet<u16>,
+    ) -> Result<NodeGossipData, String> {
         let (local_ip, local_port) = local_endpoint(&self.config, self.local_addr);
+        let role = if state.is_replica() {
+            if self.replica_synced.lock().unwrap().iter().all(|s| *s) {
+                NodeRole::Replica
+            } else {
+                NodeRole::ReplicaSyncing
+            }
+        } else {
+            NodeRole::Primary
+        };
         NodeGossipData::new(
             format!("{}:{}", local_ip, local_port),
-            slots,
-            self.role(),
-            self.replica_primary(),
+            own_slots,
+            role,
+            state.primary.clone(),
+            state.current_epoch,
+            state.config_epoch,
         )
     }
 
-    /// Update gossip data with the current slots and role. Errors, leaving the
-    /// gossiped value as it was, if the slots can't be encoded within a datagram.
+    /// Update gossip data with the current slots, role and epochs. Errors,
+    /// leaving the gossiped value as it was, if the slots can't be encoded.
     async fn update_gossip_data(&self) -> Result<(), String> {
         if let Some(chitchat_arc) = &self.chitchat {
             // Read the state under the chitchat lock, so concurrent updates
             // publish the latest one last.
             let mut chitchat_guard = chitchat_arc.lock().await;
-            let gossip_data = self.gossip_data(&*self.local_slots.read().await)?;
+            let gossip_data = {
+                let state = self.state.read().unwrap();
+                let own_slots = if state.is_replica() {
+                    HashSet::new()
+                } else {
+                    state.slots.slots_of(&self.node_id)
+                };
+                self.gossip_data_for(&state, &own_slots)?
+            };
 
             if let Ok(gossip_data_json) = serde_json::to_string(&gossip_data) {
                 debug!("Updating gossip data: {}", gossip_data_json);
@@ -936,9 +1361,11 @@ impl ClusterManager {
                     .self_node_state()
                     .set("node_info", &gossip_data_json);
                 info!(
-                    "Updated gossip data with {} slots, role {:?}",
+                    "Updated gossip data with {} slots, role {:?}, epochs {}/{}",
                     gossip_data.owned_slots().len(),
-                    gossip_data.role
+                    gossip_data.role,
+                    gossip_data.current_epoch,
+                    gossip_data.config_epoch,
                 );
             } else {
                 error!("Failed to serialize gossip data");
@@ -950,7 +1377,53 @@ impl ClusterManager {
     /// Get slots owned by this node
     #[cfg(test)]
     pub async fn get_local_slots(&self) -> HashSet<u16> {
-        self.local_slots.read().await.clone()
+        let state = self.state.read().unwrap();
+        if state.is_replica() {
+            HashSet::new()
+        } else {
+            state.slots.slots_of(&self.node_id)
+        }
+    }
+
+    /// Snapshot of persisted cluster state, for unit tests.
+    #[cfg(test)]
+    pub fn state_snapshot(&self) -> ClusterState {
+        self.state.read().unwrap().clone()
+    }
+
+    /// Create an in-memory replica `ClusterManager` without gossip, for tests
+    /// that only exercise `AppState` replica role helpers.
+    #[cfg(test)]
+    pub fn for_replica_test(node_id: &str, primary: &str, num_shards: usize) -> Self {
+        let config = ClusterConfig {
+            enabled: true,
+            node_id: node_id.to_string(),
+            seeds: vec![],
+            port: 0,
+            slots: None,
+            slot_ranges: None,
+            gossip_interval_ms: Some(1000),
+            advertise_addr: None,
+            node_timeout_ms: None,
+            replica_validity_factor: None,
+        };
+        Self {
+            node_id: node_id.to_string(),
+            nodes: Arc::new(RwLock::new(HashMap::new())),
+            known_addrs: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            state: Arc::new(std::sync::RwLock::new(ClusterState::bootstrap_replica(
+                primary.to_string(),
+            ))),
+            state_path: None,
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrapping: Arc::new(AtomicBool::new(false)),
+            config,
+            chitchat: None,
+            running: Arc::new(Mutex::new(None)),
+            local_addr: "127.0.0.1:6379".parse().unwrap(),
+            namespace_strategy: NamespaceDistributionStrategy::default(),
+            replica_synced: Arc::new(Mutex::new(vec![false; num_shards])),
+        }
     }
 
     /// Stops gossip: the node stops advertising itself and frees its UDP port.
@@ -995,13 +1468,17 @@ impl Clone for ClusterManager {
         Self {
             node_id: self.node_id.clone(),
             nodes: Arc::clone(&self.nodes),
-            local_slots: Arc::clone(&self.local_slots),
+            known_addrs: Arc::clone(&self.known_addrs),
+            state: Arc::clone(&self.state),
+            state_path: self.state_path.clone(),
+            write_lock: Arc::clone(&self.write_lock),
+            bootstrapping: Arc::clone(&self.bootstrapping),
             config: self.config.clone(),
             chitchat: self.chitchat.clone(),
             running: Arc::clone(&self.running),
             local_addr: self.local_addr,
             namespace_strategy: self.namespace_strategy,
-            replica: self.replica.clone(),
+            replica_synced: Arc::clone(&self.replica_synced),
         }
     }
 }
@@ -1119,8 +1596,21 @@ mod tests {
         assert_eq!(ClusterManager::slots_to_ranges(&slots), "");
     }
 
+    fn bootstrap_loaded(dir: &std::path::Path, replica_of: Option<&str>) -> LoadedClusterState {
+        let state = match replica_of {
+            Some(primary) => ClusterState::bootstrap_replica(primary.to_string()),
+            None => ClusterState::bootstrap_primary(),
+        };
+        LoadedClusterState {
+            state,
+            from_file: false,
+            path: dir.join(CLUSTER_STATE_FILE),
+        }
+    }
+
     #[tokio::test]
     async fn test_cluster_manager_creation() {
+        let dir = tempfile::TempDir::new().unwrap();
         let config = ClusterConfig {
             enabled: true,
             node_id: "test-node".to_string(),
@@ -1130,12 +1620,20 @@ mod tests {
             slot_ranges: None,
             gossip_interval_ms: Some(100),
             advertise_addr: Some("127.0.0.1:7000".to_string()),
+            node_timeout_ms: None,
+            replica_validity_factor: None,
         };
 
         let gossip_bind_addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
         let redis_addr: SocketAddr = "127.0.0.1:6379".parse().unwrap();
-        let cluster_manager =
-            ClusterManager::new(&config, gossip_bind_addr, redis_addr, None, 1).await;
+        let cluster_manager = ClusterManager::new(
+            &config,
+            gossip_bind_addr,
+            redis_addr,
+            bootstrap_loaded(dir.path(), None),
+            1,
+        )
+        .await;
 
         // Note: This test might fail in CI due to UDP binding issues
         if let Ok(manager) = cluster_manager {
@@ -1143,11 +1641,13 @@ mod tests {
             assert!(manager.get_local_slots().await.is_empty());
             manager.claim_slots().await.unwrap();
 
-            // Check local slots were set
+            // Check local slots were set and persisted
             let local_slots = manager.get_local_slots().await;
             assert_eq!(local_slots.len(), 5);
             assert!(local_slots.contains(&0));
             assert!(local_slots.contains(&4));
+            assert!(dir.path().join(CLUSTER_STATE_FILE).exists());
+            manager.shutdown().await;
         }
 
         // Note: Additional namespace distribution tests are in tests/namespace_distribution_test.rs
@@ -1155,64 +1655,98 @@ mod tests {
 
     /// A manager without gossip, with `remote` nodes already known as live
     fn manager_with(local: &[u16], remote: &[(&str, &str, &[u16])]) -> ClusterManager {
+        manager_with_id("node-a", local, remote)
+    }
+
+    fn manager_with_id(
+        node_id: &str,
+        local: &[u16],
+        remote: &[(&str, &str, &[u16])],
+    ) -> ClusterManager {
         let config = ClusterConfig {
             enabled: true,
-            node_id: "node-a".to_string(),
+            node_id: node_id.to_string(),
             seeds: vec![],
             port: 7000,
             slots: None,
             slot_ranges: None,
             gossip_interval_ms: Some(1000),
             advertise_addr: Some("10.0.0.1:6379".to_string()),
+            node_timeout_ms: None,
+            replica_validity_factor: None,
         };
-        let nodes = remote
-            .iter()
-            .map(|(id, addr, slots)| {
-                (
-                    id.to_string(),
-                    ClusterNode {
-                        id: id.to_string(),
-                        addr: addr.parse().unwrap(),
-                        slots: slots.iter().copied().collect(),
-                        _state: "master".to_string(),
-                        role: NodeRole::Primary,
-                        primary: None,
-                    },
-                )
-            })
-            .collect();
+        let mut state = ClusterState::bootstrap_primary();
+        for &slot in local {
+            state.slots.set(slot, node_id, 0);
+        }
+        let mut nodes = HashMap::new();
+        let mut known_addrs = HashMap::new();
+        for (id, addr, slots) in remote {
+            let parsed: SocketAddr = addr.parse().unwrap();
+            known_addrs.insert(id.to_string(), parsed);
+            for &slot in *slots {
+                state.slots.set(slot, *id, 0);
+            }
+            nodes.insert(
+                id.to_string(),
+                ClusterNode {
+                    id: id.to_string(),
+                    addr: parsed,
+                    slots: slots.iter().copied().collect(),
+                    _state: "master".to_string(),
+                    role: NodeRole::Primary,
+                    primary: None,
+                    current_epoch: 0,
+                    config_epoch: 0,
+                },
+            );
+        }
         ClusterManager {
             node_id: config.node_id.clone(),
             nodes: Arc::new(RwLock::new(nodes)),
-            local_slots: Arc::new(RwLock::new(local.iter().copied().collect())),
+            known_addrs: Arc::new(std::sync::RwLock::new(known_addrs)),
+            state: Arc::new(std::sync::RwLock::new(state)),
+            state_path: None,
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrapping: Arc::new(AtomicBool::new(false)),
             config,
             chitchat: None,
             running: Arc::new(Mutex::new(None)),
             local_addr: "0.0.0.0:6379".parse().unwrap(),
             namespace_strategy: NamespaceDistributionStrategy::default(),
-            replica: None,
+            replica_synced: Arc::new(Mutex::new(vec![false; 2])),
         }
     }
 
     /// Makes `manager` a replica of `primary` with two shards, `synced` or not.
-    fn into_replica(mut manager: ClusterManager, primary: &str, synced: bool) -> ClusterManager {
-        manager.replica = Some(Arc::new(Mutex::new(ReplicaState {
-            primary: primary.to_string(),
-            synced: vec![synced; 2],
-        })));
+    fn into_replica(manager: ClusterManager, primary: &str, synced: bool) -> ClusterManager {
+        {
+            let mut state = manager.state.write().unwrap();
+            state.role = PersistedRole::Replica;
+            state.primary = Some(primary.to_string());
+        }
+        *manager.replica_synced.lock().unwrap() = vec![synced; 2];
         manager
     }
 
     async fn add_replica(manager: &ClusterManager, id: &str, addr: &str, of: &str, role: NodeRole) {
+        let parsed: SocketAddr = addr.parse().unwrap();
+        manager
+            .known_addrs
+            .write()
+            .unwrap()
+            .insert(id.to_string(), parsed);
         manager.nodes.write().await.insert(
             id.to_string(),
             ClusterNode {
                 id: id.to_string(),
-                addr: addr.parse().unwrap(),
+                addr: parsed,
                 slots: HashSet::new(),
                 _state: "master".to_string(),
                 role,
                 primary: Some(of.to_string()),
+                current_epoch: 0,
+                config_epoch: 0,
             },
         );
     }
@@ -1285,8 +1819,15 @@ mod tests {
     #[test]
     fn test_gossip_encodes_ranges_and_legacy_slots() {
         let slots: HashSet<u16> = [0, 1, 2, 9].into_iter().collect();
-        let data =
-            NodeGossipData::new("10.0.0.1:6379".into(), &slots, NodeRole::Primary, None).unwrap();
+        let data = NodeGossipData::new(
+            "10.0.0.1:6379".into(),
+            &slots,
+            NodeRole::Primary,
+            None,
+            0,
+            0,
+        )
+        .unwrap();
         assert_eq!(data.slots, vec![0, 1, 2, 9]);
         assert_eq!(data.slot_ranges, vec![(0, 2), (9, 9)]);
         let json = serde_json::to_string(&data).unwrap();
@@ -1305,7 +1846,7 @@ mod tests {
         }
         let all = |n: u16| (0..n).collect::<HashSet<u16>>();
         let at_limit =
-            NodeGossipData::new("a:1".into(), &all(9000), NodeRole::Primary, None).unwrap();
+            NodeGossipData::new("a:1".into(), &all(9000), NodeRole::Primary, None, 0, 0).unwrap();
         assert_eq!(at_limit.slots.len(), 9000);
         let json = serde_json::to_string(&at_limit).unwrap();
         assert!(json.len() <= GOSSIP_VALUE_MAX, "{} bytes", json.len());
@@ -1315,9 +1856,10 @@ mod tests {
         );
         // The worst case for 9000 slots: all five digits.
         let high: HashSet<u16> = (7384..16384).collect();
-        let high = NodeGossipData::new("a:1".into(), &high, NodeRole::Primary, None).unwrap();
+        let high = NodeGossipData::new("a:1".into(), &high, NodeRole::Primary, None, 0, 0).unwrap();
         assert_eq!(high.slots.len(), 9000);
-        let full = NodeGossipData::new("a:1".into(), &all(16384), NodeRole::Primary, None).unwrap();
+        let full =
+            NodeGossipData::new("a:1".into(), &all(16384), NodeRole::Primary, None, 0, 0).unwrap();
         assert!(full.slots.is_empty());
         assert_eq!(full.slot_ranges, vec![(0, 16383)]);
         let json = serde_json::to_string(&full).unwrap();
@@ -1337,7 +1879,7 @@ mod tests {
         // alone is sent (and old nodes can still read it).
         let alternating: HashSet<u16> = (0..16384).step_by(2).collect();
         let data =
-            NodeGossipData::new("a:1".into(), &alternating, NodeRole::Primary, None).unwrap();
+            NodeGossipData::new("a:1".into(), &alternating, NodeRole::Primary, None, 0, 0).unwrap();
         assert!(data.slot_ranges.is_empty());
         let json = serde_json::to_string(&data).unwrap();
         assert!(json.len() <= GOSSIP_VALUE_MAX, "{} bytes", json.len());
@@ -1351,11 +1893,12 @@ mod tests {
 
     #[test]
     fn test_gossip_decodes_what_old_nodes_send() {
-        // No ranges, role or primary: read the slot list and assume a primary.
+        // No ranges, role, primary, or epochs: read the slot list and default to primary at epoch 0.
         let old = r#"{"addr":"10.0.0.1:6379","slots":[5,6,7],"state":"master"}"#;
         let data: NodeGossipData = serde_json::from_str(old).unwrap();
         assert_eq!(data.owned_slots(), [5, 6, 7].into_iter().collect());
         assert_eq!((data.role, data.primary), (NodeRole::Primary, None));
+        assert_eq!((data.current_epoch, data.config_epoch), (0, 0));
 
         // Ranges win over a stale list.
         let new = r#"{"addr":"a:1","slots":[1],"slot_ranges":[[10,12]],"state":"master"}"#;
@@ -1367,11 +1910,14 @@ mod tests {
             &HashSet::new(),
             NodeRole::ReplicaSyncing,
             Some("node-a".into()),
+            4,
+            0,
         )
         .unwrap();
         let json = serde_json::to_string(&replica).unwrap();
         assert!(json.contains(r#""role":"replica-syncing""#), "{json}");
         assert!(json.contains(r#""primary":"node-a""#), "{json}");
+        assert!(json.contains(r#""current_epoch":4"#), "{json}");
     }
 
     #[tokio::test]
@@ -1529,6 +2075,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_shutdown_stops_gossip_and_frees_its_port() {
+        let dir = tempfile::TempDir::new().unwrap();
         let port = std::net::UdpSocket::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
@@ -1543,12 +2090,19 @@ mod tests {
             slot_ranges: None,
             gossip_interval_ms: Some(100),
             advertise_addr: Some("127.0.0.1:6379".to_string()),
+            node_timeout_ms: None,
+            replica_validity_factor: None,
         };
         let bind: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        let manager =
-            ClusterManager::new(&config, bind, "127.0.0.1:6379".parse().unwrap(), None, 1)
-                .await
-                .unwrap();
+        let manager = ClusterManager::new(
+            &config,
+            bind,
+            "127.0.0.1:6379".parse().unwrap(),
+            bootstrap_loaded(dir.path(), None),
+            1,
+        )
+        .await
+        .unwrap();
         assert!(
             std::net::UdpSocket::bind(bind).is_err(),
             "gossip isn't running"
@@ -1559,6 +2113,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_remove_slots() {
+        let dir = tempfile::TempDir::new().unwrap();
         let config = ClusterConfig {
             enabled: true,
             node_id: "test-node".to_string(),
@@ -1568,14 +2123,22 @@ mod tests {
             slot_ranges: None,
             gossip_interval_ms: Some(100),
             advertise_addr: Some("127.0.0.1:7000".to_string()),
+            node_timeout_ms: None,
+            replica_validity_factor: None,
         };
 
         let gossip_bind_addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
         let redis_addr: SocketAddr = "127.0.0.1:6379".parse().unwrap();
 
         // This test might fail in CI due to UDP binding, so we'll handle the error gracefully
-        if let Ok(manager) =
-            ClusterManager::new(&config, gossip_bind_addr, redis_addr, None, 1).await
+        if let Ok(manager) = ClusterManager::new(
+            &config,
+            gossip_bind_addr,
+            redis_addr,
+            bootstrap_loaded(dir.path(), None),
+            1,
+        )
+        .await
         {
             manager.claim_slots().await.unwrap();
             // Initial slots
@@ -1600,6 +2163,12 @@ mod tests {
             assert!(after_remove.contains(&2));
             assert!(after_remove.contains(&10));
             assert!(after_remove.contains(&12));
+
+            // Persisted state matches the table after ADDSLOTS/DELSLOTS.
+            let persisted =
+                ClusterState::load(&dir.path().join(CLUSTER_STATE_FILE), "test-node").unwrap();
+            assert_eq!(persisted.slots.slots_of("test-node"), after_remove);
+            manager.shutdown().await;
         }
     }
 
@@ -1613,18 +2182,28 @@ mod tests {
             slot_ranges: None,
             gossip_interval_ms: Some(1000),
             advertise_addr: Some("127.0.0.1:6401".to_string()),
+            node_timeout_ms: None,
+            replica_validity_factor: None,
         };
+        let mut state = ClusterState::bootstrap_primary();
+        for slot in local_slots {
+            state.slots.set(slot, "node-a", 0);
+        }
 
         ClusterManager {
             node_id: config.node_id.clone(),
             nodes: Arc::new(RwLock::new(HashMap::new())),
-            local_slots: Arc::new(RwLock::new(local_slots.into_iter().collect())),
+            known_addrs: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            state: Arc::new(std::sync::RwLock::new(state)),
+            state_path: None,
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrapping: Arc::new(AtomicBool::new(false)),
             config,
             chitchat: None,
             running: Arc::new(Mutex::new(None)),
             local_addr: "127.0.0.1:6401".parse().unwrap(),
             namespace_strategy: NamespaceDistributionStrategy::default(),
-            replica: None,
+            replica_synced: Arc::new(Mutex::new(vec![false; 1])),
         }
     }
 
@@ -1645,8 +2224,9 @@ mod tests {
             Some(CLUSTERDOWN_HASH_SLOT_NOT_SERVED)
         );
 
-        // Once the peer is discovered, its slots route as MOVED.
-        manager.nodes.write().await.insert(
+        // Once the peer is discovered, its slots enter the table and route as MOVED.
+        let mut peers = HashMap::new();
+        peers.insert(
             "node-b".to_string(),
             ClusterNode {
                 id: "node-b".to_string(),
@@ -1655,8 +2235,11 @@ mod tests {
                 _state: "master".to_string(),
                 role: NodeRole::Primary,
                 primary: None,
+                current_epoch: 1,
+                config_epoch: 1,
             },
         );
+        manager.process_peers(peers).await;
         assert_eq!(
             manager.route(9706, false, false).await,
             Route::Moved(format!("MOVED 9706 {}", peer_addr))
@@ -1670,9 +2253,13 @@ mod tests {
             Some("MOVED 9706 127.0.0.1:6402")
         );
 
-        // When the peer leaves gossip (e.g. after dead_node_grace_period),
-        // its slots must become ClusterDown rather than falling through locally.
-        manager.nodes.write().await.remove("node-b");
+        // When the peer leaves gossip, its bindings stay in the slot table,
+        // while requests to its slots return ClusterDown.
+        manager.process_peers(HashMap::new()).await;
+        assert_eq!(
+            manager.state_snapshot().slots.get(9706).unwrap().node_id,
+            "node-b"
+        );
         assert_eq!(manager.route(9706, false, false).await, Route::ClusterDown);
         assert_eq!(
             manager
@@ -1729,6 +2316,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_add_and_remove_slots_keep_gossip_in_sync_with_local_slots() {
+        let dir = tempfile::TempDir::new().unwrap();
         let sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("ephemeral udp port");
         let gossip_port = sock.local_addr().unwrap().port();
         drop(sock);
@@ -1742,13 +2330,23 @@ mod tests {
             slot_ranges: None,
             gossip_interval_ms: Some(1000),
             advertise_addr: Some("127.0.0.1:6499".to_string()),
+            node_timeout_ms: None,
+            replica_validity_factor: None,
         };
         let gossip_bind_addr: SocketAddr = format!("127.0.0.1:{gossip_port}").parse().unwrap();
         let redis_addr: SocketAddr = "127.0.0.1:6499".parse().unwrap();
-        let manager = ClusterManager::new(&config, gossip_bind_addr, redis_addr, None, 1)
-            .await
-            .expect("cluster manager");
+        let mut manager = ClusterManager::new(
+            &config,
+            gossip_bind_addr,
+            redis_addr,
+            bootstrap_loaded(dir.path(), None),
+            1,
+        )
+        .await
+        .expect("cluster manager");
         manager.claim_slots().await.expect("claim initial slots");
+        // Skip per-round fsyncs here; this test stresses the in-memory gossip race.
+        manager.state_path = None;
 
         // Interleave concurrent add_slots/remove_slots on the same slot while
         // briefly contending on the chitchat lock, which previously let an
@@ -1788,5 +2386,202 @@ mod tests {
             "published gossip slots diverged from local_slots"
         );
         manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn epoch_collision_resolution_bumps_smaller_node_id_only() {
+        let dir_a = tempfile::TempDir::new().unwrap();
+        let dir_b = tempfile::TempDir::new().unwrap();
+        let mut mgr_a = manager_with_id("node-a", &[0, 1], &[]);
+        mgr_a.state_path = Some(dir_a.path().join(CLUSTER_STATE_FILE));
+        let mut mgr_b = manager_with_id("node-b", &[2, 3], &[]);
+        mgr_b.state_path = Some(dir_b.path().join(CLUSTER_STATE_FILE));
+
+        let peer_b = ClusterNode {
+            id: "node-b".to_string(),
+            addr: "10.0.0.2:6379".parse().unwrap(),
+            slots: [2, 3].into_iter().collect(),
+            _state: "master".to_string(),
+            role: NodeRole::Primary,
+            primary: None,
+            current_epoch: 0,
+            config_epoch: 0,
+        };
+        let peer_a = ClusterNode {
+            id: "node-a".to_string(),
+            addr: "10.0.0.1:6379".parse().unwrap(),
+            slots: [0, 1].into_iter().collect(),
+            _state: "master".to_string(),
+            role: NodeRole::Primary,
+            primary: None,
+            current_epoch: 0,
+            config_epoch: 0,
+        };
+
+        // node-a < node-b at config_epoch 0: node-a bumps to 1 and persists.
+        mgr_a
+            .process_peers([("node-b".to_string(), peer_b)].into())
+            .await;
+        let state_a = mgr_a.state_snapshot();
+        assert_eq!(state_a.current_epoch, 1);
+        assert_eq!(state_a.config_epoch, 1);
+        assert_eq!(state_a.slots.get(0).unwrap().epoch, 1);
+        assert_eq!(state_a.slots.get(2).unwrap().epoch, 0);
+        let persisted =
+            ClusterState::load(&dir_a.path().join(CLUSTER_STATE_FILE), "node-a").unwrap();
+        assert_eq!(persisted.config_epoch, 1);
+
+        // node-b > node-a at config_epoch 0: node-b does NOT bump.
+        mgr_b
+            .process_peers([("node-a".to_string(), peer_a)].into())
+            .await;
+        let state_b = mgr_b.state_snapshot();
+        assert_eq!(state_b.current_epoch, 0);
+        assert_eq!(state_b.config_epoch, 0);
+    }
+
+    #[tokio::test]
+    async fn primary_drops_slots_on_higher_epoch_claim_and_serves_moved() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut mgr = manager_with_id("node-a", &[0, 1], &[]);
+        mgr.state_path = Some(dir.path().join(CLUSTER_STATE_FILE));
+        {
+            let mut st = mgr.state.write().unwrap();
+            st.current_epoch = 2;
+            st.config_epoch = 2;
+            st.slots.rebind_owner_epoch("node-a", 2);
+        }
+
+        // Equal epoch claim is ignored.
+        let equal_peer = ClusterNode {
+            id: "node-b".to_string(),
+            addr: "10.0.0.2:6379".parse().unwrap(),
+            slots: [0, 1].into_iter().collect(),
+            _state: "master".to_string(),
+            role: NodeRole::Primary,
+            primary: None,
+            current_epoch: 2,
+            config_epoch: 2,
+        };
+        // Note: node-a < node-b would trigger collision at epoch 2, so test with node-z < self
+        // or test strictly lower epoch here:
+        let lower_peer = ClusterNode {
+            config_epoch: 1,
+            current_epoch: 1,
+            ..equal_peer.clone()
+        };
+        mgr.process_peers([("node-b".to_string(), lower_peer)].into())
+            .await;
+        assert_eq!(mgr.route(0, false, false).await, Route::Local);
+        assert_eq!(mgr.route(1, false, false).await, Route::Local);
+
+        // Strictly higher epoch claim on slot 1: node-a drops slot 1 immediately.
+        let take_one = ClusterNode {
+            slots: [1].into_iter().collect(),
+            current_epoch: 5,
+            config_epoch: 5,
+            ..equal_peer.clone()
+        };
+        mgr.process_peers([("node-b".to_string(), take_one)].into())
+            .await;
+        assert_eq!(mgr.route(0, false, false).await, Route::Local);
+        assert_eq!(
+            mgr.route(1, false, false).await,
+            Route::Moved("MOVED 1 10.0.0.2:6379".to_string())
+        );
+        assert_eq!(mgr.state_snapshot().current_epoch, 5);
+        let persisted = ClusterState::load(&dir.path().join(CLUSTER_STATE_FILE), "node-a").unwrap();
+        assert_eq!(persisted.slots.get(1).unwrap().node_id, "node-b");
+        assert_eq!(persisted.slots.get(1).unwrap().epoch, 5);
+
+        // Losing the last slot (slot 0): serves nothing, routes MOVED to winner.
+        let take_last = ClusterNode {
+            slots: [0, 1].into_iter().collect(),
+            current_epoch: 6,
+            config_epoch: 6,
+            ..equal_peer
+        };
+        mgr.process_peers([("node-b".to_string(), take_last)].into())
+            .await;
+        assert!(mgr.get_local_slots().await.is_empty());
+        assert_eq!(
+            mgr.route(0, false, false).await,
+            Route::Moved("MOVED 0 10.0.0.2:6379".to_string())
+        );
+        // Role stays primary (demotion is step 2).
+        assert!(!mgr.is_replica());
+    }
+
+    #[tokio::test]
+    async fn cluster_shards_info_and_nodes_reflect_epochs_and_dead_owners() {
+        let manager = manager_with(&[0, 1, 9], &[("node-b", "10.0.0.2:6380", &[5, 6])]);
+        {
+            let mut st = manager.state.write().unwrap();
+            st.current_epoch = 4;
+            st.config_epoch = 3;
+            st.slots.rebind_owner_epoch("node-a", 3);
+            st.slots.rebind_owner_epoch("node-b", 4);
+        }
+        manager
+            .nodes
+            .write()
+            .await
+            .get_mut("node-b")
+            .unwrap()
+            .config_epoch = 4;
+        add_replica(
+            &manager,
+            "node-b1",
+            "10.0.0.3:6381",
+            "node-b",
+            NodeRole::Replica,
+        )
+        .await;
+        add_replica(
+            &manager,
+            "node-a1",
+            "10.0.0.4:6382",
+            "node-a",
+            NodeRole::ReplicaSyncing,
+        )
+        .await;
+
+        let info = manager.get_cluster_info().await;
+        assert!(info.contains("cluster_current_epoch:4\n"), "{info}");
+        assert!(info.contains("cluster_my_epoch:3\n"), "{info}");
+        assert!(info.contains("cluster_slots_assigned:5\n"), "{info}");
+        assert!(info.contains("cluster_slots_ok:5\n"), "{info}");
+        assert!(info.contains("cluster_size:2\n"), "{info}");
+        assert!(info.contains("cluster_known_nodes:4\n"), "{info}");
+
+        let shards = manager.get_cluster_shards().await;
+        assert_eq!(shards.len(), 2);
+        // Shard 0 is node-a with disjoint ranges (0, 1) and (9, 9), plus loading replica node-a1.
+        assert_eq!(shards[0].slots, vec![(0, 1), (9, 9)]);
+        assert_eq!(shards[0].nodes[0].id, "node-a");
+        assert_eq!(shards[0].nodes[0].role, "master");
+        assert_eq!(shards[0].nodes[0].health, "online");
+        assert_eq!(shards[0].nodes[1].id, "node-a1");
+        assert_eq!(shards[0].nodes[1].role, "replica");
+        assert_eq!(shards[0].nodes[1].health, "loading");
+        // Shard 1 is node-b with online replica node-b1.
+        assert_eq!(shards[1].slots, vec![(5, 6)]);
+        assert_eq!(shards[1].nodes[0].id, "node-b");
+        assert_eq!(shards[1].nodes[1].id, "node-b1");
+        assert_eq!(shards[1].nodes[1].health, "online");
+
+        // When node-b leaves gossip, its slots remain bound in CLUSTER NODES
+        // as disconnected and in CLUSTER SHARDS as failed, and CLUSTER SLOTS omits it.
+        manager.process_peers(HashMap::new()).await;
+        let nodes = manager.get_cluster_nodes().await;
+        assert!(
+            nodes.contains("node-b 10.0.0.2:6380 master - 0 0 4 disconnected 5-6\n"),
+            "{nodes}"
+        );
+        let shards_after = manager.get_cluster_shards().await;
+        assert_eq!(shards_after[1].nodes[0].id, "node-b");
+        assert_eq!(shards_after[1].nodes[0].health, "failed");
+        let slots_after = manager.get_cluster_slots().await;
+        assert!(slots_after.iter().all(|r| r.node_id == "node-a"));
     }
 }

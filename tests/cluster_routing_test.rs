@@ -60,6 +60,8 @@ async fn start_cluster_node(
             slot_ranges: Some(vec![slot_range]),
             gossip_interval_ms: Some(100),
             advertise_addr: Some(addr.to_string()),
+            node_timeout_ms: None,
+            replica_validity_factor: None,
         }),
         metrics: None,
         sqlite: None,

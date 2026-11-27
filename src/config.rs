@@ -102,6 +102,13 @@ pub struct ClusterConfig {
     #[allow(dead_code)]
     pub gossip_interval_ms: Option<u64>,
     pub advertise_addr: Option<String>,
+    /// Milliseconds without heartbeat progress before a peer is suspected failed,
+    /// and the minority fencing timeout. Default: 15000.
+    pub node_timeout_ms: Option<u64>,
+    /// Multiplier on `node_timeout_ms` bounding how stale a replica may be and
+    /// still run an election. 0 disables the check. Default: 10.
+    #[allow(dead_code)]
+    pub replica_validity_factor: Option<u64>,
 }
 
 impl ClusterConfig {
@@ -112,6 +119,12 @@ impl ClusterConfig {
         if self.gossip_interval_ms == Some(0) {
             return Err(miette::miette!(
                 "cluster.gossip_interval_ms must be greater than 0"
+            ));
+        }
+
+        if self.node_timeout_ms == Some(0) {
+            return Err(miette::miette!(
+                "cluster.node_timeout_ms must be greater than 0"
             ));
         }
 
@@ -137,6 +150,18 @@ impl ClusterConfig {
         }
 
         Ok(())
+    }
+
+    /// Cluster node timeout in milliseconds (default: 15000).
+    #[allow(dead_code)]
+    pub fn node_timeout_ms(&self) -> u64 {
+        self.node_timeout_ms.unwrap_or(15_000)
+    }
+
+    /// Replica validity factor for elections (default: 10; 0 disables the check).
+    #[allow(dead_code)]
+    pub fn replica_validity_factor(&self) -> u64 {
+        self.replica_validity_factor.unwrap_or(10)
     }
 }
 
@@ -555,6 +580,8 @@ mod tests {
             slot_ranges: Some(vec![SlotRange { start: 1, end: 100 }]),
             gossip_interval_ms: Some(1000),
             advertise_addr: None,
+            node_timeout_ms: None,
+            replica_validity_factor: None,
         }
     }
 
@@ -612,6 +639,32 @@ mod tests {
         let bad = "node_id = \"node1\"\nseeds = []\nport = 7000\ngossip_interval_ms = 0\n";
         assert!(load_with_cluster(&format!("enabled = true\n{bad}")).is_err());
         assert!(load_with_cluster(&format!("enabled = false\n{bad}")).is_ok());
+    }
+
+    #[test]
+    fn cluster_failover_config_defaults_and_validation() {
+        let cfg =
+            load_with_cluster("enabled = true\nnode_id = \"node1\"\nseeds = []\nport = 7000\n")
+                .unwrap();
+        let cluster = cfg.cluster.unwrap();
+        assert_eq!(cluster.node_timeout_ms(), 15_000);
+        assert_eq!(cluster.replica_validity_factor(), 10);
+
+        let custom = load_with_cluster(
+            "enabled = true\nnode_id = \"node1\"\nseeds = []\nport = 7000\n\
+             node_timeout_ms = 5000\nreplica_validity_factor = 0\n",
+        )
+        .unwrap();
+        let cluster = custom.cluster.unwrap();
+        assert_eq!(cluster.node_timeout_ms(), 5_000);
+        assert_eq!(cluster.replica_validity_factor(), 0);
+
+        assert!(
+            load_with_cluster(
+                "enabled = true\nnode_id = \"node1\"\nseeds = []\nport = 7000\nnode_timeout_ms = 0\n"
+            )
+            .is_err()
+        );
     }
 
     fn load_with_compression(compression: &str) -> Result<Cfg> {

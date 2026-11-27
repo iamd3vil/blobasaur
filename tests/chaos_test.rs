@@ -1313,11 +1313,13 @@ impl Rig {
         self.proxy.set(Mode::Pass);
     }
 
-    /// The runbook's promotion: restart the replica's data dir as a primary
-    /// owning every slot, retrying while the startup guard refuses.
+    /// The runbook's promotion: remove persisted cluster state and restart the
+    /// replica's data dir as a primary owning every slot, retrying while the
+    /// startup guard refuses.
     async fn promote(&mut self) {
         self.r.replica_of = None;
         self.r.seeds = vec![format!("127.0.0.1:{}", self.p.gossip_port)];
+        let _ = std::fs::remove_file(self.r.data().join(blobasaur::cluster::CLUSTER_STATE_FILE));
         for attempt in 1..=30 {
             match self.r.start().await {
                 Ok(()) => return,

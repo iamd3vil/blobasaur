@@ -720,7 +720,7 @@ pub(crate) async fn primary_state(pool: &SqlitePool) -> Result<(String, u64, u64
 /// write has an LSN, and reports the highest one. A replica reports its
 /// `caught_up_lsn`, or `not-synced` for a shard that holds no complete copy.
 pub async fn shard_watermark(state: &AppState, shard: usize) -> Result<(String, String)> {
-    let replica = state.cfg.replica_of().is_some();
+    let replica = state.is_replica();
     if !replica {
         let (responder, done) = oneshot::channel();
         state.shard_senders[shard]
@@ -762,7 +762,7 @@ pub async fn serve_sync(
     let cfg = &state.cfg;
     let error = if !cfg.replication_enabled() {
         Some("replication is not enabled on this node".to_string())
-    } else if cfg.replica_of().is_some() {
+    } else if state.is_replica() {
         Some("this node is a replica".to_string())
     } else if req.num_shards != cfg.num_shards {
         Some(format!(
@@ -963,7 +963,7 @@ async fn current_row(
 /// stream open to the primary's current address and applies it through the
 /// shard's writer.
 pub async fn replica_sync_task(state: Arc<AppState>, shard: usize, shutdown: CancellationToken) {
-    let Some(primary) = state.cfg.replica_of().map(str::to_owned) else {
+    let Some(primary) = state.replica_of() else {
         return;
     };
     let mut replica = Replica {
@@ -1833,7 +1833,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_resync_waits_for_replica_reads_admitted_before_it() {
-        use crate::config::{Cfg, ReplicationConfig};
+        use crate::config::Cfg;
         use crate::metrics::Metrics;
         use crate::shard_manager::{ShardWriter, shard_writer_task};
 
@@ -1859,11 +1859,10 @@ mod tests {
         };
         let mut receivers = Vec::new();
         let mut state = AppState::new(cfg, &mut receivers).await.unwrap();
-        // AppState::new wants a cluster for a replica; the gate only needs the role.
-        state.cfg.replication = Some(ReplicationConfig {
-            replica_of: Some("p".to_string()),
-            tombstone_retention_secs: None,
-        });
+        // AppState::new wants a cluster for a replica; the gate only needs the runtime role.
+        state.cluster_manager = Some(crate::cluster::ClusterManager::for_replica_test(
+            "r", "p", 1,
+        ));
         let state = Arc::new(state);
         let shutdown = CancellationToken::new();
         let writer = tokio::spawn(shard_writer_task(ShardWriter {

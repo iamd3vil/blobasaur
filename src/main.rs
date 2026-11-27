@@ -943,6 +943,8 @@ mod tests {
                 slot_ranges: None,
                 gossip_interval_ms: None,
                 advertise_addr: Some("10.0.0.1:6379".to_string()),
+                node_timeout_ms: None,
+                replica_validity_factor: None,
             }),
             metrics: None,
             shutdown_timeout_secs: None,

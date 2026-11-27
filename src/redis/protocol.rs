@@ -112,9 +112,11 @@ pub enum RedisCommand {
         args: Vec<String>,
     },
     // Cluster commands
+    ClusterMyId,
     ClusterNodes,
     ClusterInfo,
     ClusterSlots,
+    ClusterShards,
     ClusterAddSlots {
         slots: Vec<u16>,
     },
@@ -181,9 +183,11 @@ impl RedisCommand {
             RedisCommand::Ping { .. } => "PING".to_string(),
             RedisCommand::Info { .. } => "INFO".to_string(),
             RedisCommand::Command { .. } => "COMMAND".to_string(),
+            RedisCommand::ClusterMyId => "CLUSTER MYID".to_string(),
             RedisCommand::ClusterNodes => "CLUSTER NODES".to_string(),
             RedisCommand::ClusterInfo => "CLUSTER INFO".to_string(),
             RedisCommand::ClusterSlots => "CLUSTER SLOTS".to_string(),
+            RedisCommand::ClusterShards => "CLUSTER SHARDS".to_string(),
             RedisCommand::ClusterAddSlots { .. } => "CLUSTER ADDSLOTS".to_string(),
             RedisCommand::ClusterDelSlots { .. } => "CLUSTER DELSLOTS".to_string(),
             RedisCommand::ClusterKeySlot { .. } => "CLUSTER KEYSLOT".to_string(),
@@ -654,9 +658,25 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
             }
             let subcommand = extract_string(&elements[1])?.to_uppercase();
             match subcommand.as_str() {
+                "MYID" => {
+                    if elements.len() != 2 {
+                        return Err(ParseError::Invalid(
+                            "CLUSTER MYID takes no arguments".to_string(),
+                        ));
+                    }
+                    Ok(RedisCommand::ClusterMyId)
+                }
                 "NODES" => Ok(RedisCommand::ClusterNodes),
                 "INFO" => Ok(RedisCommand::ClusterInfo),
                 "SLOTS" => Ok(RedisCommand::ClusterSlots),
+                "SHARDS" => {
+                    if elements.len() != 2 {
+                        return Err(ParseError::Invalid(
+                            "CLUSTER SHARDS takes no arguments".to_string(),
+                        ));
+                    }
+                    Ok(RedisCommand::ClusterShards)
+                }
                 "ADDSLOTS" => {
                     if elements.len() < 3 {
                         return Err(ParseError::Invalid(
@@ -1885,6 +1905,17 @@ mod tests {
         let (resp, _) = parse_resp_with_remaining(input).unwrap();
         let command = parse_command(resp).unwrap();
         assert_eq!(command, RedisCommand::ClusterNodes);
+    }
+
+    #[test]
+    fn test_parse_cluster_myid_and_shards_commands() {
+        let myid = parse_command(command_frame(&["CLUSTER", "MYID"])).unwrap();
+        assert_eq!(myid, RedisCommand::ClusterMyId);
+        assert!(parse_command(command_frame(&["CLUSTER", "MYID", "extra"])).is_err());
+
+        let shards = parse_command(command_frame(&["CLUSTER", "SHARDS"])).unwrap();
+        assert_eq!(shards, RedisCommand::ClusterShards);
+        assert!(parse_command(command_frame(&["CLUSTER", "SHARDS", "extra"])).is_err());
     }
 
     #[test]

@@ -167,14 +167,8 @@ impl AppState {
         cfg: Cfg,
         shard_receivers_out: &mut Vec<mpsc::Receiver<ShardWriteOperation>>,
     ) -> Result<Self> {
-        if let Some(primary) = cfg.replica_of() {
-            let cluster = cfg.cluster.as_ref().filter(|c| c.enabled);
-            let Some(cluster) = cluster else {
-                return Err(miette!("replication requires [cluster] to be enabled"));
-            };
-            if cluster.node_id == primary {
-                return Err(miette!("replica_of must be another node, not {}", primary));
-            }
+        if cfg.replica_of().is_some() && !cfg.cluster.as_ref().is_some_and(|c| c.enabled) {
+            return Err(miette!("replication requires [cluster] to be enabled"));
         }
 
         let mut shard_senders_vec = Vec::new();
@@ -193,6 +187,22 @@ impl AppState {
 
         // Validate the number of shards in the data directory
         validate_shard_count(&cfg.data_dir, cfg.num_shards)?;
+
+        // Load persisted cluster state if present, or prepare bootstrap state from config.
+        // Role and primary come from this state (not the config) for shard init and runtime.
+        let loaded_cluster =
+            if let Some(cluster_config) = cfg.cluster.as_ref().filter(|c| c.enabled) {
+                Some(
+                    crate::cluster::load_or_bootstrap(
+                        std::path::Path::new(&cfg.data_dir),
+                        cluster_config,
+                        cfg.replica_of(),
+                    )
+                    .map_err(|e| miette!("{}", e))?,
+                )
+            } else {
+                None
+            };
 
         // Initialize metrics early so startup storage checks can emit counters.
         let metrics = Metrics::new();
@@ -247,7 +257,9 @@ impl AppState {
         // Index pre-existing rows and settle the replid before any writer runs.
         // Without replication this only marks the index as stale.
         let enabled = cfg.replication_enabled();
-        let replica = cfg.replica_of().is_some();
+        let replica = loaded_cluster
+            .as_ref()
+            .is_some_and(|loaded| loaded.state.is_replica());
         // Also without replication: a half-copied replica must not serve as a primary.
         if !replica {
             let options: Vec<_> = (0..cfg.num_shards)
@@ -368,47 +380,45 @@ impl AppState {
         let inflight_hcache = Cache::builder().build();
 
         // Initialize cluster manager if clustering is enabled
-        let cluster_manager = if let Some(ref cluster_config) = cfg.cluster {
-            if cluster_config.enabled {
-                let gossip_bind_addr = format!("0.0.0.0:{}", cluster_config.port)
-                    .parse()
-                    .expect("Invalid cluster bind address");
+        let cluster_manager = if let (Some(cluster_config), Some(loaded)) =
+            (cfg.cluster.as_ref().filter(|c| c.enabled), loaded_cluster)
+        {
+            let gossip_bind_addr = format!("0.0.0.0:{}", cluster_config.port)
+                .parse()
+                .expect("Invalid cluster bind address");
 
-                let redis_addr = cfg
-                    .addr
-                    .as_deref()
-                    .unwrap_or("0.0.0.0:6379")
-                    .parse()
-                    .expect("Invalid Redis server address");
+            let redis_addr = cfg
+                .addr
+                .as_deref()
+                .unwrap_or("0.0.0.0:6379")
+                .parse()
+                .expect("Invalid Redis server address");
 
-                let manager = ClusterManager::new(
-                    cluster_config,
-                    gossip_bind_addr,
-                    redis_addr,
-                    cfg.replica_of(),
-                    cfg.num_shards,
-                )
-                .await;
-                match manager {
-                    Ok(manager) => {
-                        // A slot conflict stops startup, replication or not.
-                        if let Err(e) = manager.claim_slots().await {
-                            manager.shutdown().await;
-                            return Err(miette!("slot conflict: {}", e));
-                        }
-                        tracing::info!("Cluster manager initialized successfully");
-                        Some(manager)
+            let manager = ClusterManager::new(
+                cluster_config,
+                gossip_bind_addr,
+                redis_addr,
+                loaded,
+                cfg.num_shards,
+            )
+            .await;
+            match manager {
+                Ok(manager) => {
+                    // A slot conflict stops startup, replication or not.
+                    if let Err(e) = manager.claim_slots().await {
+                        manager.shutdown().await;
+                        return Err(miette!("slot conflict: {}", e));
                     }
-                    Err(e) if cfg.replication.is_some() => {
-                        return Err(miette!("failed to initialize cluster manager: {}", e));
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to initialize cluster manager: {}", e);
-                        None
-                    }
+                    tracing::info!("Cluster manager initialized successfully");
+                    Some(manager)
                 }
-            } else {
-                None
+                Err(e) if cfg.replication.is_some() => {
+                    return Err(miette!("failed to initialize cluster manager: {}", e));
+                }
+                Err(e) => {
+                    tracing::error!("Failed to initialize cluster manager: {}", e);
+                    None
+                }
             }
         } else {
             None
@@ -501,10 +511,25 @@ impl AppState {
         replication::mark_clean_shutdown(&build_sqlite_connect_options(&self.cfg, shard_id)).await
     }
 
+    /// Whether this node's runtime role (from cluster state) is replica.
+    pub fn is_replica(&self) -> bool {
+        self.cluster_manager
+            .as_ref()
+            .is_some_and(ClusterManager::is_replica)
+    }
+
+    /// Node id of the primary this node follows, if its runtime role is replica.
+    pub fn replica_of(&self) -> Option<String> {
+        self.cluster_manager
+            .as_ref()
+            .and_then(ClusterManager::primary_id)
+    }
+
     /// Set the gauges that are sampled rather than updated in place: queue
     /// depth, pool connections, and cached per-shard key counts. Called on
     /// each metrics scrape.
     pub fn record_gauges(&self) {
+        let is_replica = self.is_replica();
         for (i, sender) in self.shard_senders.iter().enumerate() {
             let shard = i.to_string();
             metrics::gauge!("blobasaur_keys", "shard" => shard.clone())
@@ -512,7 +537,7 @@ impl AppState {
             metrics::gauge!("blobasaur_write_queue_depth", "shard" => shard.clone())
                 .set(sender.queue_depth() as f64);
             if self.cfg.replication_enabled() {
-                let role = if self.cfg.replica_of().is_some() {
+                let role = if is_replica {
                     "replica"
                 } else {
                     metrics::gauge!("blobasaur_replication_latest_lsn", "shard" => shard.clone())
@@ -553,7 +578,7 @@ impl AppState {
         shard: usize,
         conn_readonly: bool,
     ) -> Option<RwLockReadGuard<'_, ()>> {
-        if conn_readonly && self.cfg.replica_of().is_some() {
+        if conn_readonly && self.is_replica() {
             Some(self.replica_gates[shard].read().await)
         } else {
             None
@@ -839,9 +864,11 @@ fn validate_shard_count(data_dir: &str, expected_shards: usize) -> Result<()> {
         ));
     }
 
-    // If the directory is empty, that's also fine - no validation needed
+    // If the directory is empty (or holds only cluster-state.json), no shards exist yet.
     if let Ok(entries) = fs::read_dir(data_path)
-        && entries.count() == 0
+        && entries
+            .flatten()
+            .all(|e| e.file_name() == crate::cluster::CLUSTER_STATE_FILE)
     {
         return Ok(());
     }
