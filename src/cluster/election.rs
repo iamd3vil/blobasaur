@@ -94,6 +94,10 @@ impl ElectionPlan {
     }
 }
 
+/// Redis' `CLUSTER_MF_TIMEOUT`: maximum duration for a coordinated manual
+/// failover (primary write pause, replica catch-up, election, and promotion).
+pub const CLUSTER_MF_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Lightweight counters exposed in `CLUSTER INFO`.
 #[derive(Debug, Default)]
 pub struct ElectionStats {
@@ -102,6 +106,9 @@ pub struct ElectionStats {
     pub elections_failed: AtomicU64,
     pub votes_granted: AtomicU64,
     pub votes_refused: AtomicU64,
+    pub manual_failovers_started: AtomicU64,
+    pub manual_failovers_succeeded: AtomicU64,
+    pub manual_failovers_aborted: AtomicU64,
 }
 
 /// Outcome of collecting votes for one election attempt.
@@ -302,6 +309,130 @@ pub async fn send_failover_auth(
         }
         BytesFrame::Error(e) => Err(e.to_string()),
         other => Err(format!("unexpected reply {other:?} from {addr}")),
+    }
+}
+
+/// Encode `BLOBASAUR.MFSTART <replica-id>` as a RESP2 array frame.
+pub fn encode_mfstart(replica_id: &str) -> Bytes {
+    let bulk = |s: &str| BytesFrame::BulkString(Bytes::copy_from_slice(s.as_bytes()));
+    serialize_frame(&BytesFrame::Array(vec![
+        bulk("BLOBASAUR.MFSTART"),
+        bulk(replica_id),
+    ]))
+}
+
+/// Parse the per-shard `[shard, replid, lsn]` reply from `BLOBASAUR.MFSTART`.
+pub fn parse_mfstart_reply(
+    frame: BytesFrame,
+    expected_shards: usize,
+) -> Result<Vec<(String, u64)>, String> {
+    match frame {
+        BytesFrame::Error(e) => Err(e.to_string()),
+        BytesFrame::Array(items) => {
+            if items.len() != expected_shards {
+                return Err(format!(
+                    "expected {expected_shards} shard watermarks from primary, got {}",
+                    items.len()
+                ));
+            }
+            let mut result = Vec::with_capacity(expected_shards);
+            for (expected_shard, item) in items.into_iter().enumerate() {
+                let BytesFrame::Array(fields) = item else {
+                    return Err(format!(
+                        "unexpected shard {expected_shard} watermark entry {item:?}"
+                    ));
+                };
+                if fields.len() != 3 {
+                    return Err(format!(
+                        "shard {expected_shard} watermark expected 3 fields, got {}",
+                        fields.len()
+                    ));
+                }
+                let BytesFrame::Integer(shard_id) = fields[0] else {
+                    return Err(format!(
+                        "shard {expected_shard} watermark missing shard index"
+                    ));
+                };
+                if shard_id != expected_shard as i64 {
+                    return Err(format!(
+                        "shard watermark out of order: expected {expected_shard}, got {shard_id}"
+                    ));
+                }
+                let BytesFrame::BulkString(ref replid_bytes) = fields[1] else {
+                    return Err(format!("shard {expected_shard} watermark missing replid"));
+                };
+                let replid = std::str::from_utf8(replid_bytes)
+                    .map_err(|_| format!("shard {expected_shard} replid is not UTF-8"))?
+                    .to_string();
+                if replid.is_empty() {
+                    return Err(format!("shard {expected_shard} replid is empty"));
+                }
+                let BytesFrame::BulkString(ref lsn_bytes) = fields[2] else {
+                    return Err(format!("shard {expected_shard} watermark missing lsn"));
+                };
+                let lsn_str = std::str::from_utf8(lsn_bytes)
+                    .map_err(|_| format!("shard {expected_shard} lsn is not UTF-8"))?;
+                let lsn = lsn_str
+                    .parse::<u64>()
+                    .map_err(|_| format!("shard {expected_shard} invalid lsn '{lsn_str}'"))?;
+                result.push((replid, lsn));
+            }
+            Ok(result)
+        }
+        other => Err(format!("unexpected MFSTART reply {other:?}")),
+    }
+}
+
+/// Send `BLOBASAUR.MFSTART <replica-id>` to the primary before `deadline` and
+/// return its per-shard `(replid, committed_lsn)` watermarks.
+pub async fn send_mfstart(
+    addr: SocketAddr,
+    replica_id: &str,
+    expected_shards: usize,
+    deadline: std::time::Instant,
+    shutdown: &CancellationToken,
+) -> Result<Vec<(String, u64)>, String> {
+    let encoded = encode_mfstart(replica_id);
+    let deadline = Instant::from_std(deadline);
+
+    let rpc = async {
+        let mut stream = timeout_at(deadline, TcpStream::connect(addr))
+            .await
+            .map_err(|_| format!("connect to primary {addr} timed out"))?
+            .map_err(|e| format!("connect to primary {addr}: {e}"))?;
+
+        timeout_at(deadline, stream.write_all(&encoded))
+            .await
+            .map_err(|_| format!("write MFSTART to {addr} timed out"))?
+            .map_err(|e| format!("write MFSTART to {addr}: {e}"))?;
+
+        let mut buf = BytesMut::new();
+        let frame = timeout_at(deadline, async {
+            loop {
+                if let Some((frame, _, _)) = decode_bytes_mut(&mut buf)
+                    .map_err(|e| format!("bad MFSTART reply from {addr}: {e:?}"))?
+                {
+                    return Ok(frame);
+                }
+                if stream
+                    .read_buf(&mut buf)
+                    .await
+                    .map_err(|e| format!("read MFSTART reply from {addr}: {e}"))?
+                    == 0
+                {
+                    return Err(format!("primary {addr} closed connection before replying"));
+                }
+            }
+        })
+        .await
+        .map_err(|_| format!("waiting for MFSTART reply from {addr} timed out"))??;
+
+        parse_mfstart_reply(frame, expected_shards)
+    };
+
+    tokio::select! {
+        _ = shutdown.cancelled() => Err("manual failover aborted by shutdown".to_string()),
+        res = rpc => res,
     }
 }
 
@@ -567,5 +698,38 @@ mod tests {
         assert!(!replids_match(&a, &empty_id));
         assert!(!replids_match(&[], &[]));
         assert_eq!(total_caught_up_lsn(&a), 30);
+    }
+
+    #[test]
+    fn mfstart_reply_parsing_validates_shards_and_lsns() {
+        let ok_frame = BytesFrame::Array(vec![
+            BytesFrame::Array(vec![
+                BytesFrame::Integer(0),
+                BytesFrame::BulkString(Bytes::from_static(b"rep-a")),
+                BytesFrame::BulkString(Bytes::from_static(b"42")),
+            ]),
+            BytesFrame::Array(vec![
+                BytesFrame::Integer(1),
+                BytesFrame::BulkString(Bytes::from_static(b"rep-b")),
+                BytesFrame::BulkString(Bytes::from_static(b"0")),
+            ]),
+        ]);
+        assert_eq!(
+            parse_mfstart_reply(ok_frame, 2).unwrap(),
+            vec![("rep-a".to_string(), 42), ("rep-b".to_string(), 0)]
+        );
+
+        let err_frame = BytesFrame::Error("ERR primary is demoting".into());
+        assert!(parse_mfstart_reply(err_frame, 2).is_err());
+
+        let wrong_count = BytesFrame::Array(vec![]);
+        assert!(parse_mfstart_reply(wrong_count, 2).is_err());
+
+        let not_synced = BytesFrame::Array(vec![BytesFrame::Array(vec![
+            BytesFrame::Integer(0),
+            BytesFrame::BulkString(Bytes::from_static(b"rep-a")),
+            BytesFrame::BulkString(Bytes::from_static(b"not-synced")),
+        ])]);
+        assert!(parse_mfstart_reply(not_synced, 1).is_err());
     }
 }

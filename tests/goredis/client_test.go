@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -482,4 +483,102 @@ func TestClusterClientAfterAutoFailover(t *testing.T) {
 	afterKey := "{" + slotKey + "}:goredis-after"
 	expect(t, "SET post-failover key", cluster.Set(ctx, afterKey, "after-auto-failover", 0), "OK")
 	expect(t, "GET post-failover key", cluster.Get(ctx, afterKey), "after-auto-failover")
+}
+
+// A ClusterClient keeps writing across a coordinated zero-loss CLUSTER FAILOVER
+// (default mode), following MOVED once the primary demotes, with zero write loss.
+// Run by tests/failover_manual_test.rs.
+func TestClusterClientSurvivesManualFailover(t *testing.T) {
+	addrsEnv := os.Getenv("BLOBASAUR_CLUSTER_ADDRS")
+	replicaAddr := os.Getenv("BLOBASAUR_MANUAL_REPLICA")
+	slotKey := os.Getenv("BLOBASAUR_SLOT_KEY")
+	if addrsEnv == "" || replicaAddr == "" || slotKey == "" {
+		t.Skip("needs a cluster; run via tests/failover_manual_test.rs")
+	}
+
+	cluster := redis.NewClusterClient(&redis.ClusterOptions{
+		Addrs: strings.Split(addrsEnv, ","),
+	})
+	t.Cleanup(func() { cluster.Close() })
+
+	replica := redis.NewClient(&redis.Options{Addr: replicaAddr})
+	t.Cleanup(func() { replica.Close() })
+
+	type kv struct {
+		key string
+		val string
+	}
+	acked := make([]kv, 0, 200)
+	stopCh := make(chan struct{})
+	preReady := make(chan struct{})
+	errCh := make(chan error, 1)
+	doneCh := make(chan []kv, 1)
+	var writtenCount int64
+
+	go func() {
+		local := make([]kv, 0, 200)
+		for i := 0; ; i++ {
+			select {
+			case <-stopCh:
+				doneCh <- local
+				return
+			default:
+			}
+			k := fmt.Sprintf("{%s}:w%d", slotKey, i)
+			v := fmt.Sprintf("val-%d", i)
+			if err := cluster.Set(ctx, k, v, 0).Err(); err != nil {
+				errCh <- fmt.Errorf("SET %s failed during manual failover: %w", k, err)
+				return
+			}
+			local = append(local, kv{key: k, val: v})
+			if len(local) == 10 {
+				close(preReady)
+			}
+			atomic.StoreInt64(&writtenCount, int64(len(local)))
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	case <-preReady:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for initial writes before CLUSTER FAILOVER")
+	}
+	expect(t, "CLUSTER FAILOVER", replica.Do(ctx, "CLUSTER", "FAILOVER"), "OK")
+
+	// Wait until replica owns the slots and answers direct GETs without MOVED.
+	waitFor(t, "replica promoted by CLUSTER FAILOVER", func() bool {
+		nodes, err := replica.ClusterNodes(ctx).Result()
+		if err != nil {
+			return false
+		}
+		for _, line := range strings.Split(nodes, "\n") {
+			fields := strings.Fields(line)
+			if len(fields) >= 9 && strings.Contains(fields[2], "myself") && strings.Contains(fields[2], "master") {
+				return true
+			}
+		}
+		return false
+	})
+
+	afterBase := atomic.LoadInt64(&writtenCount)
+	waitFor(t, "post-failover writes to complete", func() bool {
+		return atomic.LoadInt64(&writtenCount) >= afterBase+10
+	})
+	close(stopCh)
+
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	case acked = <-doneCh:
+	}
+
+	if len(acked) < 20 {
+		t.Fatalf("expected at least 20 acknowledged writes, got %d", len(acked))
+	}
+	for _, entry := range acked {
+		expect(t, "GET on promoted replica "+entry.key, replica.Get(ctx, entry.key), entry.val)
+	}
 }

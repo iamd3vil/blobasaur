@@ -146,6 +146,8 @@ pub async fn run(
         drain_timeout
     );
 
+    // Wake any client writes currently paused for manual failover so connections drain promptly.
+    state.end_write_pause();
     connections.close();
     if tokio::time::timeout_at(deadline, connections.wait())
         .await
@@ -165,6 +167,7 @@ pub async fn run(
     }
 
     state.stop_election_task().await;
+    state.wait_manual_failovers().await;
     state.wait_role_transitions().await;
 
     state.replica_sync.stop().await;
@@ -444,20 +447,10 @@ struct ShardVacuumDispatchResult {
     vacuum_result: Option<VacuumResult>,
 }
 
-/// Checks that this node serves the slot `slot` computes for a write. Otherwise
-/// replies MOVED or CLUSTERDOWN and returns false.
-async fn route_or_reply(
-    stream: &mut TcpStream,
-    state: &AppState,
-    slot: impl FnOnce(&ClusterManager) -> u16,
-) -> std::io::Result<bool> {
-    route_read_or_reply(stream, state, false, false, &mut None, slot).await
-}
-
-/// Like [`route_or_reply`], with `is_read` set for a read command, which a replica
-/// serves if the connection sent `READONLY` (`conn_readonly`). A redirect drops
-/// the replica read `gate` before replying: a client that stops reading must
-/// not hold up a resync.
+/// Checks that this node serves the slot `slot` computes for a read (which a
+/// replica serves if the connection sent `READONLY`). Otherwise replies MOVED
+/// or CLUSTERDOWN and returns false. A redirect drops the replica read `gate`
+/// before replying: a client that stops reading must not hold up a resync.
 async fn route_read_or_reply(
     stream: &mut TcpStream,
     state: &AppState,
@@ -520,6 +513,13 @@ async fn check_key_route(state: &AppState, key: &str) -> Result<(), BytesFrame> 
     }
 }
 
+fn hash_slot(state: &AppState, namespace: &str, key: &str) -> u16 {
+    state
+        .cluster_manager
+        .as_ref()
+        .map_or(0, |cm| cm.calculate_slot_for_hash(namespace, key))
+}
+
 async fn check_hash_route(state: &AppState, namespace: &str, key: &str) -> Result<(), BytesFrame> {
     let Some(cluster_manager) = state.cluster_manager.as_ref() else {
         return Ok(());
@@ -565,9 +565,6 @@ async fn handle_redis_command_inner(
             value,
             ttl_seconds,
         } => {
-            if !route_or_reply(stream, state, |_| ClusterManager::calculate_slot(&key)).await? {
-                return Ok(());
-            }
             handle_set(stream, state, key, value, ttl_seconds).await?;
         }
         RedisCommand::Del { keys } => {
@@ -680,9 +677,6 @@ async fn handle_redis_command_inner(
             handle_ttl(stream, state, key, gate).await?;
         }
         RedisCommand::Expire { key, seconds } => {
-            if !route_or_reply(stream, state, |_| ClusterManager::calculate_slot(&key)).await? {
-                return Ok(());
-            }
             handle_expire(stream, state, key, seconds).await?;
         }
         RedisCommand::BlobasaurVacuum {
@@ -701,6 +695,9 @@ async fn handle_redis_command_inner(
         }
         RedisCommand::BlobasaurFailoverAuth(req) => {
             handle_blobasaur_failover_auth(stream, state, req).await?;
+        }
+        RedisCommand::BlobasaurMfStart { replica_id } => {
+            handle_blobasaur_mfstart(stream, state, replica_id).await?;
         }
         RedisCommand::Hello { protover } => {
             handle_hello(stream, protover).await?;
@@ -854,6 +851,24 @@ async fn handle_set(
     value: Bytes,
     ttl_seconds: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let response = set_reply(state, key, value, ttl_seconds).await?;
+    stream.write_all(&serialize_frame(&response)).await?;
+    Ok(())
+}
+
+/// SET's reply; releases the write pause gate before writing to the socket.
+async fn set_reply(
+    state: &Arc<AppState>,
+    key: String,
+    value: Bytes,
+    ttl_seconds: Option<u64>,
+) -> Result<BytesFrame, Box<dyn std::error::Error>> {
+    let slot = ClusterManager::calculate_slot(&key);
+    let _write_guard = state.enter_write(&[slot]).await;
+    if let Err(response) = check_key_route(state, &key).await {
+        return Ok(response);
+    }
+
     let shard_index = state.get_shard(&key);
     let sender = &state.shard_senders[shard_index];
 
@@ -889,15 +904,13 @@ async fn handle_set(
                 "Failed to send ASYNC SET operation to shard {}",
                 shard_index
             );
-            let response = BytesFrame::Error("ERR internal error".into());
-            stream.write_all(&serialize_frame(&response)).await?;
             state.metrics.record_error("storage");
+            Ok(BytesFrame::Error("ERR internal error".into()))
         } else {
             state.metrics.value_size_set_bytes.record(value_len);
             state.metrics.stored_value_size_set_bytes.record(stored_len);
-            let response = BytesFrame::SimpleString("OK".into());
-            stream.write_all(&serialize_frame(&response)).await?;
             state.metrics.record_storage_operation();
+            Ok(BytesFrame::SimpleString("OK".into()))
         }
     } else {
         // Calculate expires_at timestamp if TTL is provided
@@ -915,35 +928,29 @@ async fn handle_set(
 
         if sender.send(operation).await.is_err() {
             tracing::error!("Failed to send SET operation to shard {}", shard_index);
-            let response = BytesFrame::Error("ERR internal error".into());
-            stream.write_all(&serialize_frame(&response)).await?;
             state.metrics.record_error("storage");
+            Ok(BytesFrame::Error("ERR internal error".into()))
         } else {
             match responder_rx.await {
                 Ok(Ok(())) => {
                     state.metrics.value_size_set_bytes.record(value_len);
                     state.metrics.stored_value_size_set_bytes.record(stored_len);
-                    let response = BytesFrame::SimpleString("OK".into());
-                    stream.write_all(&serialize_frame(&response)).await?;
                     state.metrics.record_storage_operation();
+                    Ok(BytesFrame::SimpleString("OK".into()))
                 }
                 Ok(Err(e)) => {
                     tracing::error!("Shard writer failed for SET: {}", e);
-                    let response = BytesFrame::Error("ERR database error".into());
-                    stream.write_all(&serialize_frame(&response)).await?;
                     state.metrics.record_error("storage");
+                    Ok(BytesFrame::Error("ERR database error".into()))
                 }
                 Err(_) => {
                     tracing::error!("Shard writer task cancelled or panicked for SET");
-                    let response = BytesFrame::Error("ERR internal error".into());
-                    stream.write_all(&serialize_frame(&response)).await?;
                     state.metrics.record_error("storage");
+                    Ok(BytesFrame::Error("ERR internal error".into()))
                 }
             }
         }
     }
-
-    Ok(())
 }
 
 async fn handle_del_multiple(
@@ -959,6 +966,12 @@ async fn handle_del_multiple(
 /// DEL's reply. Like every command that takes key locks, it releases them
 /// before the reply is written, so a client slow to read can't hold them.
 async fn del_reply(state: &Arc<AppState>, mut keys: Vec<String>) -> BytesFrame {
+    let slots: Vec<u16> = keys
+        .iter()
+        .map(|key| ClusterManager::calculate_slot(key))
+        .collect();
+    let _write_guard = state.enter_write(&slots).await;
+
     // Route every key before deleting any, so a redirect or unserved slot leaves them all.
     for key in &keys {
         if let Err(response) = check_key_route(state, key).await {
@@ -1558,6 +1571,9 @@ async fn hset_reply(
     key: String,
     value: Bytes,
 ) -> Result<BytesFrame, Box<dyn std::error::Error>> {
+    let slot = hash_slot(state, &namespace, &key);
+    let _write_guard = state.enter_write(&[slot]).await;
+
     // Check if we should handle this hash operation locally in a cluster
     if let Err(response) = check_hash_route(state, &namespace, &key).await {
         return Ok(response);
@@ -1697,6 +1713,12 @@ async fn hsetex_reply(
     fields: Vec<(String, Bytes)>,
 ) -> Result<BytesFrame, Box<dyn std::error::Error>> {
     use crate::redis::protocol::ExpireOption;
+
+    let slots: Vec<u16> = fields
+        .iter()
+        .map(|(field_key, _)| hash_slot(state, &namespace, field_key))
+        .collect();
+    let _write_guard = state.enter_write(&slots).await;
 
     // Route every field before locking or checking FNX/FXX, so a redirect or
     // unserved slot leaves the hash untouched and isn't masked by another field.
@@ -1910,6 +1932,9 @@ async fn handle_hdel(
 
 /// HDEL's reply; it releases its key lock before the reply is written, as DEL.
 async fn hdel_reply(state: &Arc<AppState>, namespace: String, key: String) -> BytesFrame {
+    let slot = hash_slot(state, &namespace, &key);
+    let _write_guard = state.enter_write(&[slot]).await;
+
     // Check if we should handle this hash operation locally in a cluster
     if let Err(response) = check_hash_route(state, &namespace, &key).await {
         return response;
@@ -2195,6 +2220,12 @@ async fn hexpire_reply(
     condition: Option<HExpireCondition>,
     fields: Vec<String>,
 ) -> BytesFrame {
+    let slots: Vec<u16> = fields
+        .iter()
+        .map(|field_key| hash_slot(state, &namespace, field_key))
+        .collect();
+    let _write_guard = state.enter_write(&slots).await;
+
     // Route every field before expiring any, so a redirect or unserved slot leaves them all.
     for field_key in &fields {
         if let Err(response) = check_hash_route(state, &namespace, field_key).await {
@@ -2468,9 +2499,10 @@ async fn handle_cluster_failover(
         BytesFrame::Error("ERR This instance has cluster support disabled".into())
     } else {
         match mode {
-            ClusterFailoverMode::Default => BytesFrame::Error(
-                "ERR CLUSTER FAILOVER without FORCE or TAKEOVER is not yet implemented".into(),
-            ),
+            ClusterFailoverMode::Default => match state.start_manual_failover().await {
+                Ok(()) => BytesFrame::SimpleString("OK".into()),
+                Err(e) => BytesFrame::Error(e.into()),
+            },
             ClusterFailoverMode::Force => match state.promote_failover_force().await {
                 Ok(()) => BytesFrame::SimpleString("OK".into()),
                 Err(e) => BytesFrame::Error(e.into()),
@@ -2496,6 +2528,19 @@ async fn handle_blobasaur_failover_auth(
             Ok(epoch) => BytesFrame::SimpleString(format!("VOTE {epoch}").into()),
             Err(reason) => BytesFrame::Error(format!("ERR {reason}").into()),
         },
+    };
+    stream.write_all(&serialize_frame(&response)).await?;
+    Ok(())
+}
+
+async fn handle_blobasaur_mfstart(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+    replica_id: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = match state.handle_manual_failover_start(&replica_id).await {
+        Ok(shards) => watermark_reply_frame(shards),
+        Err(e) => BytesFrame::Error(e.into()),
     };
     stream.write_all(&serialize_frame(&response)).await?;
     Ok(())
@@ -2592,6 +2637,12 @@ async fn handle_expire(
 /// EXPIRE's reply; it releases its key lock before the reply is written, as
 /// DEL.
 async fn expire_reply(state: &Arc<AppState>, key: String, seconds: u64) -> BytesFrame {
+    let slot = ClusterManager::calculate_slot(&key);
+    let _write_guard = state.enter_write(&[slot]).await;
+    if let Err(response) = check_key_route(state, &key).await {
+        return response;
+    }
+
     let shard_index = state.get_shard(&key);
     let sender = &state.shard_senders[shard_index];
 
@@ -2847,6 +2898,22 @@ fn client_disconnected(stream: &TcpStream) -> bool {
     }
 }
 
+fn watermark_reply_frame(shards: Vec<(String, String)>) -> BytesFrame {
+    BytesFrame::Array(
+        shards
+            .into_iter()
+            .enumerate()
+            .map(|(shard, (replid, lsn))| {
+                BytesFrame::Array(vec![
+                    BytesFrame::Integer(shard as i64),
+                    BytesFrame::BulkString(replid.into()),
+                    BytesFrame::BulkString(lsn.into()),
+                ])
+            })
+            .collect(),
+    )
+}
+
 async fn handle_blobasaur_watermark(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
@@ -2860,19 +2927,7 @@ async fn handle_blobasaur_watermark(
         Err(miette::miette!("replication is not enabled"))
     };
     let response = match shards {
-        Ok(shards) => BytesFrame::Array(
-            shards
-                .into_iter()
-                .enumerate()
-                .map(|(shard, (replid, lsn))| {
-                    BytesFrame::Array(vec![
-                        BytesFrame::Integer(shard as i64),
-                        BytesFrame::BulkString(replid.into()),
-                        BytesFrame::BulkString(lsn.into()),
-                    ])
-                })
-                .collect(),
-        ),
+        Ok(shards) => watermark_reply_frame(shards),
         Err(e) => BytesFrame::Error(format!("ERR {}", e).into()),
     };
     stream.write_all(&serialize_frame(&response)).await?;

@@ -465,42 +465,11 @@ cluster_manager.route(slot, is_read, conn_readonly) -> Route
 `READONLY` / `READWRITE` set a per-connection flag. Replica reads are eventually
 consistent; there is no read-your-writes guarantee.
 
-## Failover (manual)
+## Failover
 
-### Unplanned (primary lost)
+Runtime automatic failover and `CLUSTER FAILOVER [FORCE|TAKEOVER]` (see [FAILOVER.md](FAILOVER.md) and [CLUSTERING.md](CLUSTERING.md)) replace the original stop-writes, config-edit, and restart procedure.
 
-1. **Fence the old primary**: make sure it is stopped and cannot restart with
-   its old config (stop the unit, block its port, or take the host down). This
-   is mandatory. Nothing in the cluster prevents two nodes claiming the same
-   slots.
-2. Edit `node-1b`'s config: add `node-1`'s `slot_ranges`, remove `replica_of`.
-   Restart it. It promotes (see [Roles and promotion state](#roles-and-promotion-state))
-   and generates a new `replid`.
-3. Point every other replica of `node-1` at `node-1b` (`replica_of = "node-1b"`,
-   restart). Each gets `RESYNC` and re-copies.
-4. To bring `node-1` back, give it `replica_of = "node-1b"` and no slots. It
-   gets `RESYNC` on every shard and re-copies from `node-1b`. Writes it had not
-   replicated are discarded.
-
-### Planned (maintenance)
-
-1. Stop client writes to the primary's slots at the application level.
-2. Run `BLOBASAUR.WATERMARK` on the primary. It queues a barrier op through
-   every shard's writer and, once each barrier returns, reports each shard's
-   highest LSN. Every write acknowledged before the call (including
-   `async_write` ones still queued) is committed and has an LSN by then.
-3. Run `BLOBASAUR.WATERMARK` on the replica until each shard's
-   `caught_up_lsn` is at least the primary's value, under the same `replid`.
-   The primary keeps running meanwhile; idle heartbeats deliver the watermark.
-4. Stop and fence the primary, then continue from step 2 of the unplanned
-   procedure. No acknowledged writes are lost.
-
-`BLOBASAUR.WATERMARK` returns `[shard, replid, lsn]` per shard: the committed
-LSN after a writer barrier on a primary, `caught_up_lsn` on a replica. A
-replica shard with `synced = 0` reports `not-synced` instead of an LSN, so a
-reset shard can never look caught up, even to an empty primary at LSN 0. The barrier is a new
-`ShardWriteOperation::Barrier { responder }` that the writer answers after
-committing everything queued ahead of it.
+`BLOBASAUR.WATERMARK` remains available for checking replication lag and is the barrier mechanism reused by coordinated `CLUSTER FAILOVER`. It returns `[shard, replid, lsn]` per shard: the committed LSN after a writer barrier on a primary, `caught_up_lsn` on a replica. A replica shard with `synced = 0` reports `not-synced` instead of an LSN, so a reset shard can never look caught up, even to an empty primary at LSN 0. The barrier is a `ShardWriteOperation::Barrier { responder }` that the writer answers after committing everything queued ahead of it.
 
 ### Startup guard
 

@@ -9,10 +9,10 @@ Blobasaur implements Redis cluster protocol compatibility, allowing Redis cluste
 ## Implementation Status
 
 ✅ **Fully Implemented:**
-- Redis cluster protocol commands (`CLUSTER MYID`, `CLUSTER NODES`, `CLUSTER INFO`, `CLUSTER SLOTS`, `CLUSTER SHARDS`, `CLUSTER ADDSLOTS`, `CLUSTER DELSLOTS`, `CLUSTER KEYSLOT`, `CLUSTER FAILOVER FORCE`, `CLUSTER FAILOVER TAKEOVER`, `CLUSTER REPLICATE`)
+- Redis cluster protocol commands (`CLUSTER MYID`, `CLUSTER NODES`, `CLUSTER INFO`, `CLUSTER SLOTS`, `CLUSTER SHARDS`, `CLUSTER ADDSLOTS`, `CLUSTER DELSLOTS`, `CLUSTER KEYSLOT`, `CLUSTER FAILOVER [FORCE|TAKEOVER]`, `CLUSTER REPLICATE`)
 - Hash slot calculation using CRC16 (Redis-compatible)
 - Persisted per-node cluster state (`<data_dir>/cluster-state.json`) with epoch-versioned slot table and Redis-style epoch collision resolution
-- Automatic failover elections (rank delay by `caught_up_lsn`, majority voting over `BLOBASAUR.FAILOVER-AUTH` with persisted `last_vote_epoch` and vote backoff), `CLUSTER FAILOVER FORCE`, and `CLUSTER FAILOVER TAKEOVER`
+- Automatic failover elections (rank delay by `caught_up_lsn`, majority voting over `BLOBASAUR.FAILOVER-AUTH` with persisted `last_vote_epoch` and vote backoff), coordinated zero-loss `CLUSTER FAILOVER`, `CLUSTER FAILOVER FORCE`, and `CLUSTER FAILOVER TAKEOVER`
 - Runtime promotion, automatic old-primary demotion, automatic replica re-pointing, and runtime `CLUSTER REPLICATE <node-id>`
 - Redis-style failure detection (`PFAIL`/`FAIL` over gossip, `fail?`/`fail`/`disconnected` in `CLUSTER NODES`, `cluster_state:fail` in `CLUSTER INFO`) and minority write/read fencing
 - MOVED redirection for keys owned by another live node, CLUSTERDOWN for unbound, failed, or minority-fenced slots
@@ -24,7 +24,6 @@ Blobasaur implements Redis cluster protocol compatibility, allowing Redis cluste
 
 🚧 **Not Yet Implemented:**
 - Online slot migration/resharding
-- Planned zero-loss `CLUSTER FAILOVER` (default mode without `FORCE` or `TAKEOVER`)
 
 ## Configuration
 
@@ -221,10 +220,13 @@ valkey-cli -c -p 6381 CLUSTER SLOTS
 # Show Redis 7 shard topology
 valkey-cli -c -p 6381 CLUSTER SHARDS
 
-# Promote a synced replica via a manual election (no FAIL wait)
+# Planned zero-loss failover on a synced replica (returns OK right away, runs in background)
+valkey-cli -p 6384 CLUSTER FAILOVER
+
+# Promote a synced replica via a manual election when the primary is down (no FAIL wait)
 valkey-cli -p 6384 CLUSTER FAILOVER FORCE
 
-# Promote a synced replica to take over its primary's slots at runtime (no election)
+# Promote a synced replica without an election when a majority of primaries is down
 valkey-cli -p 6384 CLUSTER FAILOVER TAKEOVER
 
 # Make an empty, slotless primary (or an existing replica) replicate a primary at runtime
@@ -284,7 +286,7 @@ const value = await cluster.get('mykey');
 
 ## Replication
 
-A node can replicate another node's slots. Replication is asynchronous: it gives you a live copy for high availability and replicas that cluster clients can read from. It is not a backup (deletes replicate too), and an unplanned failover loses writes the primary acknowledged but had not yet replicated. Failover is automatic in clusters with at least three primaries, or can be triggered manually with `CLUSTER FAILOVER FORCE` / `TAKEOVER`. Design and protocol details are in [REPLICATION.md](REPLICATION.md) and [FAILOVER.md](FAILOVER.md).
+A node can replicate another node's slots. Replication is asynchronous: it gives you a live copy for high availability and replicas that cluster clients can read from. It is not a backup (deletes replicate too), and an unplanned failover loses writes the primary acknowledged but had not yet replicated. Failover is automatic in clusters with at least three primaries, or can be triggered manually with `CLUSTER FAILOVER [FORCE|TAKEOVER]`. Design and protocol details are in [REPLICATION.md](REPLICATION.md) and [FAILOVER.md](FAILOVER.md).
 
 ### Configuration
 
@@ -327,7 +329,7 @@ The replication metrics are listed in [METRICS.md](METRICS.md). The one to alert
 
 ### Failover
 
-Blobasaur supports Redis-Cluster-style automatic failover elections as well as manual `CLUSTER FAILOVER FORCE` and `CLUSTER FAILOVER TAKEOVER`. Never delete `<data_dir>/cluster-state.json` during failover—roles, epochs, slot tables, `last_vote_epoch`, and the per-primary vote backoff (`last_vote_for`) are all persisted there so returning primaries demote and restarted voters never double-vote.
+Blobasaur supports Redis-Cluster-style automatic failover elections as well as manual `CLUSTER FAILOVER`, `CLUSTER FAILOVER FORCE`, and `CLUSTER FAILOVER TAKEOVER`. Never delete `<data_dir>/cluster-state.json` during failover. Roles, epochs, slot tables, `last_vote_epoch`, and the per-primary vote backoff (`last_vote_for`) are all persisted there so returning primaries demote and restarted voters never double-vote.
 
 #### Automatic failover (3-primary minimum)
 
@@ -342,23 +344,33 @@ When a primary is marked `FAIL`:
 
 **Operational timing assumption:** The persisted vote backoff (`2 * max(2 * node_timeout_ms, 2 s)`, at least `4 s`) and the per-slot epoch check together prevent a stale second replica from taking slots from the first winner before its claim propagates. Because the winner must commit promotion within the first half of that window (`max(2 * node_timeout_ms, 2 s)`) and voters will not vote again for the same failed primary for the full backoff, the remaining half is reserved for gossip to deliver the winner's claim to voters. Keep `gossip_interval_ms` much smaller than `node_timeout_ms` (defaults: `1000 ms` vs `15000 ms`), avoid extreme GC/disk stalls on voters, and preserve `cluster-state.json` across restarts.
 
-#### Manual failover (`FORCE` and `TAKEOVER`)
+#### Planned failover (`CLUSTER FAILOVER`)
 
-- **`CLUSTER FAILOVER FORCE`** (sent to a synced replica): immediately runs a `MANUAL` election without waiting for the primary to be `FAIL` or waiting the rank delay. Voters still enforce majority quorum, single vote per epoch, persisted `last_vote_for` backoff, and the slot-epoch check. Use this when the primary is unreachable (and you do not want to wait for `node_timeout_ms`) or to force an immediate move to a specific replica while a majority of primaries is up. If the old primary is still alive, it automatically demotes when it hears the new claim.
-- **`CLUSTER FAILOVER TAKEOVER`** (sent to a synced replica): skips failure detection and elections completely, bumps `current_epoch`, and promotes immediately. Use this only when a majority of primaries is unavailable; **fencing the old primary is the operator's job**, since an unfenced partitioned primary can keep accepting writes until it hears the new claim.
-- Plain `CLUSTER FAILOVER` (coordinated zero-loss pause + catch-up) is not yet implemented; for planned maintenance without losing writes, use the watermark procedure below with `FORCE` or `TAKEOVER`.
+Run `CLUSTER FAILOVER` (with no option) on a synced replica to move its primary's slots without losing acknowledged writes:
 
-`BLOBASAUR.WATERMARK` helps decide when a replica is caught up. It returns one `[shard, replid, lsn]` entry per shard:
-- On a primary it first waits until every write acknowledged before the call (including `async_write` ones still queued) is committed, then returns the shard's highest LSN.
-- On a replica it returns the `caught_up_lsn`, or `not-synced` for a shard without a complete copy.
+```bash
+valkey-cli -p 6384 CLUSTER FAILOVER
+```
 
-#### Planned (maintenance)
+The command replies `+OK` right away and runs the handover in the background with a 5 s timeout (`CLUSTER_MF_TIMEOUT`), matching Redis Cluster:
 
-1. Stop client writes to the primary's slots in your application.
-2. On the primary, run `valkey-cli -p 6381 BLOBASAUR.WATERMARK` and note each shard's `replid` and `lsn`.
-3. On the replica, run `valkey-cli -p 6384 BLOBASAUR.WATERMARK` until every shard shows the same `replid` and an `lsn` at least the primary's. The primary stays up meanwhile, and its idle heartbeats deliver the watermark promptly. `not-synced` means the shard is not ready.
-4. Run `valkey-cli -p 6384 CLUSTER FAILOVER FORCE` on the replica (or `CLUSTER FAILOVER TAKEOVER` if a majority of primaries is unavailable). No acknowledged writes are lost; the old primary automatically demotes to a replica of `node-1b` and resyncs, and other replicas re-point automatically.
-5. **Reassigning or adding a replica at runtime:** on a replica, or on an empty primary with no assigned slots, run `valkey-cli -p <port> CLUSTER REPLICATE <primary-node-id>` to start replicating `<primary-node-id>` without restarting.
+1. The replica sends `BLOBASAUR.MFSTART` to its primary. The primary pauses writes to its slots for up to 5 s (reads continue), waits for in-flight write handlers to queue, runs a writer barrier on every shard so every acknowledged write (including queued `async_write` ops) is committed, and replies with each shard's `replid` and committed LSN.
+2. The replica waits until every shard's `caught_up_lsn` reaches the primary's LSN under the same `replid`.
+3. The replica runs a `MANUAL` election immediately (no `FAIL` mark or rank delay needed) and promotes on a majority of slot-owning primaries.
+4. Once the old primary receives the higher-epoch claim over gossip, it ends the pause, redirects paused writes with `MOVED` to the new primary, demotes to a replica of the winner, and resyncs. Sibling replicas re-point automatically.
+
+If any step does not finish within 5 s, the replica abandons the failover without starting a late election, and the primary's write pause expires on its own. Check logs or `CLUSTER INFO` (`cluster_stats_manual_failover_started`, `cluster_stats_manual_failover_succeeded`, `cluster_stats_manual_failover_aborted`) and `CLUSTER NODES` to verify the outcome.
+
+To check replication lag before maintenance (or during monitoring), `BLOBASAUR.WATERMARK` returns `[shard, replid, lsn]` per shard: the committed LSN after a writer barrier on a primary, and `caught_up_lsn` (or `not-synced`) on a replica.
+
+#### Unplanned manual failover (`FORCE` and `TAKEOVER`)
+
+Use `FORCE` or `TAKEOVER` when the primary is down or unreachable and cannot complete the write-pause handshake:
+
+- **`CLUSTER FAILOVER FORCE`** (sent to a synced replica): skips the primary handshake and immediately runs a `MANUAL` election without waiting for `node_timeout_ms` (`FAIL`) or the rank delay. Voters still enforce majority quorum, single vote per epoch, persisted `last_vote_for` backoff, and the slot-epoch check. If the old primary comes back later, it demotes automatically when it hears the new claim.
+- **`CLUSTER FAILOVER TAKEOVER`** (sent to a synced replica): skips failure detection and elections completely, bumps `current_epoch`, and promotes immediately. Use this only when both the primary and a majority of primaries are unavailable. Fencing the old primary is the operator's job, because an unfenced partitioned primary can keep accepting writes until it hears the new claim.
+
+**Reassigning or adding a replica at runtime:** on a replica, or on an empty primary with no assigned slots, run `valkey-cli -p <port> CLUSTER REPLICATE <primary-node-id>` to start replicating `<primary-node-id>` without restarting.
 
 #### Restoring a primary from backup
 
@@ -553,7 +565,6 @@ Rolling upgrades with smaller assignments need no care.
 
 1. **Asynchronous Replication:** Replicas can lag, and an unplanned failover loses unreplicated writes (see [Replication](#replication))
 2. **No Online Resharding:** Slot assignments are configured statically
-3. **No Planned Default `CLUSTER FAILOVER`:** Automatic failover elections, `CLUSTER FAILOVER FORCE`, and `CLUSTER FAILOVER TAKEOVER` are active, while coordinated zero-loss `CLUSTER FAILOVER` (without `FORCE` or `TAKEOVER`) is not yet implemented (see [Failover](#failover))
 
 ## Architecture Details
 

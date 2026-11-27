@@ -3,9 +3,9 @@ mod failure;
 mod state;
 
 pub use election::{
-    ElectionPlan, ElectionStats, FailoverAuthRequest, PromotionKind, ShardReplState,
-    VoteCollectionOutcome, collect_votes, election_delay, election_timeout, parse_slot_ranges,
-    random_jitter_ms, retry_backoff, vote_backoff,
+    CLUSTER_MF_TIMEOUT, ElectionPlan, ElectionStats, FailoverAuthRequest, PromotionKind,
+    ShardReplState, VoteCollectionOutcome, collect_votes, election_delay, election_timeout,
+    parse_slot_ranges, random_jitter_ms, retry_backoff, send_mfstart, vote_backoff,
 };
 use failure::{FailureTracker, PeerHeartbeatView};
 #[allow(unused_imports)]
@@ -484,6 +484,8 @@ pub struct ClusterManager {
     election_stats: Arc<ElectionStats>,
     /// Wakes the automatic election loop on topology/FAIL/sync updates.
     election_notify: Arc<tokio::sync::Notify>,
+    /// Wakes manual failover catch-up waiters on replica `caught_up_lsn` or role updates.
+    repl_progress_notify: Arc<tokio::sync::Notify>,
 }
 
 impl ClusterManager {
@@ -635,6 +637,7 @@ impl ClusterManager {
             vote_backoff_at,
             election_stats: Arc::new(ElectionStats::default()),
             election_notify: Arc::new(tokio::sync::Notify::new()),
+            repl_progress_notify: Arc::new(tokio::sync::Notify::new()),
         };
 
         // Start gossip processing task
@@ -691,6 +694,98 @@ impl ClusterManager {
         Arc::clone(&self.election_notify)
     }
 
+    /// Notification woken whenever a replica shard's `caught_up_lsn`, sync state,
+    /// or gossip topology changes.
+    pub fn repl_progress_notify(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.repl_progress_notify)
+    }
+
+    /// Whether this node is currently a non-demoting primary owning `slot`.
+    pub fn owns_slot(&self, slot: u16) -> bool {
+        let state = self.state.read().unwrap();
+        state.role == PersistedRole::Primary
+            && state.demoting_to.is_none()
+            && state
+                .slots
+                .get(slot)
+                .is_some_and(|binding| binding.node_id == self.node_id)
+    }
+
+    /// Last known Redis address of `node_id` from live gossip or retained peers.
+    pub async fn peer_addr(&self, node_id: &str) -> Option<SocketAddr> {
+        if let Some(addr) = self.nodes.read().await.get(node_id).map(|n| n.addr) {
+            return Some(addr);
+        }
+        self.known_peers
+            .read()
+            .unwrap()
+            .get(node_id)
+            .map(|p| p.addr)
+    }
+
+    /// Validate that this primary can accept `BLOBASAUR.MFSTART <replica_id>`.
+    pub async fn validate_mfstart(&self, replica_id: &str) -> Result<(), String> {
+        if self.persist_halted.load(Ordering::Acquire) {
+            return Err("ERR Node is shutting down".to_string());
+        }
+        if self.bootstrapping.load(Ordering::Acquire) {
+            return Err("ERR Node is still bootstrapping".to_string());
+        }
+        {
+            let state = self.state.read().unwrap();
+            if state.role != PersistedRole::Primary {
+                return Err("ERR Node is not a primary".to_string());
+            }
+            if state.demoting_to.is_some() {
+                return Err("ERR Primary is demoting".to_string());
+            }
+            if !state.slots.has_slots_of(&self.node_id) {
+                return Err("ERR Primary owns no slots".to_string());
+            }
+        }
+        let is_known_replica = {
+            let nodes = self.nodes.read().await;
+            nodes.get(replica_id).is_some_and(|peer| {
+                peer.role != NodeRole::Primary
+                    && peer.primary.as_deref() == Some(self.node_id.as_str())
+            })
+        };
+        if !is_known_replica {
+            return Err(format!(
+                "ERR Node {replica_id} is not a known replica of {}",
+                self.node_id
+            ));
+        }
+        Ok(())
+    }
+
+    /// True when every shard on this replica is synced under the primary's
+    /// `replid` and has `caught_up_lsn >= primary_lsn`.
+    pub fn replica_caught_up_to(&self, target: &[(String, u64)]) -> bool {
+        let synced = self.replica_synced.lock().unwrap();
+        let repl = self.shard_repl.lock().unwrap();
+        if synced.len() != target.len() || repl.len() != target.len() || target.is_empty() {
+            return false;
+        }
+        for (idx, (target_replid, target_lsn)) in target.iter().enumerate() {
+            if !synced[idx]
+                || target_replid.is_empty()
+                || repl[idx].replid != *target_replid
+                || repl[idx].caught_up_lsn < *target_lsn
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Snapshot of per-shard `(synced, ShardReplState)` for diagnostics.
+    pub fn replica_progress_snapshot(&self) -> Vec<(bool, ShardReplState)> {
+        let synced = self.replica_synced.lock().unwrap();
+        let repl = self.shard_repl.lock().unwrap();
+        synced.iter().copied().zip(repl.iter().cloned()).collect()
+    }
+
     /// Records the current `replid` of `shard` for gossiped ranking/history checks.
     pub fn set_shard_replid(&self, shard: usize, replid: &str) {
         let is_replica = self.is_replica();
@@ -743,6 +838,7 @@ impl ClusterManager {
             }
         }
         self.set_shard_synced(shard, synced).await;
+        self.repl_progress_notify.notify_waiters();
     }
 
     /// Replica: clears frame time and caught-up LSN for `shard` on `RESYNC` reset.
@@ -759,6 +855,7 @@ impl ClusterManager {
             }
         }
         self.set_shard_synced(shard, false).await;
+        self.repl_progress_notify.notify_waiters();
     }
 
     pub fn record_election_won(&self) {
@@ -770,6 +867,24 @@ impl ClusterManager {
     pub fn record_election_failed(&self) {
         self.election_stats
             .elections_failed
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_manual_failover_started(&self) {
+        self.election_stats
+            .manual_failovers_started
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_manual_failover_succeeded(&self) {
+        self.election_stats
+            .manual_failovers_succeeded
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_manual_failover_aborted(&self) {
+        self.election_stats
+            .manual_failovers_aborted
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -887,6 +1002,7 @@ impl ClusterManager {
             entry.caught_up_lsn = 0;
         }
         self.shard_repl_dirty.store(true, Ordering::Release);
+        self.repl_progress_notify.notify_waiters();
     }
 
     /// Publish the current state, role, and epochs to gossip.
@@ -1934,6 +2050,7 @@ impl ClusterManager {
             handler(transition);
         }
         self.election_notify.notify_one();
+        self.repl_progress_notify.notify_waiters();
     }
 
     #[cfg(test)]
@@ -2622,6 +2739,9 @@ impl ClusterManager {
              cluster_elections_failed:{}\n\
              cluster_votes_granted:{}\n\
              cluster_votes_refused:{}\n\
+             cluster_stats_manual_failover_started:{}\n\
+             cluster_stats_manual_failover_succeeded:{}\n\
+             cluster_stats_manual_failover_aborted:{}\n\
              cluster_stats_messages_sent:0\n\
              cluster_stats_messages_received:0\n",
             cluster_state,
@@ -2640,6 +2760,15 @@ impl ClusterManager {
             self.election_stats.elections_failed.load(Ordering::Relaxed),
             self.election_stats.votes_granted.load(Ordering::Relaxed),
             self.election_stats.votes_refused.load(Ordering::Relaxed),
+            self.election_stats
+                .manual_failovers_started
+                .load(Ordering::Relaxed),
+            self.election_stats
+                .manual_failovers_succeeded
+                .load(Ordering::Relaxed),
+            self.election_stats
+                .manual_failovers_aborted
+                .load(Ordering::Relaxed),
         )
     }
 
@@ -2872,6 +3001,7 @@ impl ClusterManager {
             vote_backoff_at: Arc::new(Mutex::new(HashMap::new())),
             election_stats: Arc::new(ElectionStats::default()),
             election_notify: Arc::new(tokio::sync::Notify::new()),
+            repl_progress_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -2950,6 +3080,7 @@ impl Clone for ClusterManager {
             vote_backoff_at: Arc::clone(&self.vote_backoff_at),
             election_stats: Arc::clone(&self.election_stats),
             election_notify: Arc::clone(&self.election_notify),
+            repl_progress_notify: Arc::clone(&self.repl_progress_notify),
         }
     }
 }
@@ -3219,6 +3350,7 @@ mod tests {
             vote_backoff_at: Arc::new(Mutex::new(HashMap::new())),
             election_stats: Arc::new(ElectionStats::default()),
             election_notify: Arc::new(tokio::sync::Notify::new()),
+            repl_progress_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -3230,6 +3362,7 @@ mod tests {
             state.primary = Some(primary.to_string());
         }
         *manager.replica_synced.lock().unwrap() = vec![synced; 2];
+        *manager.shard_repl.lock().unwrap() = vec![ShardReplState::default(); 2];
         manager
     }
 
@@ -3791,6 +3924,7 @@ mod tests {
             vote_backoff_at: Arc::new(Mutex::new(HashMap::new())),
             election_stats: Arc::new(ElectionStats::default()),
             election_notify: Arc::new(tokio::sync::Notify::new()),
+            repl_progress_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -5275,5 +5409,98 @@ mod tests {
         assert_eq!(on_disk.role, PersistedRole::Replica);
         assert_eq!(on_disk.primary.as_deref(), Some("p1"));
         assert_eq!(on_disk.slots.get(0).unwrap().node_id, "p1");
+    }
+
+    #[tokio::test]
+    async fn mfstart_validation_catch_up_and_cluster_info_counters() {
+        let primary = make_test_manager(0..=5460);
+        assert!(primary.owns_slot(0));
+        assert!(primary.owns_slot(5460));
+        assert!(!primary.owns_slot(5461));
+
+        // Unknown replica is rejected.
+        assert!(primary.validate_mfstart("r1").await.is_err());
+
+        // Add r1 as replica of self ("node-a") and r2 as replica of another primary.
+        {
+            let mut nodes = primary.nodes.write().await;
+            nodes.insert(
+                "r1".to_string(),
+                ClusterNode {
+                    id: "r1".to_string(),
+                    addr: "127.0.0.1:6402".parse().unwrap(),
+                    slots: HashSet::new(),
+                    _state: "connected".to_string(),
+                    role: NodeRole::Replica,
+                    primary: Some("node-a".to_string()),
+                    current_epoch: 0,
+                    config_epoch: 0,
+                    shard_repl: Vec::new(),
+                },
+            );
+            nodes.insert(
+                "r2".to_string(),
+                ClusterNode {
+                    id: "r2".to_string(),
+                    addr: "127.0.0.1:6403".parse().unwrap(),
+                    slots: HashSet::new(),
+                    _state: "connected".to_string(),
+                    role: NodeRole::Replica,
+                    primary: Some("node-2".to_string()),
+                    current_epoch: 0,
+                    config_epoch: 0,
+                    shard_repl: Vec::new(),
+                },
+            );
+        }
+        assert!(primary.validate_mfstart("r1").await.is_ok());
+        assert!(primary.validate_mfstart("r2").await.is_err());
+
+        // Demoting primary rejects MFSTART and reports owns_slot == false.
+        primary.state.write().unwrap().demoting_to = Some("r1".to_string());
+        assert!(!primary.owns_slot(0));
+        assert!(primary.validate_mfstart("r1").await.is_err());
+
+        // Replica catch-up semantics: requires synced == true, matching non-empty replid,
+        // and caught_up_lsn >= target on every shard (including empty shards at LSN 0).
+        let replica = into_replica(make_test_manager(0..=0), "p1", false);
+        let target = vec![("rep-0".to_string(), 10), ("rep-1".to_string(), 0)];
+        assert!(!replica.replica_caught_up_to(&target));
+
+        let now = Instant::now();
+        replica
+            .update_replica_shard_progress(0, "rep-0", 9, true, now)
+            .await;
+        replica
+            .update_replica_shard_progress(1, "rep-1", 0, true, now)
+            .await;
+        // Shard 0 is still behind (9 < 10).
+        assert!(!replica.replica_caught_up_to(&target));
+
+        // Wrong replid on shard 0 even with higher LSN is not caught up.
+        replica
+            .update_replica_shard_progress(0, "wrong", 20, true, now)
+            .await;
+        assert!(!replica.replica_caught_up_to(&target));
+
+        // Exact match on both shards passes.
+        replica
+            .update_replica_shard_progress(0, "rep-0", 10, true, now)
+            .await;
+        assert!(replica.replica_caught_up_to(&target));
+
+        // Resetting shard 1 clears synced and blocks catch-up even for LSN 0.
+        replica.reset_shard_replica_state(1, "rep-1").await;
+        assert!(!replica.replica_caught_up_to(&target));
+
+        // Manual failover counters appear in CLUSTER INFO.
+        replica.record_manual_failover_started();
+        replica.record_manual_failover_started();
+        replica.record_manual_failover_succeeded();
+        replica.record_manual_failover_aborted();
+        let info = replica.get_cluster_info().await;
+        assert!(info.contains("cluster_stats_manual_failover_started:2"));
+        assert!(info.contains("cluster_stats_manual_failover_succeeded:1"));
+        assert!(info.contains("cluster_stats_manual_failover_aborted:1"));
     }
 }

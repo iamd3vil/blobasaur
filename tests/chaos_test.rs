@@ -2431,6 +2431,426 @@ async fn auto_failover(mode: WriteMode) {
     }
 }
 
+/// Client writer for planned manual failovers that follows `-MOVED` redirects
+/// inline (retrying the redirected write on the new primary so paused writes
+/// complete via `MOVED` rather than failing).
+async fn manual_failover_client(
+    id: usize,
+    initial_primary: SocketAddr,
+    mut rng: Rng,
+    stop: Arc<AtomicBool>,
+    registry: Registry,
+    journal: Arc<Journal>,
+) -> Vec<Rec> {
+    let all = slot_targets(id, 0, 5460);
+    let mut target_addr = initial_primary;
+    let mut conn: Option<Conn> = None;
+    let mut recs: Vec<Rec> = Vec::new();
+    let mut n = 0u64;
+    while !stop.load(Ordering::Relaxed) {
+        if conn.is_none() {
+            match Conn::open(target_addr).await {
+                Ok(c) => conn = Some(c),
+                Err(_) => {
+                    sleep(Duration::from_millis(20)).await;
+                    continue;
+                }
+            }
+        }
+        let target = &all[rng.below(all.len())];
+        let roll = rng.below(100);
+        n += 1;
+        let value = format!("vmf-{id}-{n}");
+        let name = target.name.as_str();
+        let (effect, args): (Effect, Vec<&str>) = match (target.ns, roll) {
+            (None, 0..70) => (Effect::Put(value.clone()), vec!["SET", name, &value]),
+            (None, _) => (Effect::Del, vec!["DEL", name]),
+            (Some(ns), 0..70) => (Effect::Put(value.clone()), vec!["HSET", ns, name, &value]),
+            (Some(ns), _) => (Effect::Del, vec!["HDEL", ns, name]),
+        };
+        let ident = target.ident();
+        if let Effect::Put(v) = &effect {
+            registry.lock().unwrap().insert(v.clone(), ident.clone());
+        }
+        let mut outcome = Outcome::Failed;
+        for _ in 0..8 {
+            if conn.is_none() {
+                match Conn::open(target_addr).await {
+                    Ok(c) => conn = Some(c),
+                    Err(_) => {
+                        outcome = Outcome::Indeterminate;
+                        break;
+                    }
+                }
+            }
+            match conn.as_mut().unwrap().cmd(&args).await {
+                Ok(Resp::Err(e)) => {
+                    if let Some(moved_addr) = e
+                        .strip_prefix("MOVED ")
+                        .and_then(|rest| rest.split_whitespace().nth(1))
+                        .and_then(|a| a.parse::<SocketAddr>().ok())
+                    {
+                        target_addr = moved_addr;
+                        conn = None;
+                        continue;
+                    }
+                    outcome = Outcome::Failed;
+                    break;
+                }
+                Ok(_) => {
+                    outcome = Outcome::Ok;
+                    break;
+                }
+                Err(_) => {
+                    conn = None;
+                    outcome = Outcome::Indeterminate;
+                    break;
+                }
+            }
+        }
+        recs.push(Rec {
+            ident,
+            effect,
+            outcome,
+            seq: journal.tick(),
+        });
+        sleep(rng.ms(0, 5)).await;
+    }
+    recs
+}
+
+/// Repeated planned `CLUSTER FAILOVER`s back and forth between two nodes (`p1`
+/// and `r1`) in a 3-primary cluster under continuous write load. Every single
+/// acknowledged write must survive across all failovers in both sync and
+/// `async_write` modes (zero acknowledged-write loss), with full convergence,
+/// zero phantoms, and `UniqueClaims`.
+async fn manual_failover(mode: WriteMode) {
+    let seed = seed();
+    let name = format!("manual_failover[{}]", mode.label());
+    eprintln!("[chaos] scenario {name}: BLOBASAUR_CHAOS_SEED={seed}");
+    let started = Instant::now();
+    let root = TempDir::new().unwrap();
+
+    struct ManualFailoverLogs {
+        name: String,
+        seed: u64,
+        started: Instant,
+        root: Option<TempDir>,
+        logs: Vec<(&'static str, PathBuf, PathBuf)>,
+    }
+    impl Drop for ManualFailoverLogs {
+        fn drop(&mut self) {
+            if !std::thread::panicking() {
+                return;
+            }
+            eprintln!(
+                "[chaos] FAILED scenario {} after {:?}: reproduce with BLOBASAUR_CHAOS_SEED={}",
+                self.name,
+                self.started.elapsed(),
+                self.seed
+            );
+            if let Some(root) = self.root.take() {
+                eprintln!("[chaos] kept {}", root.keep().display());
+            }
+            for (node, log, state) in &self.logs {
+                let state_txt = std::fs::read_to_string(state).unwrap_or_default();
+                eprintln!("[chaos] ---- {node} state {}\n{state_txt}", state.display());
+                eprintln!(
+                    "[chaos] ---- {node} log {} (last 60 lines)\n{}",
+                    log.display(),
+                    tail(log, 60)
+                );
+            }
+        }
+    }
+
+    let mut p1 = Node::new(root.path(), "p1");
+    let mut p2 = Node::new(root.path(), "p2");
+    let mut p3 = Node::new(root.path(), "p3");
+    let mut r1 = Node::new(root.path(), "r1");
+
+    let _diag = ManualFailoverLogs {
+        name: name.clone(),
+        seed,
+        started,
+        logs: [&p1, &p2, &p3, &r1]
+            .into_iter()
+            .map(|n| {
+                (
+                    n.name,
+                    n.log(),
+                    n.data().join(blobasaur::cluster::CLUSTER_STATE_FILE),
+                )
+            })
+            .collect(),
+        root: Some(root),
+    };
+
+    p1.slot_range = Some((0, 5460));
+    p2.slot_range = Some((5461, 10922));
+    p3.slot_range = Some((10923, 16383));
+    r1.replica_of = Some("p1");
+
+    let g1 = format!("127.0.0.1:{}", p1.gossip_port);
+    let g2 = format!("127.0.0.1:{}", p2.gossip_port);
+    let g3 = format!("127.0.0.1:{}", p3.gossip_port);
+    p1.seeds = vec![g2.clone(), g3.clone()];
+    p2.seeds = vec![g1.clone(), g3.clone()];
+    p3.seeds = vec![g1.clone(), g2.clone()];
+    r1.seeds = vec![g1.clone(), g2.clone(), g3.clone()];
+
+    for node in [&mut p1, &mut p2, &mut p3, &mut r1] {
+        node.mode = mode;
+        node.node_timeout_ms = Some(2000);
+    }
+
+    tokio::join!(p1.must_start(), p2.must_start(), p3.must_start());
+    r1.must_start().await;
+
+    let p2_addr = p2.addr;
+    let p3_addr = p3.addr;
+    let mut pair = [p1, r1];
+    let all_addrs: Vec<(String, SocketAddr)> = pair
+        .iter()
+        .map(|n| (n.name.to_string(), n.addr))
+        .chain([("p2".to_string(), p2_addr), ("p3".to_string(), p3_addr)])
+        .collect();
+
+    wait_for("initial 4-node cluster ok and r1 synced", 30, || async {
+        let Ok(mut c) = Conn::open(p2_addr).await else {
+            return false;
+        };
+        let Ok(Resp::Bulk(Some(info))) = c.cmd(&["CLUSTER", "INFO"]).await else {
+            return false;
+        };
+        if !String::from_utf8_lossy(&info).contains("cluster_state:ok") {
+            return false;
+        }
+        watermark(pair[1].addr)
+            .await
+            .is_ok_and(|m| m.iter().all(|(_, lsn)| lsn != "not-synced"))
+    })
+    .await;
+
+    // Background UniqueClaims monitor.
+    let stop_monitor = Arc::new(AtomicBool::new(false));
+    let monitor_stop = stop_monitor.clone();
+    let monitor_addrs = all_addrs.clone();
+    let monitor_task = tokio::spawn(async move {
+        let mut seen_claims: HashMap<(u16, u64), String> = HashMap::new();
+        let mut violations: Vec<String> = Vec::new();
+        while !monitor_stop.load(Ordering::Relaxed) {
+            for (observer, addr) in &monitor_addrs {
+                let Ok(mut conn) = Conn::open(*addr).await else {
+                    continue;
+                };
+                let Ok(Resp::Bulk(Some(raw))) = conn.cmd(&["CLUSTER", "NODES"]).await else {
+                    continue;
+                };
+                let text = String::from_utf8_lossy(&raw);
+                for (id, flags, _, epoch, slots) in parse_cluster_nodes_lines(&text) {
+                    if !flags.contains("master") || slots.is_empty() {
+                        continue;
+                    }
+                    let Ok(parsed) = blobasaur::cluster::parse_slot_ranges(&slots) else {
+                        continue;
+                    };
+                    let mut sorted: Vec<u16> = parsed.into_iter().collect();
+                    sorted.sort_unstable();
+                    let sample_slots =
+                        [sorted[0], sorted[sorted.len() / 2], *sorted.last().unwrap()];
+                    for slot in sample_slots {
+                        match seen_claims.get(&(slot, epoch)) {
+                            Some(prev) if prev != &id => {
+                                violations.push(format!(
+                                    "slot {slot} epoch {epoch}: claimed by both {prev} and {id} (seen on {observer})"
+                                ));
+                            }
+                            None => {
+                                seen_claims.insert((slot, epoch), id.clone());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        violations
+    });
+
+    let journal = Arc::new(Journal::default());
+    let registry = Registry::default();
+    let stop_writers = Arc::new(AtomicBool::new(false));
+    let initial_primary_addr = pair[0].addr;
+    let writer_tasks: Vec<JoinHandle<Vec<Rec>>> = (0..CLIENTS)
+        .map(|id| {
+            tokio::spawn(manual_failover_client(
+                id,
+                initial_primary_addr,
+                Rng::new(seed ^ ((id as u64 + 1) << 32)),
+                stop_writers.clone(),
+                registry.clone(),
+                journal.clone(),
+            ))
+        })
+        .collect();
+
+    // Alternate CLUSTER FAILOVER back and forth between p1 and r1:
+    // p1 -> r1, r1 -> p1, p1 -> r1.
+    // Voters hold a persisted vote backoff of 2 * max(2 * node_timeout, 2 s) = 8 s
+    // per failed primary (with node_timeout_ms = 2000), so track the last failover
+    // time per primary.
+    let mut cur_primary_idx = 0usize;
+    let mut last_failover_of: [Option<Instant>; 2] = [None, None];
+    let cycles = 3usize;
+
+    for cycle in 0..cycles {
+        sleep(Duration::from_millis(400)).await;
+        // Respect voters' per-primary vote backoff (8 s) when failing over the same primary again.
+        if let Some(prev) = last_failover_of[cur_primary_idx] {
+            let min_gap = Duration::from_millis(8500);
+            if let Some(rem) = min_gap.checked_sub(prev.elapsed()) {
+                sleep(rem).await;
+            }
+        }
+
+        let target_idx = 1 - cur_primary_idx;
+        let old_name = pair[cur_primary_idx].name;
+        let new_name = pair[target_idx].name;
+        eprintln!("[chaos] {name} cycle {cycle}: CLUSTER FAILOVER {old_name} -> {new_name}");
+        last_failover_of[cur_primary_idx] = Some(Instant::now());
+
+        let mut c = Conn::open(pair[target_idx].addr).await.unwrap();
+        let reply = c.cmd(&["CLUSTER", "FAILOVER"]).await.unwrap();
+        assert!(
+            matches!(reply, Resp::Simple(ref s) if s == "OK"),
+            "cycle {cycle}: CLUSTER FAILOVER on {new_name} failed: {reply:?}"
+        );
+
+        // Wait for new_name to own 0-5460, old_name to demote to a replica of
+        // new_name, gossip to converge on the primaries so they see old_name as
+        // a replica of new_name, and old_name to finish resyncing every shard.
+        wait_for(
+            &format!("cycle {cycle}: {new_name} owns 0-5460 and {old_name} demoted & synced"),
+            20,
+            || async {
+                for check_addr in [pair[target_idx].addr, p2_addr, p3_addr] {
+                    let Ok(mut cn) = Conn::open(check_addr).await else {
+                        return false;
+                    };
+                    let Ok(Resp::Bulk(Some(raw))) = cn.cmd(&["CLUSTER", "NODES"]).await else {
+                        return false;
+                    };
+                    let lines = parse_cluster_nodes_lines(&String::from_utf8_lossy(&raw));
+                    let new_is_master = lines.iter().any(|(id, flags, _, _, slots)| {
+                        id == new_name && flags.contains("master") && slots == "0-5460"
+                    });
+                    let old_is_slave = lines.iter().any(|(id, flags, master, _, slots)| {
+                        id == old_name
+                            && flags.contains("slave")
+                            && master == new_name
+                            && slots.is_empty()
+                    });
+                    if !new_is_master || !old_is_slave {
+                        return false;
+                    }
+                }
+                watermark(pair[cur_primary_idx].addr)
+                    .await
+                    .is_ok_and(|m| m.iter().all(|(_, lsn)| lsn != "not-synced"))
+            },
+        )
+        .await;
+
+        cur_primary_idx = target_idx;
+    }
+
+    sleep(Duration::from_millis(300)).await;
+    stop_writers.store(true, Ordering::Relaxed);
+    let mut recs = Vec::new();
+    for task in writer_tasks {
+        recs.extend(task.await.expect("manual failover client panicked"));
+    }
+
+    let replica_idx = 1 - cur_primary_idx;
+    let final_target = watermark(pair[cur_primary_idx].addr)
+        .await
+        .expect("final primary WATERMARK");
+    wait_for("final replica converges to final primary", 30, || async {
+        watermark(pair[replica_idx].addr)
+            .await
+            .is_ok_and(|m| reached(&m, &final_target))
+    })
+    .await;
+
+    stop_monitor.store(true, Ordering::Relaxed);
+    let epoch_violations = monitor_task.await.expect("epoch monitor panicked");
+    assert_none(
+        "UniqueClaims (no two nodes own a slot at the same epoch)",
+        epoch_violations,
+    );
+
+    pair[replica_idx].stop().await;
+    pair[cur_primary_idx].stop().await;
+    p3.stop().await;
+    p2.stop().await;
+
+    // Check UniqueClaims on persisted cluster-state.json files as well.
+    let mut disk_claims: HashMap<(u16, u64), String> = HashMap::new();
+    for node in [&pair[0], &pair[1], &p2, &p3] {
+        let state = blobasaur::cluster::ClusterState::load(
+            &node.data().join(blobasaur::cluster::CLUSTER_STATE_FILE),
+            node.name,
+        )
+        .unwrap();
+        for run in state.slots.runs() {
+            for slot in [run.start, run.end] {
+                if let Some(prev) = disk_claims.get(&(slot, run.config_epoch)) {
+                    assert_eq!(
+                        prev, &run.node_id,
+                        "persisted UniqueClaims violation on slot {slot} epoch {}",
+                        run.config_epoch
+                    );
+                } else {
+                    disk_claims.insert((slot, run.config_epoch), run.node_id.clone());
+                }
+            }
+        }
+    }
+
+    // Zero-loss durability check: EVERY acknowledged write across all planned
+    // failovers (even in async_write mode!) must survive on the final primary.
+    let durability = Durability {
+        asynchronous: false,
+        lifetimes: vec![Lifetime {
+            start: 0,
+            end: Some(journal.tick()),
+            graceful: true,
+        }],
+        marks: Vec::new(),
+    };
+    let ok_count = recs.iter().filter(|r| r.outcome == Outcome::Ok).count();
+    eprintln!(
+        "[chaos] {name}: {}; {ok_count} acked ops across {cycles} planned failovers; {:?}",
+        outcomes(&recs),
+        started.elapsed()
+    );
+    assert!(ok_count > 50, "expected > 50 acked ops, got {ok_count}");
+
+    let primary_data = read_data(&pair[cur_primary_idx].data()).await;
+    assert_none(
+        "zero-loss durability across repeated planned manual failovers",
+        durability_violations(&recs, &primary_data, &durability),
+    );
+    assert_none(
+        "phantoms on final primary",
+        phantom_violations(&primary_data, &registry),
+    );
+    let replica_data = read_data(&pair[replica_idx].data()).await;
+    assert_converged(&primary_data, &replica_data);
+}
+
 /// Each scenario as `<scenario>::sync` and `<scenario>::async_write`.
 macro_rules! both_modes {
     ($($scenario:ident),* $(,)?) => {$(
@@ -2455,4 +2875,5 @@ both_modes!(
     unplanned_failover,
     power_loss_on_the_primary,
     auto_failover,
+    manual_failover,
 );

@@ -410,14 +410,14 @@ async fn five_node_cluster_takeover_repoints_replica_and_demotes_live_primary() 
     })
     .await;
 
-    // Default mode replies with a clear error; TAKEOVER and FORCE on a primary error.
+    // CLUSTER FAILOVER (default, FORCE, TAKEOVER) on a primary all return a replica error.
     let mut cr1 = Client::connect(r1.addr).await;
-    let err_default = cr1.call_simple(&["CLUSTER", "FAILOVER"]).await;
-    assert!(
-        err_default.starts_with("-ERR") && err_default.contains("not yet implemented"),
-        "{err_default}"
-    );
     let mut cp2 = Client::connect(p2.addr).await;
+    let err_default_primary = cp2.call_simple(&["CLUSTER", "FAILOVER"]).await;
+    assert!(
+        err_default_primary.starts_with("-ERR") && err_default_primary.contains("replica"),
+        "{err_default_primary}"
+    );
     let err_force_primary = cp2.call_simple(&["CLUSTER", "FAILOVER", "FORCE"]).await;
     assert!(
         err_force_primary.starts_with("-ERR") && err_force_primary.contains("replica"),
