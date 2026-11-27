@@ -77,11 +77,21 @@ run_cluster_and_negatives() {
   expect_violation "ClusterGossip.tla" "ClusterGossip_BugPublishRace.cfg" "Temporal properties were violated"
 }
 
+run_replication() {
+  expect_pass "Replication.tla" "Replication.cfg"
+  local bug
+  for bug in UpsertKeepsLsn NoAutoincrement TrimIgnoresPins SkipTrimmedThroughCheck \
+             NoReplidRotation CommitAfterCleanMarker VolatileStartupMarker ReplicaCursorNotAtomic; do
+    expect_violation "Replication.tla" "Replication_Bug$bug.cfg" "Invariant CaughtUpMeansEqual is violated"
+  done
+}
+
 case "$SUITE" in
   all)
     run_async_write
     run_async_barrier
     run_cluster_and_negatives
+    run_replication
     ;;
   async-write)
     run_async_write
@@ -92,8 +102,14 @@ case "$SUITE" in
   cluster-and-negatives)
     run_cluster_and_negatives
     ;;
+  replication)
+    run_replication
+    ;;
+  replication-large)
+    expect_pass "Replication.tla" "Replication_Large.cfg"
+    ;;
   *)
-    echo "Usage: $0 [all|async-write|async-barrier|cluster-and-negatives]" >&2
+    echo "Usage: $0 [all|async-write|async-barrier|cluster-and-negatives|replication|replication-large]" >&2
     exit 2
     ;;
 esac

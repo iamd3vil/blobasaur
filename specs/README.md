@@ -33,6 +33,22 @@ Models Blobasaur's cluster routing and Chitchat gossip protocol (`src/cluster.rs
 - **Safety**: `TypeOK`, `SingleSlotOwner`, `NoOrphanedWrites` (#35), `NoSelfRedirect`, deadlock freedom.
 - **Liveness**: `GossipEventuallyConverges` (`<>[]TopologyConverged`), `RoutingEventuallyAccurate` (`<>[]RoutingAccurate`).
 
+## 3. `Replication.tla`
+
+Models primary -> replica replication for one shard (`src/replication.rs`, the `repl_log` writes in `src/shard_manager.rs`, `REPLICATION.md`):
+
+- **Change index**: one `repl_log` entry per key, `INSERT OR REPLACE` with an `AUTOINCREMENT` LSN, tombstones for `DEL` and expiry cleanup, tombstone trimming bounded by stream pins, and `trimmed_through`.
+- **Handshake** (`can_continue`): `CONTINUE` vs `RESYNC` on replid, `trimmed_through` and the committed watermark.
+- **Stream** (`read_page`): pages of entries after the cursor with their current rows in one read transaction, ending with a watermark at the head of the log.
+- **Replica**: `apply_frames` and `reset` as single transactions, and the replica's own expiry cleanup.
+- **Faults**: dropped connections, primary process crash, primary power loss (commits since the last fsync are lost), replica power loss, graceful stop with the `clean_shutdown` marker, and the boot-id replid rotation in `init_shard`.
+
+Abstractions: one shard, one table, one replica; each write is its own commit; a TTL is expired or not, the same on both clocks.
+
+### Properties verified
+- **Safety**: `TypeOK`, `CaughtUpMeansEqual` (when a replica commits watermark `W`, its live rows equal the primary's live rows as of LSN `W` under the same replid; planned failover relies on this), `ReplicaNeverAhead`, `LsnsUnique`, `SyncedMeansCaughtUp`, `PagesMatchReplid`, `StreamImpliesConnection`, deadlock freedom.
+- **Liveness**: `ReplicaEventuallyConverges` (`<>[]Converged`: once faults and writes stop, the replica is caught up to the primary's watermark with its live rows).
+
 ## Configs
 
 | Spec | Config | Purpose | Expected |
@@ -46,6 +62,16 @@ Models Blobasaur's cluster routing and Chitchat gossip protocol (`src/cluster.rs
 | `ClusterGossip.tla` | `ClusterGossip.cfg` | 3-node cluster with crashes, partitions, slot handoffs — safety + liveness | Pass |
 | `ClusterGossip.tla` | `ClusterGossip_Bug35.cfg` | Enables pre-#35 local fallback on unserved slots | Fails `NoOrphanedWrites` (#35) |
 | `ClusterGossip.tla` | `ClusterGossip_BugPublishRace.cfg` | Enables unlocked `update_gossip_data()` race (`src/cluster.rs:573-628`) | Fails `GossipEventuallyConverges` |
+| `Replication.tla` | `Replication.cfg` | Writes, cleanup, trims, disconnects, crashes and power loss on both sides — safety + liveness | Pass |
+| `Replication.tla` | `Replication_Large.cfg` | Same with 3 writes; about 25 minutes on 16 cores, not in CI (`./specs/check.sh replication-large`) | Pass |
+| `Replication.tla` | `Replication_BugUpsertKeepsLsn.cfg` | `ON CONFLICT DO UPDATE` instead of `INSERT OR REPLACE`: a rewrite keeps its LSN | Fails `CaughtUpMeansEqual` |
+| `Replication.tla` | `Replication_BugNoAutoincrement.cfg` | `repl_log` without `AUTOINCREMENT` reuses a trimmed tombstone's LSN | Fails `CaughtUpMeansEqual` |
+| `Replication.tla` | `Replication_BugTrimIgnoresPins.cfg` | Trims tombstones above an active stream's cursor | Fails `CaughtUpMeansEqual` |
+| `Replication.tla` | `Replication_BugSkipTrimmedThroughCheck.cfg` | Handshake answers `CONTINUE` to a cursor below `trimmed_through` | Fails `CaughtUpMeansEqual` |
+| `Replication.tla` | `Replication_BugNoReplidRotation.cfg` | Keeps the replid after a power loss | Fails `CaughtUpMeansEqual` |
+| `Replication.tla` | `Replication_BugCommitAfterCleanMarker.cfg` | Writes `clean_shutdown = 1` while the writer can still commit | Fails `CaughtUpMeansEqual` |
+| `Replication.tla` | `Replication_BugVolatileStartupMarker.cfg` | Writes `clean_shutdown = 0` at startup without `synchronous = FULL` | Fails `CaughtUpMeansEqual` |
+| `Replication.tla` | `Replication_BugReplicaCursorNotAtomic.cfg` | Makes `applied_lsn` durable apart from the replica's rows | Fails `CaughtUpMeansEqual` |
 
 ## Running locally
 
