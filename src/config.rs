@@ -153,7 +153,6 @@ impl ClusterConfig {
     }
 
     /// Cluster node timeout in milliseconds (default: 15000).
-    #[allow(dead_code)]
     pub fn node_timeout_ms(&self) -> u64 {
         self.node_timeout_ms.unwrap_or(15_000)
     }

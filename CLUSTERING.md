@@ -13,7 +13,8 @@ Blobasaur implements Redis cluster protocol compatibility, allowing Redis cluste
 - Hash slot calculation using CRC16 (Redis-compatible)
 - Persisted per-node cluster state (`<data_dir>/cluster-state.json`) with epoch-versioned slot table and Redis-style epoch collision resolution
 - Runtime promotion (`CLUSTER FAILOVER TAKEOVER`), automatic old-primary demotion, automatic replica re-pointing, and runtime `CLUSTER REPLICATE <node-id>`
-- MOVED redirection for keys owned by another live node, CLUSTERDOWN for unbound or offline slots
+- Redis-style failure detection (`PFAIL`/`FAIL` over gossip, `fail?`/`fail`/`disconnected` in `CLUSTER NODES`, `cluster_state:fail` in `CLUSTER INFO`) and minority write/read fencing
+- MOVED redirection for keys owned by another live node, CLUSTERDOWN for unbound, failed, or minority-fenced slots
 - Gossip protocol implementation using chitchat for node discovery
 - Automatic node discovery and cluster membership management
 - Cross-node key operations with automatic redirects
@@ -23,7 +24,7 @@ Blobasaur implements Redis cluster protocol compatibility, allowing Redis cluste
 
 🚧 **Not Yet Implemented:**
 - Online slot migration/resharding
-- Automatic failover
+- Automatic failover elections (promotion is still manual via `CLUSTER FAILOVER TAKEOVER`)
 
 ## Configuration
 
@@ -127,9 +128,19 @@ The `slot_ranges`, `slots`, and `[replication].replica_of` settings in the confi
 
 Each primary gossips its `current_epoch` and `config_epoch` along with its slots. Every node adopts the maximum `current_epoch` it sees and updates its slot table only when a primary claims a slot with a strictly higher `config_epoch`. Bindings for nodes that go down stay in the slot table (requests to those slots return `-CLUSTERDOWN`), so a returning old primary at a lower epoch cannot reclaim slots it lost. When two primaries share the same `config_epoch` (such as after bootstrapping at epoch 0), the one with the lexicographically smaller `node_id` increments `current_epoch`, takes it as its new `config_epoch`, persists, and gossips until every primary has a distinct epoch.
 
-Two `[cluster]` failover configuration options are also available (used by automatic failover):
-- `node_timeout_ms` (default `15000`): failure-detection and minority fencing timeout in milliseconds.
+Two `[cluster]` failover configuration options are also available:
+- `node_timeout_ms` (default `15000`): failure-detection (`PFAIL`) and minority fencing timeout in milliseconds.
 - `replica_validity_factor` (default `10`, `0` disables the check): multiplier on `node_timeout_ms` bounding how stale a replica may be when standing for election.
+
+### Failure Detection and Minority Behavior
+
+Each node monitors peers using chitchat's per-node heartbeats against a monotonic clock, independent of chitchat's phi detector:
+
+- **PFAIL (`fail?`):** a peer is marked `PFAIL` locally when its chitchat heartbeat has not advanced for `node_timeout_ms` (or after its state is evicted from chitchat). Unreachable peers appear with `fail?` and `disconnected` in `CLUSTER NODES`, and are gossiped in `pfail`.
+- **FAIL (`fail`):** a node is marked `FAIL` when a majority of the slot-owning primaries in the local slot table (`owners / 2 + 1`, counting any down slot owner in `owners`) have reported it in `pfail` or `fail` within `2 * node_timeout_ms`. Nodes gossip `FAIL` marks in `fail`, and any node seeing a peer in a live peer's `fail` list marks it `FAIL` as well. Slots owned by a `FAIL` primary answer `-CLUSTERDOWN`, stay listed against the failed owner in `CLUSTER NODES` with `fail`, and are omitted from `CLUSTER SLOTS`.
+- **Clearing FAIL:** `FAIL` clears immediately once the node is reachable again if it is a replica or owns no slots. If it still owns slots, `FAIL` clears after `2 * node_timeout_ms` of continuous reachability with no failover taking its slots.
+- **3-primary minimum:** Because quorum is `owners / 2 + 1` including the dead primary, a cluster needs **at least three slot-owning primaries** to agree on `FAIL` (and to tolerate losing one primary without losing quorum).
+- **Minority write stop (fencing):** A primary that can reach fewer than a majority of slot-owning primaries (itself included) for `node_timeout_ms` stops serving its own slots—returning `-CLUSTERDOWN` for every read and write—and reports `cluster_state:fail` in `CLUSTER INFO` until a majority is reachable again. A replica in the same situation stops serving `READONLY` reads. A single-primary cluster (`owners = 1`, quorum `1`) is never in a minority.
 
 ### Port Configuration
 
@@ -525,12 +536,13 @@ owning no slots, and runs requests for them locally instead of redirecting.
 Upgrade every peer before giving one node an assignment too large for the list.
 Rolling upgrades with smaller assignments need no care.
 
+**Two-primary clusters and minority fencing:** With minority write fencing enabled, a cluster with exactly two slot-owning primaries has a quorum of 2 (`2 / 2 + 1`). If one primary goes down or is partitioned, the surviving primary can reach only 1 of 2 primaries and will stop serving its own slots (`-CLUSTERDOWN`, `cluster_state:fail`) after `node_timeout_ms`, matching Redis Cluster. Run either a single primary (quorum 1, never in a minority) or at least three primaries so the cluster can survive losing one primary.
+
 ## Current Limitations
 
 1. **Asynchronous Replication:** Replicas can lag, and a failover loses unreplicated writes (see [Replication](#replication))
 2. **No Online Resharding:** Slot assignments are configured statically
-3. **No Automatic Failover:** Promotion is manual (see [Failover](#failover))
-4. **Basic Failure Detection:** Uses gossip protocol timeouts for node failure detection
+3. **No Automatic Failover Elections:** Failure detection and minority fencing are active, but promotion is still manual via `CLUSTER FAILOVER TAKEOVER` (see [Failover](#failover))
 
 ## Architecture Details
 

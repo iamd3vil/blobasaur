@@ -1,5 +1,7 @@
+mod failure;
 mod state;
 
+use failure::{FailureTracker, PeerHeartbeatView};
 #[allow(unused_imports)]
 pub use state::{
     CLUSTER_STATE_FILE, ClusterState, LoadedClusterState, MergeOutcome, PersistedRole, SlotBinding,
@@ -12,7 +14,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chitchat::{
     Chitchat, ChitchatConfig, ChitchatHandle, ChitchatId, FailureDetectorConfig, spawn_chitchat,
@@ -149,6 +151,86 @@ fn newest_generations<'a>(ids: impl Iterator<Item = &'a ChitchatId>) -> Vec<&'a 
     newest.into_values().collect()
 }
 
+/// Snapshot of a peer from `chitchat.node_states()` (newest generation carrying
+/// `node_info`), including its raw chitchat heartbeat and failure reports.
+#[derive(Debug, Clone)]
+struct PeerSnapshot {
+    node: ClusterNode,
+    heartbeat_view: PeerHeartbeatView,
+}
+
+/// Last known metadata for a peer seen in gossip, kept for `CLUSTER NODES` and
+/// `CLUSTER SHARDS` while the peer is disconnected or evicted.
+#[derive(Debug, Clone)]
+struct KnownPeer {
+    addr: SocketAddr,
+    role: NodeRole,
+    primary: Option<String>,
+    config_epoch: u64,
+}
+
+/// Reads the newest generation carrying `node_info` for every peer in chitchat's
+/// state table, regardless of chitchat's own phi failure detector.
+fn peer_snapshots(chitchat: &Chitchat, self_id: &str) -> HashMap<String, PeerSnapshot> {
+    let ids_with_info = chitchat
+        .node_states()
+        .iter()
+        .filter(|(id, state)| id.node_id != self_id && state.get("node_info").is_some())
+        .map(|(id, _)| id);
+
+    let mut snapshots = HashMap::new();
+    for chitchat_id in newest_generations(ids_with_info) {
+        let Some(node_state) = chitchat.node_state(chitchat_id) else {
+            continue;
+        };
+        let Some(node_info_value) = node_state.get("node_info") else {
+            continue;
+        };
+        match serde_json::from_str::<NodeGossipData>(node_info_value) {
+            Ok(gossip_data) => {
+                if let Ok(addr) = gossip_data.addr.parse::<SocketAddr>() {
+                    let slots = gossip_data.owned_slots();
+                    let cluster_node = ClusterNode {
+                        id: chitchat_id.node_id.clone(),
+                        addr,
+                        slots,
+                        _state: gossip_data.state,
+                        role: gossip_data.role,
+                        primary: gossip_data.primary,
+                        current_epoch: gossip_data.current_epoch,
+                        config_epoch: gossip_data.config_epoch,
+                    };
+                    let heartbeat_view = PeerHeartbeatView {
+                        generation_id: chitchat_id.generation_id,
+                        heartbeat: u64::from(node_state.heartbeat()),
+                        pfail: gossip_data.pfail,
+                        fail: gossip_data.fail,
+                    };
+                    snapshots.insert(
+                        chitchat_id.node_id.clone(),
+                        PeerSnapshot {
+                            node: cluster_node,
+                            heartbeat_view,
+                        },
+                    );
+                } else {
+                    warn!(
+                        "Invalid address format from {}: {}",
+                        chitchat_id.node_id, gossip_data.addr
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to deserialize gossip data from {}: {} (data: {})",
+                    chitchat_id.node_id, e, node_info_value
+                );
+            }
+        }
+    }
+    snapshots
+}
+
 /// The other live nodes and what they gossiped. Only live nodes own slots, and
 /// only their newest generation counts.
 fn live_peers(chitchat: &Chitchat, self_id: &str) -> HashMap<String, ClusterNode> {
@@ -226,12 +308,19 @@ struct NodeGossipData {
     pub current_epoch: u64,
     #[serde(default)]
     pub config_epoch: u64,
+    /// Node ids this node currently cannot reach (PFAIL).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pfail: Vec<String>,
+    /// Node ids this node has marked failed (FAIL).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fail: Vec<String>,
 }
 
 impl NodeGossipData {
     /// Encodes `slots` as both a list and ranges if that fits `GOSSIP_VALUE_MAX`,
     /// else as whichever one alone fits, preferring the list old nodes can read.
     /// Errors if neither fits: peers would never receive the value.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         addr: String,
         slots: &HashSet<u16>,
@@ -239,6 +328,8 @@ impl NodeGossipData {
         primary: Option<String>,
         current_epoch: u64,
         config_epoch: u64,
+        pfail: Vec<String>,
+        fail: Vec<String>,
     ) -> Result<Self, String> {
         let mut list: Vec<u16> = slots.iter().copied().collect();
         list.sort_unstable();
@@ -251,6 +342,8 @@ impl NodeGossipData {
             primary,
             current_epoch,
             config_epoch,
+            pfail,
+            fail,
         };
         let size = |data: &Self| serde_json::to_string(data).map_or(usize::MAX, |json| json.len());
         if size(&both) <= GOSSIP_VALUE_MAX {
@@ -334,10 +427,12 @@ type Gossip = (ChitchatHandle, Option<JoinHandle<()>>);
 /// Manages cluster state and gossip protocol
 pub struct ClusterManager {
     node_id: String,
-    /// Live peers from gossip (newest generation per node id).
+    /// Reachable peers from gossip (present in chitchat and not PFAIL).
     nodes: Arc<RwLock<HashMap<String, ClusterNode>>>,
-    /// Last known Redis address of any peer seen live.
-    known_addrs: Arc<std::sync::RwLock<HashMap<String, SocketAddr>>>,
+    /// Last known metadata of any peer seen in gossip (retained while disconnected/evicted).
+    known_peers: Arc<std::sync::RwLock<HashMap<String, KnownPeer>>>,
+    /// Heartbeat-based PFAIL/FAIL detector and minority tracker.
+    failure: Arc<std::sync::RwLock<FailureTracker>>,
     /// Persisted cluster state (role, primary, epochs, slot table).
     state: Arc<std::sync::RwLock<ClusterState>>,
     /// Path to `<data_dir>/cluster-state.json`; `None` only in tests without persistence.
@@ -382,7 +477,14 @@ impl ClusterManager {
             path: state_path,
         } = loaded;
         let nodes = Arc::new(RwLock::new(HashMap::new()));
-        let known_addrs = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let known_peers = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let gossip_interval = Duration::from_millis(config.gossip_interval_ms.unwrap_or(1000));
+        let node_timeout = Duration::from_millis(config.node_timeout_ms());
+        let failure = Arc::new(std::sync::RwLock::new(FailureTracker::new(
+            config.node_id.clone(),
+            node_timeout,
+            Instant::now(),
+        )));
         let replica_synced = Arc::new(Mutex::new(vec![false; num_shards]));
 
         // Set up chitchat for gossip protocol
@@ -407,16 +509,16 @@ impl ClusterManager {
 
         let failure_detector_config = FailureDetectorConfig {
             phi_threshold: 8.0,
-            initial_interval: Duration::from_millis(1000),
+            initial_interval: gossip_interval.max(Duration::from_millis(50)),
             max_interval: Duration::from_secs(10),
-            dead_node_grace_period: Duration::from_secs(60),
+            dead_node_grace_period: Duration::from_secs(60).max(node_timeout.saturating_mul(4)),
             sampling_window_size: 100,
         };
 
         let chitchat_config = ChitchatConfig {
             chitchat_id: chitchat_id.clone(),
             cluster_id: "blobasaur-cluster".to_string(),
-            gossip_interval: Duration::from_millis(config.gossip_interval_ms.unwrap_or(1000)),
+            gossip_interval,
             listen_addr: gossip_addr,
             seed_nodes: config.seeds.clone(),
             failure_detector_config,
@@ -442,6 +544,8 @@ impl ClusterManager {
             initial_state.primary.clone(),
             initial_state.current_epoch,
             initial_state.config_epoch,
+            Vec::new(),
+            Vec::new(),
         )?;
 
         let gossip_data_json = serde_json::to_string(&initial_gossip_data)
@@ -472,7 +576,8 @@ impl ClusterManager {
         let cluster_manager = Self {
             node_id: config.node_id.clone(),
             nodes,
-            known_addrs,
+            known_peers,
+            failure,
             state: Arc::new(std::sync::RwLock::new(initial_state)),
             state_path: Some(state_path),
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -515,6 +620,23 @@ impl ClusterManager {
         self.state.read().unwrap().primary.clone()
     }
 
+    /// Whether `node_id` is currently marked FAIL in this node's failure view.
+    pub fn is_failed(&self, node_id: &str) -> bool {
+        self.failure.read().unwrap().is_failed(node_id)
+    }
+
+    /// Whether `node_id` is currently suspected unreachable (PFAIL) locally.
+    #[allow(dead_code)]
+    pub fn is_pfail(&self, node_id: &str) -> bool {
+        self.failure.read().unwrap().is_pfail(node_id)
+    }
+
+    /// Whether this node is fenced in a minority (cannot reach a majority of
+    /// slot-owning primaries for `node_timeout_ms`).
+    pub fn is_in_minority(&self) -> bool {
+        self.failure.read().unwrap().is_in_minority()
+    }
+
     async fn persist_state(&self, state: &ClusterState) -> Result<(), String> {
         if self.persist_halted.load(Ordering::Acquire) {
             return Err("cluster state persistence halted during shutdown".to_string());
@@ -530,9 +652,9 @@ impl ClusterManager {
 
     /// Background task to process gossip updates
     async fn gossip_task(&self) {
-        let mut interval = interval(Duration::from_millis(
-            self.config.gossip_interval_ms.unwrap_or(1000),
-        ));
+        let gossip_ms = self.config.gossip_interval_ms.unwrap_or(1000);
+        let tick_ms = gossip_ms.min((self.config.node_timeout_ms() / 2).max(50));
+        let mut interval = interval(Duration::from_millis(tick_ms));
 
         info!("Gossip task started for node: {}", self.node_id);
 
@@ -566,11 +688,11 @@ impl ClusterManager {
                     dead_nodes
                 );
 
-                let nodes_map = live_peers(&chitchat_guard, &self.node_id);
+                let snapshots = peer_snapshots(&chitchat_guard, &self.node_id);
 
                 drop(chitchat_guard);
 
-                self.process_peers(nodes_map).await;
+                self.process_peer_snapshots(snapshots, Instant::now()).await;
             } else {
                 warn!(
                     "Gossip task running without chitchat for node: {}",
@@ -863,18 +985,46 @@ impl ClusterManager {
         Ok(())
     }
 
-    /// Apply a fresh snapshot of live gossip peers: update peer view, adopt
-    /// higher `current_epoch`, merge slot claims by the epoch rule, and resolve
-    /// `config_epoch` collisions.
-    async fn process_peers(&self, nodes_map: HashMap<String, ClusterNode>) {
+    /// Apply a fresh snapshot of chitchat peers at monotonic time `now`:
+    /// advance heartbeat-based PFAIL tracking, update the reachable peer view,
+    /// adopt higher `current_epoch`, merge slot claims by the epoch rule,
+    /// resolve `config_epoch` collisions, and evaluate FAIL / minority state.
+    async fn process_peer_snapshots(&self, snapshots: HashMap<String, PeerSnapshot>, now: Instant) {
+        let observations: HashMap<String, PeerHeartbeatView> = snapshots
+            .iter()
+            .map(|(id, snap)| (id.clone(), snap.heartbeat_view.clone()))
+            .collect();
+
+        // Phase 1: heartbeat tracking and local PFAIL.
+        let initial_owners = self.state.read().unwrap().slots.owners();
+        let (progressed, mut failure_outcome, nodes_map) = {
+            let mut failure = self.failure.write().unwrap();
+            let (progressed, outcome) =
+                failure.observe_heartbeats(now, &observations, &initial_owners);
+            let reachable: HashMap<String, ClusterNode> = snapshots
+                .iter()
+                .filter(|(id, _)| !failure.is_pfail(id))
+                .map(|(id, snap)| (id.clone(), snap.node.clone()))
+                .collect();
+            (progressed, outcome, reachable)
+        };
+
         {
-            let mut addrs = self.known_addrs.write().unwrap();
-            for (id, node) in &nodes_map {
-                addrs.insert(id.clone(), node.addr);
+            let mut known = self.known_peers.write().unwrap();
+            for (id, snap) in &snapshots {
+                known.insert(
+                    id.clone(),
+                    KnownPeer {
+                        addr: snap.node.addr,
+                        role: snap.node.role,
+                        primary: snap.node.primary.clone(),
+                        config_epoch: snap.node.config_epoch,
+                    },
+                );
             }
         }
 
-        // Update the nodes map and log topology changes
+        // Update the reachable nodes map and log topology changes
         let mut nodes = self.nodes.write().await;
 
         let mut added = Vec::new();
@@ -973,7 +1123,7 @@ impl ClusterManager {
         let mut gossip_changed = false;
         let mut mark_repointing = false;
 
-        // Adopt the highest epoch seen across all peers.
+        // Adopt the highest epoch seen across all reachable peers.
         let mut max_epoch = state.current_epoch;
         for peer in nodes_map.values() {
             max_epoch = max_epoch.max(peer.current_epoch).max(peer.config_epoch);
@@ -984,7 +1134,7 @@ impl ClusterManager {
             gossip_changed = true;
         }
 
-        // Merge live primaries' slot claims in deterministic node-id order.
+        // Merge reachable primaries' slot claims in deterministic node-id order.
         let mut primary_peers: Vec<&ClusterNode> = nodes_map
             .values()
             .filter(|peer| peer.role == NodeRole::Primary)
@@ -1107,6 +1257,7 @@ impl ClusterManager {
             Self::pending_transition_for(&state)
         };
 
+        let post_merge_owners = state.slots.owners();
         if changed {
             if !is_bootstrapping && let Err(e) = self.persist_state(&state).await {
                 error!("Failed to persist cluster state after gossip update: {}", e);
@@ -1118,6 +1269,47 @@ impl ClusterManager {
             }
         }
         drop(_guard);
+
+        // Phase 2: evaluate FAIL and minority state against the updated slot table.
+        if !is_bootstrapping {
+            let mut failure = self.failure.write().unwrap();
+            failure.evaluate_failures(
+                now,
+                &observations,
+                &progressed,
+                &post_merge_owners,
+                &mut failure_outcome,
+            );
+        }
+        if failure_outcome.gossip_changed {
+            gossip_changed = true;
+        }
+        for id in &failure_outcome.newly_pfail {
+            warn!("Peer {} marked PFAIL on {}", id, self.node_id);
+        }
+        for id in &failure_outcome.cleared_pfail {
+            info!(
+                "Peer {} reachable again on {} (cleared PFAIL)",
+                id, self.node_id
+            );
+        }
+        for id in &failure_outcome.newly_failed {
+            warn!("Peer {} marked FAIL on {}", id, self.node_id);
+        }
+        for id in &failure_outcome.cleared_failed {
+            info!("Peer {} cleared FAIL on {}", id, self.node_id);
+        }
+        if failure_outcome.entered_minority {
+            warn!(
+                "Node {} lost majority of slot-owning primaries; fencing requests with CLUSTERDOWN",
+                self.node_id
+            );
+        } else if failure_outcome.exited_minority {
+            info!(
+                "Node {} regained majority of slot-owning primaries; resuming service",
+                self.node_id
+            );
+        }
 
         if gossip_changed
             && !is_bootstrapping
@@ -1131,6 +1323,28 @@ impl ClusterManager {
         {
             handler(transition);
         }
+    }
+
+    #[cfg(test)]
+    async fn process_peers(&self, nodes_map: HashMap<String, ClusterNode>) {
+        let snapshots = nodes_map
+            .into_iter()
+            .map(|(id, node)| {
+                (
+                    id,
+                    PeerSnapshot {
+                        node,
+                        heartbeat_view: PeerHeartbeatView {
+                            generation_id: 1,
+                            heartbeat: 1,
+                            pfail: Vec::new(),
+                            fail: Vec::new(),
+                        },
+                    },
+                )
+            })
+            .collect();
+        self.process_peer_snapshots(snapshots, Instant::now()).await;
     }
 
     /// Decide where a request for `slot` should run from the slot table.
@@ -1150,11 +1364,14 @@ impl ClusterManager {
             return Route::ClusterDown;
         };
         if binding.node_id == self.node_id {
-            return if role == PersistedRole::Primary {
+            return if role == PersistedRole::Primary && !self.is_in_minority() {
                 Route::Local
             } else {
                 Route::ClusterDown
             };
+        }
+        if self.is_failed(&binding.node_id) {
+            return Route::ClusterDown;
         }
         let nodes = self.nodes.read().await;
         let Some(owner) = nodes.get(&binding.node_id) else {
@@ -1167,7 +1384,11 @@ impl ClusterManager {
             && self.role() == NodeRole::Replica
             && primary.as_deref() == Some(binding.node_id.as_str())
         {
-            return Route::Local;
+            return if self.is_in_minority() {
+                Route::ClusterDown
+            } else {
+                Route::Local
+            };
         }
         Route::Moved(format!("MOVED {} {}", slot, owner.addr))
     }
@@ -1330,7 +1551,14 @@ impl ClusterManager {
         let mut result = Vec::new();
         let nodes = self.nodes.read().await;
         let state = self.state.read().unwrap().clone();
-        let known_addrs = self.known_addrs.read().unwrap().clone();
+        let known_peers = self.known_peers.read().unwrap().clone();
+        let (pfail_set, fail_set): (HashSet<String>, HashSet<String>) = {
+            let failure = self.failure.read().unwrap();
+            (
+                failure.pfail_list().into_iter().collect(),
+                failure.fail_list().into_iter().collect(),
+            )
+        };
 
         let (local_ip, local_port) = local_endpoint(&self.config, self.local_addr);
         // In Redis CLUSTER NODES, a replica reports its primary's config_epoch.
@@ -1340,7 +1568,10 @@ impl ClusterManager {
             } else if let Some(peer) = nodes.get(primary_id) {
                 peer.config_epoch
             } else {
-                state.slots.max_epoch_for(primary_id)
+                state
+                    .slots
+                    .max_epoch_for(primary_id)
+                    .max(known_peers.get(primary_id).map_or(0, |p| p.config_epoch))
             }
         };
 
@@ -1375,59 +1606,107 @@ impl ClusterManager {
         };
         result.push(local_info);
 
-        // Live peers sorted by node id.
-        let mut peers: Vec<&ClusterNode> = nodes.values().collect();
-        peers.sort_by(|a, b| a.id.cmp(&b.id));
-        for node in peers {
-            let node_info = match (node.role, &node.primary) {
-                (NodeRole::Primary, _) | (_, None) => {
-                    let peer_slots = state.slots.slots_of(&node.id);
-                    let ranges = Self::slots_to_ranges(&peer_slots);
-                    if ranges.is_empty() {
-                        format!(
-                            "{} {}:{} master - 0 0 {} connected",
-                            node.id,
-                            node.addr.ip(),
-                            node.addr.port(),
-                            node.config_epoch
-                        )
-                    } else {
-                        format!(
-                            "{} {}:{} master - 0 0 {} connected {}",
-                            node.id,
-                            node.addr.ip(),
-                            node.addr.port(),
-                            node.config_epoch,
-                            ranges
-                        )
-                    }
-                }
-                (_, Some(primary)) => format!(
-                    "{} {}:{} slave {} 0 0 {} connected",
-                    node.id,
-                    node.addr.ip(),
-                    node.addr.port(),
-                    primary,
-                    primary_epoch(primary)
-                ),
-            };
-            result.push(node_info);
-        }
+        // Collect all remote peer ids: reachable peers, offline/evicted known
+        // peers, retained slot owners, and any nodes marked PFAIL/FAIL.
+        let mut peer_ids: BTreeSet<String> = BTreeSet::new();
+        peer_ids.extend(nodes.keys().cloned());
+        peer_ids.extend(known_peers.keys().cloned());
+        peer_ids.extend(state.slots.owners());
+        peer_ids.extend(pfail_set.iter().cloned());
+        peer_ids.extend(fail_set.iter().cloned());
+        peer_ids.remove(&self.node_id);
 
-        // Offline slot owners retained in the slot table stay listed with their slots.
-        for owner_id in state.slots.owners() {
-            if owner_id == self.node_id || nodes.contains_key(&owner_id) {
-                continue;
-            }
-            let addr = known_addrs
-                .get(&owner_id)
-                .map_or_else(|| "0.0.0.0:0".to_string(), ToString::to_string);
-            let epoch = state.slots.max_epoch_for(&owner_id);
-            let ranges = Self::slots_to_ranges(&state.slots.slots_of(&owner_id));
-            result.push(format!(
-                "{} {} master - 0 0 {} disconnected {}",
-                owner_id, addr, epoch, ranges
-            ));
+        for peer_id in peer_ids {
+            let is_failed = fail_set.contains(&peer_id);
+            let is_pfail = pfail_set.contains(&peer_id);
+            let fail_suffix = if is_failed {
+                ",fail"
+            } else if is_pfail {
+                ",fail?"
+            } else {
+                ""
+            };
+            let link_state = if nodes.contains_key(&peer_id) && !is_pfail {
+                "connected"
+            } else {
+                "disconnected"
+            };
+
+            let line = if let Some(node) = nodes.get(&peer_id) {
+                match (node.role, &node.primary) {
+                    (NodeRole::Primary, _) | (_, None) => {
+                        let peer_slots = state.slots.slots_of(&node.id);
+                        let ranges = Self::slots_to_ranges(&peer_slots);
+                        if ranges.is_empty() {
+                            format!(
+                                "{} {}:{} master{} - 0 0 {} {}",
+                                node.id,
+                                node.addr.ip(),
+                                node.addr.port(),
+                                fail_suffix,
+                                node.config_epoch,
+                                link_state,
+                            )
+                        } else {
+                            format!(
+                                "{} {}:{} master{} - 0 0 {} {} {}",
+                                node.id,
+                                node.addr.ip(),
+                                node.addr.port(),
+                                fail_suffix,
+                                node.config_epoch,
+                                link_state,
+                                ranges,
+                            )
+                        }
+                    }
+                    (_, Some(primary)) => format!(
+                        "{} {}:{} slave{} {} 0 0 {} {}",
+                        node.id,
+                        node.addr.ip(),
+                        node.addr.port(),
+                        fail_suffix,
+                        primary,
+                        primary_epoch(primary),
+                        link_state,
+                    ),
+                }
+            } else {
+                let addr = known_peers
+                    .get(&peer_id)
+                    .map_or_else(|| "0.0.0.0:0".to_string(), |p| p.addr.to_string());
+                let peer_slots = state.slots.slots_of(&peer_id);
+                if !peer_slots.is_empty() {
+                    let epoch = state.slots.max_epoch_for(&peer_id);
+                    let ranges = Self::slots_to_ranges(&peer_slots);
+                    format!(
+                        "{} {} master{} - 0 0 {} {} {}",
+                        peer_id, addr, fail_suffix, epoch, link_state, ranges
+                    )
+                } else if let Some(known) = known_peers.get(&peer_id) {
+                    match (known.role, &known.primary) {
+                        (NodeRole::Primary, _) | (_, None) => format!(
+                            "{} {} master{} - 0 0 {} {}",
+                            peer_id, addr, fail_suffix, known.config_epoch, link_state
+                        ),
+                        (_, Some(primary)) => format!(
+                            "{} {} slave{} {} 0 0 {} {}",
+                            peer_id,
+                            addr,
+                            fail_suffix,
+                            primary,
+                            primary_epoch(primary),
+                            link_state,
+                        ),
+                    }
+                } else {
+                    format!(
+                        "{} {} master{} - 0 0 0 {}",
+                        peer_id, addr, fail_suffix, link_state
+                    )
+                }
+            };
+            result.push(line);
         }
 
         format!("{}\n", result.join("\n"))
@@ -1464,11 +1743,18 @@ impl ClusterManager {
     }
 
     /// Get the slot ranges from the slot table for CLUSTER SLOTS.
-    /// Lists only live slot owners; replicas are listed only once synced.
+    /// Lists only live, non-failed slot owners; replicas are listed only once synced.
     pub async fn get_cluster_slots(&self) -> Vec<SlotRange> {
         let (local_ip, local_port) = local_endpoint(&self.config, self.local_addr);
         let nodes = self.nodes.read().await;
         let state = self.state.read().unwrap().clone();
+        let fail_set: HashSet<String> = self
+            .failure
+            .read()
+            .unwrap()
+            .fail_list()
+            .into_iter()
+            .collect();
 
         // Replicas serving reads, by the primary they follow.
         let mut replicas: HashMap<String, Vec<(String, u16, String)>> = HashMap::new();
@@ -1482,6 +1768,9 @@ impl ClusterManager {
             ));
         }
         for node in nodes.values() {
+            if fail_set.contains(&node.id) {
+                continue;
+            }
             if let (NodeRole::Replica, Some(primary)) = (node.role, &node.primary) {
                 replicas.entry(primary.clone()).or_default().push((
                     node.addr.ip().to_string(),
@@ -1498,10 +1787,12 @@ impl ClusterManager {
         for (start, end, owner_id) in state.slots.runs_by_owner() {
             let (ip, port) = if owner_id == self.node_id && state.role == PersistedRole::Primary {
                 (local_ip.clone(), local_port)
-            } else if let Some(peer) = nodes.get(&owner_id) {
+            } else if !fail_set.contains(&owner_id)
+                && let Some(peer) = nodes.get(&owner_id)
+            {
                 (peer.addr.ip().to_string(), peer.addr.port())
             } else {
-                // Owner is down: slot is currently CLUSTERDOWN, omit from CLUSTER SLOTS.
+                // Owner is down or FAIL: slot is currently CLUSTERDOWN, omit from CLUSTER SLOTS.
                 continue;
             };
             ranges.push(SlotRange {
@@ -1521,7 +1812,14 @@ impl ClusterManager {
         let (local_ip, local_port) = local_endpoint(&self.config, self.local_addr);
         let nodes = self.nodes.read().await;
         let state = self.state.read().unwrap().clone();
-        let known_addrs = self.known_addrs.read().unwrap().clone();
+        let known_peers = self.known_peers.read().unwrap().clone();
+        let fail_set: HashSet<String> = self
+            .failure
+            .read()
+            .unwrap()
+            .fail_list()
+            .into_iter()
+            .collect();
 
         let mut slots_by_owner: BTreeMap<String, Vec<(u16, u16)>> = BTreeMap::new();
         for (start, end, owner_id) in state.slots.runs_by_owner() {
@@ -1554,6 +1852,9 @@ impl ClusterManager {
                 });
         }
         for node in nodes.values() {
+            if fail_set.contains(&node.id) {
+                continue;
+            }
             if let Some(primary) = &node.primary
                 && node.role != NodeRole::Primary
             {
@@ -1593,7 +1894,9 @@ impl ClusterManager {
                     replication_offset: 0,
                     health: "online",
                 }
-            } else if let Some(peer) = nodes.get(&owner_id) {
+            } else if !fail_set.contains(&owner_id)
+                && let Some(peer) = nodes.get(&owner_id)
+            {
                 let ip = peer.addr.ip().to_string();
                 ClusterShardNode {
                     id: peer.id.clone(),
@@ -1604,7 +1907,11 @@ impl ClusterManager {
                     replication_offset: 0,
                     health: "online",
                 }
-            } else if let Some(addr) = known_addrs.get(&owner_id) {
+            } else if let Some(addr) = nodes
+                .get(&owner_id)
+                .map(|p| p.addr)
+                .or_else(|| known_peers.get(&owner_id).map(|p| p.addr))
+            {
                 let ip = addr.ip().to_string();
                 ClusterShardNode {
                     id: owner_id.clone(),
@@ -1637,30 +1944,50 @@ impl ClusterManager {
     pub async fn get_cluster_info(&self) -> String {
         let nodes = self.nodes.read().await;
         let state = self.state.read().unwrap().clone();
+        let known_peers = self.known_peers.read().unwrap().clone();
+        let (in_minority, pfail_set, fail_set): (bool, HashSet<String>, HashSet<String>) = {
+            let failure = self.failure.read().unwrap();
+            (
+                failure.is_in_minority(),
+                failure.pfail_list().into_iter().collect(),
+                failure.fail_list().into_iter().collect(),
+            )
+        };
 
         let slot_owners = state.slots.owners();
         let assigned_slots = state.slots.slot_count();
 
         let mut ok_slots = 0usize;
+        let mut pfail_slots = 0usize;
+        let mut fail_slots = 0usize;
         for (start, end, owner_id) in state.slots.runs_by_owner() {
-            let live = (owner_id == self.node_id && state.role == PersistedRole::Primary)
-                || nodes.contains_key(&owner_id);
-            if live {
-                ok_slots += (end - start) as usize + 1;
+            let count = (end - start) as usize + 1;
+            if owner_id == self.node_id && state.role == PersistedRole::Primary {
+                ok_slots += count;
+            } else if fail_set.contains(&owner_id) {
+                fail_slots += count;
+            } else if pfail_set.contains(&owner_id) {
+                pfail_slots += count;
+            } else if nodes.contains_key(&owner_id) {
+                ok_slots += count;
+            } else {
+                fail_slots += count;
             }
         }
-        let fail_slots = assigned_slots.saturating_sub(ok_slots);
 
         let mut known_nodes: BTreeSet<&str> = BTreeSet::new();
         known_nodes.insert(&self.node_id);
         for id in nodes.keys() {
             known_nodes.insert(id.as_str());
         }
+        for id in known_peers.keys() {
+            known_nodes.insert(id.as_str());
+        }
         for owner in &slot_owners {
             known_nodes.insert(owner.as_str());
         }
 
-        let cluster_state = if ok_slots == REDIS_CLUSTER_SLOTS as usize {
+        let cluster_state = if !in_minority && ok_slots == REDIS_CLUSTER_SLOTS as usize {
             "ok"
         } else {
             "fail"
@@ -1670,7 +1997,7 @@ impl ClusterManager {
             "cluster_state:{}\n\
              cluster_slots_assigned:{}\n\
              cluster_slots_ok:{}\n\
-             cluster_slots_pfail:0\n\
+             cluster_slots_pfail:{}\n\
              cluster_slots_fail:{}\n\
              cluster_known_nodes:{}\n\
              cluster_size:{}\n\
@@ -1681,6 +2008,7 @@ impl ClusterManager {
             cluster_state,
             assigned_slots,
             ok_slots,
+            pfail_slots,
             fail_slots,
             known_nodes.len(),
             slot_owners.len(),
@@ -1790,6 +2118,10 @@ impl ClusterManager {
         } else {
             NodeRole::Primary
         };
+        let (pfail, fail) = {
+            let failure = self.failure.read().unwrap();
+            (failure.pfail_list(), failure.fail_list())
+        };
         NodeGossipData::new(
             format!("{}:{}", local_ip, local_port),
             own_slots,
@@ -1797,6 +2129,8 @@ impl ClusterManager {
             state.primary.clone(),
             state.current_epoch,
             state.config_epoch,
+            pfail,
+            fail,
         )
     }
 
@@ -1872,7 +2206,12 @@ impl ClusterManager {
         Self {
             node_id: node_id.to_string(),
             nodes: Arc::new(RwLock::new(HashMap::new())),
-            known_addrs: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            known_peers: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            failure: Arc::new(std::sync::RwLock::new(FailureTracker::new(
+                node_id.to_string(),
+                Duration::from_millis(config.node_timeout_ms()),
+                Instant::now(),
+            ))),
             state: Arc::new(std::sync::RwLock::new(ClusterState::bootstrap_replica(
                 node_id.to_string(),
                 primary.to_string(),
@@ -1946,7 +2285,8 @@ impl Clone for ClusterManager {
         Self {
             node_id: self.node_id.clone(),
             nodes: Arc::clone(&self.nodes),
-            known_addrs: Arc::clone(&self.known_addrs),
+            known_peers: Arc::clone(&self.known_peers),
+            failure: Arc::clone(&self.failure),
             state: Arc::clone(&self.state),
             state_path: self.state_path.clone(),
             write_lock: Arc::clone(&self.write_lock),
@@ -2167,10 +2507,25 @@ mod tests {
             state.slots.set(slot, node_id, 0);
         }
         let mut nodes = HashMap::new();
-        let mut known_addrs = HashMap::new();
+        let mut known_peers = HashMap::new();
+        let now = Instant::now();
+        let mut failure = FailureTracker::new(
+            node_id.to_string(),
+            Duration::from_millis(config.node_timeout_ms()),
+            now,
+        );
         for (id, addr, slots) in remote {
             let parsed: SocketAddr = addr.parse().unwrap();
-            known_addrs.insert(id.to_string(), parsed);
+            known_peers.insert(
+                id.to_string(),
+                KnownPeer {
+                    addr: parsed,
+                    role: NodeRole::Primary,
+                    primary: None,
+                    config_epoch: 0,
+                },
+            );
+            failure.seed_live_peer(id, now);
             for &slot in *slots {
                 state.slots.set(slot, *id, 0);
             }
@@ -2191,7 +2546,8 @@ mod tests {
         ClusterManager {
             node_id: config.node_id.clone(),
             nodes: Arc::new(RwLock::new(nodes)),
-            known_addrs: Arc::new(std::sync::RwLock::new(known_addrs)),
+            known_peers: Arc::new(std::sync::RwLock::new(known_peers)),
+            failure: Arc::new(std::sync::RwLock::new(failure)),
             state: Arc::new(std::sync::RwLock::new(state)),
             state_path: None,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -2221,11 +2577,20 @@ mod tests {
 
     async fn add_replica(manager: &ClusterManager, id: &str, addr: &str, of: &str, role: NodeRole) {
         let parsed: SocketAddr = addr.parse().unwrap();
+        manager.known_peers.write().unwrap().insert(
+            id.to_string(),
+            KnownPeer {
+                addr: parsed,
+                role,
+                primary: Some(of.to_string()),
+                config_epoch: 0,
+            },
+        );
         manager
-            .known_addrs
+            .failure
             .write()
             .unwrap()
-            .insert(id.to_string(), parsed);
+            .seed_live_peer(id, Instant::now());
         manager.nodes.write().await.insert(
             id.to_string(),
             ClusterNode {
@@ -2316,6 +2681,8 @@ mod tests {
             None,
             0,
             0,
+            vec![],
+            vec![],
         )
         .unwrap();
         assert_eq!(data.slots, vec![0, 1, 2, 9]);
@@ -2335,8 +2702,17 @@ mod tests {
             slots: Vec<u16>,
         }
         let all = |n: u16| (0..n).collect::<HashSet<u16>>();
-        let at_limit =
-            NodeGossipData::new("a:1".into(), &all(9000), NodeRole::Primary, None, 0, 0).unwrap();
+        let at_limit = NodeGossipData::new(
+            "a:1".into(),
+            &all(9000),
+            NodeRole::Primary,
+            None,
+            0,
+            0,
+            vec![],
+            vec![],
+        )
+        .unwrap();
         assert_eq!(at_limit.slots.len(), 9000);
         let json = serde_json::to_string(&at_limit).unwrap();
         assert!(json.len() <= GOSSIP_VALUE_MAX, "{} bytes", json.len());
@@ -2346,10 +2722,29 @@ mod tests {
         );
         // The worst case for 9000 slots: all five digits.
         let high: HashSet<u16> = (7384..16384).collect();
-        let high = NodeGossipData::new("a:1".into(), &high, NodeRole::Primary, None, 0, 0).unwrap();
+        let high = NodeGossipData::new(
+            "a:1".into(),
+            &high,
+            NodeRole::Primary,
+            None,
+            0,
+            0,
+            vec![],
+            vec![],
+        )
+        .unwrap();
         assert_eq!(high.slots.len(), 9000);
-        let full =
-            NodeGossipData::new("a:1".into(), &all(16384), NodeRole::Primary, None, 0, 0).unwrap();
+        let full = NodeGossipData::new(
+            "a:1".into(),
+            &all(16384),
+            NodeRole::Primary,
+            None,
+            0,
+            0,
+            vec![],
+            vec![],
+        )
+        .unwrap();
         assert!(full.slots.is_empty());
         assert_eq!(full.slot_ranges, vec![(0, 16383)]);
         let json = serde_json::to_string(&full).unwrap();
@@ -2368,8 +2763,17 @@ mod tests {
         // Every other slot: the ranges are longer than the list, so the list
         // alone is sent (and old nodes can still read it).
         let alternating: HashSet<u16> = (0..16384).step_by(2).collect();
-        let data =
-            NodeGossipData::new("a:1".into(), &alternating, NodeRole::Primary, None, 0, 0).unwrap();
+        let data = NodeGossipData::new(
+            "a:1".into(),
+            &alternating,
+            NodeRole::Primary,
+            None,
+            0,
+            0,
+            vec![],
+            vec![],
+        )
+        .unwrap();
         assert!(data.slot_ranges.is_empty());
         let json = serde_json::to_string(&data).unwrap();
         assert!(json.len() <= GOSSIP_VALUE_MAX, "{} bytes", json.len());
@@ -2383,12 +2787,14 @@ mod tests {
 
     #[test]
     fn test_gossip_decodes_what_old_nodes_send() {
-        // No ranges, role, primary, or epochs: read the slot list and default to primary at epoch 0.
+        // No ranges, role, primary, epochs, pfail, or fail: read the slot list and default cleanly.
         let old = r#"{"addr":"10.0.0.1:6379","slots":[5,6,7],"state":"master"}"#;
         let data: NodeGossipData = serde_json::from_str(old).unwrap();
         assert_eq!(data.owned_slots(), [5, 6, 7].into_iter().collect());
         assert_eq!((data.role, data.primary), (NodeRole::Primary, None));
         assert_eq!((data.current_epoch, data.config_epoch), (0, 0));
+        assert!(data.pfail.is_empty());
+        assert!(data.fail.is_empty());
 
         // Ranges win over a stale list.
         let new = r#"{"addr":"a:1","slots":[1],"slot_ranges":[[10,12]],"state":"master"}"#;
@@ -2402,12 +2808,19 @@ mod tests {
             Some("node-a".into()),
             4,
             0,
+            vec!["node-b".into()],
+            vec!["node-c".into()],
         )
         .unwrap();
         let json = serde_json::to_string(&replica).unwrap();
         assert!(json.contains(r#""role":"replica-syncing""#), "{json}");
         assert!(json.contains(r#""primary":"node-a""#), "{json}");
         assert!(json.contains(r#""current_epoch":4"#), "{json}");
+        assert!(json.contains(r#""pfail":["node-b"]"#), "{json}");
+        assert!(json.contains(r#""fail":["node-c"]"#), "{json}");
+        let roundtrip: NodeGossipData = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip.pfail, vec!["node-b"]);
+        assert_eq!(roundtrip.fail, vec!["node-c"]);
     }
 
     #[tokio::test]
@@ -2683,7 +3096,12 @@ mod tests {
         ClusterManager {
             node_id: config.node_id.clone(),
             nodes: Arc::new(RwLock::new(HashMap::new())),
-            known_addrs: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            known_peers: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            failure: Arc::new(std::sync::RwLock::new(FailureTracker::new(
+                config.node_id.clone(),
+                Duration::from_millis(config.node_timeout_ms()),
+                Instant::now(),
+            ))),
             state: Arc::new(std::sync::RwLock::new(state)),
             state_path: None,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -3243,5 +3661,248 @@ mod tests {
         assert!(!manager.is_demoting());
         manager.process_peers(HashMap::new()).await;
         assert_eq!(fired.lock().unwrap().len(), 2);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn make_peer_snapshot(
+        id: &str,
+        addr: &str,
+        slots: std::ops::RangeInclusive<u16>,
+        epoch: u64,
+        generation: u64,
+        hb: u64,
+        pfail: &[&str],
+        fail: &[&str],
+    ) -> (String, PeerSnapshot) {
+        (
+            id.to_string(),
+            PeerSnapshot {
+                node: ClusterNode {
+                    id: id.to_string(),
+                    addr: addr.parse().unwrap(),
+                    slots: slots.collect(),
+                    _state: "master".to_string(),
+                    role: NodeRole::Primary,
+                    primary: None,
+                    current_epoch: epoch,
+                    config_epoch: epoch,
+                },
+                heartbeat_view: PeerHeartbeatView {
+                    generation_id: generation,
+                    heartbeat: hb,
+                    pfail: pfail.iter().map(|s| s.to_string()).collect(),
+                    fail: fail.iter().map(|s| s.to_string()).collect(),
+                },
+            },
+        )
+    }
+
+    fn full_cluster_manager(
+        node_id: &str,
+        local: std::ops::RangeInclusive<u16>,
+        timeout_ms: u64,
+        t0: Instant,
+    ) -> ClusterManager {
+        let mut mgr = make_test_manager(local);
+        mgr.node_id = node_id.to_string();
+        mgr.config.node_id = node_id.to_string();
+        mgr.config.node_timeout_ms = Some(timeout_ms);
+        {
+            let mut st = mgr.state.write().unwrap();
+            st.node_id = node_id.to_string();
+            let slots = st.slots.slots_of("node-a");
+            for s in slots {
+                st.slots.set(s, node_id, 1);
+            }
+            st.current_epoch = 1;
+            st.config_epoch = 1;
+        }
+        *mgr.failure.write().unwrap() =
+            FailureTracker::new(node_id.to_string(), Duration::from_millis(timeout_ms), t0);
+        mgr
+    }
+
+    #[tokio::test]
+    async fn cluster_nodes_info_and_routing_reflect_pfail_fail_and_recovery() {
+        let t0 = Instant::now();
+        let mgr = full_cluster_manager("p1", 0..=5460, 1000, t0);
+
+        let initial: HashMap<_, _> = [
+            make_peer_snapshot("p2", "10.0.0.2:6379", 5461..=10922, 2, 1, 1, &[], &[]),
+            make_peer_snapshot("p3", "10.0.0.3:6379", 10923..=16383, 3, 1, 1, &[], &[]),
+        ]
+        .into();
+        mgr.process_peer_snapshots(initial, t0).await;
+
+        assert!(!mgr.is_pfail("p3"));
+        assert!(!mgr.is_failed("p3"));
+        assert_eq!(mgr.route(0, false, false).await, Route::Local);
+        assert_eq!(
+            mgr.route(12000, false, false).await,
+            Route::Moved("MOVED 12000 10.0.0.3:6379".to_string())
+        );
+        let info = mgr.get_cluster_info().await;
+        assert!(info.contains("cluster_state:ok\n"), "{info}");
+        assert!(info.contains("cluster_slots_ok:16384\n"), "{info}");
+        assert!(info.contains("cluster_slots_pfail:0\n"), "{info}");
+        assert!(info.contains("cluster_slots_fail:0\n"), "{info}");
+
+        // p3 stalls for node_timeout; p2 has NOT reported p3 yet -> p3 is PFAIL only.
+        let p3_pfail: HashMap<_, _> = [
+            make_peer_snapshot("p2", "10.0.0.2:6379", 5461..=10922, 2, 1, 2, &[], &[]),
+            make_peer_snapshot("p3", "10.0.0.3:6379", 10923..=16383, 3, 1, 1, &[], &[]),
+        ]
+        .into();
+        mgr.process_peer_snapshots(p3_pfail, t0 + Duration::from_millis(1000))
+            .await;
+        assert!(mgr.is_pfail("p3"));
+        assert!(!mgr.is_failed("p3"));
+        let nodes = mgr.get_cluster_nodes().await;
+        assert!(
+            nodes.contains("p3 10.0.0.3:6379 master,fail? - 0 0 3 disconnected 10923-16383\n"),
+            "{nodes}"
+        );
+        let info = mgr.get_cluster_info().await;
+        assert!(info.contains("cluster_slots_pfail:5461\n"), "{info}");
+        assert!(info.contains("cluster_slots_fail:0\n"), "{info}");
+
+        // p2 reports p3 PFAIL -> majority (2/3) marks p3 FAIL; slots answer CLUSTERDOWN.
+        let p3_fail: HashMap<_, _> = [
+            make_peer_snapshot("p2", "10.0.0.2:6379", 5461..=10922, 2, 1, 3, &["p3"], &[]),
+            make_peer_snapshot("p3", "10.0.0.3:6379", 10923..=16383, 3, 1, 1, &[], &[]),
+        ]
+        .into();
+        mgr.process_peer_snapshots(p3_fail, t0 + Duration::from_millis(1100))
+            .await;
+        assert!(mgr.is_failed("p3"));
+        assert_eq!(mgr.route(12000, false, false).await, Route::ClusterDown);
+        assert_eq!(mgr.route(0, false, false).await, Route::Local);
+        let nodes = mgr.get_cluster_nodes().await;
+        assert!(
+            nodes.contains("p3 10.0.0.3:6379 master,fail - 0 0 3 disconnected 10923-16383\n"),
+            "{nodes}"
+        );
+        let info = mgr.get_cluster_info().await;
+        assert!(info.contains("cluster_slots_pfail:0\n"), "{info}");
+        assert!(info.contains("cluster_slots_fail:5461\n"), "{info}");
+
+        // p3 restarts (new generation): connected but still `fail` for 2 * node_timeout.
+        let p3_back: HashMap<_, _> = [
+            make_peer_snapshot("p2", "10.0.0.2:6379", 5461..=10922, 2, 1, 4, &[], &["p3"]),
+            make_peer_snapshot("p3", "10.0.0.3:6379", 10923..=16383, 3, 2, 1, &[], &[]),
+        ]
+        .into();
+        mgr.process_peer_snapshots(p3_back, t0 + Duration::from_millis(2000))
+            .await;
+        assert!(!mgr.is_pfail("p3"));
+        assert!(mgr.is_failed("p3"));
+        assert_eq!(mgr.route(12000, false, false).await, Route::ClusterDown);
+        let nodes = mgr.get_cluster_nodes().await;
+        assert!(
+            nodes.contains("p3 10.0.0.3:6379 master,fail - 0 0 3 connected 10923-16383\n"),
+            "{nodes}"
+        );
+
+        // After 2 * node_timeout of reachability (t0 + 4000ms), FAIL clears.
+        let p3_mid: HashMap<_, _> = [
+            make_peer_snapshot("p2", "10.0.0.2:6379", 5461..=10922, 2, 1, 5, &[], &["p3"]),
+            make_peer_snapshot("p3", "10.0.0.3:6379", 10923..=16383, 3, 2, 2, &[], &[]),
+        ]
+        .into();
+        mgr.process_peer_snapshots(p3_mid, t0 + Duration::from_millis(3000))
+            .await;
+        let p3_clear: HashMap<_, _> = [
+            make_peer_snapshot("p2", "10.0.0.2:6379", 5461..=10922, 2, 1, 6, &[], &["p3"]),
+            make_peer_snapshot("p3", "10.0.0.3:6379", 10923..=16383, 3, 2, 3, &[], &[]),
+        ]
+        .into();
+        mgr.process_peer_snapshots(p3_clear, t0 + Duration::from_millis(4000))
+            .await;
+        assert!(!mgr.is_failed("p3"));
+        assert_eq!(
+            mgr.route(12000, false, false).await,
+            Route::Moved("MOVED 12000 10.0.0.3:6379".to_string())
+        );
+        let info = mgr.get_cluster_info().await;
+        assert!(info.contains("cluster_state:ok\n"), "{info}");
+    }
+
+    #[tokio::test]
+    async fn minority_stops_primary_reads_writes_and_replica_readonly_reads() {
+        let t0 = Instant::now();
+        let primary = full_cluster_manager("p1", 0..=5460, 1000, t0);
+        let peers_all: HashMap<_, _> = [
+            make_peer_snapshot("p2", "10.0.0.2:6379", 5461..=10922, 2, 1, 1, &[], &[]),
+            make_peer_snapshot("p3", "10.0.0.3:6379", 10923..=16383, 3, 1, 1, &[], &[]),
+        ]
+        .into();
+        primary.process_peer_snapshots(peers_all.clone(), t0).await;
+        assert!(!primary.is_in_minority());
+        assert_eq!(primary.route(0, false, false).await, Route::Local);
+        assert_eq!(primary.route(0, true, false).await, Route::Local);
+
+        // Both p2 and p3 stall for node_timeout -> p1 is in a minority.
+        primary
+            .process_peer_snapshots(peers_all, t0 + Duration::from_millis(1000))
+            .await;
+        assert!(primary.is_in_minority());
+        assert_eq!(primary.route(0, false, false).await, Route::ClusterDown);
+        assert_eq!(primary.route(0, true, false).await, Route::ClusterDown);
+        let info = primary.get_cluster_info().await;
+        assert!(info.contains("cluster_state:fail\n"), "{info}");
+
+        // p2 comes back -> p1 regains majority and serves again.
+        let p2_back: HashMap<_, _> = [
+            make_peer_snapshot("p2", "10.0.0.2:6379", 5461..=10922, 2, 1, 2, &[], &[]),
+            make_peer_snapshot("p3", "10.0.0.3:6379", 10923..=16383, 3, 1, 1, &[], &[]),
+        ]
+        .into();
+        primary
+            .process_peer_snapshots(p2_back, t0 + Duration::from_millis(1200))
+            .await;
+        assert!(!primary.is_in_minority());
+        assert_eq!(primary.route(0, false, false).await, Route::Local);
+        assert_eq!(primary.route(0, true, false).await, Route::Local);
+
+        // Synced replica of p1 in the same minority stops serving READONLY reads.
+        let replica = into_replica(full_cluster_manager("r1", 0..=0, 1000, t0), "p1", true);
+        {
+            let mut st = replica.state.write().unwrap();
+            st.slots = SlotTable::new();
+        }
+        let rep_all: HashMap<_, _> = [
+            make_peer_snapshot("p1", "10.0.0.1:6379", 0..=5460, 1, 1, 1, &[], &[]),
+            make_peer_snapshot("p2", "10.0.0.2:6379", 5461..=10922, 2, 1, 1, &[], &[]),
+            make_peer_snapshot("p3", "10.0.0.3:6379", 10923..=16383, 3, 1, 1, &[], &[]),
+        ]
+        .into();
+        replica.process_peer_snapshots(rep_all, t0).await;
+        assert_eq!(replica.route(0, true, true).await, Route::Local);
+
+        // p2 and p3 stall while p1 stays reachable -> replica is in a minority.
+        let rep_minority: HashMap<_, _> = [
+            make_peer_snapshot("p1", "10.0.0.1:6379", 0..=5460, 1, 1, 2, &[], &[]),
+            make_peer_snapshot("p2", "10.0.0.2:6379", 5461..=10922, 2, 1, 1, &[], &[]),
+            make_peer_snapshot("p3", "10.0.0.3:6379", 10923..=16383, 3, 1, 1, &[], &[]),
+        ]
+        .into();
+        replica
+            .process_peer_snapshots(rep_minority, t0 + Duration::from_millis(1000))
+            .await;
+        assert!(replica.is_in_minority());
+        assert_eq!(replica.route(0, true, true).await, Route::ClusterDown);
+
+        // p2 comes back -> replica resumes READONLY reads.
+        let rep_recovered: HashMap<_, _> = [
+            make_peer_snapshot("p1", "10.0.0.1:6379", 0..=5460, 1, 1, 3, &[], &[]),
+            make_peer_snapshot("p2", "10.0.0.2:6379", 5461..=10922, 2, 1, 2, &[], &[]),
+            make_peer_snapshot("p3", "10.0.0.3:6379", 10923..=16383, 3, 1, 1, &[], &[]),
+        ]
+        .into();
+        replica
+            .process_peer_snapshots(rep_recovered, t0 + Duration::from_millis(1200))
+            .await;
+        assert!(!replica.is_in_minority());
+        assert_eq!(replica.route(0, true, true).await, Route::Local);
     }
 }
