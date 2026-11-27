@@ -136,12 +136,6 @@ pub fn election_timeout(node_timeout: Duration) -> Duration {
     node_timeout.saturating_mul(2).max(Duration::from_secs(2))
 }
 
-/// Minimum time between the start of a failed election attempt and the next:
-/// `max(4 * node_timeout, 4 s)`.
-pub fn retry_backoff(node_timeout: Duration) -> Duration {
-    node_timeout.saturating_mul(4).max(Duration::from_secs(4))
-}
-
 /// Per-failed-primary vote backoff on voters: `2 * election_timeout(node_timeout)`
 /// (at least 4 s).
 ///
@@ -151,6 +145,18 @@ pub fn retry_backoff(node_timeout: Duration) -> Duration {
 /// winner's claim, even when `node_timeout_ms` is small (e.g. `< 1000 ms`).
 pub fn vote_backoff(node_timeout: Duration) -> Duration {
     election_timeout(node_timeout).saturating_mul(2)
+}
+
+/// Minimum time between the start of a failed election attempt and arming the
+/// next retry: `2 * vote_backoff(node_timeout)` (`4 * election_timeout`, at
+/// least 8 s), plus the rank delay and jitter applied on each retry.
+///
+/// Must strictly exceed `vote_backoff + election_timeout` so that if competing
+/// candidates split votes across staggered attempts, every voter's backoff has
+/// expired before the next round instead of locking candidates into permanent
+/// split-vote alternation (`FAILOVER.md` "Timing assumption").
+pub fn retry_backoff(node_timeout: Duration) -> Duration {
+    vote_backoff(node_timeout).saturating_mul(2)
 }
 
 /// Election start delay: `500 ms + random(0..500 ms) + rank * 1000 ms`.
@@ -676,25 +682,31 @@ mod tests {
 
         assert_eq!(
             retry_backoff(Duration::from_millis(500)),
-            Duration::from_secs(4)
+            Duration::from_secs(8)
         );
         assert_eq!(
             retry_backoff(Duration::from_millis(1000)),
-            Duration::from_secs(4)
+            Duration::from_secs(8)
         );
         assert_eq!(
             retry_backoff(Duration::from_millis(15_000)),
-            Duration::from_secs(60)
+            Duration::from_secs(120)
         );
 
         for ms in [10, 100, 500, 999, 1000, 5000, 15_000, 60_000] {
             let nt = Duration::from_millis(ms);
             let et = election_timeout(nt);
             let vb = vote_backoff(nt);
+            let rb = retry_backoff(nt);
             assert_eq!(vb, et.saturating_mul(2), "node_timeout_ms={ms}");
+            assert_eq!(rb, vb.saturating_mul(2), "node_timeout_ms={ms}");
             assert!(
-                vb >= et && vb >= Duration::from_secs(4),
-                "node_timeout_ms={ms}: vote_backoff={vb:?}, election_timeout={et:?}"
+                vb >= Duration::from_secs(4) && rb >= Duration::from_secs(8),
+                "node_timeout_ms={ms}: vote_backoff={vb:?}, retry_backoff={rb:?}"
+            );
+            assert!(
+                et <= vb && vb < rb.saturating_sub(et),
+                "node_timeout_ms={ms}: expected election_timeout({et:?}) <= vote_backoff({vb:?}) < retry_backoff({rb:?}) - election_timeout({et:?})"
             );
         }
         assert_eq!(

@@ -5504,4 +5504,141 @@ mod tests {
         assert!(info.contains("cluster_stats_manual_failover_succeeded:1"));
         assert!(info.contains("cluster_stats_manual_failover_aborted:1"));
     }
+
+    #[tokio::test]
+    async fn split_vote_resolves_on_next_retry_round() {
+        for (timeout_ms, stagger_r2) in [
+            // Typical rank-0 vs rank-1 stagger with worst-case jitter (r1 at 500ms, r2 at 1999ms).
+            (1000u64, election_delay(1, 499) - election_delay(0, 0)),
+            // Small node_timeout floor (200ms) with a full election_timeout stagger between attempts.
+            (200u64, election_timeout(Duration::from_millis(200))),
+            // Default node_timeout (15s) with a full election_timeout stagger between attempts.
+            (15_000u64, election_timeout(Duration::from_millis(15_000))),
+        ] {
+            let nt = Duration::from_millis(timeout_ms);
+            let t0 = Instant::now();
+
+            let p2 = full_cluster_manager("p2", 5461..=10922, timeout_ms, t0);
+            let p3 = full_cluster_manager("p3", 10923..=16383, timeout_ms, t0);
+            for voter in [&p2, &p3] {
+                {
+                    let mut st = voter.state.write().unwrap();
+                    st.current_epoch = 2;
+                    st.config_epoch = 1;
+                    for s in 0..=5460 {
+                        st.slots.set(s, "p1", 1);
+                    }
+                    for s in 5461..=10922 {
+                        st.slots.set(s, "p2", 1);
+                    }
+                    for s in 10923..=16383 {
+                        st.slots.set(s, "p3", 2);
+                    }
+                }
+                add_replica(voter, "r1", "10.0.0.10:6379", "p1", NodeRole::Replica).await;
+                add_replica(voter, "r2", "10.0.0.11:6379", "p1", NodeRole::Replica).await;
+            }
+
+            // Round 1 (split vote):
+            // r1 starts first; p2 sees p1 FAIL, p3 has not marked p1 FAIL yet.
+            let t_r1_round1 = t0 + election_delay(0, 0);
+            p2.failure
+                .write()
+                .unwrap()
+                .mark_failed_for_test("p1", t_r1_round1);
+            let r1_votes_1 = [
+                p2.handle_failover_auth_at(
+                    &auth_req("r1", 3, "p1", 1, 0..=5460, false),
+                    t_r1_round1,
+                )
+                .await,
+                p3.handle_failover_auth_at(
+                    &auth_req("r1", 3, "p1", 1, 0..=5460, false),
+                    t_r1_round1,
+                )
+                .await,
+            ];
+            assert!(r1_votes_1[0].is_ok(), "p2 should vote for r1 in round 1");
+            assert!(
+                r1_votes_1[1]
+                    .as_ref()
+                    .unwrap_err()
+                    .contains("not marked FAIL"),
+                "p3 should refuse r1 before marking p1 FAIL"
+            );
+
+            // r2 starts later after p3 has marked p1 FAIL; p3 votes for r2, p2 refuses (backoff).
+            let t_r2_round1 = t_r1_round1 + stagger_r2;
+            p3.failure
+                .write()
+                .unwrap()
+                .mark_failed_for_test("p1", t_r2_round1);
+            let r2_votes_1 = [
+                p2.handle_failover_auth_at(
+                    &auth_req("r2", 4, "p1", 1, 0..=5460, false),
+                    t_r2_round1,
+                )
+                .await,
+                p3.handle_failover_auth_at(
+                    &auth_req("r2", 4, "p1", 1, 0..=5460, false),
+                    t_r2_round1,
+                )
+                .await,
+            ];
+            assert!(
+                r2_votes_1[0].as_ref().unwrap_err().contains("vote backoff"),
+                "p2 should still be in vote backoff for r2 in round 1"
+            );
+            assert!(r2_votes_1[1].is_ok(), "p3 should vote for r2 in round 1");
+
+            // Round 2: both candidates wait retry_backoff(nt) from their round-1
+            // start plus a fresh rank delay + jitter (worst case: r1 earliest).
+            let t_r1_round2 = t_r1_round1 + retry_backoff(nt) + election_delay(0, 0);
+            let t_r2_round2 = t_r2_round1 + retry_backoff(nt) + election_delay(1, 0);
+
+            let r1_votes_2: usize = [
+                p2.handle_failover_auth_at(
+                    &auth_req("r1", 5, "p1", 1, 0..=5460, false),
+                    t_r1_round2,
+                )
+                .await,
+                p3.handle_failover_auth_at(
+                    &auth_req("r1", 5, "p1", 1, 0..=5460, false),
+                    t_r1_round2,
+                )
+                .await,
+            ]
+            .into_iter()
+            .filter(Result::is_ok)
+            .count();
+
+            let r2_votes_2: usize = [
+                p2.handle_failover_auth_at(
+                    &auth_req("r2", 6, "p1", 1, 0..=5460, false),
+                    t_r2_round2,
+                )
+                .await,
+                p3.handle_failover_auth_at(
+                    &auth_req("r2", 6, "p1", 1, 0..=5460, false),
+                    t_r2_round2,
+                )
+                .await,
+            ]
+            .into_iter()
+            .filter(Result::is_ok)
+            .count();
+
+            // Quorum is 2 of 3 primaries ({p1, p2, p3}): exactly one candidate wins round 2.
+            let winners = usize::from(r1_votes_2 >= 2) + usize::from(r2_votes_2 >= 2);
+            assert_eq!(
+                r1_votes_2, 2,
+                "timeout_ms={timeout_ms}: rank-0 candidate r1 must collect both votes on retry"
+            );
+            assert_eq!(
+                r2_votes_2, 0,
+                "timeout_ms={timeout_ms}: rank-1 candidate r2 must not split votes after r1 wins"
+            );
+            assert_eq!(winners, 1, "timeout_ms={timeout_ms}: expected one winner");
+        }
+    }
 }

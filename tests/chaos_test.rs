@@ -2259,7 +2259,7 @@ async fn auto_failover(mode: WriteMode) {
         let new_primary_idx = Mutex::new(None);
         wait_for(
             &format!("cycle {cycle}: automatic failover replaces {killed_name}"),
-            20,
+            30,
             || async {
                 let Ok(mut c) = Conn::open(p2_addr).await else {
                     return false;

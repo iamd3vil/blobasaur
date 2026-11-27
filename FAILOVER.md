@@ -155,8 +155,9 @@ majority of slot-owning primaries within `max(2 * node_timeout_ms, 2 s)`
 (measured from before sending the first vote request), the candidate wins and
 promotes only if the promotion commit point (`cluster-state.json` persist) is
 still reached before that election deadline; otherwise it abandons the attempt
-and can retry after `max(4 * node_timeout_ms, 4 s)` from the start of the
-previous attempt, with a new epoch.
+and can retry after `4 * max(2 * node_timeout_ms, 2 s)` (twice the vote backoff,
+at least 8 s) from the start of the previous attempt, plus a fresh rank delay
+and jitter, with a new epoch.
 
 Because a primary votes once per epoch and a win needs a majority, at most one
 candidate wins any epoch.
@@ -172,13 +173,22 @@ vote.
 second replica from taking slots that the first winner already took (whose
 writes it doesn't have). That holds only if an election ends, and the winner's
 claim reaches the voters, within the backoff: the candidate sets its election
-deadline to `max(2 * node_timeout_ms, 2 s)` before sending its first vote
+deadline to `T = max(2 * node_timeout_ms, 2 s)` before sending its first vote
 request (earlier than any voter records its vote) and re-checks that deadline
 right before committing `cluster-state.json` (so stopping sync tasks on a slow
-in-flight apply cannot commit late), while voters hold the backoff for twice
-that election window (`2 * max(2 * node_timeout_ms, 2 s)`, at least 4 s),
-leaving a full election window for the winner's claim to spread through gossip.
-Redis relies on the same assumption.
+in-flight apply cannot commit late), while voters hold the backoff for `2T`
+(`2 * max(2 * node_timeout_ms, 2 s)`, at least 4 s), leaving a full election
+window `T` for the winner's claim to spread through gossip. Redis relies on the
+same assumption.
+
+For liveness, the retry interval must strictly exceed the vote backoff plus an
+election window (`election_timeout <= vote_backoff < retry_backoff - election_timeout`,
+so `retry_backoff = 2 * vote_backoff = 4T`, at least 8 s, plus rank delay and
+jitter on re-arm). If `retry_backoff <= vote_backoff`, two competing candidates
+whose staggered first attempts each won one voter can retry in lockstep while
+the other candidate's voter is still in backoff and split votes indefinitely.
+`specs/Failover.tla`'s liveness abstracts this timing relation through
+`ForgetVote`.
 
 ## Promotion
 
