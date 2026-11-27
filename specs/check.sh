@@ -86,12 +86,27 @@ run_replication() {
   done
 }
 
+run_failover() {
+  expect_pass "Failover.tla" "Failover.cfg"
+  expect_pass "Failover.tla" "Failover_Liveness.cfg"
+  expect_violation "Failover.tla" "Failover_BugNoVoteBackoff.cfg" "Invariant WinnerReplacesCurrentOwner is violated"
+  expect_violation "Failover.tla" "Failover_BugNoSlotEpochCheck.cfg" "Invariant WinnerReplacesCurrentOwner is violated"
+  expect_violation "Failover.tla" "Failover_BugTableIgnoresEpoch.cfg" "Action property TableEpochsNeverDecrease is violated"
+}
+
+# Not in CI: about 40 minutes on 16 cores.
+run_failover_large() {
+  expect_pass "Failover.tla" "Failover_Large.cfg"
+  expect_violation "Failover.tla" "Failover_BugVolatileVotes.cfg" "Invariant OneWinnerPerEpoch is violated"
+}
+
 case "$SUITE" in
   all)
     run_async_write
     run_async_barrier
     run_cluster_and_negatives
     run_replication
+    run_failover
     ;;
   async-write)
     run_async_write
@@ -105,11 +120,17 @@ case "$SUITE" in
   replication)
     run_replication
     ;;
+  failover)
+    run_failover
+    ;;
+  failover-large)
+    run_failover_large
+    ;;
   replication-large)
     expect_pass "Replication.tla" "Replication_Large.cfg"
     ;;
   *)
-    echo "Usage: $0 [all|async-write|async-barrier|cluster-and-negatives|replication|replication-large]" >&2
+    echo "Usage: $0 [all|async-write|async-barrier|cluster-and-negatives|replication|replication-large|failover|failover-large]" >&2
     exit 2
     ;;
 esac

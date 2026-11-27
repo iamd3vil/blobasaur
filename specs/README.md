@@ -49,6 +49,14 @@ Abstractions: one shard, one table, one replica; each write is its own commit; a
 - **Safety**: `TypeOK`, `CaughtUpMeansEqual` (when a replica commits watermark `W`, its live rows equal the primary's live rows as of LSN `W` under the same replid; planned failover relies on this), `ReplicaNeverAhead`, `LsnsUnique`, `SyncedMeansCaughtUp`, `PagesMatchReplid`, `StreamImpliesConnection`, deadlock freedom.
 - **Liveness**: `ReplicaEventuallyConverges` (`<>[]Converged`: once faults and writes stop, the replica is caught up to the primary's watermark with its live rows).
 
+## 4. `Failover.tla`
+
+Models the automatic failover in `FAILOVER.md`, which follows Redis Cluster: `configEpoch`-versioned slot claims in per-node slot tables merged by gossip, FAIL agreement, replica elections voted by a majority of slot-owning primaries (`last_vote_epoch` and a persisted vote backoff), promotion, demotion of a returning primary, and re-pointing of the other replicas. Three primaries, two replicas of one of them, crashes, restarts, partitions and aborted elections. FAIL can be marked only while a majority of primaries can't reach the node; data is not modeled.
+
+### Properties verified
+- **Safety**: `TypeOK`, `OneWinnerPerEpoch`, `WinnerReplacesCurrentOwner` (a winner never takes slots from a superseded claim, which would drop the current owner's writes), `UniqueClaims`, `TableEpochsNeverDecrease` (action property: a returning old primary never takes its slots back).
+- **Liveness**: `EventuallyConverges` (once faults stop, all live nodes agree on the table, every slot has a live primary and every replica is synced; a replica replaces a primary that never returns).
+
 ## Configs
 
 | Spec | Config | Purpose | Expected |
@@ -64,6 +72,13 @@ Abstractions: one shard, one table, one replica; each write is its own commit; a
 | `ClusterGossip.tla` | `ClusterGossip_BugPublishRace.cfg` | Enables unlocked `update_gossip_data()` race (`src/cluster.rs:573-628`) | Fails `GossipEventuallyConverges` |
 | `Replication.tla` | `Replication.cfg` | Writes, cleanup, trims, disconnects, crashes and power loss on both sides — safety + liveness | Pass |
 | `Replication.tla` | `Replication_Large.cfg` | Same with 3 writes; about 25 minutes on 16 cores, not in CI (`./specs/check.sh replication-large`) | Pass |
+| `Failover.tla` | `Failover.cfg` | Two replicas competing, one fault, two election epochs — safety | Pass |
+| `Failover.tla` | `Failover_Liveness.cfg` | One replica; `p1` may crash for good — safety + liveness | Pass |
+| `Failover.tla` | `Failover_Large.cfg` | Two faults; about 30 minutes on 16 cores, not in CI (`./specs/check.sh failover-large`) | Pass |
+| `Failover.tla` | `Failover_BugNoVoteBackoff.cfg` | Votes again for the same failed primary before the first winner's claim arrives | Fails `WinnerReplacesCurrentOwner` |
+| `Failover.tla` | `Failover_BugNoSlotEpochCheck.cfg` | Votes without comparing the request's slot epochs | Fails `WinnerReplacesCurrentOwner` |
+| `Failover.tla` | `Failover_BugTableIgnoresEpoch.cfg` | Gossip overwrites slot bindings regardless of epoch | Fails `TableEpochsNeverDecrease` |
+| `Failover.tla` | `Failover_BugVolatileVotes.cfg` | `last_vote_epoch` and the vote backoff lost on restart; about 10 minutes, not in CI | Fails `OneWinnerPerEpoch` |
 | `Replication.tla` | `Replication_BugUpsertKeepsLsn.cfg` | `ON CONFLICT DO UPDATE` instead of `INSERT OR REPLACE`: a rewrite keeps its LSN | Fails `CaughtUpMeansEqual` |
 | `Replication.tla` | `Replication_BugNoAutoincrement.cfg` | `repl_log` without `AUTOINCREMENT` reuses a trimmed tombstone's LSN | Fails `CaughtUpMeansEqual` |
 | `Replication.tla` | `Replication_BugTrimIgnoresPins.cfg` | Trims tombstones above an active stream's cursor | Fails `CaughtUpMeansEqual` |

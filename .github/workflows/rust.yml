@@ -36,7 +36,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [async-write, async-barrier, cluster-and-negatives, replication]
+        suite: [async-write, async-barrier, cluster-and-negatives, replication, failover]
 
     steps:
     - uses: actions/checkout@v4
