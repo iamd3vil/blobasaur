@@ -5,6 +5,7 @@
 //! a returning primary at an older epoch cannot reclaim its slots.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -18,6 +19,17 @@ use crate::config::ClusterConfig;
 
 /// File inside `<data_dir>` holding persisted cluster state.
 pub const CLUSTER_STATE_FILE: &str = "cluster-state.json";
+
+/// Prefix of temp files written by [`ClusterState::save_atomic`].
+const CLUSTER_STATE_TMP_PREFIX: &str = ".cluster-state.json.tmp.";
+
+/// Returns true if `name` is `cluster-state.json` or a temp file created while writing it.
+pub fn is_cluster_state_file(name: &OsStr) -> bool {
+    name == CLUSTER_STATE_FILE
+        || name
+            .to_str()
+            .is_some_and(|s| s.starts_with(CLUSTER_STATE_TMP_PREFIX))
+}
 
 /// Node role stored in `cluster-state.json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -256,6 +268,7 @@ impl SlotTable {
 /// On-disk JSON representation of [`ClusterState`].
 #[derive(Debug, Serialize, Deserialize)]
 struct ClusterStateWire {
+    node_id: String,
     current_epoch: u64,
     last_vote_epoch: u64,
     #[serde(default)]
@@ -270,6 +283,7 @@ struct ClusterStateWire {
 /// Persisted per-node cluster state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterState {
+    pub node_id: String,
     pub current_epoch: u64,
     pub last_vote_epoch: u64,
     pub last_vote_for: BTreeMap<String, u64>,
@@ -280,8 +294,9 @@ pub struct ClusterState {
 }
 
 impl ClusterState {
-    pub fn bootstrap_primary() -> Self {
+    pub fn bootstrap_primary(node_id: String) -> Self {
         Self {
+            node_id,
             current_epoch: 0,
             last_vote_epoch: 0,
             last_vote_for: BTreeMap::new(),
@@ -292,8 +307,9 @@ impl ClusterState {
         }
     }
 
-    pub fn bootstrap_replica(primary: String) -> Self {
+    pub fn bootstrap_replica(node_id: String, primary: String) -> Self {
         Self {
+            node_id,
             current_epoch: 0,
             last_vote_epoch: 0,
             last_vote_for: BTreeMap::new(),
@@ -310,6 +326,7 @@ impl ClusterState {
 
     fn to_wire(&self) -> ClusterStateWire {
         ClusterStateWire {
+            node_id: self.node_id.clone(),
             current_epoch: self.current_epoch,
             last_vote_epoch: self.last_vote_epoch,
             last_vote_for: self.last_vote_for.clone(),
@@ -320,7 +337,25 @@ impl ClusterState {
         }
     }
 
-    fn from_wire(wire: ClusterStateWire, node_id: &str) -> Result<Self, String> {
+    fn from_wire(
+        wire: ClusterStateWire,
+        expected_node_id: &str,
+        path: &Path,
+    ) -> Result<Self, String> {
+        if wire.node_id.is_empty() {
+            return Err(format!(
+                "cluster state {} has an empty node_id",
+                path.display()
+            ));
+        }
+        if wire.node_id != expected_node_id {
+            return Err(format!(
+                "cluster state {} belongs to node '{}', but config has node_id '{}'",
+                path.display(),
+                wire.node_id,
+                expected_node_id
+            ));
+        }
         let slots = SlotTable::from_runs(wire.slots)?;
         match wire.role {
             PersistedRole::Replica => {
@@ -330,14 +365,14 @@ impl ClusterState {
                 if primary.is_empty() {
                     return Err("cluster state has role=replica with empty primary".to_string());
                 }
-                if primary == node_id {
+                if primary == expected_node_id {
                     return Err(format!(
-                        "cluster state has role=replica pointing to self ({node_id})"
+                        "cluster state has role=replica pointing to self ({expected_node_id})"
                     ));
                 }
-                if slots.has_slots_of(node_id) {
+                if slots.has_slots_of(expected_node_id) {
                     return Err(format!(
-                        "cluster state has role=replica while node {node_id} owns slots"
+                        "cluster state has role=replica while node {expected_node_id} owns slots"
                     ));
                 }
             }
@@ -348,6 +383,7 @@ impl ClusterState {
             }
         }
         Ok(Self {
+            node_id: wire.node_id,
             current_epoch: wire.current_epoch,
             last_vote_epoch: wire.last_vote_epoch,
             last_vote_for: wire.last_vote_for,
@@ -368,7 +404,7 @@ impl ClusterState {
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         let seq = NEXT_TMP.fetch_add(1, Ordering::Relaxed);
         let tmp_path = parent.join(format!(
-            ".{CLUSTER_STATE_FILE}.tmp.{}.{seq}",
+            "{CLUSTER_STATE_TMP_PREFIX}{}.{seq}",
             std::process::id()
         ));
 
@@ -403,7 +439,31 @@ impl ClusterState {
             .map_err(|e| format!("failed to read cluster state {}: {e}", path.display()))?;
         let wire: ClusterStateWire = serde_json::from_slice(&raw)
             .map_err(|e| format!("failed to parse cluster state {}: {e}", path.display()))?;
-        Self::from_wire(wire, node_id)
+        Self::from_wire(wire, node_id, path)
+    }
+}
+
+/// Remove stale `.cluster-state.json.tmp.*` files left behind by an interrupted write.
+fn cleanup_stale_tmp_files(data_dir: &Path) {
+    let Ok(entries) = fs::read_dir(data_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name
+            .to_str()
+            .is_some_and(|s| s.starts_with(CLUSTER_STATE_TMP_PREFIX))
+        {
+            let path = entry.path();
+            match fs::remove_file(&path) {
+                Ok(()) => warn!("Removed stale cluster state temp file {}", path.display()),
+                Err(e) => warn!(
+                    "Failed to remove stale cluster state temp file {}: {}",
+                    path.display(),
+                    e
+                ),
+            }
+        }
     }
 }
 
@@ -428,12 +488,14 @@ pub struct LoadedClusterState {
 
 /// Load `<data_dir>/cluster-state.json` if it exists, otherwise build the
 /// initial state from config (without writing the file yet; bootstrap writes it
-/// once `claim_slots` completes).
+/// once `claim_slots` completes). Removes stale temp files left by crashes.
 pub fn load_or_bootstrap(
     data_dir: &Path,
     config: &ClusterConfig,
     cfg_replica_of: Option<&str>,
 ) -> Result<LoadedClusterState, String> {
+    cleanup_stale_tmp_files(data_dir);
+
     let path = data_dir.join(CLUSTER_STATE_FILE);
     if path.exists() {
         let state = ClusterState::load(&path, &config.node_id)?;
@@ -450,9 +512,9 @@ pub fn load_or_bootstrap(
             if primary == config.node_id {
                 return Err(format!("replica_of must be another node, not {primary}"));
             }
-            ClusterState::bootstrap_replica(primary.to_string())
+            ClusterState::bootstrap_replica(config.node_id.clone(), primary.to_string())
         }
-        None => ClusterState::bootstrap_primary(),
+        None => ClusterState::bootstrap_primary(config.node_id.clone()),
     };
     Ok(LoadedClusterState {
         state,
@@ -535,7 +597,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join(CLUSTER_STATE_FILE);
 
-        let mut state = ClusterState::bootstrap_primary();
+        let mut state = ClusterState::bootstrap_primary("node-1".to_string());
         state.current_epoch = 7;
         state.last_vote_epoch = 5;
         state.last_vote_for.insert("node-dead".to_string(), 5);
@@ -569,11 +631,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join(CLUSTER_STATE_FILE);
 
-        let mut first = ClusterState::bootstrap_primary();
+        let mut first = ClusterState::bootstrap_primary("node-2".to_string());
         first.current_epoch = 1;
         first.save_atomic(&path).unwrap();
 
-        let mut second = ClusterState::bootstrap_replica("node-1".to_string());
+        let mut second =
+            ClusterState::bootstrap_replica("node-2".to_string(), "node-1".to_string());
         second.current_epoch = 9;
         second.last_vote_epoch = 8;
         second.save_atomic(&path).unwrap();
@@ -590,20 +653,70 @@ mod tests {
         // Bootstrap without state file follows config.
         let boot = load_or_bootstrap(dir.path(), &cfg, None).unwrap();
         assert!(!boot.from_file);
+        assert_eq!(boot.state.node_id, "node-1");
         assert_eq!(boot.state.role, PersistedRole::Primary);
         assert_eq!(boot.state.primary, None);
         assert!(!boot.path.exists(), "bootstrap writes only after claim");
 
         // Persist a replica state file, then restart with primary config: file wins.
-        let mut persisted = ClusterState::bootstrap_replica("node-2".to_string());
+        let mut persisted =
+            ClusterState::bootstrap_replica("node-1".to_string(), "node-2".to_string());
         persisted.current_epoch = 3;
         persisted.save_atomic(&boot.path).unwrap();
 
         let reloaded = load_or_bootstrap(dir.path(), &cfg, None).unwrap();
         assert!(reloaded.from_file);
+        assert_eq!(reloaded.state.node_id, "node-1");
         assert_eq!(reloaded.state.role, PersistedRole::Replica);
         assert_eq!(reloaded.state.primary.as_deref(), Some("node-2"));
         assert_eq!(reloaded.state.current_epoch, 3);
+    }
+
+    #[test]
+    fn load_rejects_mismatched_node_id() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(CLUSTER_STATE_FILE);
+
+        let state = ClusterState::bootstrap_primary("node-1".to_string());
+        state.save_atomic(&path).unwrap();
+
+        let err = ClusterState::load(&path, "node-2").unwrap_err();
+        assert!(err.contains("node-1"), "error should name state id: {err}");
+        assert!(err.contains("node-2"), "error should name config id: {err}");
+        assert!(
+            err.contains(&path.display().to_string()),
+            "error should name file path: {err}"
+        );
+
+        let cfg = test_cluster_cfg("node-2", None);
+        let boot_err = load_or_bootstrap(dir.path(), &cfg, None).unwrap_err();
+        assert!(boot_err.contains("node-1") && boot_err.contains("node-2"));
+    }
+
+    #[test]
+    fn load_or_bootstrap_removes_stale_tmp_files() {
+        let dir = TempDir::new().unwrap();
+        let stale1 = dir.path().join(".cluster-state.json.tmp.1234.0");
+        let stale2 = dir.path().join(".cluster-state.json.tmp.5678.9");
+        let keep = dir.path().join("other.txt");
+        fs::write(&stale1, b"partial").unwrap();
+        fs::write(&stale2, b"partial").unwrap();
+        fs::write(&keep, b"keep").unwrap();
+
+        let cfg = test_cluster_cfg("node-1", None);
+        let loaded = load_or_bootstrap(dir.path(), &cfg, None).unwrap();
+        assert!(!loaded.from_file);
+        assert!(!stale1.exists());
+        assert!(!stale2.exists());
+        assert!(keep.exists());
+
+        // Also cleans up when an existing cluster-state.json is loaded.
+        loaded.state.save_atomic(&loaded.path).unwrap();
+        fs::write(&stale1, b"partial").unwrap();
+        let reloaded = load_or_bootstrap(dir.path(), &cfg, None).unwrap();
+        assert!(reloaded.from_file);
+        assert!(!stale1.exists());
+        assert!(loaded.path.exists());
     }
 
     #[test]
@@ -649,7 +762,7 @@ mod tests {
         // Replica without primary.
         fs::write(
             &path,
-            r#"{"current_epoch":0,"last_vote_epoch":0,"last_vote_for":{},"role":"replica","primary":null,"config_epoch":0,"slots":[]}"#,
+            r#"{"node_id":"n1","current_epoch":0,"last_vote_epoch":0,"last_vote_for":{},"role":"replica","primary":null,"config_epoch":0,"slots":[]}"#,
         )
         .unwrap();
         assert!(ClusterState::load(&path, "n1").is_err());
@@ -657,7 +770,7 @@ mod tests {
         // Overlapping slot ranges.
         fs::write(
             &path,
-            r#"{"current_epoch":1,"last_vote_epoch":0,"last_vote_for":{},"role":"primary","primary":null,"config_epoch":1,"slots":[{"start":0,"end":5,"node_id":"n1","config_epoch":1},{"start":5,"end":10,"node_id":"n2","config_epoch":1}]}"#,
+            r#"{"node_id":"n1","current_epoch":1,"last_vote_epoch":0,"last_vote_for":{},"role":"primary","primary":null,"config_epoch":1,"slots":[{"start":0,"end":5,"node_id":"n1","config_epoch":1},{"start":5,"end":10,"node_id":"n2","config_epoch":1}]}"#,
         )
         .unwrap();
         assert!(ClusterState::load(&path, "n1").is_err());

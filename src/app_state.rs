@@ -864,11 +864,12 @@ fn validate_shard_count(data_dir: &str, expected_shards: usize) -> Result<()> {
         ));
     }
 
-    // If the directory is empty (or holds only cluster-state.json), no shards exist yet.
+    // If the directory is empty (or holds only cluster-state.json and its temp files),
+    // no shards exist yet.
     if let Ok(entries) = fs::read_dir(data_path)
         && entries
             .flatten()
-            .all(|e| e.file_name() == crate::cluster::CLUSTER_STATE_FILE)
+            .all(|e| crate::cluster::is_cluster_state_file(&e.file_name()))
     {
         return Ok(());
     }
@@ -1232,6 +1233,19 @@ mod tests {
             "Shard count mismatch: expected 3 shards, found 3 of them. Found shard files beyond \
              num_shards: [3, 4] (change the shard count with `blobasaur shard migrate`)"
         );
+    }
+
+    #[test]
+    fn validate_shard_count_ignores_cluster_state_and_tmp_files() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join(crate::cluster::CLUSTER_STATE_FILE), b"{}").unwrap();
+        fs::write(dir.path().join(".cluster-state.json.tmp.42.0"), b"partial").unwrap();
+
+        validate_shard_count(dir.path().to_str().unwrap(), 2).unwrap();
+
+        // Any other file with missing shards is still treated as a mismatch.
+        fs::write(dir.path().join("unrelated.db"), b"").unwrap();
+        assert!(validate_shard_count(dir.path().to_str().unwrap(), 2).is_err());
     }
 
     #[tokio::test]

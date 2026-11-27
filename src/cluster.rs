@@ -3,7 +3,7 @@ mod state;
 #[allow(unused_imports)]
 pub use state::{
     CLUSTER_STATE_FILE, ClusterState, LoadedClusterState, MergeOutcome, PersistedRole, SlotBinding,
-    SlotRangeBinding, SlotTable, configured_slots, load_or_bootstrap,
+    SlotRangeBinding, SlotTable, configured_slots, is_cluster_state_file, load_or_bootstrap,
 };
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -888,6 +888,16 @@ impl ClusterManager {
         let known_addrs = self.known_addrs.read().unwrap().clone();
 
         let (local_ip, local_port) = local_endpoint(&self.config, self.local_addr);
+        // In Redis CLUSTER NODES, a replica reports its primary's config_epoch.
+        let primary_epoch = |primary_id: &str| -> u64 {
+            if primary_id == self.node_id && state.role == PersistedRole::Primary {
+                state.config_epoch
+            } else if let Some(peer) = nodes.get(primary_id) {
+                peer.config_epoch
+            } else {
+                state.slots.max_epoch_for(primary_id)
+            }
+        };
 
         // Local node line.
         let local_info = match state.role {
@@ -895,7 +905,11 @@ impl ClusterManager {
                 let primary = state.primary.as_deref().unwrap_or("-");
                 format!(
                     "{} {}:{} myself,slave {} 0 0 {} connected",
-                    self.node_id, local_ip, local_port, primary, state.config_epoch
+                    self.node_id,
+                    local_ip,
+                    local_port,
+                    primary,
+                    primary_epoch(primary)
                 )
             }
             PersistedRole::Primary => {
@@ -949,7 +963,7 @@ impl ClusterManager {
                     node.addr.ip(),
                     node.addr.port(),
                     primary,
-                    node.config_epoch
+                    primary_epoch(primary)
                 ),
             };
             result.push(node_info);
@@ -1246,11 +1260,8 @@ impl ClusterManager {
             }
             if let Some(existing) = candidate.slots.get(slot)
                 && existing.node_id != self.node_id
-                && existing.epoch >= candidate.config_epoch
             {
-                return Err(
-                    format!("ERR slot {} is already owned by {}", slot, existing.node_id).into(),
-                );
+                return Err(format!("ERR Slot {} is already busy", slot).into());
             }
             candidate
                 .slots
@@ -1412,6 +1423,7 @@ impl ClusterManager {
             nodes: Arc::new(RwLock::new(HashMap::new())),
             known_addrs: Arc::new(std::sync::RwLock::new(HashMap::new())),
             state: Arc::new(std::sync::RwLock::new(ClusterState::bootstrap_replica(
+                node_id.to_string(),
                 primary.to_string(),
             ))),
             state_path: None,
@@ -1596,10 +1608,16 @@ mod tests {
         assert_eq!(ClusterManager::slots_to_ranges(&slots), "");
     }
 
-    fn bootstrap_loaded(dir: &std::path::Path, replica_of: Option<&str>) -> LoadedClusterState {
+    fn bootstrap_loaded(
+        dir: &std::path::Path,
+        node_id: &str,
+        replica_of: Option<&str>,
+    ) -> LoadedClusterState {
         let state = match replica_of {
-            Some(primary) => ClusterState::bootstrap_replica(primary.to_string()),
-            None => ClusterState::bootstrap_primary(),
+            Some(primary) => {
+                ClusterState::bootstrap_replica(node_id.to_string(), primary.to_string())
+            }
+            None => ClusterState::bootstrap_primary(node_id.to_string()),
         };
         LoadedClusterState {
             state,
@@ -1630,7 +1648,7 @@ mod tests {
             &config,
             gossip_bind_addr,
             redis_addr,
-            bootstrap_loaded(dir.path(), None),
+            bootstrap_loaded(dir.path(), "test-node", None),
             1,
         )
         .await;
@@ -1675,7 +1693,7 @@ mod tests {
             node_timeout_ms: None,
             replica_validity_factor: None,
         };
-        let mut state = ClusterState::bootstrap_primary();
+        let mut state = ClusterState::bootstrap_primary(node_id.to_string());
         for &slot in local {
             state.slots.set(slot, node_id, 0);
         }
@@ -2098,7 +2116,7 @@ mod tests {
             &config,
             bind,
             "127.0.0.1:6379".parse().unwrap(),
-            bootstrap_loaded(dir.path(), None),
+            bootstrap_loaded(dir.path(), "test-node", None),
             1,
         )
         .await
@@ -2135,7 +2153,7 @@ mod tests {
             &config,
             gossip_bind_addr,
             redis_addr,
-            bootstrap_loaded(dir.path(), None),
+            bootstrap_loaded(dir.path(), "test-node", None),
             1,
         )
         .await
@@ -2185,7 +2203,7 @@ mod tests {
             node_timeout_ms: None,
             replica_validity_factor: None,
         };
-        let mut state = ClusterState::bootstrap_primary();
+        let mut state = ClusterState::bootstrap_primary("node-a".to_string());
         for slot in local_slots {
             state.slots.set(slot, "node-a", 0);
         }
@@ -2339,7 +2357,7 @@ mod tests {
             &config,
             gossip_bind_addr,
             redis_addr,
-            bootstrap_loaded(dir.path(), None),
+            bootstrap_loaded(dir.path(), "node-race", None),
             1,
         )
         .await
@@ -2554,6 +2572,17 @@ mod tests {
         assert!(info.contains("cluster_size:2\n"), "{info}");
         assert!(info.contains("cluster_known_nodes:4\n"), "{info}");
 
+        // Replicas report their primary's config_epoch in CLUSTER NODES.
+        let live_nodes = manager.get_cluster_nodes().await;
+        assert!(
+            live_nodes.contains("node-a1 10.0.0.4:6382 slave node-a 0 0 3 connected\n"),
+            "{live_nodes}"
+        );
+        assert!(
+            live_nodes.contains("node-b1 10.0.0.3:6381 slave node-b 0 0 4 connected\n"),
+            "{live_nodes}"
+        );
+
         let shards = manager.get_cluster_shards().await;
         assert_eq!(shards.len(), 2);
         // Shard 0 is node-a with disjoint ranges (0, 1) and (9, 9), plus loading replica node-a1.
@@ -2583,5 +2612,71 @@ mod tests {
         assert_eq!(shards_after[1].nodes[0].health, "failed");
         let slots_after = manager.get_cluster_slots().await;
         assert!(slots_after.iter().all(|r| r.node_id == "node-a"));
+    }
+
+    #[tokio::test]
+    async fn add_slots_refuses_slots_bound_to_another_node_even_at_lower_epoch() {
+        let manager = manager_with(&[0, 1], &[("node-b", "10.0.0.2:6379", &[10, 11])]);
+        {
+            let mut st = manager.state.write().unwrap();
+            st.current_epoch = 5;
+            st.config_epoch = 5;
+            st.slots.rebind_owner_epoch("node-a", 5);
+            st.slots.rebind_owner_epoch("node-b", 1);
+        }
+
+        // Slot 10 is bound to node-b at epoch 1 < node-a's config_epoch 5: must be refused.
+        let err = manager.add_slots(vec![2, 10]).await.unwrap_err();
+        assert_eq!(err.to_string(), "ERR Slot 10 is already busy");
+        // Failed command leaves both slot 2 and slot 10 unchanged.
+        assert!(manager.state_snapshot().slots.get(2).is_none());
+        assert_eq!(
+            manager.state_snapshot().slots.get(10).unwrap().node_id,
+            "node-b"
+        );
+        assert_eq!(manager.state_snapshot().slots.get(10).unwrap().epoch, 1);
+
+        // Self-owned and unbound slots are accepted.
+        manager.add_slots(vec![0, 2]).await.unwrap();
+        assert_eq!(
+            manager.state_snapshot().slots.get(2).unwrap().node_id,
+            "node-a"
+        );
+        assert_eq!(manager.state_snapshot().slots.get(2).unwrap().epoch, 5);
+    }
+
+    #[tokio::test]
+    async fn replica_self_line_reports_primary_config_epoch() {
+        let manager = into_replica(
+            manager_with(&[], &[("node-b", "10.0.0.2:6379", &[5, 6])]),
+            "node-b",
+            true,
+        );
+        {
+            let mut st = manager.state.write().unwrap();
+            st.current_epoch = 7;
+            st.slots.rebind_owner_epoch("node-b", 7);
+        }
+        manager
+            .nodes
+            .write()
+            .await
+            .get_mut("node-b")
+            .unwrap()
+            .config_epoch = 7;
+
+        let nodes = manager.get_cluster_nodes().await;
+        assert!(
+            nodes.starts_with("node-a 10.0.0.1:6379 myself,slave node-b 0 0 7 connected\n"),
+            "{nodes}"
+        );
+
+        // Even when primary is offline, replica falls back to the slot table's epoch.
+        manager.process_peers(HashMap::new()).await;
+        let nodes = manager.get_cluster_nodes().await;
+        assert!(
+            nodes.starts_with("node-a 10.0.0.1:6379 myself,slave node-b 0 0 7 connected\n"),
+            "{nodes}"
+        );
     }
 }

@@ -116,6 +116,7 @@ end = 16383
 
 Each clustered node persists its cluster metadata to `<data_dir>/cluster-state.json` using atomic writes (write temp file, fsync, rename, fsync directory). The file stores:
 
+- `node_id` (checked against `[cluster].node_id` on startup; a mismatch stops startup)
 - `current_epoch`, `last_vote_epoch`, `last_vote_for`
 - `role` (`primary` or `replica`) and `primary` (replica only)
 - `config_epoch` (primary slot-claim version)
@@ -315,7 +316,7 @@ Failover is manual and the operator fences the old primary. Nothing in the clust
 
 1. **Fence the old primary.** Make sure `node-1` is stopped and cannot restart with its old config: stop the unit, block its ports, or take the host down.
 2. **Wait for the cluster to see it as dead.** Run `valkey-cli -p 6384 CLUSTER NODES` (any live node) until `node-1` is no longer listed as live. Restarting the replica earlier fails: the startup guard refuses to start while a live node still claims the slots.
-3. **Promote the replica.** Stop the replica, remove `<data_dir>/cluster-state.json` (so it re-bootstraps from config rather than keeping its persisted replica role), edit `config.node1b.toml` to remove `[replication]`'s `replica_of` and add `node-1`'s slots, then start it:
+3. **Promote the replica (interim procedure until `CLUSTER FAILOVER TAKEOVER` lands).** Stop the replica, remove `<data_dir>/cluster-state.json` (so it re-bootstraps from config rather than keeping its persisted replica role), edit `config.node1b.toml` to remove `[replication]`'s `replica_of` and add `node-1`'s slots, then start it:
    ```toml
    [replication]
    tombstone_retention_secs = 86400
@@ -325,8 +326,10 @@ Failover is manual and the operator fences the old primary. Nothing in the clust
    end = 5460
    ```
    On start it promotes (refusing if any shard never finished its first copy) and generates a new `replid`. Check `valkey-cli -p 6384 CLUSTER NODES` shows it as `master` with the slots.
-4. **Repoint other replicas.** For every other replica of `node-1`, stop it, remove its `<data_dir>/cluster-state.json`, set `replica_of = "node-1b"`, and start it. It gets a resync and copies everything again.
-5. **Bring `node-1` back (optional).** Remove its `<data_dir>/cluster-state.json`, give it `replica_of = "node-1b"`, remove its `slot_ranges`, and start it. It resyncs from `node-1b`; writes it never replicated are discarded.
+
+   > **Warning:** Removing `<data_dir>/cluster-state.json` is an interim step until `CLUSTER FAILOVER TAKEOVER` lands in the next failover PR. Outside of this manual failover procedure, never delete `cluster-state.json`: doing so discards the node's epochs (`current_epoch`, `config_epoch`), slot table, and persisted vote state (`last_vote_epoch`, `last_vote_for`).
+4. **Repoint other replicas (interim).** For every other replica of `node-1`, stop it, remove its `<data_dir>/cluster-state.json`, set `replica_of = "node-1b"`, and start it. It gets a resync and copies everything again.
+5. **Bring `node-1` back (optional, interim).** Remove its `<data_dir>/cluster-state.json`, give it `replica_of = "node-1b"`, remove its `slot_ranges`, and start it. It resyncs from `node-1b`; writes it never replicated are discarded.
 
 #### Planned (maintenance)
 

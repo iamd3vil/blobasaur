@@ -1450,8 +1450,9 @@ async fn planned_failover_promotes_the_replica_without_losing_writes() {
     .await;
     drop(client);
 
-    // Step 4: stop the primary, remove the replica's persisted cluster state so
-    // it re-bootstraps from the primary config, and restart it with the slots.
+    // Step 4 (interim until CLUSTER FAILOVER TAKEOVER lands): stop the primary,
+    // remove the replica's persisted cluster state so it re-bootstraps from the
+    // primary config, and restart it with the slots.
     primary.stop().await;
     replica.stop().await;
     std::fs::remove_file(rdir.path().join(blobasaur::cluster::CLUSTER_STATE_FILE)).unwrap();

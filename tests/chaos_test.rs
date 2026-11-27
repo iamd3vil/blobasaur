@@ -1313,9 +1313,9 @@ impl Rig {
         self.proxy.set(Mode::Pass);
     }
 
-    /// The runbook's promotion: remove persisted cluster state and restart the
-    /// replica's data dir as a primary owning every slot, retrying while the
-    /// startup guard refuses.
+    /// Interim promotion until `CLUSTER FAILOVER TAKEOVER` lands: remove
+    /// persisted cluster state and restart the replica's data dir as a primary
+    /// owning every slot, retrying while the startup guard refuses.
     async fn promote(&mut self) {
         self.r.replica_of = None;
         self.r.seeds = vec![format!("127.0.0.1:{}", self.p.gossip_port)];

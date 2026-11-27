@@ -424,11 +424,21 @@ async fn three_node_cluster_resolves_epochs_serves_shards_and_reloads_state_on_r
     assert_eq!(replica0["health"], "online");
     assert_eq!(replica0["port"], replica.addr.port().to_string());
 
-    // State file was persisted on disk with the resolved epochs and slot table.
+    // State file was persisted on disk with node_id, resolved epochs, and slot table.
     let saved_n1 = ClusterState::load(&dir1.path().join(CLUSTER_STATE_FILE), "node-1").unwrap();
+    assert_eq!(saved_n1.node_id, "node-1");
     assert_eq!(saved_n1.role, PersistedRole::Primary);
     assert_eq!(saved_n1.config_epoch, primary_my_epochs["node-1"]);
     assert_eq!(saved_n1.slots.slot_count(), 16384);
+
+    // Replica's config-epoch column in CLUSTER NODES matches its primary's config_epoch.
+    let n1_nodes_epochs = parse_nodes_epochs(
+        &Client::connect(n1.addr)
+            .await
+            .call_bulk(&["CLUSTER", "NODES"])
+            .await,
+    );
+    assert_eq!(n1_nodes_epochs["node-1b"], primary_my_epochs["node-1"]);
 
     // Restart node-1 with a DISAGREEING config (wrong slots + replica_of set):
     // cluster-state.json must win over the config and keep its role, slots, and epoch.
@@ -482,9 +492,10 @@ async fn three_node_cluster_resolves_epochs_serves_shards_and_reloads_state_on_r
         .await;
     assert!(
         r_nodes.contains(&format!(
-            "node-1b {}:{} myself,slave node-1 0 0 0 connected\n",
+            "node-1b {}:{} myself,slave node-1 0 0 {} connected\n",
             replica_restarted.addr.ip(),
-            replica_restarted.addr.port()
+            replica_restarted.addr.port(),
+            n1_epoch_before
         )),
         "{r_nodes}"
     );
