@@ -549,24 +549,44 @@ func TestClusterClientSurvivesManualFailover(t *testing.T) {
 	expect(t, "CLUSTER FAILOVER", replica.Do(ctx, "CLUSTER", "FAILOVER"), "OK")
 
 	// Wait until replica owns the slots and answers direct GETs without MOVED.
-	waitFor(t, "replica promoted by CLUSTER FAILOVER", func() bool {
+	// Manual failover has a 5 s deadline (CLUSTER_MF_TIMEOUT), so allow up to 10 s
+	// under parallel test load instead of waitFor's 2 s timeout.
+	promoDeadline := time.Now().Add(10 * time.Second)
+	for {
 		nodes, err := replica.ClusterNodes(ctx).Result()
-		if err != nil {
-			return false
-		}
-		for _, line := range strings.Split(nodes, "\n") {
-			fields := strings.Fields(line)
-			if len(fields) >= 9 && strings.Contains(fields[2], "myself") && strings.Contains(fields[2], "master") {
-				return true
+		promoted := false
+		if err == nil {
+			for _, line := range strings.Split(nodes, "\n") {
+				fields := strings.Fields(line)
+				if len(fields) >= 9 && strings.Contains(fields[2], "myself") && strings.Contains(fields[2], "master") {
+					promoted = true
+					break
+				}
 			}
 		}
-		return false
-	})
+		if promoted {
+			break
+		}
+		if time.Now().After(promoDeadline) {
+			info, _ := replica.Do(ctx, "CLUSTER", "INFO").Result()
+			t.Fatalf("replica not promoted by CLUSTER FAILOVER within 10s\nCLUSTER NODES:\n%s\nCLUSTER INFO:\n%v", nodes, info)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 
 	afterBase := atomic.LoadInt64(&writtenCount)
-	waitFor(t, "post-failover writes to complete", func() bool {
-		return atomic.LoadInt64(&writtenCount) >= afterBase+10
-	})
+	postDeadline := time.Now().Add(10 * time.Second)
+	for atomic.LoadInt64(&writtenCount) < afterBase+10 {
+		select {
+		case err := <-errCh:
+			t.Fatal(err)
+		default:
+		}
+		if time.Now().After(postDeadline) {
+			t.Fatalf("post-failover writes did not reach %d within 10s (got %d)", afterBase+10, atomic.LoadInt64(&writtenCount))
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
 	close(stopCh)
 
 	select {

@@ -280,6 +280,40 @@ async fn all_shards_synced(dir: &Path) -> bool {
     true
 }
 
+/// True once `p1` reports `cluster_state:ok`, every listed node sees `p1` as
+/// master of `0-5460` and `r1` as a replica of `p1` in `CLUSTER NODES`, and
+/// every shard on `r1` has completed initial sync.
+async fn cluster_ready_for_manual_failover(
+    p1_addr: SocketAddr,
+    addrs: [SocketAddr; 4],
+    r1_dir: &Path,
+) -> bool {
+    let info = parse_info(
+        &Client::connect(p1_addr)
+            .await
+            .call_bulk(&["CLUSTER", "INFO"])
+            .await,
+    );
+    if info.get("cluster_state").map(String::as_str) != Some("ok") {
+        return false;
+    }
+    for addr in addrs {
+        let nodes = Client::connect(addr)
+            .await
+            .call_bulk(&["CLUSTER", "NODES"])
+            .await;
+        let p1_ok = node_entry(&nodes, "p1")
+            .is_some_and(|(flags, _, _, slots)| flags.contains("master") && slots == "0-5460");
+        let r1_ok = node_entry(&nodes, "r1").is_some_and(|(flags, master, _, slots)| {
+            flags.contains("slave") && master == "p1" && slots.is_empty()
+        });
+        if !p1_ok || !r1_ok {
+            return false;
+        }
+    }
+    all_shards_synced(r1_dir).await
+}
+
 /// Protocol-aware TCP proxy for the abort test: forwards `BLOBASAUR.MFSTART` and
 /// other commands normally, while stalling `BLOBASAUR.SYNC` streams whenever
 /// `stall_sync` is set to `true`.
@@ -501,15 +535,12 @@ async fn run_manual_failover_under_writes(async_write: bool) {
     wait_for(
         "cluster ok and r1 synced before manual failover",
         Duration::from_secs(15),
-        || async {
-            let info = parse_info(
-                &Client::connect(p1.addr)
-                    .await
-                    .call_bulk(&["CLUSTER", "INFO"])
-                    .await,
-            );
-            info.get("cluster_state").map(String::as_str) == Some("ok")
-                && all_shards_synced(dr1.path()).await
+        || {
+            cluster_ready_for_manual_failover(
+                p1.addr,
+                [p1.addr, p2.addr, p3.addr, r1.addr],
+                dr1.path(),
+            )
         },
     )
     .await;
@@ -775,15 +806,12 @@ async fn manual_failover_abort_on_stalled_catchup_and_in_progress_refusal() {
     wait_for(
         "cluster ok and r1 synced through proxy",
         Duration::from_secs(15),
-        || async {
-            let info = parse_info(
-                &Client::connect(p1.addr)
-                    .await
-                    .call_bulk(&["CLUSTER", "INFO"])
-                    .await,
-            );
-            info.get("cluster_state").map(String::as_str) == Some("ok")
-                && all_shards_synced(dr1.path()).await
+        || {
+            cluster_ready_for_manual_failover(
+                p1.addr,
+                [p1.addr, p2.addr, p3.addr, r1.addr],
+                dr1.path(),
+            )
         },
     )
     .await;
@@ -1146,15 +1174,12 @@ async fn goredis_cluster_client_survives_manual_failover() {
     wait_for(
         "cluster ok and r1 synced for go-redis manual failover",
         Duration::from_secs(15),
-        || async {
-            let info = parse_info(
-                &Client::connect(p1.addr)
-                    .await
-                    .call_bulk(&["CLUSTER", "INFO"])
-                    .await,
-            );
-            info.get("cluster_state").map(String::as_str) == Some("ok")
-                && all_shards_synced(dr1.path()).await
+        || {
+            cluster_ready_for_manual_failover(
+                p1.addr,
+                [p1.addr, p2.addr, p3.addr, r1.addr],
+                dr1.path(),
+            )
         },
     )
     .await;
@@ -1336,15 +1361,12 @@ async fn manual_failover_zero_loss_when_claim_reaches_old_primary_late() {
     wait_for(
         "initial cluster ok before restarting p1 with slow gossip",
         Duration::from_secs(15),
-        || async {
-            let info = parse_info(
-                &Client::connect(p1.addr)
-                    .await
-                    .call_bulk(&["CLUSTER", "INFO"])
-                    .await,
-            );
-            info.get("cluster_state").map(String::as_str) == Some("ok")
-                && all_shards_synced(dr1.path()).await
+        || {
+            cluster_ready_for_manual_failover(
+                p1.addr,
+                [p1.addr, p2.addr, p3.addr, r1.addr],
+                dr1.path(),
+            )
         },
     )
     .await;

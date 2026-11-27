@@ -96,8 +96,46 @@ fn secs() -> u64 {
 }
 
 /// A port that is free now and never handed out twice in this process.
+///
+/// Allocates from `15000..30000` (outside the Linux/macOS OS ephemeral port
+/// range `32768..65535`) so concurrent `bind(0)` listeners (such as `Proxy`)
+/// and outbound `TcpStream::connect` sockets cannot steal a `Node`'s port
+/// between allocation and child startup, or while a node is killed and
+/// restarting.
 fn free_port(udp: bool) -> u16 {
-    static ISSUED: Mutex<BTreeSet<(bool, u16)>> = Mutex::new(BTreeSet::new());
+    const RANGE_START: u16 = 15_000;
+    const RANGE_LEN: u16 = 15_000;
+    struct PortPool {
+        issued: BTreeSet<(bool, u16)>,
+        cursor: u16,
+    }
+    static STATE: Mutex<Option<PortPool>> = Mutex::new(None);
+    let mut guard = STATE.lock().unwrap();
+    let pool = guard.get_or_insert_with(|| {
+        let offset = (RandomState::new()
+            .hash_one((std::process::id(), std::time::SystemTime::now()))
+            % u64::from(RANGE_LEN)) as u16;
+        PortPool {
+            issued: BTreeSet::new(),
+            cursor: offset,
+        }
+    });
+    for _ in 0..RANGE_LEN {
+        let port = RANGE_START + pool.cursor;
+        pool.cursor = (pool.cursor + 1) % RANGE_LEN;
+        if pool.issued.contains(&(udp, port)) {
+            continue;
+        }
+        let available = if udp {
+            UdpSocket::bind(("127.0.0.1", port)).is_ok()
+        } else {
+            StdListener::bind(("127.0.0.1", port)).is_ok()
+        };
+        if available {
+            pool.issued.insert((udp, port));
+            return port;
+        }
+    }
     loop {
         let port = if udp {
             UdpSocket::bind("127.0.0.1:0")
@@ -111,7 +149,7 @@ fn free_port(udp: bool) -> u16 {
                 .unwrap()
         }
         .port();
-        if ISSUED.lock().unwrap().insert((udp, port)) {
+        if pool.issued.insert((udp, port)) {
             return port;
         }
     }
@@ -2626,6 +2664,24 @@ async fn manual_failover(mode: WriteMode) {
         if !String::from_utf8_lossy(&info).contains("cluster_state:ok") {
             return false;
         }
+        for check_addr in [pair[0].addr, pair[1].addr, p2_addr, p3_addr] {
+            let Ok(mut cn) = Conn::open(check_addr).await else {
+                return false;
+            };
+            let Ok(Resp::Bulk(Some(raw))) = cn.cmd(&["CLUSTER", "NODES"]).await else {
+                return false;
+            };
+            let lines = parse_cluster_nodes_lines(&String::from_utf8_lossy(&raw));
+            let p1_is_master = lines.iter().any(|(id, flags, _, _, slots)| {
+                id == "p1" && flags.contains("master") && slots == "0-5460"
+            });
+            let r1_is_slave = lines.iter().any(|(id, flags, master, _, slots)| {
+                id == "r1" && flags.contains("slave") && master == "p1" && slots.is_empty()
+            });
+            if !p1_is_master || !r1_is_slave {
+                return false;
+            }
+        }
         watermark(pair[1].addr)
             .await
             .is_ok_and(|m| m.iter().all(|(_, lsn)| lsn != "not-synced"))
@@ -2705,42 +2761,72 @@ async fn manual_failover(mode: WriteMode) {
     let mut last_failover_of: [Option<Instant>; 2] = [None, None];
     let cycles = 3usize;
 
+    async fn manual_failover_aborted_count(addr: SocketAddr) -> Option<u64> {
+        let mut cn = Conn::open(addr).await.ok()?;
+        let Resp::Bulk(Some(info)) = cn.cmd(&["CLUSTER", "INFO"]).await.ok()? else {
+            return None;
+        };
+        String::from_utf8_lossy(&info).lines().find_map(|line| {
+            line.trim()
+                .strip_prefix("cluster_stats_manual_failover_aborted:")
+                .and_then(|v| v.parse::<u64>().ok())
+        })
+    }
+
     for cycle in 0..cycles {
         sleep(Duration::from_millis(400)).await;
-        // Respect voters' per-primary vote backoff (8 s) when failing over the same primary again.
-        if let Some(prev) = last_failover_of[cur_primary_idx] {
-            let min_gap = Duration::from_millis(8500);
-            if let Some(rem) = min_gap.checked_sub(prev.elapsed()) {
-                sleep(rem).await;
-            }
-        }
 
         let target_idx = 1 - cur_primary_idx;
         let old_name = pair[cur_primary_idx].name;
         let new_name = pair[target_idx].name;
-        eprintln!("[chaos] {name} cycle {cycle}: CLUSTER FAILOVER {old_name} -> {new_name}");
-        last_failover_of[cur_primary_idx] = Some(Instant::now());
 
-        let mut c = Conn::open(pair[target_idx].addr).await.unwrap();
-        let reply = c.cmd(&["CLUSTER", "FAILOVER"]).await.unwrap();
-        assert!(
-            matches!(reply, Resp::Simple(ref s) if s == "OK"),
-            "cycle {cycle}: CLUSTER FAILOVER on {new_name} failed: {reply:?}"
-        );
+        let mut promoted = false;
+        for attempt in 0..3usize {
+            // Respect voters' per-primary vote backoff (8 s) when failing over the same primary again.
+            if let Some(prev) = last_failover_of[cur_primary_idx] {
+                let min_gap = Duration::from_millis(8500);
+                if let Some(rem) = min_gap.checked_sub(prev.elapsed()) {
+                    sleep(rem).await;
+                }
+            }
 
-        // Wait for new_name to own 0-5460, old_name to demote to a replica of
-        // new_name, gossip to converge on the primaries so they see old_name as
-        // a replica of new_name, and old_name to finish resyncing every shard.
-        wait_for(
-            &format!("cycle {cycle}: {new_name} owns 0-5460 and {old_name} demoted & synced"),
-            20,
-            || async {
-                for check_addr in [pair[target_idx].addr, p2_addr, p3_addr] {
+            let aborted_before = manual_failover_aborted_count(pair[target_idx].addr)
+                .await
+                .unwrap_or(0);
+            eprintln!(
+                "[chaos] {name} cycle {cycle} attempt {attempt}: CLUSTER FAILOVER {old_name} -> {new_name}"
+            );
+            last_failover_of[cur_primary_idx] = Some(Instant::now());
+
+            let mut c = Conn::open(pair[target_idx].addr).await.unwrap();
+            let reply = c.cmd(&["CLUSTER", "FAILOVER"]).await.unwrap();
+            assert!(
+                matches!(reply, Resp::Simple(ref s) if s == "OK"),
+                "cycle {cycle} attempt {attempt}: CLUSTER FAILOVER on {new_name} failed: {reply:?}"
+            );
+
+            // Wait for new_name to own 0-5460, old_name to demote to a replica of
+            // new_name, gossip to converge on all 4 nodes, and old_name to finish
+            // resyncing every shard. If heavy host I/O stalls catch-up or MFSTART
+            // past the 5 s CLUSTER_MF_TIMEOUT, the replica cleanly aborts and sends
+            // MFABORT; detect that via cluster_stats_manual_failover_aborted and retry.
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let mut aborted = false;
+            while Instant::now() < deadline {
+                let mut converged = true;
+                for check_addr in [
+                    pair[target_idx].addr,
+                    pair[cur_primary_idx].addr,
+                    p2_addr,
+                    p3_addr,
+                ] {
                     let Ok(mut cn) = Conn::open(check_addr).await else {
-                        return false;
+                        converged = false;
+                        break;
                     };
                     let Ok(Resp::Bulk(Some(raw))) = cn.cmd(&["CLUSTER", "NODES"]).await else {
-                        return false;
+                        converged = false;
+                        break;
                     };
                     let lines = parse_cluster_nodes_lines(&String::from_utf8_lossy(&raw));
                     let new_is_master = lines.iter().any(|(id, flags, _, _, slots)| {
@@ -2753,15 +2839,42 @@ async fn manual_failover(mode: WriteMode) {
                             && slots.is_empty()
                     });
                     if !new_is_master || !old_is_slave {
-                        return false;
+                        converged = false;
+                        break;
                     }
                 }
-                watermark(pair[cur_primary_idx].addr)
+                if converged
+                    && watermark(pair[cur_primary_idx].addr)
+                        .await
+                        .is_ok_and(|m| m.iter().all(|(_, lsn)| lsn != "not-synced"))
+                {
+                    promoted = true;
+                    break;
+                }
+                if manual_failover_aborted_count(pair[target_idx].addr)
                     .await
-                    .is_ok_and(|m| m.iter().all(|(_, lsn)| lsn != "not-synced"))
-            },
-        )
-        .await;
+                    .is_some_and(|n| n > aborted_before)
+                {
+                    eprintln!(
+                        "[chaos] {name} cycle {cycle} attempt {attempt}: CLUSTER FAILOVER cleanly aborted; retrying"
+                    );
+                    aborted = true;
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+            if promoted {
+                break;
+            }
+            assert!(
+                aborted,
+                "timed out waiting for cycle {cycle} attempt {attempt}: {new_name} owns 0-5460 and {old_name} demoted & synced"
+            );
+        }
+        assert!(
+            promoted,
+            "cycle {cycle}: CLUSTER FAILOVER {old_name} -> {new_name} aborted on every attempt"
+        );
 
         cur_primary_idx = target_idx;
     }
