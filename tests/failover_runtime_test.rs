@@ -1254,3 +1254,526 @@ async fn go_redis_cluster_client_keeps_working_across_takeover() {
     p2.stop().await;
     p3.stop().await;
 }
+
+async fn exec_sql(dir: &Path, shard: usize, sql: &str) {
+    let mut conn = connect_db(dir, shard).await;
+    sqlx::query(sql).execute(&mut conn).await.unwrap();
+}
+
+#[tokio::test]
+async fn demotion_retries_after_transient_failure_and_delslots_stays_primary() {
+    const SHARDS: usize = 2;
+
+    // Part 1: A primary that becomes slotless via CLUSTER DELSLOTS has no
+    // demoting_to marker and stays a primary across gossip ticks.
+    let d_solo = TempDir::new().unwrap();
+    let gp_solo = free_udp_port();
+    let solo = start_node(
+        d_solo.path(),
+        "solo",
+        gp_solo,
+        vec![],
+        Some(vec![SlotRange { start: 0, end: 3 }]),
+        None,
+        SHARDS,
+    )
+    .await;
+    let mut c_solo = Client::connect(solo.addr).await;
+    assert_eq!(
+        c_solo
+            .call_simple(&["CLUSTER", "DELSLOTS", "0", "1", "2", "3"])
+            .await,
+        "+OK"
+    );
+    sleep(Duration::from_millis(350)).await;
+    let solo_state = ClusterState::load(&d_solo.path().join(CLUSTER_STATE_FILE), "solo").unwrap();
+    assert_eq!(solo_state.role, PersistedRole::Primary);
+    assert_eq!(solo_state.demoting_to, None);
+    assert!(!solo_state.slots.has_slots_of("solo"));
+    solo.stop().await;
+
+    // Part 2: Inject a per-shard failure on p1's shard 1 so the first demotion
+    // attempt fails, then clear the failure and confirm a later gossip tick
+    // completes demotion and resyncs p1 to r1.
+    let dp = TempDir::new().unwrap();
+    let dr = TempDir::new().unwrap();
+    let (gp, gr) = (free_udp_port(), free_udp_port());
+
+    let p1 = start_node(
+        dp.path(),
+        "p1",
+        gp,
+        vec![],
+        Some(vec![SlotRange {
+            start: 0,
+            end: 16383,
+        }]),
+        None,
+        SHARDS,
+    )
+    .await;
+    let r1 = start_node(
+        dr.path(),
+        "r1",
+        gr,
+        vec![p1.gossip_addr.clone()],
+        None,
+        Some("p1"),
+        SHARDS,
+    )
+    .await;
+
+    let mut cp1 = Client::connect(p1.addr).await;
+    assert_eq!(cp1.call_simple(&["SET", "before", "v1"]).await, "+OK");
+    wait_for("r1 synced and learned p1 slots", || async {
+        all_synced(dr.path(), SHARDS).await
+            && snapshot(dr.path(), SHARDS).await == snapshot(dp.path(), SHARDS).await
+            && ClusterState::load(&dr.path().join(CLUSTER_STATE_FILE), "r1")
+                .is_ok_and(|s| s.slots.has_slots_of("p1"))
+    })
+    .await;
+
+    // Fail `demote_shard` on p1's shard 1.
+    exec_sql(
+        dp.path(),
+        1,
+        "CREATE TRIGGER fail_demote BEFORE INSERT ON repl_state \
+         WHEN NEW.k = 'role' AND NEW.v = 'replica' \
+         BEGIN SELECT RAISE(ABORT, 'injected demote failure'); END",
+    )
+    .await;
+
+    let mut cr1 = Client::connect(r1.addr).await;
+    assert_eq!(
+        cr1.call_simple(&["CLUSTER", "FAILOVER", "TAKEOVER"]).await,
+        "+OK"
+    );
+    let r1_replids = shard_replids(dr.path(), SHARDS).await;
+
+    // Wait until p1 persists the slot loss + demoting_to marker AND its first
+    // demotion attempt has run (demoting shard 0 while failing on shard 1).
+    wait_for(
+        "p1 to persist demoting_to and fail shard 1 demotion",
+        || async {
+            let st = ClusterState::load(&dp.path().join(CLUSTER_STATE_FILE), "p1").ok();
+            let state_ok = st.is_some_and(|s| {
+                s.role == PersistedRole::Primary
+                    && s.demoting_to.as_deref() == Some("r1")
+                    && !s.slots.has_slots_of("p1")
+            });
+            state_ok
+                && repl_state(dp.path(), 0, "role").await.as_deref() == Some("replica")
+                && repl_state(dp.path(), 1, "role").await.as_deref() == Some("primary")
+        },
+    )
+    .await;
+
+    // While demotion is retrying, p1 must not serve writes for lost slots.
+    let moved = cp1.call_simple(&["SET", "during_retry", "nope"]).await;
+    assert!(
+        moved.starts_with("-MOVED ") && moved.ends_with(&r1.addr.to_string()),
+        "expected MOVED to r1 while demotion retries, got {moved}"
+    );
+
+    // Lift the injected failure; a subsequent gossip tick must finish demotion.
+    exec_sql(dp.path(), 1, "DROP TRIGGER fail_demote").await;
+
+    assert_eq!(cr1.call_simple(&["SET", "after", "v2"]).await, "+OK");
+    wait_for("p1 demotion retry to succeed and resync to r1", || async {
+        let st = ClusterState::load(&dp.path().join(CLUSTER_STATE_FILE), "p1").ok();
+        st.is_some_and(|s| {
+            s.role == PersistedRole::Replica
+                && s.primary.as_deref() == Some("r1")
+                && s.demoting_to.is_none()
+        }) && all_synced(dp.path(), SHARDS).await
+            && shard_replids(dp.path(), SHARDS).await == r1_replids
+            && snapshot(dp.path(), SHARDS).await == snapshot(dr.path(), SHARDS).await
+    })
+    .await;
+
+    assert_eq!(cp1.call_simple(&["READONLY"]).await, "+OK");
+    assert_eq!(cp1.call_bulk(&["GET", "after"]).await, "v2");
+
+    p1.stop().await;
+    r1.stop().await;
+}
+
+#[tokio::test]
+async fn demotion_crash_after_slot_loss_never_serves_lost_slots_and_finishes_on_restart() {
+    const SHARDS: usize = 2;
+    let dp = TempDir::new().unwrap();
+    let dr = TempDir::new().unwrap();
+    let (gp, gr) = (free_udp_port(), free_udp_port());
+
+    let p1 = start_node(
+        dp.path(),
+        "p1",
+        gp,
+        vec![],
+        Some(vec![SlotRange {
+            start: 0,
+            end: 16383,
+        }]),
+        None,
+        SHARDS,
+    )
+    .await;
+    let r1 = start_node(
+        dr.path(),
+        "r1",
+        gr,
+        vec![p1.gossip_addr.clone()],
+        None,
+        Some("p1"),
+        SHARDS,
+    )
+    .await;
+
+    wait_for("r1 synced and learned p1 slots", || async {
+        all_synced(dr.path(), SHARDS).await
+            && ClusterState::load(&dr.path().join(CLUSTER_STATE_FILE), "r1")
+                .is_ok_and(|s| s.slots.has_slots_of("p1"))
+    })
+    .await;
+
+    // Hold demotion mid-flight after slot loss + demoting_to persist and shard 0 demote.
+    exec_sql(
+        dp.path(),
+        1,
+        "CREATE TRIGGER fail_demote BEFORE INSERT ON repl_state \
+         WHEN NEW.k = 'role' AND NEW.v = 'replica' \
+         BEGIN SELECT RAISE(ABORT, 'injected demote failure'); END",
+    )
+    .await;
+
+    let mut cr1 = Client::connect(r1.addr).await;
+    assert_eq!(
+        cr1.call_simple(&["CLUSTER", "FAILOVER", "TAKEOVER"]).await,
+        "+OK"
+    );
+    assert_eq!(cr1.call_simple(&["SET", "winner_key", "ok"]).await, "+OK");
+    let r1_replids = shard_replids(dr.path(), SHARDS).await;
+
+    wait_for("p1 in crash window after slot loss", || async {
+        let st = ClusterState::load(&dp.path().join(CLUSTER_STATE_FILE), "p1").ok();
+        st.is_some_and(|s| {
+            s.role == PersistedRole::Primary
+                && s.demoting_to.as_deref() == Some("r1")
+                && !s.slots.has_slots_of("p1")
+        }) && repl_state(dp.path(), 0, "role").await.as_deref() == Some("replica")
+            && repl_state(dp.path(), 1, "role").await.as_deref() == Some("primary")
+    })
+    .await;
+
+    // Stop p1 before role change commits, then clear the injected failure.
+    p1.stop().await;
+    let pre_restart = ClusterState::load(&dp.path().join(CLUSTER_STATE_FILE), "p1").unwrap();
+    assert_eq!(pre_restart.role, PersistedRole::Primary);
+    assert_eq!(pre_restart.demoting_to.as_deref(), Some("r1"));
+    assert!(!pre_restart.slots.has_slots_of("p1"));
+    exec_sql(dp.path(), 1, "DROP TRIGGER fail_demote").await;
+
+    // Restart p1 isolated (no seeds) with its original primary slot config:
+    // it must never serve the lost slots and must finish demotion on startup.
+    let p1_isolated = start_node(
+        dp.path(),
+        "p1",
+        gp,
+        vec![],
+        Some(vec![SlotRange {
+            start: 0,
+            end: 16383,
+        }]),
+        None,
+        SHARDS,
+    )
+    .await;
+    let mut cp1 = Client::connect(p1_isolated.addr).await;
+    let write_reply = cp1.call_simple(&["SET", "must_not_serve", "bad"]).await;
+    assert!(
+        write_reply.starts_with("-CLUSTERDOWN"),
+        "restarted demoting node served lost slot locally: {write_reply}"
+    );
+    wait_for("isolated restarted p1 to finish demotion", || async {
+        let st = ClusterState::load(&dp.path().join(CLUSTER_STATE_FILE), "p1").ok();
+        st.is_some_and(|s| {
+            s.role == PersistedRole::Replica
+                && s.primary.as_deref() == Some("r1")
+                && s.demoting_to.is_none()
+        }) && repl_state(dp.path(), 0, "role").await.as_deref() == Some("replica")
+            && repl_state(dp.path(), 1, "role").await.as_deref() == Some("replica")
+    })
+    .await;
+    p1_isolated.stop().await;
+
+    // Rejoin gossip and verify p1 resyncs cleanly from r1.
+    let p1_rejoined = start_node(
+        dp.path(),
+        "p1",
+        gp,
+        vec![r1.gossip_addr.clone()],
+        Some(vec![SlotRange {
+            start: 0,
+            end: 16383,
+        }]),
+        None,
+        SHARDS,
+    )
+    .await;
+    wait_for("rejoined p1 to sync from r1", || async {
+        all_synced(dp.path(), SHARDS).await
+            && shard_replids(dp.path(), SHARDS).await == r1_replids
+            && snapshot(dp.path(), SHARDS).await == snapshot(dr.path(), SHARDS).await
+    })
+    .await;
+
+    p1_rejoined.stop().await;
+    r1.stop().await;
+}
+
+#[tokio::test]
+async fn takeover_retries_transient_shard_promote_failure_without_serving_early() {
+    const SHARDS: usize = 2;
+    let dp = TempDir::new().unwrap();
+    let dr = TempDir::new().unwrap();
+    let (gp, gr) = (free_udp_port(), free_udp_port());
+
+    let p = start_node(
+        dp.path(),
+        "p",
+        gp,
+        vec![],
+        Some(vec![SlotRange {
+            start: 0,
+            end: 16383,
+        }]),
+        None,
+        SHARDS,
+    )
+    .await;
+    let r = start_node(
+        dr.path(),
+        "r",
+        gr,
+        vec![p.gossip_addr.clone()],
+        None,
+        Some("p"),
+        SHARDS,
+    )
+    .await;
+
+    let mut cp = Client::connect(p.addr).await;
+    for i in 0..4 {
+        assert_eq!(
+            cp.call_simple(&["SET", &format!("k{i}"), &format!("v{i}")])
+                .await,
+            "+OK"
+        );
+    }
+    wait_for("r synced with p", || async {
+        all_synced(dr.path(), SHARDS).await
+            && snapshot(dr.path(), SHARDS).await == snapshot(dp.path(), SHARDS).await
+            && ClusterState::load(&dr.path().join(CLUSTER_STATE_FILE), "r")
+                .is_ok_and(|s| s.slots.has_slots_of("p"))
+    })
+    .await;
+
+    let old_replids = shard_replids(dr.path(), SHARDS).await;
+    p.stop().await;
+
+    // Fail `promote_shard` on r's shard 1 initially.
+    exec_sql(
+        dr.path(),
+        1,
+        "CREATE TRIGGER fail_promote BEFORE INSERT ON repl_state \
+         WHEN NEW.k = 'role' AND NEW.v = 'primary' \
+         BEGIN SELECT RAISE(ABORT, 'injected promote failure'); END",
+    )
+    .await;
+
+    let r_addr = r.addr;
+    let takeover_task = tokio::spawn(async move {
+        let mut cr = Client::connect(r_addr).await;
+        cr.call_simple(&["CLUSTER", "FAILOVER", "TAKEOVER"]).await
+    });
+
+    // Wait until cluster-state.json committed role=primary and shard 0 promoted
+    // while shard 1 is still failing its retry loop.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let state_ok = ClusterState::load(&dr.path().join(CLUSTER_STATE_FILE), "r")
+            .is_ok_and(|s| s.role == PersistedRole::Primary && s.slots.has_slots_of("r"));
+        if state_ok
+            && repl_state(dr.path(), 0, "role").await.as_deref() == Some("primary")
+            && repl_state(dr.path(), 1, "role").await.as_deref() == Some("replica")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for shard 0 promote during TAKEOVER retry"
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+
+    // Slots must NOT serve writes before shard 1 has its new replid.
+    let mut probe = Client::connect(r.addr).await;
+    let early = probe.call_simple(&["SET", "early_write", "nope"]).await;
+    assert!(
+        early.starts_with('-'),
+        "r served write before every shard promoted: {early}"
+    );
+
+    // Clear the injected failure; a retry attempt must complete TAKEOVER.
+    exec_sql(dr.path(), 1, "DROP TRIGGER fail_promote").await;
+
+    let takeover_reply = timeout(Duration::from_secs(10), takeover_task)
+        .await
+        .expect("TAKEOVER timed out")
+        .unwrap();
+    assert_eq!(takeover_reply, "+OK");
+
+    let new_replids = shard_replids(dr.path(), SHARDS).await;
+    for shard in 0..SHARDS {
+        assert_eq!(
+            repl_state(dr.path(), shard, "role").await.as_deref(),
+            Some("primary")
+        );
+        assert_ne!(new_replids[shard], old_replids[shard]);
+    }
+    assert_eq!(
+        probe.call_simple(&["SET", "after_retry", "ok"]).await,
+        "+OK"
+    );
+    assert_eq!(probe.call_bulk(&["GET", "after_retry"]).await, "ok");
+    assert_eq!(probe.call_bulk(&["GET", "k0"]).await, "v0");
+
+    r.stop().await;
+}
+
+#[tokio::test]
+async fn takeover_persistent_shard_promote_failure_shuts_down_and_recovers_on_restart() {
+    const SHARDS: usize = 2;
+    let dp = TempDir::new().unwrap();
+    let dr = TempDir::new().unwrap();
+    let (gp, gr) = (free_udp_port(), free_udp_port());
+
+    let p = start_node(
+        dp.path(),
+        "p",
+        gp,
+        vec![],
+        Some(vec![SlotRange {
+            start: 0,
+            end: 16383,
+        }]),
+        None,
+        SHARDS,
+    )
+    .await;
+    let r = start_node(
+        dr.path(),
+        "r",
+        gr,
+        vec![p.gossip_addr.clone()],
+        None,
+        Some("p"),
+        SHARDS,
+    )
+    .await;
+
+    let mut cp = Client::connect(p.addr).await;
+    for i in 0..4 {
+        assert_eq!(
+            cp.call_simple(&["SET", &format!("k{i}"), &format!("v{i}")])
+                .await,
+            "+OK"
+        );
+    }
+    wait_for("r synced with p", || async {
+        all_synced(dr.path(), SHARDS).await
+            && snapshot(dr.path(), SHARDS).await == snapshot(dp.path(), SHARDS).await
+            && ClusterState::load(&dr.path().join(CLUSTER_STATE_FILE), "r")
+                .is_ok_and(|s| s.slots.has_slots_of("p"))
+    })
+    .await;
+
+    let old_replids = shard_replids(dr.path(), SHARDS).await;
+
+    // Keep p alive while failing shard 1 promotion persistently: r must never
+    // roll back to replica or restart sync tasks against p; it must shut down
+    // cleanly so restart finishes promotion via init_shard.
+    exec_sql(
+        dr.path(),
+        1,
+        "CREATE TRIGGER fail_promote BEFORE INSERT ON repl_state \
+         WHEN NEW.k = 'role' AND NEW.v = 'primary' \
+         BEGIN SELECT RAISE(ABORT, 'persistent promote failure'); END",
+    )
+    .await;
+
+    let mut cr = Client::connect(r.addr).await;
+    let reply = cr.call_simple(&["CLUSTER", "FAILOVER", "TAKEOVER"]).await;
+    assert!(
+        reply.starts_with("-ERR"),
+        "expected error after retries exhausted, got {reply}"
+    );
+    drop(cr);
+
+    // r must shut down cleanly on its own without external cancellation.
+    let RunningNode { handle, .. } = r;
+    timeout(Duration::from_secs(15), handle)
+        .await
+        .expect("r did not shut down after persistent post-commit TAKEOVER failure")
+        .unwrap()
+        .expect("r shutdown returned an error");
+
+    // On disk: cluster-state.json stayed primary (never rolled back to replica),
+    // shard 0 is promoted with a new replid, shard 1 is still replica/synced=1.
+    let saved = ClusterState::load(&dr.path().join(CLUSTER_STATE_FILE), "r").unwrap();
+    assert_eq!(saved.role, PersistedRole::Primary);
+    assert_eq!(saved.primary, None);
+    assert!(saved.slots.has_slots_of("r"));
+    assert_eq!(
+        repl_state(dr.path(), 0, "role").await.as_deref(),
+        Some("primary")
+    );
+    assert_ne!(
+        repl_state(dr.path(), 0, "replid").await.unwrap_or_default(),
+        old_replids[0]
+    );
+    assert_eq!(
+        repl_state(dr.path(), 1, "role").await.as_deref(),
+        Some("replica")
+    );
+    assert_eq!(
+        repl_state(dr.path(), 1, "synced").await.as_deref(),
+        Some("1")
+    );
+
+    p.stop().await;
+    exec_sql(dr.path(), 1, "DROP TRIGGER fail_promote").await;
+
+    // Restart r (with its original replica config): init_shard completes promotion
+    // of shard 1 and r serves both existing keys and new writes as primary.
+    let r_restarted = start_node(dr.path(), "r", gr, vec![], None, Some("p"), SHARDS).await;
+    let new_replids = shard_replids(dr.path(), SHARDS).await;
+    for shard in 0..SHARDS {
+        assert_eq!(
+            repl_state(dr.path(), shard, "role").await.as_deref(),
+            Some("primary")
+        );
+        assert_ne!(new_replids[shard], old_replids[shard]);
+    }
+    let mut cr = Client::connect(r_restarted.addr).await;
+    for i in 0..4 {
+        assert_eq!(
+            cr.call_bulk(&["GET", &format!("k{i}")]).await,
+            format!("v{i}")
+        );
+    }
+    assert_eq!(cr.call_simple(&["SET", "recovered", "yes"]).await, "+OK");
+    assert_eq!(cr.call_bulk(&["GET", "recovered"]).await, "yes");
+
+    r_restarted.stop().await;
+}

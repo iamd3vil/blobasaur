@@ -109,7 +109,7 @@ pub async fn run(
 
     // Attach runtime role-transition handling (demotion, replica re-pointing)
     // and start replica sync tasks if this node is currently a replica.
-    state.attach_cluster_runtime().await;
+    state.attach_cluster_runtime(shutdown.clone()).await;
 
     // Start HTTP metrics server if enabled
     if let Some(handle) = prometheus_handle {
@@ -157,12 +157,14 @@ pub async fn run(
         );
     }
 
-    // Stop gossip processing before stopping replica sync and writers so no
-    // new role transition starts during shutdown, while letting any in-flight
-    // transition finish its writer barriers cleanly.
+    // Stop gossip processing before waiting on spawned role transitions,
+    // stopping replica sync, and draining writers so no new transition starts
+    // during shutdown while any in-flight transition finishes cleanly.
     if let Some(cluster_manager) = &state.cluster_manager {
         cluster_manager.stop_gossip_task().await;
     }
+
+    state.wait_role_transitions().await;
 
     state.replica_sync.stop().await;
 

@@ -4,21 +4,22 @@ use moka::future::Cache;
 use mpchash::HashRing;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Connection, SqliteConnection, SqlitePool};
-use std::collections::HashSet;
 use std::fs;
 use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::time::Duration;
 use tokio::sync::{
     Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, Semaphore, mpsc, oneshot, watch,
 };
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use crate::compression::{self, Compressor};
 // Import ShardWriteOperation from shard_manager
 use crate::{
-    cluster::{ClusterManager, ReplicateCheck, RoleTransition},
+    cluster::{ClusterManager, PromoteError, ReplicateCheck, RoleTransition},
     config::Cfg,
     metrics::{Metrics, ShardMetrics},
     replication,
@@ -101,11 +102,26 @@ pub struct AppState {
     pub replica_sync: replication::ReplicaSyncSupervisor,
     /// Serializes runtime role transitions (promotion, demotion, re-pointing, REPLICATE).
     role_change_lock: Mutex<()>,
+    /// Ensures at most one gossip-triggered role transition task runs at a time.
+    transition_running: Arc<AtomicBool>,
+    /// Tracks spawned gossip-triggered role transition tasks so shutdown waits for them.
+    transition_tasks: TaskTracker,
+    /// Server shutdown token, attached once the server starts; cancelled if a
+    /// post-commit TAKEOVER cannot finish promoting every shard.
+    server_shutdown: std::sync::Mutex<Option<CancellationToken>>,
     /// Cancelled whenever this node leaves the primary role, closing active
     /// outbound `BLOBASAUR.SYNC` streams.
     primary_stream_cancel: std::sync::Mutex<CancellationToken>,
 
     ring: HashRing<ShardNode>,
+}
+
+struct TransitionGuard(Arc<AtomicBool>);
+
+impl Drop for TransitionGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 /// Makes a command's existence check and its write one step per key.
@@ -269,8 +285,11 @@ impl AppState {
         let replica = loaded_cluster
             .as_ref()
             .is_some_and(|loaded| loaded.state.is_replica());
+        let is_demoting = loaded_cluster
+            .as_ref()
+            .is_some_and(|loaded| loaded.state.demoting_to.is_some());
         // Also without replication: a half-copied replica must not serve as a primary.
-        if !replica {
+        if !replica && !is_demoting {
             let options: Vec<_> = (0..cfg.num_shards)
                 .map(|i| build_sqlite_connect_options(&cfg, i))
                 .collect();
@@ -279,9 +298,12 @@ impl AppState {
         let mut commit_watch = Vec::with_capacity(cfg.num_shards);
         for i in 0..cfg.num_shards {
             let options = build_sqlite_connect_options(&cfg, i);
-            let lsn = replication::init_shard(&options, enabled, cfg.new_replid, replica)
-                .await
-                .map_err(|e| miette!("failed to initialize change index of shard {}: {}", i, e))?;
+            let lsn =
+                replication::init_shard(&options, enabled, cfg.new_replid, replica || is_demoting)
+                    .await
+                    .map_err(|e| {
+                        miette!("failed to initialize change index of shard {}: {}", i, e)
+                    })?;
             commit_watch.push(Arc::new(watch::channel(lsn).0));
         }
 
@@ -467,6 +489,9 @@ impl AppState {
             replids,
             replica_sync: replication::ReplicaSyncSupervisor::new(),
             role_change_lock: Mutex::new(()),
+            transition_running: Arc::new(AtomicBool::new(false)),
+            transition_tasks: TaskTracker::new(),
+            server_shutdown: std::sync::Mutex::new(None),
             primary_stream_cancel: std::sync::Mutex::new(CancellationToken::new()),
             ring,
         };
@@ -552,34 +577,61 @@ impl AppState {
         old.cancel();
     }
 
-    /// Attaches the runtime demotion/re-pointing handler to the cluster manager
-    /// and starts replica sync tasks if this node is currently a replica.
-    pub async fn attach_cluster_runtime(self: &Arc<Self>) {
+    /// Attaches the non-blocking runtime demotion/re-pointing handler to the
+    /// cluster manager and starts replica sync tasks if this node is a replica
+    /// without a pending re-point.
+    pub async fn attach_cluster_runtime(self: &Arc<Self>, shutdown: CancellationToken) {
+        *self.server_shutdown.lock().unwrap() = Some(shutdown);
         if let Some(cluster_manager) = &self.cluster_manager {
             let weak = Arc::downgrade(self);
             let handler: crate::cluster::RoleTransitionHandler = Arc::new(move |transition| {
-                let weak = weak.clone();
-                Box::pin(async move {
-                    let Some(state) = weak.upgrade() else {
-                        return;
-                    };
-                    match transition {
-                        RoleTransition::Demote { lost_slots, winner } => {
-                            state.complete_demotion(lost_slots, winner).await;
-                        }
-                        RoleTransition::Repoint {
-                            old_primary,
-                            new_primary,
-                        } => {
-                            state.complete_repoint(old_primary, new_primary).await;
-                        }
-                    }
-                })
+                let Some(state) = weak.upgrade() else {
+                    return;
+                };
+                state.spawn_role_transition(transition);
             });
-            cluster_manager.set_role_handler(handler).await;
+            cluster_manager.set_role_handler(handler);
         }
-        if self.cfg.replication_enabled() && self.is_replica() {
+        let repointing = self
+            .cluster_manager
+            .as_ref()
+            .is_some_and(ClusterManager::is_repointing);
+        if self.cfg.replication_enabled() && self.is_replica() && !repointing {
             self.replica_sync.start(self.clone()).await;
+        }
+    }
+
+    /// Spawns a role-transition task unless one is already running.
+    fn spawn_role_transition(self: &Arc<Self>, transition: RoleTransition) {
+        if self
+            .transition_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let guard = TransitionGuard(self.transition_running.clone());
+        let state = self.clone();
+        self.transition_tasks.spawn(async move {
+            let _guard = guard;
+            match transition {
+                RoleTransition::Demote => state.complete_demotion().await,
+                RoleTransition::Repoint => state.complete_repoint().await,
+            }
+        });
+    }
+
+    /// Prevents new transition tasks from starting and waits for any running
+    /// transition to finish before writers shut down.
+    pub async fn wait_role_transitions(&self) {
+        self.transition_tasks.close();
+        self.transition_tasks.wait().await;
+    }
+
+    /// Initiates a clean server shutdown.
+    fn trigger_shutdown(&self) {
+        if let Some(token) = self.server_shutdown.lock().unwrap().as_ref() {
+            token.cancel();
         }
     }
 
@@ -690,78 +742,136 @@ impl AppState {
         }
 
         // 2-4. Persist cluster state (commit point), promote every shard through
-        // its writer in a synchronous=FULL transaction, then expose & gossip.
+        // its writer in a synchronous=FULL transaction (retrying failed shards
+        // with backoff), then expose & gossip.
+        const PROMOTE_SHARD_MAX_ATTEMPTS: usize = 5;
         let shard_senders = &self.shard_senders;
         let result = cluster
             .promote_takeover(|| async {
-                let mut receivers = Vec::with_capacity(shard_senders.len());
-                for (shard, sender) in shard_senders.iter().enumerate() {
-                    let (responder, done) = oneshot::channel();
-                    sender
-                        .send(ShardWriteOperation::Promote { responder })
-                        .await
-                        .map_err(|_| format!("shard {shard} writer is gone"))?;
-                    receivers.push((shard, done));
+                let mut pending: Vec<usize> = (0..shard_senders.len()).collect();
+                let mut delay = Duration::from_millis(100);
+                let mut last_err = String::new();
+                for attempt in 1..=PROMOTE_SHARD_MAX_ATTEMPTS {
+                    let mut receivers = Vec::with_capacity(pending.len());
+                    for &shard in &pending {
+                        let (responder, done) = oneshot::channel();
+                        if shard_senders[shard]
+                            .send(ShardWriteOperation::Promote { responder })
+                            .await
+                            .is_err()
+                        {
+                            last_err = format!("shard {shard} writer is gone");
+                            receivers.push((shard, None));
+                        } else {
+                            receivers.push((shard, Some(done)));
+                        }
+                    }
+                    let mut still_pending = Vec::new();
+                    for (shard, done) in receivers {
+                        match done {
+                            None => still_pending.push(shard),
+                            Some(done) => match done.await {
+                                Ok(Ok(replid)) => self.set_replid(shard, &replid),
+                                Ok(Err(e)) => {
+                                    last_err = format!("shard {shard} promote failed: {e}");
+                                    still_pending.push(shard);
+                                }
+                                Err(_) => {
+                                    last_err = format!("shard {shard} writer is gone");
+                                    still_pending.push(shard);
+                                }
+                            },
+                        }
+                    }
+                    pending = still_pending;
+                    if pending.is_empty() {
+                        return Ok(());
+                    }
+                    tracing::warn!(
+                        attempt,
+                        max_attempts = PROMOTE_SHARD_MAX_ATTEMPTS,
+                        remaining_shards = ?pending,
+                        error = %last_err,
+                        "Per-shard TAKEOVER promotion failed after cluster state commit; retrying"
+                    );
+                    if attempt < PROMOTE_SHARD_MAX_ATTEMPTS {
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(Duration::from_secs(2));
+                    }
                 }
-                let mut new_replids = Vec::with_capacity(receivers.len());
-                for (shard, done) in receivers {
-                    let replid = done
-                        .await
-                        .map_err(|_| format!("shard {shard} writer is gone"))??;
-                    new_replids.push((shard, replid));
-                }
-                for (shard, replid) in new_replids {
-                    self.set_replid(shard, &replid);
-                }
-                Ok(())
+                Err(format!(
+                    "ERR Promotion committed in cluster-state.json but shards {:?} failed after {} attempts ({}); shutting down for startup recovery",
+                    pending, PROMOTE_SHARD_MAX_ATTEMPTS, last_err
+                ))
             })
             .await;
 
-        if let Err(e) = result {
-            if self.is_replica() {
-                self.replica_sync.start(self.clone()).await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(PromoteError::BeforeCommit(e)) => {
+                if self.is_replica() {
+                    self.replica_sync.start(self.clone()).await;
+                }
+                Err(e)
             }
-            return Err(e);
+            Err(PromoteError::AfterCommit(e)) => {
+                // Past the commit point: never revert to replica or restart sync
+                // tasks. Shut down cleanly so restart completes promotion via
+                // `replication::init_shard`.
+                tracing::error!(
+                    "TAKEOVER failed past cluster-state.json commit point: {}. Shutting down cleanly so startup completes promotion.",
+                    e
+                );
+                self.trigger_shutdown();
+                Err(e)
+            }
         }
-        Ok(())
     }
 
-    /// Completes runtime demotion after gossip dropped the node's last slot
-    /// from routing: run writer barriers, persist `role = replica, primary = winner`,
-    /// update per-shard `repl_state`, gossip, and start replica sync tasks.
-    pub async fn complete_demotion(self: &Arc<Self>, lost_slots: HashSet<u16>, winner: String) {
+    /// Level-triggered demotion: while `role == primary && demoting_to.is_some()`,
+    /// drain writer barriers, cancel outbound primary sync streams, mark shards
+    /// as unsynced replicas, atomically persist `role = replica, primary = winner`
+    /// clearing `demoting_to`, gossip, and start replica sync tasks. Any failure
+    /// leaves `demoting_to` set so a later gossip tick retries.
+    pub async fn complete_demotion(self: &Arc<Self>) {
         let Some(cluster) = self.cluster_manager.as_ref() else {
             return;
         };
         let _role_guard = self.role_change_lock.lock().await;
-        if self.is_replica() {
+        if !cluster.is_demoting() {
             return;
         }
 
-        // 2. Drain everything that passed the route check before slots were dropped.
+        // 1. Drain everything that passed the route check before slots were dropped.
         if let Err(e) = self.barrier_all_shards().await {
-            tracing::error!("Demotion barrier failed: {}", e);
+            tracing::error!("Demotion barrier failed (will retry): {}", e);
             return;
         }
 
-        // 3. Persist state: role = replica, primary = winner.
-        let winner = match cluster.finish_demotion(&lost_slots, &winner).await {
+        // 2. Close any outbound streams this node was serving as a primary.
+        self.cancel_primary_streams();
+
+        // 3. Per shard through the writer: role = replica, synced = 0.
+        if let Err(e) = self.demote_all_shards().await {
+            tracing::error!(
+                "Failed to mark shards as replica during demotion (will retry): {}",
+                e
+            );
+            return;
+        }
+
+        // 4. Atomically clear `demoting_to` and persist `role = replica, primary = winner`.
+        let winner = match cluster.finish_demotion().await {
             Ok(Some(winner)) => winner,
             Ok(None) => return,
             Err(e) => {
-                tracing::error!("Failed to persist demoted cluster state: {}", e);
+                tracing::error!(
+                    "Failed to persist demoted cluster state (will retry): {}",
+                    e
+                );
                 return;
             }
         };
-
-        // Close any outbound streams this node was serving as a primary.
-        self.cancel_primary_streams();
-
-        // 4. Per shard through the writer: role = replica, synced = 0.
-        if let Err(e) = self.demote_all_shards().await {
-            tracing::error!("Failed to mark shards as replica during demotion: {}", e);
-            return;
-        }
 
         if let Err(e) = cluster.publish_gossip().await {
             tracing::error!("Failed to gossip demoted role: {}", e);
@@ -778,15 +888,16 @@ impl AppState {
         }
     }
 
-    /// Completes runtime replica re-pointing when its primary's slots moved to
-    /// `new_primary`: stop sync tasks, mark shards unsynced, persist `primary`,
-    /// gossip, and restart sync tasks against `new_primary`.
-    pub async fn complete_repoint(self: &Arc<Self>, old_primary: String, new_primary: String) {
+    /// Level-triggered replica re-pointing: while `role == replica &&
+    /// repointing_to.is_some()`, stop sync tasks, mark shards unsynced,
+    /// atomically persist `primary = new_primary` clearing `repointing_to`,
+    /// gossip, and start sync tasks against the new primary.
+    pub async fn complete_repoint(self: &Arc<Self>) {
         let Some(cluster) = self.cluster_manager.as_ref() else {
             return;
         };
         let _role_guard = self.role_change_lock.lock().await;
-        if !self.is_replica() || self.replica_of().as_deref() != Some(old_primary.as_str()) {
+        if !cluster.is_repointing() {
             return;
         }
 
@@ -794,26 +905,21 @@ impl AppState {
         cluster.reset_replica_synced();
 
         if let Err(e) = self.demote_all_shards().await {
-            tracing::error!("Failed to mark shards unsynced during re-point: {}", e);
-            if self.is_replica() && self.cfg.replication_enabled() {
-                self.replica_sync.start(self.clone()).await;
-            }
+            tracing::error!(
+                "Failed to mark shards unsynced during re-point (will retry): {}",
+                e
+            );
             return;
         }
 
-        match cluster.finish_repoint(&old_primary, &new_primary).await {
+        match cluster.finish_repoint().await {
             Ok(Some(_)) => {}
-            Ok(None) => {
-                if self.is_replica() && self.cfg.replication_enabled() {
-                    self.replica_sync.start(self.clone()).await;
-                }
-                return;
-            }
+            Ok(None) => return,
             Err(e) => {
-                tracing::error!("Failed to persist re-pointed cluster state: {}", e);
-                if self.is_replica() && self.cfg.replication_enabled() {
-                    self.replica_sync.start(self.clone()).await;
-                }
+                tracing::error!(
+                    "Failed to persist re-pointed cluster state (will retry): {}",
+                    e
+                );
                 return;
             }
         }

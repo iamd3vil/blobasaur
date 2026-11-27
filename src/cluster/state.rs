@@ -278,6 +278,14 @@ struct ClusterStateWire {
     config_epoch: u64,
     #[serde(default)]
     slots: Vec<SlotRangeBinding>,
+    /// Durable marker set when a primary lost its last slot and must finish
+    /// demoting to a replica of this node; cleared when `role = replica` persists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    demoting_to: Option<String>,
+    /// Durable marker set when a replica saw its primary's slots move to this
+    /// node; cleared when `primary` is updated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repointing_to: Option<String>,
 }
 
 /// Persisted per-node cluster state.
@@ -291,6 +299,8 @@ pub struct ClusterState {
     pub primary: Option<String>,
     pub config_epoch: u64,
     pub slots: SlotTable,
+    pub demoting_to: Option<String>,
+    pub repointing_to: Option<String>,
 }
 
 impl ClusterState {
@@ -304,6 +314,8 @@ impl ClusterState {
             primary: None,
             config_epoch: 0,
             slots: SlotTable::new(),
+            demoting_to: None,
+            repointing_to: None,
         }
     }
 
@@ -317,6 +329,8 @@ impl ClusterState {
             primary: Some(primary),
             config_epoch: 0,
             slots: SlotTable::new(),
+            demoting_to: None,
+            repointing_to: None,
         }
     }
 
@@ -334,6 +348,8 @@ impl ClusterState {
             primary: self.primary.clone(),
             config_epoch: self.config_epoch,
             slots: self.slots.runs(),
+            demoting_to: self.demoting_to.clone(),
+            repointing_to: self.repointing_to.clone(),
         }
     }
 
@@ -375,10 +391,41 @@ impl ClusterState {
                         "cluster state has role=replica while node {expected_node_id} owns slots"
                     ));
                 }
+                if wire.demoting_to.is_some() {
+                    return Err("cluster state has role=replica with demoting_to set".to_string());
+                }
+                if let Some(ref target) = wire.repointing_to {
+                    if target.is_empty() {
+                        return Err("cluster state has empty repointing_to".to_string());
+                    }
+                    if target == expected_node_id {
+                        return Err(format!(
+                            "cluster state has repointing_to pointing to self ({expected_node_id})"
+                        ));
+                    }
+                }
             }
             PersistedRole::Primary => {
                 if wire.primary.is_some() {
                     return Err("cluster state has role=primary with a primary field".to_string());
+                }
+                if wire.repointing_to.is_some() {
+                    return Err("cluster state has role=primary with repointing_to set".to_string());
+                }
+                if let Some(ref winner) = wire.demoting_to {
+                    if winner.is_empty() {
+                        return Err("cluster state has empty demoting_to".to_string());
+                    }
+                    if winner == expected_node_id {
+                        return Err(format!(
+                            "cluster state has demoting_to pointing to self ({expected_node_id})"
+                        ));
+                    }
+                    if slots.has_slots_of(expected_node_id) {
+                        return Err(format!(
+                            "cluster state has demoting_to set while node {expected_node_id} owns slots"
+                        ));
+                    }
                 }
             }
         }
@@ -391,6 +438,8 @@ impl ClusterState {
             primary: wire.primary,
             config_epoch: wire.config_epoch,
             slots,
+            demoting_to: wire.demoting_to,
+            repointing_to: wire.repointing_to,
         })
     }
 
@@ -774,5 +823,57 @@ mod tests {
         )
         .unwrap();
         assert!(ClusterState::load(&path, "n1").is_err());
+
+        // Replica with demoting_to set.
+        fs::write(
+            &path,
+            r#"{"node_id":"n1","current_epoch":1,"last_vote_epoch":0,"last_vote_for":{},"role":"replica","primary":"n2","config_epoch":0,"slots":[],"demoting_to":"n2"}"#,
+        )
+        .unwrap();
+        assert!(ClusterState::load(&path, "n1").is_err());
+
+        // Primary with repointing_to set.
+        fs::write(
+            &path,
+            r#"{"node_id":"n1","current_epoch":1,"last_vote_epoch":0,"last_vote_for":{},"role":"primary","primary":null,"config_epoch":1,"slots":[],"repointing_to":"n2"}"#,
+        )
+        .unwrap();
+        assert!(ClusterState::load(&path, "n1").is_err());
+
+        // Primary with demoting_to set while still owning slots.
+        fs::write(
+            &path,
+            r#"{"node_id":"n1","current_epoch":1,"last_vote_epoch":0,"last_vote_for":{},"role":"primary","primary":null,"config_epoch":1,"slots":[{"start":0,"end":5,"node_id":"n1","config_epoch":1}],"demoting_to":"n2"}"#,
+        )
+        .unwrap();
+        assert!(ClusterState::load(&path, "n1").is_err());
+
+        // demoting_to pointing to self.
+        fs::write(
+            &path,
+            r#"{"node_id":"n1","current_epoch":1,"last_vote_epoch":0,"last_vote_for":{},"role":"primary","primary":null,"config_epoch":1,"slots":[],"demoting_to":"n1"}"#,
+        )
+        .unwrap();
+        assert!(ClusterState::load(&path, "n1").is_err());
+    }
+
+    #[test]
+    fn demoting_and_repointing_markers_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(CLUSTER_STATE_FILE);
+
+        let mut primary = ClusterState::bootstrap_primary("n1".to_string());
+        primary.current_epoch = 2;
+        primary.slots.set(0, "n2", 2);
+        primary.demoting_to = Some("n2".to_string());
+        primary.save_atomic(&path).unwrap();
+        assert_eq!(ClusterState::load(&path, "n1").unwrap(), primary);
+
+        let mut replica = ClusterState::bootstrap_replica("n3".to_string(), "n1".to_string());
+        replica.current_epoch = 2;
+        replica.slots.set(0, "n2", 2);
+        replica.repointing_to = Some("n2".to_string());
+        replica.save_atomic(&path).unwrap();
+        assert_eq!(ClusterState::load(&path, "n3").unwrap(), replica);
     }
 }
