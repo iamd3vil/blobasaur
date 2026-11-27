@@ -1734,13 +1734,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let pool = replica_pool(&dir).await;
         let now = Utc::now().timestamp();
-        // lsn 1, 2, 3 are old tombstones, 4 is an old live entry, 5 a fresh tombstone.
+        // lsn 1, 2, 3 are old tombstones, 4 is an old live entry, 5 a fresh
+        // tombstone, stamped ahead so the clock can't age it during the test.
         for (key, deleted, at) in [
             ("a", 1, now - 100),
             ("b", 1, now - 100),
             ("c", 1, now - 100),
             ("d", 0, now - 100),
-            ("e", 1, now),
+            ("e", 1, now + 60),
         ] {
             sqlx::query("INSERT INTO repl_log (tbl, key, deleted, at) VALUES ('blobs', ?, ?, ?)")
                 .bind(key)
