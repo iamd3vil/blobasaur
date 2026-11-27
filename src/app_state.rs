@@ -791,8 +791,11 @@ impl AppState {
             .unwrap()
             .clone()
             .unwrap_or_default();
-        let timeout = election_timeout(cluster.node_timeout());
-        let outcome = collect_votes(&plan, timeout, &shutdown, || {
+        // Measure the election deadline before sending the first vote request
+        // (earlier than any voter's vote time), and enforce it both during vote
+        // collection and right before the promotion commit point.
+        let deadline = std::time::Instant::now() + election_timeout(cluster.node_timeout());
+        let outcome = collect_votes(&plan, deadline, &shutdown, || {
             !cluster.is_replica()
                 || cluster.is_repointing()
                 || cluster.primary_id().as_deref() != Some(plan.failed_primary.as_str())
@@ -815,6 +818,7 @@ impl AppState {
                     failed_primary: plan.failed_primary.clone(),
                     primary_config_epoch: plan.primary_config_epoch,
                     expected_slots: plan.slots.clone(),
+                    deadline,
                 };
                 match self.promote_with_kind(kind).await {
                     Ok(epoch) => {

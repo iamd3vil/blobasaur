@@ -144,15 +144,19 @@ persists `last_vote_epoch = epoch` before replying:
 - the candidate is a replica of `failed-primary`, and `failed-primary` is FAIL
   in its view (or `MANUAL` is set, see [Manual failover](#manual-failover));
 - it hasn't voted for a replica of the same primary in the last
-  `2 * node_timeout_ms` (the vote backoff);
+  `2 * max(2 * node_timeout_ms, 2 s)` (the vote backoff: twice the election
+  window, at least 4 s);
 - for every slot in `slot-ranges`, its table's epoch for that slot is at
   most `primary-config-epoch` (the candidate isn't working from an old
   config).
 
 Votes are counted only for the epoch the candidate asked in. With votes from a
-majority of slot-owning primaries within `2 * node_timeout_ms` (at least 2 s),
-the candidate wins. Otherwise it can retry after `4 * node_timeout_ms` (at
-least 4 s), with a new epoch.
+majority of slot-owning primaries within `max(2 * node_timeout_ms, 2 s)`
+(measured from before sending the first vote request), the candidate wins and
+promotes only if the promotion commit point (`cluster-state.json` persist) is
+still reached before that election deadline; otherwise it abandons the attempt
+and can retry after `max(4 * node_timeout_ms, 4 s)` from the start of the
+previous attempt, with a new epoch.
 
 Because a primary votes once per epoch and a win needs a majority, at most one
 candidate wins any epoch.
@@ -167,9 +171,14 @@ vote.
 **Timing assumption.** The backoff and the slot-epoch check together stop a
 second replica from taking slots that the first winner already took (whose
 writes it doesn't have). That holds only if an election ends, and the winner's
-claim reaches the voters, within the backoff: an election gives up after
-`2 * node_timeout_ms`, the same as the backoff, and a claim spreads in a few
-gossip intervals. Redis relies on the same assumption.
+claim reaches the voters, within the backoff: the candidate sets its election
+deadline to `max(2 * node_timeout_ms, 2 s)` before sending its first vote
+request (earlier than any voter records its vote) and re-checks that deadline
+right before committing `cluster-state.json` (so stopping sync tasks on a slow
+in-flight apply cannot commit late), while voters hold the backoff for twice
+that election window (`2 * max(2 * node_timeout_ms, 2 s)`, at least 4 s),
+leaving a full election window for the winner's claim to spread through gossip.
+Redis relies on the same assumption.
 
 ## Promotion
 

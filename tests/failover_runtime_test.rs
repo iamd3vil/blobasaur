@@ -819,13 +819,20 @@ async fn takeover_refused_when_replica_is_not_synced() {
     )
     .await;
 
+    let mut cr = Client::connect(r.addr).await;
     wait_for("r to learn p's slots via gossip", || async {
-        ClusterState::load(&dr.path().join(CLUSTER_STATE_FILE), "r")
-            .is_ok_and(|s| s.slots.has_slots_of("p"))
+        // Wait for both persisted state and in-memory slot table (the file
+        // rename happens before `dir.sync_all()` returns to update memory).
+        let persisted = ClusterState::load(&dr.path().join(CLUSTER_STATE_FILE), "r")
+            .is_ok_and(|s| s.slots.has_slots_of("p"));
+        if !persisted {
+            return false;
+        }
+        let mut c = Client::connect(r.addr).await;
+        c.call_bulk(&["CLUSTER", "NODES"]).await.contains("0-16383")
     })
     .await;
 
-    let mut cr = Client::connect(r.addr).await;
     let reply = cr.call_simple(&["CLUSTER", "FAILOVER", "TAKEOVER"]).await;
     assert!(
         reply.starts_with("-ERR") && reply.contains("not synced"),

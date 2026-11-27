@@ -77,6 +77,10 @@ pub(crate) struct FailureTracker {
     /// edges and prevent lingering recovery-window `fail` marks from re-triggering
     /// FAIL after this node clears it.
     prev_peer_fail: HashMap<String, HashSet<String>>,
+    /// Monotonic time when this node last cleared FAIL for a target. Suppresses
+    /// delayed gossiped `fail` echoes from peers still draining the same failure
+    /// wave so staggered clears cannot ping-pong a live node back into FAIL.
+    cleared_fail_at: HashMap<String, Instant>,
     in_minority: bool,
 }
 
@@ -92,6 +96,7 @@ impl FailureTracker {
             reports: HashMap::new(),
             prev_peer_pfail: HashMap::new(),
             prev_peer_fail: HashMap::new(),
+            cleared_fail_at: HashMap::new(),
             in_minority: false,
         }
     }
@@ -254,11 +259,17 @@ impl FailureTracker {
                 });
         }
 
-        // Expire stale reports and ingest reports from live (reachable) peers.
+        // Expire stale reports and cleared-FAIL echo guards, and ingest reports
+        // from live (reachable) peers.
         let report_ttl = self.node_timeout.saturating_mul(2);
+        let clear_timeout = self.node_timeout.saturating_mul(2);
         self.reports.retain(|_, reporters| {
             reporters.retain(|_, seen_at| now.saturating_duration_since(*seen_at) <= report_ttl);
             !reporters.is_empty()
+        });
+        self.cleared_fail_at.retain(|target, cleared_at| {
+            !self.pfail.contains(target)
+                && now.saturating_duration_since(*cleared_at) < clear_timeout
         });
 
         let mut newly_propagated_fail: BTreeSet<String> = BTreeSet::new();
@@ -287,7 +298,11 @@ impl FailureTracker {
                     continue;
                 }
                 let rising = prev_fail.is_none_or(|s| !s.contains(target));
-                if rising {
+                // Ignore delayed/bounced `fail` echoes for a target we just
+                // cleared while it remains reachable here.
+                let recently_cleared_live =
+                    !self.pfail.contains(target) && self.cleared_fail_at.contains_key(target);
+                if rising && !recently_cleared_live {
                     self.reports
                         .entry(target.clone())
                         .or_default()
@@ -303,7 +318,6 @@ impl FailureTracker {
         }
 
         // Clear FAIL on nodes that are reachable again.
-        let clear_timeout = self.node_timeout.saturating_mul(2);
         let mut to_clear: Vec<String> = Vec::new();
         for (target, rec) in &mut self.failed {
             let reachable_again = observations.contains_key(target)
@@ -327,6 +341,7 @@ impl FailureTracker {
         for target in to_clear {
             self.failed.remove(&target);
             self.reports.remove(&target);
+            self.cleared_fail_at.insert(target.clone(), now);
             just_cleared.insert(target.clone());
             outcome.cleared_failed.push(target);
             outcome.gossip_changed = true;
@@ -968,6 +983,80 @@ mod tests {
             &o,
         );
         assert!(!tracker.is_failed("p5"));
+    }
+
+    #[test]
+    fn delayed_fail_echo_after_clear_does_not_ping_pong_recovered_node() {
+        let t0 = Instant::now();
+        let timeout = Duration::from_millis(1000);
+        let mut tracker = FailureTracker::new("p2".into(), timeout, t0);
+        let o_before = owners(&["p1", "p2", "p3"]);
+
+        tracker.tick(
+            t0,
+            &obs(&[
+                ("p1", peer(1, 1, &[], &[])),
+                ("p3", peer(1, 1, &[], &[])),
+                ("r2", peer(1, 1, &[], &[])),
+            ]),
+            &o_before,
+        );
+        // p1 stalls and {p2, p3} mark it FAIL; r2 has not gossiped fail=["p1"] yet.
+        tracker.tick(
+            t0 + Duration::from_millis(1000),
+            &obs(&[
+                ("p1", peer(1, 1, &[], &[])),
+                ("p3", peer(1, 2, &["p1"], &["p1"])),
+                ("r2", peer(1, 2, &[], &[])),
+            ]),
+            &o_before,
+        );
+        assert!(tracker.is_failed("p1"));
+
+        // r1 takes p1's slots and p1 restarts. p2 clears FAIL(p1) immediately.
+        let o_after = owners(&["r1", "p2", "p3"]);
+        let out = tracker.tick(
+            t0 + Duration::from_millis(1200),
+            &obs(&[
+                ("p1", peer(2, 1, &[], &[])),
+                ("p3", peer(1, 3, &[], &["p1"])),
+                ("r1", peer(1, 3, &[], &[])),
+                ("r2", peer(1, 3, &[], &[])),
+            ]),
+            &o_after,
+        );
+        assert!(!tracker.is_failed("p1"));
+        assert_eq!(out.cleared_failed, vec!["p1"]);
+
+        // 50ms later, r2's delayed `fail: ["p1"]` arrives as a rising edge while
+        // p1 is live. p2 must NOT re-mark p1 FAIL (which would ping-pong back).
+        let out = tracker.tick(
+            t0 + Duration::from_millis(1250),
+            &obs(&[
+                ("p1", peer(2, 2, &[], &[])),
+                ("p3", peer(1, 4, &[], &[])),
+                ("r1", peer(1, 4, &[], &[])),
+                ("r2", peer(1, 4, &[], &["p1"])),
+            ]),
+            &o_after,
+        );
+        assert!(!tracker.is_failed("p1"));
+        assert!(out.newly_failed.is_empty());
+
+        // If p1 genuinely crashes again right after recovery, p2 still marks it
+        // FAIL once node_timeout elapses and a primary majority agrees.
+        tracker.tick(
+            t0 + Duration::from_millis(2250),
+            &obs(&[
+                ("p1", peer(2, 2, &[], &[])),
+                ("p3", peer(1, 5, &["p1"], &["p1"])),
+                ("r1", peer(1, 5, &[], &[])),
+                ("r2", peer(1, 5, &[], &[])),
+            ]),
+            &o_after,
+        );
+        assert!(tracker.is_pfail("p1"));
+        assert!(tracker.is_failed("p1"));
     }
 
     #[test]

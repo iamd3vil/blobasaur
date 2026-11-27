@@ -2028,11 +2028,61 @@ async fn auto_failover(mode: WriteMode) {
     let started = Instant::now();
     let root = TempDir::new().unwrap();
 
+    struct AutoFailoverLogs {
+        name: String,
+        seed: u64,
+        started: Instant,
+        root: Option<TempDir>,
+        logs: Vec<(&'static str, PathBuf, PathBuf)>,
+    }
+    impl Drop for AutoFailoverLogs {
+        fn drop(&mut self) {
+            if !std::thread::panicking() {
+                return;
+            }
+            eprintln!(
+                "[chaos] FAILED scenario {} after {:?}: reproduce with BLOBASAUR_CHAOS_SEED={}",
+                self.name,
+                self.started.elapsed(),
+                self.seed
+            );
+            if let Some(root) = self.root.take() {
+                eprintln!("[chaos] kept {}", root.keep().display());
+            }
+            for (node, log, state) in &self.logs {
+                let state_txt = std::fs::read_to_string(state).unwrap_or_default();
+                eprintln!("[chaos] ---- {node} state {}\n{state_txt}", state.display());
+                eprintln!(
+                    "[chaos] ---- {node} log {} (last 60 lines)\n{}",
+                    log.display(),
+                    tail(log, 60)
+                );
+            }
+        }
+    }
+
     let mut p1 = Node::new(root.path(), "p1");
     let mut p2 = Node::new(root.path(), "p2");
     let mut p3 = Node::new(root.path(), "p3");
     let mut r1 = Node::new(root.path(), "r1");
     let mut r2 = Node::new(root.path(), "r2");
+
+    let _diag = AutoFailoverLogs {
+        name: name.clone(),
+        seed,
+        started,
+        logs: [&p1, &p2, &p3, &r1, &r2]
+            .into_iter()
+            .map(|n| {
+                (
+                    n.name,
+                    n.log(),
+                    n.data().join(blobasaur::cluster::CLUSTER_STATE_FILE),
+                )
+            })
+            .collect(),
+        root: Some(root),
+    };
 
     p1.slot_range = Some((0, 5460));
     p2.slot_range = Some((5461, 10922));

@@ -920,7 +920,11 @@ impl ClusterManager {
                 failed_primary,
                 primary_config_epoch,
                 expected_slots,
+                deadline,
             } => {
+                if Instant::now() >= *deadline {
+                    return Err("ERR Election deadline passed before promotion commit".to_string());
+                }
                 if primary != failed_primary {
                     return Err(format!(
                         "ERR Replica now follows {primary}, no longer {failed_primary}"
@@ -1340,7 +1344,7 @@ impl ClusterManager {
                 "ERR Replica has no configured primary".to_string(),
             ));
         };
-        let (taken, new_epoch) = match kind {
+        let (taken, new_epoch, election_deadline) = match kind {
             PromotionKind::Takeover => {
                 let taken = candidate.slots.slots_of(&old_primary);
                 if taken.is_empty() {
@@ -1350,13 +1354,14 @@ impl ClusterManager {
                 }
                 let new_epoch = candidate.current_epoch + 1;
                 candidate.current_epoch = new_epoch;
-                (taken, new_epoch)
+                (taken, new_epoch, None)
             }
             PromotionKind::Elected {
                 election_epoch,
                 failed_primary,
                 primary_config_epoch,
                 expected_slots,
+                deadline,
             } => {
                 if old_primary != failed_primary {
                     return Err(PromoteError::BeforeCommit(format!(
@@ -1380,7 +1385,7 @@ impl ClusterManager {
                     ));
                 }
                 candidate.current_epoch = candidate.current_epoch.max(election_epoch);
-                (expected_slots, election_epoch)
+                (expected_slots, election_epoch, Some(deadline))
             }
         };
         candidate.config_epoch = new_epoch;
@@ -1393,6 +1398,17 @@ impl ClusterManager {
         }
         self.gossip_data_for(&candidate, &taken)
             .map_err(|e| PromoteError::BeforeCommit(format!("ERR {e}")))?;
+
+        // Re-check the election deadline right before the commit point so a slow
+        // replica-sync stop or lock wait cannot promote after the voter backoff
+        // window's timing assumption (`FAILOVER.md` "Timing assumption").
+        if let Some(deadline) = election_deadline
+            && Instant::now() >= deadline
+        {
+            return Err(PromoteError::BeforeCommit(
+                "ERR Election deadline passed before promotion commit".to_string(),
+            ));
+        }
 
         // Commit point: persist cluster state before per-shard promotion or serving.
         self.persist_state(&candidate)
@@ -4693,11 +4709,11 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("already voted"), "{err}");
 
-        // 7. Higher epoch within 2 * node_timeout backoff for same failed primary -> refused.
+        // 7. Higher epoch within vote backoff (2 * election_timeout = 4000ms for nt=1000ms) -> refused.
         let err = voter
             .handle_failover_auth_at(
                 &auth_req("r2", 6, "p1", 3, 0..=5460, false),
-                t0 + Duration::from_millis(1999),
+                t0 + Duration::from_millis(3999),
             )
             .await
             .unwrap_err();
@@ -4715,12 +4731,12 @@ mod tests {
             6
         );
 
-        // 9. After 2 * node_timeout elapses, p1's backoff expires -> vote at epoch 7 granted.
+        // 9. After vote backoff (4000ms) elapses, p1's backoff expires -> vote at epoch 7 granted.
         assert_eq!(
             voter
                 .handle_failover_auth_at(
                     &auth_req("r2", 7, "p1", 3, 0..=5460, false),
-                    t0 + Duration::from_millis(2000),
+                    t0 + Duration::from_millis(4000),
                 )
                 .await
                 .unwrap(),
@@ -4811,11 +4827,11 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("already voted"), "{err}");
 
-        // Next epoch within 2 * node_timeout is blocked by persisted last_vote_for backoff.
+        // Next epoch within vote backoff (4000ms for nt=1000ms) is blocked by persisted last_vote_for.
         let err = restarted
             .handle_failover_auth_at(
                 &auth_req("r2", 6, "p1", 1, 0..=5460, false),
-                t_restart + Duration::from_millis(1999),
+                t_restart + Duration::from_millis(3999),
             )
             .await
             .unwrap_err();
@@ -4826,7 +4842,65 @@ mod tests {
             restarted
                 .handle_failover_auth_at(
                     &auth_req("r2", 6, "p1", 1, 0..=5460, false),
-                    t_restart + Duration::from_millis(2000),
+                    t_restart + Duration::from_millis(4000),
+                )
+                .await
+                .unwrap(),
+            6
+        );
+
+        // Even with small node_timeout_ms (< 1000ms), vote_backoff enforces the 4s floor
+        // (2 * election_timeout >= 4s) so backoff never expires before the election window ends.
+        let small_dir = tempfile::TempDir::new().unwrap();
+        let mut small_voter = full_cluster_manager("p2", 5461..=10922, 200, t0);
+        small_voter.state_path = Some(small_dir.path().join(CLUSTER_STATE_FILE));
+        {
+            let mut st = small_voter.state.write().unwrap();
+            for s in 0..=5460 {
+                st.slots.set(s, "p1", 1);
+            }
+        }
+        add_replica(
+            &small_voter,
+            "r1",
+            "10.0.0.10:6379",
+            "p1",
+            NodeRole::Replica,
+        )
+        .await;
+        add_replica(
+            &small_voter,
+            "r2",
+            "10.0.0.11:6379",
+            "p1",
+            NodeRole::Replica,
+        )
+        .await;
+        small_voter
+            .failure
+            .write()
+            .unwrap()
+            .mark_failed_for_test("p1", t0);
+        assert_eq!(
+            small_voter
+                .handle_failover_auth_at(&auth_req("r1", 5, "p1", 1, 0..=5460, false), t0)
+                .await
+                .unwrap(),
+            5
+        );
+        let err = small_voter
+            .handle_failover_auth_at(
+                &auth_req("r2", 6, "p1", 1, 0..=5460, false),
+                t0 + Duration::from_millis(3999),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("vote backoff"), "{err}");
+        assert_eq!(
+            small_voter
+                .handle_failover_auth_at(
+                    &auth_req("r2", 6, "p1", 1, 0..=5460, false),
+                    t0 + Duration::from_millis(4000),
                 )
                 .await
                 .unwrap(),
@@ -4916,7 +4990,13 @@ mod tests {
             manual: false,
         };
         let shutdown = CancellationToken::new();
-        let outcome = collect_votes(&plan, Duration::from_secs(2), &shutdown, || false).await;
+        let outcome = collect_votes(
+            &plan,
+            Instant::now() + Duration::from_secs(2),
+            &shutdown,
+            || false,
+        )
+        .await;
         assert!(
             matches!(outcome, VoteCollectionOutcome::NoMajority { ref votes, quorum: 2 } if votes.len() == 1),
             "{outcome:?}"
@@ -4933,7 +5013,13 @@ mod tests {
             ],
             ..plan.clone()
         };
-        let outcome = collect_votes(&plan_wrong, Duration::from_secs(2), &shutdown, || false).await;
+        let outcome = collect_votes(
+            &plan_wrong,
+            Instant::now() + Duration::from_secs(2),
+            &shutdown,
+            || false,
+        )
+        .await;
         assert!(
             matches!(outcome, VoteCollectionOutcome::NoMajority { ref votes, quorum: 2 } if votes.len() == 1),
             "{outcome:?}"
@@ -4950,7 +5036,13 @@ mod tests {
             ],
             ..plan
         };
-        let outcome = collect_votes(&plan_win, Duration::from_secs(2), &shutdown, || false).await;
+        let outcome = collect_votes(
+            &plan_win,
+            Instant::now() + Duration::from_secs(2),
+            &shutdown,
+            || false,
+        )
+        .await;
         assert!(
             matches!(outcome, VoteCollectionOutcome::Won { ref votes } if votes.len() == 2),
             "{outcome:?}"
@@ -5095,5 +5187,93 @@ mod tests {
             mgr.nodes.write().await.get_mut(id).unwrap().shard_repl = repl;
         }
         assert_eq!(mgr.compute_replica_rank("p1").await, 2);
+    }
+
+    #[tokio::test]
+    async fn elected_promotion_aborts_if_deadline_expires_before_commit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state_path = dir.path().join(CLUSTER_STATE_FILE);
+        let mut mgr = into_replica(
+            manager_with_id("r1", &[], &[("p1", "10.0.0.1:6379", &[0, 1])]),
+            "p1",
+            true,
+        );
+        mgr.state_path = Some(state_path.clone());
+        {
+            let mut st = mgr.state.write().unwrap();
+            st.current_epoch = 5;
+            st.slots.rebind_owner_epoch("p1", 1);
+            st.save_atomic(&state_path).unwrap();
+        }
+
+        let expected_slots: HashSet<u16> = [0, 1].into_iter().collect();
+
+        // 1) Already-expired deadline is rejected by can_promote and promote.
+        let expired_kind = PromotionKind::Elected {
+            election_epoch: 5,
+            failed_primary: "p1".into(),
+            primary_config_epoch: 1,
+            expected_slots: expected_slots.clone(),
+            deadline: Instant::now() - Duration::from_millis(1),
+        };
+        let err = mgr.can_promote(&expired_kind).unwrap_err();
+        assert!(err.contains("deadline"), "{err}");
+
+        let ran_shards = Arc::new(AtomicBool::new(false));
+        let ran_flag = ran_shards.clone();
+        let res = mgr
+            .promote(expired_kind, move || async move {
+                ran_flag.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
+        assert!(
+            matches!(res, Err(PromoteError::BeforeCommit(ref e)) if e.contains("deadline")),
+            "{res:?}"
+        );
+        assert!(!ran_shards.load(Ordering::SeqCst));
+        assert!(mgr.is_replica());
+        let on_disk = ClusterState::load(&state_path, "r1").unwrap();
+        assert_eq!(on_disk.role, PersistedRole::Replica);
+        assert_eq!(on_disk.primary.as_deref(), Some("p1"));
+        assert_eq!(on_disk.slots.get(0).unwrap().node_id, "p1");
+
+        // 2) Deadline valid at can_promote, then expires before commit (simulated
+        // by holding write_lock past the deadline as a slow sync stop / apply would).
+        let short_deadline = Instant::now() + Duration::from_millis(40);
+        let delayed_kind = PromotionKind::Elected {
+            election_epoch: 5,
+            failed_primary: "p1".into(),
+            primary_config_epoch: 1,
+            expected_slots,
+            deadline: short_deadline,
+        };
+        assert!(mgr.can_promote(&delayed_kind).is_ok());
+
+        let write_guard = mgr.write_lock.lock().await;
+        let mgr_clone = mgr.clone();
+        let ran_flag = ran_shards.clone();
+        let promote_task = tokio::spawn(async move {
+            mgr_clone
+                .promote(delayed_kind, move || async move {
+                    ran_flag.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        drop(write_guard);
+
+        let res = promote_task.await.unwrap();
+        assert!(
+            matches!(res, Err(PromoteError::BeforeCommit(ref e)) if e.contains("deadline")),
+            "{res:?}"
+        );
+        assert!(!ran_shards.load(Ordering::SeqCst));
+        assert!(mgr.is_replica());
+        let on_disk = ClusterState::load(&state_path, "r1").unwrap();
+        assert_eq!(on_disk.role, PersistedRole::Replica);
+        assert_eq!(on_disk.primary.as_deref(), Some("p1"));
+        assert_eq!(on_disk.slots.get(0).unwrap().node_id, "p1");
     }
 }

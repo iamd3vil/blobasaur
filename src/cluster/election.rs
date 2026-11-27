@@ -51,14 +51,16 @@ pub struct FailoverAuthRequest {
 pub enum PromotionKind {
     /// `CLUSTER FAILOVER TAKEOVER`: bumps `current_epoch` and promotes at it.
     Takeover,
-    /// Won an election: re-checks that this replica still follows `failed_primary`
-    /// and `expected_slots` are still bound to `failed_primary` at `primary_config_epoch`,
-    /// then promotes with `config_epoch = election_epoch`.
+    /// Won an election: re-checks that this replica still follows `failed_primary`,
+    /// `expected_slots` are still bound to `failed_primary` at `primary_config_epoch`,
+    /// and `deadline` (measured from before the first vote request was sent) has
+    /// not passed, then promotes with `config_epoch = election_epoch`.
     Elected {
         election_epoch: u64,
         failed_primary: String,
         primary_config_epoch: u64,
         expected_slots: HashSet<u16>,
+        deadline: std::time::Instant,
     },
 }
 
@@ -126,9 +128,15 @@ pub fn retry_backoff(node_timeout: Duration) -> Duration {
     node_timeout.saturating_mul(4).max(Duration::from_secs(4))
 }
 
-/// Per-failed-primary vote backoff on voters: `2 * node_timeout`.
+/// Per-failed-primary vote backoff on voters: `2 * election_timeout(node_timeout)`
+/// (at least 4 s).
+///
+/// Matches the timing assumption in `FAILOVER.md` and `specs/Failover.tla`
+/// (`ForgetVote` / `Failover_BugNoVoteBackoff`): the backoff must strictly cover
+/// the full election window (`election_timeout`) plus gossip propagation of the
+/// winner's claim, even when `node_timeout_ms` is small (e.g. `< 1000 ms`).
 pub fn vote_backoff(node_timeout: Duration) -> Duration {
-    node_timeout.saturating_mul(2)
+    election_timeout(node_timeout).saturating_mul(2)
 }
 
 /// Election start delay: `500 ms + random(0..500 ms) + rank * 1000 ms`.
@@ -298,11 +306,11 @@ pub async fn send_failover_auth(
 }
 
 /// Concurrently send `BLOBASAUR.FAILOVER-AUTH` to every target in `plan` and
-/// tally distinct votes matching `plan.epoch` until majority, timeout, abort,
+/// tally distinct votes matching `plan.epoch` until majority, `deadline`, abort,
 /// or shutdown.
 pub async fn collect_votes<F>(
     plan: &ElectionPlan,
-    timeout: Duration,
+    deadline: std::time::Instant,
     shutdown: &CancellationToken,
     mut should_abort: F,
 ) -> VoteCollectionOutcome
@@ -311,7 +319,7 @@ where
 {
     let req = plan.to_request();
     let encoded = encode_failover_auth(&req);
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::from_std(deadline);
 
     let mut set: JoinSet<(String, Result<u64, String>)> = JoinSet::new();
     for (owner_id, addr) in &plan.targets {
@@ -483,9 +491,27 @@ mod tests {
             Duration::from_secs(60)
         );
 
+        for ms in [10, 100, 500, 999, 1000, 5000, 15_000, 60_000] {
+            let nt = Duration::from_millis(ms);
+            let et = election_timeout(nt);
+            let vb = vote_backoff(nt);
+            assert_eq!(vb, et.saturating_mul(2), "node_timeout_ms={ms}");
+            assert!(
+                vb >= et && vb >= Duration::from_secs(4),
+                "node_timeout_ms={ms}: vote_backoff={vb:?}, election_timeout={et:?}"
+            );
+        }
+        assert_eq!(
+            vote_backoff(Duration::from_millis(200)),
+            Duration::from_secs(4)
+        );
         assert_eq!(
             vote_backoff(Duration::from_millis(1000)),
-            Duration::from_secs(2)
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            vote_backoff(Duration::from_millis(15_000)),
+            Duration::from_secs(60)
         );
 
         assert_eq!(election_delay(0, 0), Duration::from_millis(500));
