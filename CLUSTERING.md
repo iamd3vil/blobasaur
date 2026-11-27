@@ -352,14 +352,14 @@ Run `CLUSTER FAILOVER` (with no option) on a synced replica to move its primary'
 valkey-cli -p 6384 CLUSTER FAILOVER
 ```
 
-The command replies `+OK` right away and runs the handover in the background with a 5 s timeout (`CLUSTER_MF_TIMEOUT`), matching Redis Cluster:
+The command replies `+OK` right away and runs the handover in the background with a 5 s replica timeout (`CLUSTER_MF_TIMEOUT`), matching Redis Cluster. Writes to the primary's slots can block for up to 10 s (`CLUSTER_MF_TIMEOUT * CLUSTER_MF_PAUSE_MULT`) while the handover is in flight:
 
-1. The replica sends `BLOBASAUR.MFSTART` to its primary. The primary pauses writes to its slots for up to 5 s (reads continue), waits for in-flight write handlers to queue, runs a writer barrier on every shard so every acknowledged write (including queued `async_write` ops) is committed, and replies with each shard's `replid` and committed LSN.
+1. The replica sends `BLOBASAUR.MFSTART` to its primary. The primary pauses writes to its slots for up to 10 s (reads continue), waits for in-flight write handlers to queue, runs a writer barrier on every shard so every acknowledged write (including queued `async_write` ops) is committed, and replies with each shard's `replid` and committed LSN.
 2. The replica waits until every shard's `caught_up_lsn` reaches the primary's LSN under the same `replid`.
-3. The replica runs a `MANUAL` election immediately (no `FAIL` mark or rank delay needed) and promotes on a majority of slot-owning primaries.
-4. Once the old primary receives the higher-epoch claim over gossip, it ends the pause, redirects paused writes with `MOVED` to the new primary, demotes to a replica of the winner, and resyncs. Sibling replicas re-point automatically.
+3. The replica runs a `MANUAL` election immediately (no `FAIL` mark or rank delay needed) and promotes on a majority of slot-owning primaries before its 5 s deadline.
+4. Once the old primary receives the higher-epoch claim over gossip, it ends the pause right away, redirects paused writes with `MOVED` to the new primary, demotes to a replica of the winner, and resyncs. Sibling replicas re-point automatically.
 
-If any step does not finish within 5 s, the replica abandons the failover without starting a late election, and the primary's write pause expires on its own. Check logs or `CLUSTER INFO` (`cluster_stats_manual_failover_started`, `cluster_stats_manual_failover_succeeded`, `cluster_stats_manual_failover_aborted`) and `CLUSTER NODES` to verify the outcome.
+If any step does not finish within 5 s, the replica abandons the failover without starting a late election and sends a best-effort `BLOBASAUR.MFABORT` to release the primary's pause promptly; if that message is lost, the primary's 10 s pause expires on its own. Check logs or `CLUSTER INFO` (`cluster_stats_manual_failover_started`, `cluster_stats_manual_failover_succeeded`, `cluster_stats_manual_failover_aborted`) and `CLUSTER NODES` to verify the outcome.
 
 To check replication lag before maintenance (or during monitoring), `BLOBASAUR.WATERMARK` returns `[shard, replid, lsn]` per shard: the committed LSN after a writer barrier on a primary, and `caught_up_lsn` (or `not-synced`) on a replica.
 

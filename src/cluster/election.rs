@@ -95,8 +95,15 @@ impl ElectionPlan {
 }
 
 /// Redis' `CLUSTER_MF_TIMEOUT`: maximum duration for a coordinated manual
-/// failover (primary write pause, replica catch-up, election, and promotion).
+/// failover on the replica (MFSTART handshake, catch-up, election, and commit).
 pub const CLUSTER_MF_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Redis' `CLUSTER_MF_PAUSE_MULT`: the primary pauses writes for
+/// `CLUSTER_MF_TIMEOUT * CLUSTER_MF_PAUSE_MULT` (10 s) while the replica gives
+/// up at `CLUSTER_MF_TIMEOUT` (5 s). This preserves the zero-loss invariant:
+/// replica deadline (5 s, started before MFSTART) < primary pause (10 s,
+/// started after MFSTART) minus gossip claim propagation.
+pub const CLUSTER_MF_PAUSE_MULT: u32 = 2;
 
 /// Lightweight counters exposed in `CLUSTER INFO`.
 #[derive(Debug, Default)]
@@ -433,6 +440,64 @@ pub async fn send_mfstart(
     tokio::select! {
         _ = shutdown.cancelled() => Err("manual failover aborted by shutdown".to_string()),
         res = rpc => res,
+    }
+}
+
+/// Encode `BLOBASAUR.MFABORT <replica-id>` as a RESP2 array frame.
+pub fn encode_mfabort(replica_id: &str) -> Bytes {
+    let bulk = |s: &str| BytesFrame::BulkString(Bytes::copy_from_slice(s.as_bytes()));
+    serialize_frame(&BytesFrame::Array(vec![
+        bulk("BLOBASAUR.MFABORT"),
+        bulk(replica_id),
+    ]))
+}
+
+/// Best-effort `BLOBASAUR.MFABORT <replica-id>` sent to the primary when a
+/// replica abandons a manual failover after `MFSTART` succeeded, so the primary
+/// does not hold writes for the full `CLUSTER_MF_TIMEOUT * CLUSTER_MF_PAUSE_MULT`.
+pub async fn send_mfabort(
+    addr: SocketAddr,
+    replica_id: &str,
+    limit: Duration,
+) -> Result<(), String> {
+    let encoded = encode_mfabort(replica_id);
+    let deadline = Instant::now() + limit;
+
+    let mut stream = timeout_at(deadline, TcpStream::connect(addr))
+        .await
+        .map_err(|_| format!("connect to primary {addr} timed out"))?
+        .map_err(|e| format!("connect to primary {addr}: {e}"))?;
+
+    timeout_at(deadline, stream.write_all(&encoded))
+        .await
+        .map_err(|_| format!("write MFABORT to {addr} timed out"))?
+        .map_err(|e| format!("write MFABORT to {addr}: {e}"))?;
+
+    let mut buf = BytesMut::new();
+    let frame = timeout_at(deadline, async {
+        loop {
+            if let Some((frame, _, _)) = decode_bytes_mut(&mut buf)
+                .map_err(|e| format!("bad MFABORT reply from {addr}: {e:?}"))?
+            {
+                return Ok(frame);
+            }
+            if stream
+                .read_buf(&mut buf)
+                .await
+                .map_err(|e| format!("read MFABORT reply from {addr}: {e}"))?
+                == 0
+            {
+                return Err(format!("primary {addr} closed connection before replying"));
+            }
+        }
+    })
+    .await
+    .map_err(|_| format!("waiting for MFABORT reply from {addr} timed out"))??;
+
+    match frame {
+        BytesFrame::SimpleString(_) => Ok(()),
+        BytesFrame::Error(e) => Err(e.to_string()),
+        other => Err(format!("unexpected MFABORT reply {other:?}")),
     }
 }
 

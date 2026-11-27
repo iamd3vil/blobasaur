@@ -169,6 +169,10 @@ pub enum RedisCommand {
     BlobasaurMfStart {
         replica_id: String,
     },
+    /// Best-effort abort sent by a replica to end its primary's write pause early.
+    BlobasaurMfAbort {
+        replica_id: String,
+    },
     Hello {
         protover: Option<u64>,
     },
@@ -219,6 +223,7 @@ impl RedisCommand {
             RedisCommand::BlobasaurSync { .. } => "BLOBASAUR.SYNC".to_string(),
             RedisCommand::BlobasaurFailoverAuth(_) => "BLOBASAUR.FAILOVER-AUTH".to_string(),
             RedisCommand::BlobasaurMfStart { .. } => "BLOBASAUR.MFSTART".to_string(),
+            RedisCommand::BlobasaurMfAbort { .. } => "BLOBASAUR.MFABORT".to_string(),
             RedisCommand::Hello { .. } => "HELLO".to_string(),
             RedisCommand::Client { .. }
             | RedisCommand::ClientGetName
@@ -815,6 +820,7 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
         "BLOBASAUR.SYNC" => parse_blobasaur_sync_command(&elements),
         "BLOBASAUR.FAILOVER-AUTH" => parse_blobasaur_failover_auth_command(&elements),
         "BLOBASAUR.MFSTART" => parse_blobasaur_mfstart_command(&elements),
+        "BLOBASAUR.MFABORT" => parse_blobasaur_mfabort_command(&elements),
         "BLOBASAUR.WATERMARK" => {
             if elements.len() != 1 {
                 return Err(ParseError::Invalid(
@@ -953,6 +959,21 @@ fn parse_blobasaur_mfstart_command(elements: &[BytesFrame]) -> Result<RedisComma
         ));
     }
     Ok(RedisCommand::BlobasaurMfStart { replica_id })
+}
+
+fn parse_blobasaur_mfabort_command(elements: &[BytesFrame]) -> Result<RedisCommand, ParseError> {
+    if elements.len() != 2 {
+        return Err(ParseError::Invalid(
+            "BLOBASAUR.MFABORT syntax: BLOBASAUR.MFABORT <replica-id>".to_string(),
+        ));
+    }
+    let replica_id = extract_string(&elements[1])?;
+    if replica_id.is_empty() {
+        return Err(ParseError::Invalid(
+            "replica-id cannot be empty".to_string(),
+        ));
+    }
+    Ok(RedisCommand::BlobasaurMfAbort { replica_id })
 }
 
 fn parse_blobasaur_vacuum_command(elements: &[BytesFrame]) -> Result<RedisCommand, ParseError> {
@@ -1741,6 +1762,25 @@ mod tests {
             &["BLOBASAUR.MFSTART"][..],
             &["BLOBASAUR.MFSTART", ""][..],
             &["BLOBASAUR.MFSTART", "r1", "extra"][..],
+        ] {
+            assert!(parse_command(command_frame(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn test_parse_blobasaur_mfabort_command() {
+        let cmd = parse_command(command_frame(&["blobasaur.mfabort", "r1"])).unwrap();
+        assert_eq!(cmd.name(), "BLOBASAUR.MFABORT");
+        assert_eq!(
+            cmd,
+            RedisCommand::BlobasaurMfAbort {
+                replica_id: "r1".to_string(),
+            }
+        );
+        for bad in [
+            &["BLOBASAUR.MFABORT"][..],
+            &["BLOBASAUR.MFABORT", ""][..],
+            &["BLOBASAUR.MFABORT", "r1", "extra"][..],
         ] {
             assert!(parse_command(command_frame(bad)).is_err(), "{bad:?}");
         }

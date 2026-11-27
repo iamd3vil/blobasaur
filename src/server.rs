@@ -699,6 +699,9 @@ async fn handle_redis_command_inner(
         RedisCommand::BlobasaurMfStart { replica_id } => {
             handle_blobasaur_mfstart(stream, state, replica_id).await?;
         }
+        RedisCommand::BlobasaurMfAbort { replica_id } => {
+            handle_blobasaur_mfabort(stream, state, replica_id).await?;
+        }
         RedisCommand::Hello { protover } => {
             handle_hello(stream, protover).await?;
         }
@@ -2540,6 +2543,19 @@ async fn handle_blobasaur_mfstart(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let response = match state.handle_manual_failover_start(&replica_id).await {
         Ok(shards) => watermark_reply_frame(shards),
+        Err(e) => BytesFrame::Error(e.into()),
+    };
+    stream.write_all(&serialize_frame(&response)).await?;
+    Ok(())
+}
+
+async fn handle_blobasaur_mfabort(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+    replica_id: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = match state.handle_manual_failover_abort(&replica_id).await {
+        Ok(()) => BytesFrame::SimpleString("OK".into()),
         Err(e) => BytesFrame::Error(e.into()),
     };
     stream.write_all(&serialize_frame(&response)).await?;

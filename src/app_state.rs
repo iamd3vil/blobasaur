@@ -20,9 +20,9 @@ use crate::compression::{self, Compressor};
 // Import ShardWriteOperation from shard_manager
 use crate::{
     cluster::{
-        CLUSTER_MF_TIMEOUT, ClusterManager, PromoteError, PromotionKind, ReplicateCheck,
-        RoleTransition, VoteCollectionOutcome, collect_votes, election_delay, election_timeout,
-        random_jitter_ms, retry_backoff, send_mfstart,
+        CLUSTER_MF_PAUSE_MULT, CLUSTER_MF_TIMEOUT, ClusterManager, PromoteError, PromotionKind,
+        ReplicateCheck, RoleTransition, VoteCollectionOutcome, collect_votes, election_delay,
+        election_timeout, random_jitter_ms, retry_backoff, send_mfabort, send_mfstart,
     },
     config::Cfg,
     metrics::{Metrics, ShardMetrics},
@@ -130,11 +130,17 @@ pub struct AppState {
     ring: HashRing<ShardNode>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PauseState {
+    deadline: tokio::time::Instant,
+    owner: String,
+}
+
 struct WritePause {
-    /// Serializes `BLOBASAUR.MFSTART` pause setup and barrier runs.
+    /// Serializes `BLOBASAUR.MFSTART` / `BLOBASAUR.MFABORT` control updates.
     control: Mutex<()>,
-    /// Current pause deadline (`None` when writes are not paused).
-    state_tx: Arc<watch::Sender<Option<tokio::time::Instant>>>,
+    /// Active pause deadline and owning replica id (`None` when not paused).
+    state_tx: Arc<watch::Sender<Option<PauseState>>>,
     /// In-flight local writes hold a shared read guard from before route checks
     /// until their shard ops are queued/committed. `MFSTART` takes a brief
     /// exclusive write guard after activating the pause so no write admitted
@@ -155,13 +161,14 @@ impl WritePause {
         }
     }
 
-    fn activate(&self, deadline: tokio::time::Instant) {
-        self.state_tx.send_replace(Some(deadline));
+    fn activate(&self, deadline: tokio::time::Instant, owner: String) {
+        let target = PauseState { deadline, owner };
+        self.state_tx.send_replace(Some(target.clone()));
         let tx = Arc::clone(&self.state_tx);
         let handle = tokio::spawn(async move {
             tokio::time::sleep_until(deadline).await;
             tx.send_if_modified(|current| {
-                if *current == Some(deadline) {
+                if current.as_ref() == Some(&target) {
                     *current = None;
                     true
                 } else {
@@ -188,9 +195,28 @@ impl WritePause {
         });
     }
 
+    /// Ends the active pause only if it belongs to `replica_id`. Caller must
+    /// hold `control` so this cannot race with a concurrent `activate`.
+    fn clear_if_owner(&self, replica_id: &str) -> bool {
+        let mut cleared = false;
+        self.state_tx.send_if_modified(|current| {
+            if current.as_ref().is_some_and(|p| p.owner == replica_id) {
+                *current = None;
+                cleared = true;
+                true
+            } else {
+                false
+            }
+        });
+        if cleared && let Some(prev) = self.timer.lock().unwrap().take() {
+            prev.abort();
+        }
+        cleared
+    }
+
     fn clear_if_deadline(&self, deadline: tokio::time::Instant) {
         self.state_tx.send_if_modified(|current| {
-            if *current == Some(deadline) {
+            if current.as_ref().is_some_and(|p| p.deadline == deadline) {
                 *current = None;
                 true
             } else {
@@ -796,7 +822,7 @@ impl AppState {
             {
                 let mut rx = self.write_pause.state_tx.subscribe();
                 loop {
-                    let Some(deadline) = *rx.borrow_and_update() else {
+                    let Some(deadline) = rx.borrow_and_update().as_ref().map(|p| p.deadline) else {
                         break;
                     };
                     if shutdown.is_cancelled() || !self.should_pause_write_slots(slots) {
@@ -833,8 +859,14 @@ impl AppState {
     }
 
     /// Primary side of `BLOBASAUR.MFSTART <replica-id>`: pause local writes for
-    /// at most `CLUSTER_MF_TIMEOUT` (5 s), drain already-admitted write handlers,
-    /// run a writer barrier on every shard, and return each shard's `(replid, lsn)`.
+    /// `CLUSTER_MF_TIMEOUT * CLUSTER_MF_PAUSE_MULT` (10 s), drain already-admitted
+    /// write handlers, run a writer barrier on every shard, and return each
+    /// shard's `(replid, lsn)`.
+    ///
+    /// Pausing for `2 * CLUSTER_MF_TIMEOUT` while the replica gives up at
+    /// `CLUSTER_MF_TIMEOUT` (5 s) ensures a late pre-deadline promotion commit
+    /// cannot race with the pause expiring before gossip delivers the winner's
+    /// higher-epoch claim to this primary.
     pub async fn handle_manual_failover_start(
         &self,
         replica_id: &str,
@@ -850,23 +882,28 @@ impl AppState {
         let _control = self.write_pause.control.lock().await;
         cluster.validate_mfstart(replica_id).await?;
 
-        let deadline = tokio::time::Instant::now() + CLUSTER_MF_TIMEOUT;
-        self.write_pause.activate(deadline);
+        let now = tokio::time::Instant::now();
+        let drain_deadline = now + CLUSTER_MF_TIMEOUT;
+        let pause_duration = CLUSTER_MF_TIMEOUT.saturating_mul(CLUSTER_MF_PAUSE_MULT);
+        let pause_deadline = now + pause_duration;
+        self.write_pause
+            .activate(pause_deadline, replica_id.to_string());
 
         let drain_and_barrier = async {
             // Wait for every write handler that entered before the pause to
             // finish queueing its shard op(s) so the barriers below cover them.
-            let inflight = tokio::time::timeout_at(deadline, self.write_pause.inflight.write())
-                .await
-                .map_err(|_| {
-                    "ERR Timed out draining in-flight writes for manual failover".to_string()
-                })?;
+            let inflight =
+                tokio::time::timeout_at(drain_deadline, self.write_pause.inflight.write())
+                    .await
+                    .map_err(|_| {
+                        "ERR Timed out draining in-flight writes for manual failover".to_string()
+                    })?;
             drop(inflight);
 
             cluster.validate_mfstart(replica_id).await?;
 
             let shards = tokio::time::timeout_at(
-                deadline,
+                drain_deadline,
                 futures::future::try_join_all(
                     (0..self.shard_senders.len())
                         .map(|shard| replication::shard_watermark(self, shard)),
@@ -886,17 +923,40 @@ impl AppState {
                 tracing::info!(
                     primary = %cluster.node_id(),
                     replica = %replica_id,
-                    timeout_ms = CLUSTER_MF_TIMEOUT.as_millis() as u64,
+                    pause_ms = pause_duration.as_millis() as u64,
                     watermarks = ?shards,
                     "Paused primary writes for manual failover"
                 );
                 Ok(shards)
             }
             Err(e) => {
-                self.write_pause.clear_if_deadline(deadline);
+                self.write_pause.clear_if_deadline(pause_deadline);
                 Err(e)
             }
         }
+    }
+
+    /// Primary side of `BLOBASAUR.MFABORT <replica-id>`: end the active write
+    /// pause early only if it was started by `replica_id`.
+    pub async fn handle_manual_failover_abort(&self, replica_id: &str) -> Result<(), String> {
+        let Some(cluster) = self.cluster_manager.as_ref() else {
+            return Err("ERR This instance has cluster support disabled".to_string());
+        };
+        let _control = self.write_pause.control.lock().await;
+        if self.write_pause.clear_if_owner(replica_id) {
+            tracing::info!(
+                primary = %cluster.node_id(),
+                replica = %replica_id,
+                "Ended primary write pause early on MFABORT"
+            );
+        } else {
+            tracing::debug!(
+                primary = %cluster.node_id(),
+                replica = %replica_id,
+                "Ignored stale MFABORT (pause not owned by replica)"
+            );
+        }
+        Ok(())
     }
 
     /// Initiates a clean server shutdown.
@@ -1030,11 +1090,19 @@ impl AppState {
         let Some(cluster) = self.cluster_manager.as_ref() else {
             return;
         };
+        // Zero-loss timing invariant (matches Redis Cluster):
+        //   replica deadline (CLUSTER_MF_TIMEOUT = 5 s, started before MFSTART)
+        //   < primary pause (CLUSTER_MF_TIMEOUT * CLUSTER_MF_PAUSE_MULT = 10 s, started after MFSTART)
+        //     minus gossip claim propagation.
+        // The replica must neither start its election nor commit promotion past
+        // `mf_deadline`, leaving the remaining ~5 s of primary pause for the
+        // winner's claim to reach the old primary and trigger demotion.
         let mf_deadline = std::time::Instant::now() + CLUSTER_MF_TIMEOUT;
         let shutdown = self.shutdown_token();
 
+        let mut paused_primary_addr: Option<std::net::SocketAddr> = None;
         match self
-            .run_manual_failover_inner(cluster, mf_deadline, &shutdown)
+            .run_manual_failover_inner(cluster, mf_deadline, &shutdown, &mut paused_primary_addr)
             .await
         {
             Ok(epoch) => {
@@ -1052,6 +1120,21 @@ impl AppState {
                     reason = %reason,
                     "Coordinated manual failover aborted"
                 );
+                // Best-effort MFABORT so an aborted failover releases the
+                // primary's 10 s pause promptly instead of waiting for expiry.
+                // Skip if promotion already committed on this node.
+                if let Some(primary_addr) = paused_primary_addr
+                    && cluster.is_replica()
+                    && let Err(abort_err) =
+                        send_mfabort(primary_addr, cluster.node_id(), Duration::from_secs(2)).await
+                {
+                    tracing::debug!(
+                        replica = %cluster.node_id(),
+                        primary_addr = %primary_addr,
+                        error = %abort_err,
+                        "Best-effort MFABORT to primary failed; primary pause will expire on timeout"
+                    );
+                }
             }
         }
     }
@@ -1061,6 +1144,7 @@ impl AppState {
         cluster: &ClusterManager,
         mf_deadline: std::time::Instant,
         shutdown: &CancellationToken,
+        paused_primary_addr: &mut Option<std::net::SocketAddr>,
     ) -> Result<u64, String> {
         let primary_id = cluster
             .primary_id()
@@ -1087,6 +1171,7 @@ impl AppState {
         )
         .await
         .map_err(|e| format!("MFSTART handshake with {primary_id} failed: {e}"))?;
+        *paused_primary_addr = Some(primary_addr);
 
         let progress_notify = cluster.repl_progress_notify();
         let tokio_deadline = tokio::time::Instant::from_std(mf_deadline);

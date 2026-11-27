@@ -845,29 +845,43 @@ async fn manual_failover_abort_on_stalled_catchup_and_in_progress_refusal() {
         (reply, t0.elapsed())
     });
 
-    // Must still be paused after 400 ms.
+    // Must still be paused after 400 ms, and a stale MFABORT from another replica
+    // must NOT release p1's pause.
     sleep(Duration::from_millis(400)).await;
     assert!(
         !paused_write.is_finished(),
         "write on paused primary should remain blocked while manual failover is active"
     );
+    assert_eq!(
+        Client::connect(p1.addr)
+            .await
+            .call_simple(&["BLOBASAUR.MFABORT", "other-replica"])
+            .await,
+        "+OK"
+    );
+    sleep(Duration::from_millis(300)).await;
+    assert!(
+        !paused_write.is_finished(),
+        "stale MFABORT from another replica must not release p1's write pause"
+    );
 
-    // Wait for the 5 s timeout: paused write resumes and completes on p1.
+    // Wait for r1's 5 s timeout: r1 aborts and sends MFABORT to release p1's
+    // 10 s pause promptly, so the paused write completes well before 10 s.
     let (write_reply, write_elapsed) = timeout(Duration::from_secs(8), paused_write)
         .await
-        .expect("paused write did not resume after 5 s timeout")
+        .expect("paused write did not resume promptly via MFABORT after r1's 5 s timeout")
         .unwrap();
     assert_eq!(
         write_reply, "+OK",
-        "paused write should complete on p1 after pause expires"
+        "paused write should complete on p1 after MFABORT releases the pause"
     );
     assert!(
         write_elapsed >= Duration::from_secs(3),
         "write resumed too early ({write_elapsed:?}); pause may not have held"
     );
     assert!(
-        started.elapsed() < Duration::from_secs(9),
-        "pause should expire near 5 s, took {:?}",
+        started.elapsed() < Duration::from_secs(8),
+        "MFABORT should release the 10 s pause near 5 s, took {:?}",
         started.elapsed()
     );
 
@@ -1170,6 +1184,484 @@ async fn goredis_cluster_client_survives_manual_failover() {
         String::from_utf8_lossy(&output.stderr)
     );
 
+    r1.stop().await;
+    p3.stop().await;
+    p2.stop().await;
+    p1.stop().await;
+}
+
+/// Regression test for the gap between replica promotion and late gossip claim
+/// propagation to the old primary:
+/// - `p1` runs with a 6.5 s `gossip_interval_ms`, so after `r1` promotes it
+///   takes > 5 s (past `CLUSTER_MF_TIMEOUT`, inside the 10 s primary pause)
+///   for `p1` to observe `r1`'s higher-epoch claim and demote.
+/// - A writer hammers `p1` continuously throughout the failover.
+/// - Because `p1` stays paused for `2 * CLUSTER_MF_TIMEOUT` (10 s) until it
+///   demotes, no write slips into `p1` after 5 s to be discarded by RESYNC:
+///   every acknowledged write is readable from `r1` afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manual_failover_zero_loss_when_claim_reaches_old_primary_late() {
+    let d1 = TempDir::new().unwrap();
+    let d2 = TempDir::new().unwrap();
+    let d3 = TempDir::new().unwrap();
+    let dr1 = TempDir::new().unwrap();
+
+    let gp1 = free_udp_port();
+    let gp2 = free_udp_port();
+    let gp3 = free_udp_port();
+    let gpr1 = free_udp_port();
+    let g1 = format!("127.0.0.1:{gp1}");
+    let g2 = format!("127.0.0.1:{gp2}");
+    let g3 = format!("127.0.0.1:{gp3}");
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_with_timing(
+        dir: &Path,
+        node_id: &str,
+        gossip_port: u16,
+        seeds: Vec<String>,
+        slot_ranges: Option<Vec<SlotRange>>,
+        replica_of: Option<&str>,
+        gossip_interval_ms: u64,
+        node_timeout_ms: u64,
+    ) -> RunningNode {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cfg = Cfg {
+            data_dir: dir.to_string_lossy().into_owned(),
+            num_shards: SHARDS,
+            storage_compression: None,
+            async_write: Some(true),
+            batch_size: Some(100),
+            batch_timeout_ms: Some(10),
+            write_queue_capacity: None,
+            addr: Some(addr.to_string()),
+            cluster: Some(ClusterConfig {
+                enabled: true,
+                node_id: node_id.to_string(),
+                seeds,
+                port: gossip_port,
+                slots: None,
+                slot_ranges,
+                gossip_interval_ms: Some(gossip_interval_ms),
+                advertise_addr: Some(addr.to_string()),
+                node_timeout_ms: Some(node_timeout_ms),
+                replica_validity_factor: None,
+            }),
+            replication: Some(ReplicationConfig {
+                replica_of: replica_of.map(str::to_string),
+                tombstone_retention_secs: Some(86400),
+            }),
+            metrics: None,
+            sqlite: None,
+            shutdown_timeout_secs: Some(20),
+            max_request_size_mb: None,
+            cleanup_chunk_size: None,
+            cleanup_interval_secs: None,
+            new_replid: false,
+        };
+        let shutdown = CancellationToken::new();
+        let handle = tokio::spawn(server::run(cfg, listener, shutdown.clone()));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Ok(mut client) = Client::try_connect(addr).await
+                && client.call_simple(&["PING"]).await == "+PONG"
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "node {node_id} did not start");
+            sleep(Duration::from_millis(50)).await;
+        }
+        RunningNode {
+            addr,
+            shutdown,
+            handle,
+        }
+    }
+
+    // Bootstrap quickly at 100 ms gossip so cluster-state.json is persisted on p1.
+    let (p1, p2, p3) = tokio::join!(
+        start_with_timing(
+            d1.path(),
+            "p1",
+            gp1,
+            vec![g2.clone(), g3.clone()],
+            Some(vec![SlotRange {
+                start: 0,
+                end: 5460,
+            }]),
+            None,
+            100,
+            15_000,
+        ),
+        start_with_timing(
+            d2.path(),
+            "p2",
+            gp2,
+            vec![g1.clone(), g3.clone()],
+            Some(vec![SlotRange {
+                start: 5461,
+                end: 10922,
+            }]),
+            None,
+            100,
+            15_000,
+        ),
+        start_with_timing(
+            d3.path(),
+            "p3",
+            gp3,
+            vec![g1.clone(), g2.clone()],
+            Some(vec![SlotRange {
+                start: 10923,
+                end: 16383,
+            }]),
+            None,
+            100,
+            15_000,
+        ),
+    );
+    let r1 = start_with_timing(
+        dr1.path(),
+        "r1",
+        gpr1,
+        vec![g1.clone(), g2.clone(), g3.clone()],
+        None,
+        Some("p1"),
+        100,
+        15_000,
+    )
+    .await;
+
+    wait_for(
+        "initial cluster ok before restarting p1 with slow gossip",
+        Duration::from_secs(15),
+        || async {
+            let info = parse_info(
+                &Client::connect(p1.addr)
+                    .await
+                    .call_bulk(&["CLUSTER", "INFO"])
+                    .await,
+            );
+            info.get("cluster_state").map(String::as_str) == Some("ok")
+                && all_shards_synced(dr1.path()).await
+        },
+    )
+    .await;
+
+    // Restart p1 from persisted state with a 6.5 s gossip_interval_ms: its first
+    // gossip tick runs immediately on start (before peers arrive) and its next
+    // tick runs 6.5 s later, so right after p1 discovers r1 its following gossip
+    // tick is ~6.5 s away (> 5 s CLUSTER_MF_TIMEOUT, < 10 s primary pause).
+    p1.stop().await;
+    let p1 = start_with_timing(
+        d1.path(),
+        "p1",
+        gp1,
+        vec![g2.clone(), g3.clone()],
+        Some(vec![SlotRange {
+            start: 0,
+            end: 5460,
+        }]),
+        None,
+        6500,
+        15_000,
+    )
+    .await;
+
+    wait_for(
+        "slow-gossip p1 discovers r1 and r1 reconnects",
+        Duration::from_secs(20),
+        || async {
+            let nodes = Client::connect(p1.addr)
+                .await
+                .call_bulk(&["CLUSTER", "NODES"])
+                .await;
+            let p1_knows_r1 = node_entry(&nodes, "r1")
+                .is_some_and(|(flags, master, _, _)| flags.contains("slave") && master == "p1");
+            if !p1_knows_r1 {
+                return false;
+            }
+            let r1_nodes = Client::connect(r1.addr)
+                .await
+                .call_bulk(&["CLUSTER", "NODES"])
+                .await;
+            let r1_sees_p1 = r1_nodes
+                .lines()
+                .any(|l| l.starts_with("p1 ") && l.contains(&p1.addr.to_string()));
+            r1_sees_p1 && all_shards_synced(dr1.path()).await
+        },
+    )
+    .await;
+
+    // Hammer p1 continuously while triggering CLUSTER FAILOVER on r1.
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_w = stop.clone();
+    let p1_addr = p1.addr;
+    let write_keys = keys_in_range("late_claim_k", 300, 0, 5460);
+    let writer = tokio::spawn(async move {
+        let mut target = p1_addr;
+        let mut conn = Client::connect(target).await;
+        let mut acked: BTreeMap<String, String> = BTreeMap::new();
+        let mut moved_count = 0usize;
+        let mut i = 0usize;
+        while !stop_w.load(Ordering::Relaxed) {
+            let key = &write_keys[i % write_keys.len()];
+            let val = format!("late-v-{i}");
+            let saw_moved = write_following_moved(&mut conn, &mut target, &["SET", key, &val])
+                .await
+                .expect("write during late-claim manual failover must complete via MOVED");
+            if saw_moved {
+                moved_count += 1;
+            }
+            acked.insert(key.clone(), val);
+            i += 1;
+            if i.is_multiple_of(5) {
+                sleep(Duration::from_millis(1)).await;
+            }
+        }
+        (acked, moved_count, target)
+    });
+
+    sleep(Duration::from_millis(100)).await;
+    let mf_started = Instant::now();
+    assert_eq!(
+        Client::connect(r1.addr)
+            .await
+            .call_simple(&["CLUSTER", "FAILOVER"])
+            .await,
+        "+OK"
+    );
+
+    // r1 promotes quickly (well before its 5 s deadline).
+    wait_for("r1 promotes quickly", Duration::from_secs(5), || async {
+        let nodes = Client::connect(r1.addr)
+            .await
+            .call_bulk(&["CLUSTER", "NODES"])
+            .await;
+        node_entry(&nodes, "r1")
+            .is_some_and(|(flags, _, _, slots)| flags.contains("master") && slots == "0-5460")
+    })
+    .await;
+    let r1_promoted_at = mf_started.elapsed();
+    assert!(
+        r1_promoted_at < Duration::from_secs(4),
+        "r1 should promote before its 5 s deadline, took {r1_promoted_at:?}"
+    );
+
+    // Wait for slow-gossip p1 to eventually observe r1's claim and demote.
+    wait_for(
+        "slow-gossip p1 demotes and resyncs from r1",
+        Duration::from_secs(15),
+        || async {
+            let nodes = Client::connect(p1.addr)
+                .await
+                .call_bulk(&["CLUSTER", "NODES"])
+                .await;
+            node_entry(&nodes, "p1").is_some_and(|(flags, master, _, slots)| {
+                flags.contains("slave") && master == "r1" && slots.is_empty()
+            }) && all_shards_synced(d1.path()).await
+        },
+    )
+    .await;
+    let p1_demoted_at = mf_started.elapsed();
+    assert!(
+        p1_demoted_at > Duration::from_secs(5),
+        "expected p1's slow gossip tick to land past 5 s to exercise the gap (demoted at {p1_demoted_at:?})"
+    );
+
+    sleep(Duration::from_millis(150)).await;
+    stop.store(true, Ordering::Relaxed);
+    let (acked, moved_count, final_target) = writer.await.unwrap();
+    assert!(moved_count >= 1, "expected writer to follow MOVED to r1");
+    assert_eq!(final_target, r1.addr);
+
+    // Every single acknowledged write must be readable directly from r1 (zero loss).
+    let mut cr1 = Client::connect(r1.addr).await;
+    for (k, expected) in &acked {
+        let got = cr1.call_bulk(&["GET", k]).await;
+        assert_eq!(
+            &got, expected,
+            "acknowledged write for {k} lost during late-claim gap"
+        );
+    }
+
+    r1.stop().await;
+    p3.stop().await;
+    p2.stop().await;
+    p1.stop().await;
+}
+
+/// Direct test of `BLOBASAUR.MFABORT` owner matching:
+/// - `BLOBASAUR.MFSTART r1` pauses writes on `p1` for 10 s.
+/// - A stale `BLOBASAUR.MFABORT r2` from another replica leaves the pause active.
+/// - `BLOBASAUR.MFABORT r1` from the owning replica ends the pause immediately.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manual_failover_mfabort_ends_pause_promptly_and_ignores_stale_replica() {
+    let d1 = TempDir::new().unwrap();
+    let d2 = TempDir::new().unwrap();
+    let d3 = TempDir::new().unwrap();
+    let dr1 = TempDir::new().unwrap();
+    let dr2 = TempDir::new().unwrap();
+
+    let gp1 = free_udp_port();
+    let gp2 = free_udp_port();
+    let gp3 = free_udp_port();
+    let gpr1 = free_udp_port();
+    let gpr2 = free_udp_port();
+    let g1 = format!("127.0.0.1:{gp1}");
+    let g2 = format!("127.0.0.1:{gp2}");
+    let g3 = format!("127.0.0.1:{gp3}");
+
+    let (p1, p2, p3) = tokio::join!(
+        start_node(
+            d1.path(),
+            "p1",
+            gp1,
+            vec![g2.clone(), g3.clone()],
+            Some(vec![SlotRange {
+                start: 0,
+                end: 5460,
+            }]),
+            None,
+            false,
+            None,
+        ),
+        start_node(
+            d2.path(),
+            "p2",
+            gp2,
+            vec![g1.clone(), g3.clone()],
+            Some(vec![SlotRange {
+                start: 5461,
+                end: 10922,
+            }]),
+            None,
+            false,
+            None,
+        ),
+        start_node(
+            d3.path(),
+            "p3",
+            gp3,
+            vec![g1.clone(), g2.clone()],
+            Some(vec![SlotRange {
+                start: 10923,
+                end: 16383,
+            }]),
+            None,
+            false,
+            None,
+        ),
+    );
+    let (r1, r2) = tokio::join!(
+        start_node(
+            dr1.path(),
+            "r1",
+            gpr1,
+            vec![g1.clone(), g2.clone(), g3.clone()],
+            None,
+            Some("p1"),
+            false,
+            None,
+        ),
+        start_node(
+            dr2.path(),
+            "r2",
+            gpr2,
+            vec![g1.clone(), g2.clone(), g3.clone()],
+            None,
+            Some("p1"),
+            false,
+            None,
+        ),
+    );
+
+    wait_for(
+        "p1 sees both r1 and r2 as replicas",
+        Duration::from_secs(15),
+        || async {
+            let nodes = Client::connect(p1.addr)
+                .await
+                .call_bulk(&["CLUSTER", "NODES"])
+                .await;
+            let has_r1 = node_entry(&nodes, "r1")
+                .is_some_and(|(flags, master, _, _)| flags.contains("slave") && master == "p1");
+            let has_r2 = node_entry(&nodes, "r2")
+                .is_some_and(|(flags, master, _, _)| flags.contains("slave") && master == "p1");
+            has_r1 && has_r2
+        },
+    )
+    .await;
+
+    // Start pause owned by r1.
+    let mut c_mf = Client::connect(p1.addr).await;
+    c_mf.send(&["BLOBASAUR.MFSTART", "r1"]).await.unwrap();
+    let header = c_mf.line().await.unwrap();
+    assert!(
+        header.starts_with('*'),
+        "expected watermark array reply from MFSTART, got {header}"
+    );
+    drop(c_mf);
+
+    let key = key_in_range("mfabort_k", 0, 5460);
+    let p1_addr = p1.addr;
+    let key_copy = key.clone();
+    let blocked_write = tokio::spawn(async move {
+        Client::connect(p1_addr)
+            .await
+            .call_simple(&["SET", &key_copy, "after-abort"])
+            .await
+    });
+
+    sleep(Duration::from_millis(250)).await;
+    assert!(
+        !blocked_write.is_finished(),
+        "write should be paused after MFSTART r1"
+    );
+
+    // Stale MFABORT from r2 must be ignored and keep the write blocked.
+    assert_eq!(
+        Client::connect(p1.addr)
+            .await
+            .call_simple(&["BLOBASAUR.MFABORT", "r2"])
+            .await,
+        "+OK"
+    );
+    sleep(Duration::from_millis(350)).await;
+    assert!(
+        !blocked_write.is_finished(),
+        "stale MFABORT from r2 must not end r1's pause"
+    );
+
+    // Owning replica's MFABORT must end the 10 s pause immediately.
+    let t_abort = Instant::now();
+    assert_eq!(
+        Client::connect(p1.addr)
+            .await
+            .call_simple(&["BLOBASAUR.MFABORT", "r1"])
+            .await,
+        "+OK"
+    );
+    let reply = timeout(Duration::from_secs(2), blocked_write)
+        .await
+        .expect("MFABORT from owning replica r1 did not release pause promptly")
+        .unwrap();
+    assert_eq!(reply, "+OK");
+    assert!(
+        t_abort.elapsed() < Duration::from_secs(1),
+        "pause should end immediately on owner MFABORT, took {:?}",
+        t_abort.elapsed()
+    );
+    assert_eq!(
+        Client::connect(p1.addr)
+            .await
+            .call_bulk(&["GET", &key])
+            .await,
+        "after-abort"
+    );
+
+    r2.stop().await;
     r1.stop().await;
     p3.stop().await;
     p2.stop().await;

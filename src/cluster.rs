@@ -3,9 +3,10 @@ mod failure;
 mod state;
 
 pub use election::{
-    CLUSTER_MF_TIMEOUT, ElectionPlan, ElectionStats, FailoverAuthRequest, PromotionKind,
-    ShardReplState, VoteCollectionOutcome, collect_votes, election_delay, election_timeout,
-    parse_slot_ranges, random_jitter_ms, retry_backoff, send_mfstart, vote_backoff,
+    CLUSTER_MF_PAUSE_MULT, CLUSTER_MF_TIMEOUT, ElectionPlan, ElectionStats, FailoverAuthRequest,
+    PromotionKind, ShardReplState, VoteCollectionOutcome, collect_votes, election_delay,
+    election_timeout, parse_slot_ranges, random_jitter_ms, retry_backoff, send_mfabort,
+    send_mfstart, vote_backoff,
 };
 use failure::{FailureTracker, PeerHeartbeatView};
 #[allow(unused_imports)]
