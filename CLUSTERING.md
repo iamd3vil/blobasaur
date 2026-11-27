@@ -9,16 +9,17 @@ Blobasaur implements Redis cluster protocol compatibility, allowing Redis cluste
 ## Implementation Status
 
 ✅ **Fully Implemented:**
-- Redis cluster protocol commands (`CLUSTER MYID`, `CLUSTER NODES`, `CLUSTER INFO`, `CLUSTER SLOTS`, `CLUSTER SHARDS`, `CLUSTER ADDSLOTS`, `CLUSTER DELSLOTS`, `CLUSTER KEYSLOT`)
+- Redis cluster protocol commands (`CLUSTER MYID`, `CLUSTER NODES`, `CLUSTER INFO`, `CLUSTER SLOTS`, `CLUSTER SHARDS`, `CLUSTER ADDSLOTS`, `CLUSTER DELSLOTS`, `CLUSTER KEYSLOT`, `CLUSTER FAILOVER TAKEOVER`, `CLUSTER REPLICATE`)
 - Hash slot calculation using CRC16 (Redis-compatible)
 - Persisted per-node cluster state (`<data_dir>/cluster-state.json`) with epoch-versioned slot table and Redis-style epoch collision resolution
+- Runtime promotion (`CLUSTER FAILOVER TAKEOVER`), automatic old-primary demotion, automatic replica re-pointing, and runtime `CLUSTER REPLICATE <node-id>`
 - MOVED redirection for keys owned by another live node, CLUSTERDOWN for unbound or offline slots
 - Gossip protocol implementation using chitchat for node discovery
 - Automatic node discovery and cluster membership management
 - Cross-node key operations with automatic redirects
 - Cluster state management and health monitoring
 
-- Asynchronous replication with manual failover (see [Replication](#replication))
+- Asynchronous replication with manual runtime failover (see [Replication](#replication))
 
 🚧 **Not Yet Implemented:**
 - Online slot migration/resharding
@@ -208,6 +209,12 @@ valkey-cli -c -p 6381 CLUSTER SLOTS
 
 # Show Redis 7 shard topology
 valkey-cli -c -p 6381 CLUSTER SHARDS
+
+# Promote a synced replica to take over its primary's slots at runtime (no election)
+valkey-cli -p 6384 CLUSTER FAILOVER TAKEOVER
+
+# Make an empty, slotless primary (or an existing replica) replicate a primary at runtime
+valkey-cli -p 6385 CLUSTER REPLICATE node-1
 ```
 
 ### Key Operations
@@ -306,7 +313,7 @@ The replication metrics are listed in [METRICS.md](METRICS.md). The one to alert
 
 ### Failover
 
-Failover is manual and the operator fences the old primary. Nothing in the cluster stops two nodes from claiming the same slots; a node that starts with slots refuses to if it sees a live node already claiming them, but that check is best effort only.
+Failover is manual (`CLUSTER FAILOVER TAKEOVER`), and **fencing the old primary is still the operator's job**: `TAKEOVER` skips failure detection and elections, so an unfenced primary partitioned from the rest of the cluster can keep accepting writes until it hears the new claim. Never delete `<data_dir>/cluster-state.json` during failover—promotion, replica re-pointing, and old-primary demotion all happen at runtime and persist their new roles and epochs there.
 
 `BLOBASAUR.WATERMARK` helps decide when a replica is caught up. It returns one `[shard, replid, lsn]` entry per shard:
 - On a primary it first waits until every write acknowledged before the call (including `async_write` ones still queued) is committed, then returns the shard's highest LSN.
@@ -314,29 +321,22 @@ Failover is manual and the operator fences the old primary. Nothing in the clust
 
 #### Unplanned (the primary is lost)
 
-1. **Fence the old primary.** Make sure `node-1` is stopped and cannot restart with its old config: stop the unit, block its ports, or take the host down.
-2. **Wait for the cluster to see it as dead.** Run `valkey-cli -p 6384 CLUSTER NODES` (any live node) until `node-1` is no longer listed as live. Restarting the replica earlier fails: the startup guard refuses to start while a live node still claims the slots.
-3. **Promote the replica (interim procedure until `CLUSTER FAILOVER TAKEOVER` lands).** Stop the replica, remove `<data_dir>/cluster-state.json` (so it re-bootstraps from config rather than keeping its persisted replica role), edit `config.node1b.toml` to remove `[replication]`'s `replica_of` and add `node-1`'s slots, then start it:
-   ```toml
-   [replication]
-   tombstone_retention_secs = 86400
-
-   [[cluster.slot_ranges]]
-   start = 0
-   end = 5460
+1. **Fence the old primary.** Make sure `node-1` is stopped or isolated from clients (stop the unit, block its client port, or take the host down) so clients cannot keep writing to it before it learns about the takeover.
+2. **Promote a synced replica at runtime.** Send `CLUSTER FAILOVER TAKEOVER` to `node-1b`:
+   ```bash
+   valkey-cli -p 6384 CLUSTER FAILOVER TAKEOVER
    ```
-   On start it promotes (refusing if any shard never finished its first copy) and generates a new `replid`. Check `valkey-cli -p 6384 CLUSTER NODES` shows it as `master` with the slots.
-
-   > **Warning:** Removing `<data_dir>/cluster-state.json` is an interim step until `CLUSTER FAILOVER TAKEOVER` lands in the next failover PR. Outside of this manual failover procedure, never delete `cluster-state.json`: doing so discards the node's epochs (`current_epoch`, `config_epoch`), slot table, and persisted vote state (`last_vote_epoch`, `last_vote_for`).
-4. **Repoint other replicas (interim).** For every other replica of `node-1`, stop it, remove its `<data_dir>/cluster-state.json`, set `replica_of = "node-1b"`, and start it. It gets a resync and copies everything again.
-5. **Bring `node-1` back (optional, interim).** Remove its `<data_dir>/cluster-state.json`, give it `replica_of = "node-1b"`, remove its `slot_ranges`, and start it. It resyncs from `node-1b`; writes it never replicated are discarded.
+   `node-1b` stops its replica sync tasks, bumps `current_epoch`, claims `node-1`'s slots at the new `config_epoch`, persists `<data_dir>/cluster-state.json`, sets each shard to `primary` with a new `replid` (refusing if any shard is not synced), and begins serving the slots. Check `valkey-cli -p 6384 CLUSTER NODES` shows it as `master` with the slots.
+3. **Other replicas re-point automatically.** Every other replica of `node-1` sees `node-1`'s slots bound to `node-1b` at a higher epoch via gossip, persists `primary = "node-1b"`, marks itself unsynced, and restarts its sync tasks against `node-1b`. Because `node-1b` has a new `replid`, each replica receives `RESYNC` and copies from scratch.
+4. **Bring `node-1` back (optional).** Start `node-1` normally (keep its `<data_dir>/cluster-state.json`; do not delete it). Once it receives gossip from `node-1b` (or immediately if it was still running and reachable), it sees its slots bound at a higher epoch, drops them from routing (`MOVED`), drains in-flight writes through per-shard writer barriers, demotes to a replica of `node-1b`, and resyncs from scratch. **Any writes `node-1` accepted that were never streamed to `node-1b` (including acknowledged `async_write` ops that were queued) are discarded.**
+5. **Reassigning or adding a replica at runtime.** On a replica, or on an empty primary with no assigned slots, run `valkey-cli -p <port> CLUSTER REPLICATE <primary-node-id>` to start replicating `<primary-node-id>` without restarting.
 
 #### Planned (maintenance)
 
 1. Stop client writes to the primary's slots in your application.
 2. On the primary, run `valkey-cli -p 6381 BLOBASAUR.WATERMARK` and note each shard's `replid` and `lsn`.
 3. On the replica, run `valkey-cli -p 6384 BLOBASAUR.WATERMARK` until every shard shows the same `replid` and an `lsn` at least the primary's. The primary stays up meanwhile, and its idle heartbeats deliver the watermark within about 10 seconds. `not-synced` means the shard is not ready.
-4. Stop and fence `node-1`, then continue from step 2 of the unplanned procedure. No acknowledged writes are lost.
+4. Run `valkey-cli -p 6384 CLUSTER FAILOVER TAKEOVER` on the replica (or stop/fence `node-1` first, then run `TAKEOVER`). No acknowledged writes are lost; if `node-1` is left running or restarted later, it automatically demotes to a replica of `node-1b` and resyncs.
 
 #### Restoring a primary from backup
 

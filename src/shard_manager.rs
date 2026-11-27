@@ -132,6 +132,16 @@ pub enum ShardWriteOperation {
         replid: String,
         responder: oneshot::Sender<Result<(), String>>,
     },
+    /// Runtime promotion: sets `repl_state.role = primary` and a new `replid`
+    /// in one `synchronous = FULL` transaction; returns the new `replid`.
+    Promote {
+        responder: oneshot::Sender<Result<String, String>>,
+    },
+    /// Runtime demotion / re-pointing: sets `repl_state.role = replica` and
+    /// `synced = 0` in one `synchronous = FULL` transaction.
+    Demote {
+        responder: oneshot::Sender<Result<(), String>>,
+    },
     /// Answered once everything queued ahead of it has committed.
     Barrier { responder: oneshot::Sender<()> },
 }
@@ -141,7 +151,12 @@ impl ShardWriteOperation {
     fn is_maintenance(&self) -> bool {
         matches!(
             self,
-            Self::Vacuum { .. } | Self::Apply { .. } | Self::Reset { .. } | Self::Barrier { .. }
+            Self::Vacuum { .. }
+                | Self::Apply { .. }
+                | Self::Reset { .. }
+                | Self::Promote { .. }
+                | Self::Demote { .. }
+                | Self::Barrier { .. }
         )
     }
 }
@@ -1082,6 +1097,14 @@ pub async fn shard_writer_task(writer: ShardWriter) {
                 let _ = responder.send(replication::reset(&pool, &replid, &key_count).await);
                 continue;
             }
+            Some(ShardWriteOperation::Promote { responder }) => {
+                let _ = responder.send(replication::promote_shard(&pool, &commit_watch).await);
+                continue;
+            }
+            Some(ShardWriteOperation::Demote { responder }) => {
+                let _ = responder.send(replication::demote_shard(&pool).await);
+                continue;
+            }
             Some(ShardWriteOperation::Barrier { responder }) => {
                 let _ = responder.send(());
                 continue;
@@ -1752,6 +1775,8 @@ pub(crate) async fn process_batch(
             ShardWriteOperation::Vacuum { .. }
             | ShardWriteOperation::Apply { .. }
             | ShardWriteOperation::Reset { .. }
+            | ShardWriteOperation::Promote { .. }
+            | ShardWriteOperation::Demote { .. }
             | ShardWriteOperation::Barrier { .. } => {
                 Err("Maintenance operation reached transactional batch unexpectedly".to_string())
             }
@@ -1939,7 +1964,9 @@ pub(crate) async fn process_batch(
                 });
             }
             // Never batched; dropping the responder reports it as cancelled.
-            ShardWriteOperation::Barrier { .. } => {}
+            ShardWriteOperation::Promote { .. }
+            | ShardWriteOperation::Demote { .. }
+            | ShardWriteOperation::Barrier { .. } => {}
         }
     }
 
@@ -2001,7 +2028,9 @@ async fn fail_batch(
                 shard_metrics.async_writes_pending.decrement(1.0);
             }
             // Never batched; dropping the responder reports it as cancelled.
-            ShardWriteOperation::Barrier { .. } => {}
+            ShardWriteOperation::Promote { .. }
+            | ShardWriteOperation::Demote { .. }
+            | ShardWriteOperation::Barrier { .. } => {}
         }
     }
 }

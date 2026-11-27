@@ -49,6 +49,13 @@ pub enum VacuumCommandMode {
     Full,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterFailoverMode {
+    Default,
+    Force,
+    Takeover,
+}
+
 /// Commands supported by Blobasaur
 #[derive(Debug, Clone, PartialEq)]
 pub enum RedisCommand {
@@ -126,6 +133,12 @@ pub enum RedisCommand {
     ClusterKeySlot {
         key: String,
     },
+    ClusterFailover {
+        mode: ClusterFailoverMode,
+    },
+    ClusterReplicate {
+        node_id: String,
+    },
     Ttl {
         key: String,
     },
@@ -191,6 +204,8 @@ impl RedisCommand {
             RedisCommand::ClusterAddSlots { .. } => "CLUSTER ADDSLOTS".to_string(),
             RedisCommand::ClusterDelSlots { .. } => "CLUSTER DELSLOTS".to_string(),
             RedisCommand::ClusterKeySlot { .. } => "CLUSTER KEYSLOT".to_string(),
+            RedisCommand::ClusterFailover { .. } => "CLUSTER FAILOVER".to_string(),
+            RedisCommand::ClusterReplicate { .. } => "CLUSTER REPLICATE".to_string(),
             RedisCommand::Ttl { .. } => "TTL".to_string(),
             RedisCommand::Expire { .. } => "EXPIRE".to_string(),
             RedisCommand::BlobasaurVacuum { .. } => "BLOBASAUR.VACUUM".to_string(),
@@ -725,6 +740,41 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
                     }
                     let key = extract_string(&elements[2])?;
                     Ok(RedisCommand::ClusterKeySlot { key })
+                }
+                "FAILOVER" => match elements.len() {
+                    2 => Ok(RedisCommand::ClusterFailover {
+                        mode: ClusterFailoverMode::Default,
+                    }),
+                    3 => {
+                        let option = extract_string(&elements[2])?.to_uppercase();
+                        let mode = match option.as_str() {
+                            "FORCE" => ClusterFailoverMode::Force,
+                            "TAKEOVER" => ClusterFailoverMode::Takeover,
+                            _ => {
+                                return Err(ParseError::Invalid(
+                                    "CLUSTER FAILOVER option must be FORCE or TAKEOVER".to_string(),
+                                ));
+                            }
+                        };
+                        Ok(RedisCommand::ClusterFailover { mode })
+                    }
+                    _ => Err(ParseError::Invalid(
+                        "wrong number of arguments for 'cluster|failover' command".to_string(),
+                    )),
+                },
+                "REPLICATE" => {
+                    if elements.len() != 3 {
+                        return Err(ParseError::Invalid(
+                            "CLUSTER REPLICATE requires exactly 1 argument".to_string(),
+                        ));
+                    }
+                    let node_id = extract_string(&elements[2])?;
+                    if node_id.is_empty() {
+                        return Err(ParseError::Invalid(
+                            "CLUSTER REPLICATE node id cannot be empty".to_string(),
+                        ));
+                    }
+                    Ok(RedisCommand::ClusterReplicate { node_id })
                 }
                 _ => Ok(RedisCommand::Unknown(format!("CLUSTER {}", subcommand))),
             }
@@ -2369,5 +2419,45 @@ mod tests {
         ]);
         let serialized = serialize_frame(&value);
         assert_eq!(serialized.as_ref(), b"*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n");
+    }
+
+    #[test]
+    fn test_parse_cluster_failover_and_replicate() {
+        assert_eq!(
+            parse(&["CLUSTER", "FAILOVER"]).unwrap(),
+            RedisCommand::ClusterFailover {
+                mode: ClusterFailoverMode::Default
+            }
+        );
+        assert_eq!(
+            parse(&["cluster", "failover", "force"]).unwrap(),
+            RedisCommand::ClusterFailover {
+                mode: ClusterFailoverMode::Force
+            }
+        );
+        assert_eq!(
+            parse(&["CLUSTER", "FAILOVER", "TAKEOVER"]).unwrap(),
+            RedisCommand::ClusterFailover {
+                mode: ClusterFailoverMode::Takeover
+            }
+        );
+        assert_parse_error(&["CLUSTER", "FAILOVER", "INVALID"], "FORCE or TAKEOVER");
+        assert_parse_error(
+            &["CLUSTER", "FAILOVER", "FORCE", "EXTRA"],
+            "wrong number of arguments",
+        );
+
+        assert_eq!(
+            parse(&["CLUSTER", "REPLICATE", "node-1"]).unwrap(),
+            RedisCommand::ClusterReplicate {
+                node_id: "node-1".to_string()
+            }
+        );
+        assert_parse_error(&["CLUSTER", "REPLICATE"], "requires exactly 1 argument");
+        assert_parse_error(
+            &["CLUSTER", "REPLICATE", "a", "b"],
+            "requires exactly 1 argument",
+        );
+        assert_parse_error(&["CLUSTER", "REPLICATE", ""], "cannot be empty");
     }
 }

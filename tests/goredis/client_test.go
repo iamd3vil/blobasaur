@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -406,4 +407,58 @@ func TestClusterReadOnlyReadsFromReplica(t *testing.T) {
 	expect(t, "GET from the replica", rdb.Get(ctx, key), "from-replica")
 	// Writes still go to the primary.
 	expect(t, "SET", rdb.Set(ctx, "written", "v", 0), "OK")
+}
+
+// A ClusterClient keeps reading and writing across a runtime CLUSTER FAILOVER TAKEOVER.
+// Run by tests/failover_runtime_test.rs.
+func TestClusterClientSurvivesTakeover(t *testing.T) {
+	addrsEnv := os.Getenv("BLOBASAUR_CLUSTER_ADDRS")
+	replicaAddr := os.Getenv("BLOBASAUR_TAKEOVER_REPLICA")
+	slotKey := os.Getenv("BLOBASAUR_SLOT_KEY")
+	if addrsEnv == "" || replicaAddr == "" || slotKey == "" {
+		t.Skip("needs a cluster; run via tests/failover_runtime_test.rs")
+	}
+
+	cluster := redis.NewClusterClient(&redis.ClusterOptions{
+		Addrs: strings.Split(addrsEnv, ","),
+	})
+	t.Cleanup(func() { cluster.Close() })
+
+	// Write before takeover on the failing-over shard and verify replication reaches the replica.
+	expect(t, "SET pre-takeover", cluster.Set(ctx, slotKey, "before-takeover", 0), "OK")
+	expect(t, "GET pre-takeover", cluster.Get(ctx, slotKey), "before-takeover")
+
+	replica := redis.NewClient(&redis.Options{Addr: replicaAddr})
+	t.Cleanup(func() { replica.Close() })
+	expect(t, "READONLY on replica", replica.Do(ctx, "READONLY"), "OK")
+	waitFor(t, "replica to receive pre-takeover key", func() bool {
+		v, err := replica.Get(ctx, slotKey).Result()
+		return err == nil && v == "before-takeover"
+	})
+
+	// Trigger runtime TAKEOVER on the replica.
+	expect(t, "CLUSTER FAILOVER TAKEOVER", replica.Do(ctx, "CLUSTER", "FAILOVER", "TAKEOVER"), "OK")
+
+	// Wait until gossip delivers the new epoch to the old primary so ClusterClient
+	// receives MOVED, reloads its slot map, and routes writes to the promoted replica.
+	probeKey := "{" + slotKey + "}:probe"
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if err := cluster.Set(ctx, probeKey, "routed-to-winner", 0).Err(); err == nil {
+			if v, err := replica.Get(ctx, probeKey).Result(); err == nil && v == "routed-to-winner" {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("ClusterClient did not route writes to promoted replica within 10s")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Once routed to the new primary, subsequent reads and writes hit it directly.
+	afterKey := "{" + slotKey + "}:after"
+	expect(t, "SET post-takeover", cluster.Set(ctx, afterKey, "after-takeover", 0), "OK")
+	expect(t, "GET pre-takeover after failover", cluster.Get(ctx, slotKey), "before-takeover")
+	expect(t, "GET post-takeover", cluster.Get(ctx, afterKey), "after-takeover")
+	expect(t, "GET directly on promoted replica", replica.Get(ctx, afterKey), "after-takeover")
 }

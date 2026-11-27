@@ -1313,23 +1313,17 @@ impl Rig {
         self.proxy.set(Mode::Pass);
     }
 
-    /// Interim promotion until `CLUSTER FAILOVER TAKEOVER` lands: remove
-    /// persisted cluster state and restart the replica's data dir as a primary
-    /// owning every slot, retrying while the startup guard refuses.
+    /// Promotes the running replica at runtime with `CLUSTER FAILOVER TAKEOVER`.
     async fn promote(&mut self) {
-        self.r.replica_of = None;
-        self.r.seeds = vec![format!("127.0.0.1:{}", self.p.gossip_port)];
-        let _ = std::fs::remove_file(self.r.data().join(blobasaur::cluster::CLUSTER_STATE_FILE));
-        for attempt in 1..=30 {
-            match self.r.start().await {
-                Ok(()) => return,
-                Err(e) => {
-                    eprintln!("[chaos] promotion attempt {attempt} failed: {e}");
-                    sleep(Duration::from_secs(1)).await;
-                }
-            }
-        }
-        panic!("the replica could not be promoted");
+        let mut conn = Conn::open(self.r.addr).await.expect("connect to replica");
+        let reply = conn
+            .cmd(&["CLUSTER", "FAILOVER", "TAKEOVER"])
+            .await
+            .expect("CLUSTER FAILOVER TAKEOVER");
+        assert!(
+            matches!(reply, Resp::Simple(ref s) if s == "OK"),
+            "CLUSTER FAILOVER TAKEOVER failed: {reply:?}"
+        );
     }
 
     fn resyncs(&self) -> usize {
@@ -1641,7 +1635,6 @@ async fn planned_failover(mode: WriteMode) {
     stop_sampler.store(true, Ordering::Relaxed);
     let seen = sampler.await.unwrap();
     rig.check_replica_reads(&recs, seen).await;
-    rig.r.stop().await;
     rig.promote().await;
     let new = watermark(rig.r.addr).await.unwrap();
     assert!(
@@ -1701,6 +1694,7 @@ async fn unplanned_failover(mode: WriteMode) {
     } else {
         rig.r.kill9();
     }
+    rig.r.must_start().await;
     rig.promote().await;
     let new = watermark(rig.r.addr).await.unwrap();
     assert!(

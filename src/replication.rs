@@ -685,6 +685,88 @@ pub(crate) async fn reset(
     Ok(())
 }
 
+/// Runtime promotion: sets `repl_state.role = primary` and a new `replid` in
+/// one `synchronous = FULL` transaction on the shard writer connection.
+pub(crate) async fn promote_shard(
+    pool: &SqlitePool,
+    commit_watch: &watch::Sender<u64>,
+) -> Result<String, String> {
+    let sql = |e: sqlx::Error| e.to_string();
+    let state = |e: miette::Report| e.to_string();
+    let mut conn = pool.acquire().await.map_err(sql)?;
+    let prev_sync: i64 = sqlx::query_scalar("PRAGMA synchronous")
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(sql)?;
+    sqlx::query("PRAGMA synchronous = FULL")
+        .execute(&mut *conn)
+        .await
+        .map_err(sql)?;
+
+    let result: Result<(String, u64), String> = async {
+        let mut tx = conn.begin().await.map_err(sql)?;
+        let replid = new_replid();
+        set_state(&mut tx, "role", "primary").await.map_err(state)?;
+        set_state(&mut tx, "replid", &replid).await.map_err(state)?;
+        set_state(&mut tx, "clean_shutdown", "0")
+            .await
+            .map_err(state)?;
+        let lsn = watermark(&mut tx).await.map_err(sql)? as u64;
+        tx.commit().await.map_err(sql)?;
+        Ok((replid, lsn))
+    }
+    .await;
+
+    let _ = sqlx::query(&format!("PRAGMA synchronous = {prev_sync}"))
+        .execute(&mut *conn)
+        .await;
+
+    let (replid, lsn) = result?;
+    publish(commit_watch, lsn);
+    Ok(replid)
+}
+
+/// Runtime demotion or replica re-pointing: sets `repl_state.role = replica`
+/// and `synced = 0` in one `synchronous = FULL` transaction on the shard
+/// writer connection.
+pub(crate) async fn demote_shard(pool: &SqlitePool) -> Result<(), String> {
+    let sql = |e: sqlx::Error| e.to_string();
+    let state = |e: miette::Report| e.to_string();
+    let mut conn = pool.acquire().await.map_err(sql)?;
+    let prev_sync: i64 = sqlx::query_scalar("PRAGMA synchronous")
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(sql)?;
+    sqlx::query("PRAGMA synchronous = FULL")
+        .execute(&mut *conn)
+        .await
+        .map_err(sql)?;
+
+    let result: Result<(), String> = async {
+        let mut tx = conn.begin().await.map_err(sql)?;
+        set_state(&mut tx, "role", "replica").await.map_err(state)?;
+        set_state(&mut tx, "synced", "0").await.map_err(state)?;
+        tx.commit().await.map_err(sql)?;
+        Ok(())
+    }
+    .await;
+
+    let _ = sqlx::query(&format!("PRAGMA synchronous = {prev_sync}"))
+        .execute(&mut *conn)
+        .await;
+
+    result
+}
+
+/// Whether `shard`'s DB currently records `repl_state.synced = 1`.
+pub async fn is_shard_synced(pool: &SqlitePool) -> Result<bool, String> {
+    let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
+    let synced = get_state(&mut conn, "synced")
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(synced.as_deref() == Some("1"))
+}
+
 /// What a replica asks for in `BLOBASAUR.SYNC`.
 pub struct SyncRequest {
     pub shard: usize,
@@ -759,6 +841,10 @@ pub async fn serve_sync(
     shutdown: &CancellationToken,
     req: SyncRequest,
 ) -> io::Result<()> {
+    // Grab the role-cancellation token before checking `is_replica()` so a
+    // concurrent demotion that flips the role and cancels the token never
+    // leaves a newly accepted stream uncancelled.
+    let role_cancel = state.primary_stream_cancel();
     let cfg = &state.cfg;
     let error = if !cfg.replication_enabled() {
         Some("replication is not enabled on this node".to_string())
@@ -818,6 +904,7 @@ pub async fn serve_sync(
     let result = match sent {
         Ok(()) => tokio::select! {
             _ = shutdown.cancelled() => Ok(()),
+            _ = role_cancel.cancelled() => Ok(()),
             result = stream_pages(&mut stream, state, shard, pin, req.lsn) => result,
         },
         Err(e) => Err(e),
@@ -959,6 +1046,67 @@ async fn current_row(
     }
 }
 
+/// Supervises a node's per-shard replica sync tasks so they can be started,
+/// stopped, and restarted at runtime on role or primary changes.
+///
+/// Stopping cancels the tasks and awaits every handle; each task finishes any
+/// `Apply` or `Reset` it already placed in a shard writer queue before exiting,
+/// so no `Apply`/`Reset` can be left queued behind a role change.
+#[derive(Default)]
+pub struct ReplicaSyncSupervisor {
+    inner: Mutex<Option<RunningReplicaSync>>,
+}
+
+struct RunningReplicaSync {
+    cancel: CancellationToken,
+    handles: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl ReplicaSyncSupervisor {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(None),
+        }
+    }
+
+    /// Starts one sync task per shard against the current followed primary,
+    /// stopping any previously running tasks first. Does nothing (and leaves
+    /// tasks stopped) if replication is disabled or the node is not a replica.
+    pub async fn start(&self, state: Arc<AppState>) {
+        let mut guard = self.inner.lock().await;
+        if let Some(running) = guard.take() {
+            running.cancel.cancel();
+            for handle in running.handles {
+                let _ = handle.await;
+            }
+        }
+        if !state.cfg.replication_enabled() || !state.is_replica() {
+            return;
+        }
+        let cancel = CancellationToken::new();
+        let handles = (0..state.cfg.num_shards)
+            .map(|i| tokio::spawn(replica_sync_task(state.clone(), i, cancel.clone())))
+            .collect();
+        *guard = Some(RunningReplicaSync { cancel, handles });
+    }
+
+    /// Stops all running replica sync tasks and waits for them to exit.
+    pub async fn stop(&self) {
+        let mut guard = self.inner.lock().await;
+        if let Some(running) = guard.take() {
+            running.cancel.cancel();
+            for handle in running.handles {
+                let _ = handle.await;
+            }
+        }
+    }
+
+    /// Stops any existing sync tasks and starts fresh ones for the current primary.
+    pub async fn restart(&self, state: Arc<AppState>) {
+        self.start(state).await;
+    }
+}
+
 /// Runs the replica side of one shard until `shutdown` is cancelled: keeps a
 /// stream open to the primary's current address and applies it through the
 /// shard's writer.
@@ -974,14 +1122,12 @@ pub async fn replica_sync_task(state: Arc<AppState>, shard: usize, shutdown: Can
         state,
         shard,
         primary,
+        cancel: shutdown,
     };
     replica
         .tick
         .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    tokio::select! {
-        _ = shutdown.cancelled() => {}
-        _ = replica.run() => {}
-    }
+    replica.run().await;
 }
 
 struct Replica {
@@ -995,14 +1141,23 @@ struct Replica {
     /// session reads it back (or starts counting from now), and restarted by a reset.
     last_watermark_ms: Option<i64>,
     backoff: Duration,
+    cancel: CancellationToken,
 }
 
 impl Replica {
     async fn run(&mut self) {
-        loop {
+        while !self.cancel.is_cancelled() {
             match self.session().await {
-                Ok(()) => self.pause(BACKOFF_MIN).await,
+                Ok(()) => {
+                    if self.cancel.is_cancelled() {
+                        return;
+                    }
+                    self.pause(BACKOFF_MIN).await;
+                }
                 Err(e) => {
+                    if self.cancel.is_cancelled() {
+                        return;
+                    }
                     tracing::warn!(
                         "[Shard {}] replication from {} failed: {}",
                         self.shard,
@@ -1021,6 +1176,7 @@ impl Replica {
         let end = Instant::now() + duration;
         loop {
             tokio::select! {
+                _ = self.cancel.cancelled() => return,
                 _ = tokio::time::sleep_until(end) => return,
                 _ = self.tick.tick() => self.publish_staleness(),
             }
@@ -1070,15 +1226,21 @@ impl Replica {
     /// One connection to the primary: handshake, then either a reset (`RESYNC`)
     /// or applying the stream. Returns `Ok` when it should reconnect at once.
     async fn session(&mut self) -> Result<(), String> {
+        if self.cancel.is_cancelled() {
+            return Ok(());
+        }
         let (replid, applied) = self.stored().await?;
         let addr = self
             .primary_addr()
             .await
             .ok_or_else(|| format!("{} is not in the cluster gossip", self.primary))?;
-        let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
-            .await
-            .map_err(|_| format!("connecting to {addr} timed out"))?
-            .map_err(|e| format!("connecting to {addr}: {e}"))?;
+        let mut stream = tokio::select! {
+            _ = self.cancel.cancelled() => return Ok(()),
+            res = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)) => {
+                res.map_err(|_| format!("connecting to {addr} timed out"))?
+                    .map_err(|e| format!("connecting to {addr}: {e}"))?
+            }
+        };
 
         let cfg = &self.state.cfg;
         let bulk = |s: String| BytesFrame::BulkString(Bytes::from(s));
@@ -1090,25 +1252,28 @@ impl Replica {
             bulk(cfg.num_shards.to_string()),
             bulk(cfg.compression_id()),
         ]);
-        write_all(&mut stream, &serialize_frame(&handshake))
-            .await
-            .map_err(|e| e.to_string())?;
+        let encoded = serialize_frame(&handshake);
+        tokio::select! {
+            _ = self.cancel.cancelled() => return Ok(()),
+            res = write_all(&mut stream, &encoded) => res.map_err(|e| e.to_string())?,
+        }
 
         let mut buf = BytesMut::new();
-        let reply = timeout(CONNECT_TIMEOUT, async {
-            loop {
-                if let Some((frame, _, _)) =
-                    decode_bytes_mut(&mut buf).map_err(|e| format!("bad reply: {e:?}"))?
-                {
-                    return Ok(frame);
+        let reply = tokio::select! {
+            _ = self.cancel.cancelled() => return Ok(()),
+            res = timeout(CONNECT_TIMEOUT, async {
+                loop {
+                    if let Some((frame, _, _)) =
+                        decode_bytes_mut(&mut buf).map_err(|e| format!("bad reply: {e:?}"))?
+                    {
+                        return Ok(frame);
+                    }
+                    if stream.read_buf(&mut buf).await.map_err(|e| e.to_string())? == 0 {
+                        return Err("primary closed the connection".to_string());
+                    }
                 }
-                if stream.read_buf(&mut buf).await.map_err(|e| e.to_string())? == 0 {
-                    return Err("primary closed the connection".to_string());
-                }
-            }
-        })
-        .await
-        .map_err(|_| "handshake timed out".to_string())??;
+            }) => res.map_err(|_| "handshake timed out".to_string())??,
+        };
 
         let reply = match reply {
             BytesFrame::SimpleString(s) => String::from_utf8_lossy(&s).into_owned(),
@@ -1136,6 +1301,9 @@ impl Replica {
         let mut frames = Vec::new();
         let mut bytes = 0;
         loop {
+            if self.cancel.is_cancelled() {
+                return Ok(());
+            }
             // Apply what has arrived before reading more: at a watermark, when
             // enough has piled up, or when nothing is buffered anymore.
             while let Some((frame, _, _)) =
@@ -1148,14 +1316,21 @@ impl Replica {
                 if watermark || frames.len() >= PAGE_ROWS || bytes >= PAGE_BYTES {
                     self.apply(std::mem::take(&mut frames)).await?;
                     bytes = 0;
+                    if self.cancel.is_cancelled() {
+                        return Ok(());
+                    }
                 }
             }
             if !frames.is_empty() {
                 self.apply(std::mem::take(&mut frames)).await?;
                 bytes = 0;
+                if self.cancel.is_cancelled() {
+                    return Ok(());
+                }
             }
 
             tokio::select! {
+                _ = self.cancel.cancelled() => return Ok(()),
                 read = stream.read_buf(&mut buf) => {
                     if read.map_err(|e| e.to_string())? == 0 {
                         return Err("primary closed the stream".to_string());
@@ -1207,12 +1382,17 @@ impl Replica {
         if let Some((_, unix_ms)) = caught_up {
             self.last_watermark_ms = Some(unix_ms);
             self.publish_staleness();
-            self.set_synced(true).await;
+            if !self.cancel.is_cancelled() {
+                self.set_synced(true).await;
+            }
         }
         Ok(())
     }
 
     async fn reset(&mut self, replid: &str) -> Result<(), String> {
+        if self.cancel.is_cancelled() {
+            return Ok(());
+        }
         tracing::warn!(
             "[Shard {}] resyncing from {}: discarding the local copy",
             self.shard,
@@ -1220,7 +1400,13 @@ impl Replica {
         );
         // Reads admitted while synced finish first; later ones are redirected.
         let state = self.state.clone();
-        let _gate = state.replica_reset_gate(self.shard).await;
+        let _gate = tokio::select! {
+            _ = self.cancel.cancelled() => return Ok(()),
+            gate = state.replica_reset_gate(self.shard) => gate,
+        };
+        if self.cancel.is_cancelled() {
+            return Ok(());
+        }
         self.set_synced(false).await;
         let (responder, committed) = oneshot::channel();
         let op = ShardWriteOperation::Reset {
@@ -1236,17 +1422,21 @@ impl Replica {
     }
 
     /// Queues `op` and waits for the writer's answer, still ticking the
-    /// staleness gauge meanwhile.
+    /// staleness gauge meanwhile. Once `op` enters the writer queue we always
+    /// wait for it to commit so stopping sync tasks never leaves an Apply or
+    /// Reset queued behind a role change.
     async fn writer(
         &mut self,
         op: ShardWriteOperation,
         mut committed: oneshot::Receiver<Result<(), String>>,
     ) -> Result<(), String> {
         let stopped = || "shard writer stopped".to_string();
-        self.state.shard_senders[self.shard]
-            .send(op)
-            .await
-            .map_err(|_| stopped())?;
+        let permit = tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => return Err("replica sync cancelled".to_string()),
+            res = self.state.shard_senders[self.shard].reserve() => res.map_err(|_| stopped())?,
+        };
+        permit.send(op);
         loop {
             tokio::select! {
                 result = &mut committed => return result.map_err(|_| stopped())?,
@@ -1904,6 +2094,7 @@ mod tests {
             tick: interval(Duration::from_secs(1)),
             last_watermark_ms: None,
             backoff: BACKOFF_MIN,
+            cancel: CancellationToken::new(),
         };
         let mut reset = tokio::spawn(async move { replica.reset("new-replid").await });
         // The reset can't start, so the admitted read still sees the copy. (A

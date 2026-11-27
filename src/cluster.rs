@@ -7,8 +7,10 @@ pub use state::{
 };
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -20,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio::time::interval;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 /// Strategy for distributing namespace operations across cluster nodes
@@ -296,8 +299,35 @@ impl NodeGossipData {
     }
 }
 
+/// Runtime role transition triggered when gossip changes slot ownership.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoleTransition {
+    /// Primary lost its last slot; `lost_slots` were its slots before losing them.
+    Demote {
+        lost_slots: HashSet<u16>,
+        winner: String,
+    },
+    /// Replica saw one or more of its primary's slots move to `new_primary`.
+    Repoint {
+        old_primary: String,
+        new_primary: String,
+    },
+}
+
+/// Callback invoked by gossip when a node must demote or re-point its replica.
+pub type RoleTransitionHandler =
+    Arc<dyn Fn(RoleTransition) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+/// Pre-check result for `CLUSTER REPLICATE <node-id>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicateCheck {
+    AlreadyFollowing,
+    FromEmptyPrimary,
+    SwitchReplica,
+}
+
 /// The gossip server and the task reading its state.
-type Gossip = (ChitchatHandle, JoinHandle<()>);
+type Gossip = (ChitchatHandle, Option<JoinHandle<()>>);
 
 /// Manages cluster state and gossip protocol
 pub struct ClusterManager {
@@ -319,6 +349,12 @@ pub struct ClusterManager {
     chitchat: Option<Arc<tokio::sync::Mutex<Chitchat>>>,
     /// What [`Self::shutdown`] stops.
     running: Arc<Mutex<Option<Gossip>>>,
+    /// Cancels `gossip_task` cooperatively between ticks on shutdown.
+    gossip_shutdown: CancellationToken,
+    /// Runtime handler for demotion and replica re-pointing; attached once writers start.
+    role_handler: Arc<Mutex<Option<RoleTransitionHandler>>>,
+    /// Transition detected before `role_handler` was attached; drained on attach.
+    pending_transition: Arc<Mutex<Option<RoleTransition>>>,
     local_addr: SocketAddr,
     namespace_strategy: NamespaceDistributionStrategy,
     /// Per-shard synced flags for a replica; role is `Replica` once all are true.
@@ -441,6 +477,9 @@ impl ClusterManager {
             config: config.clone(),
             chitchat: Some(chitchat_handle.chitchat()),
             running: Arc::new(Mutex::new(None)),
+            gossip_shutdown: CancellationToken::new(),
+            role_handler: Arc::new(Mutex::new(None)),
+            pending_transition: Arc::new(Mutex::new(None)),
             local_addr: redis_addr,
             namespace_strategy: NamespaceDistributionStrategy::default(),
             replica_synced,
@@ -451,7 +490,7 @@ impl ClusterManager {
         let gossip_task = tokio::spawn(async move {
             gossip_manager.gossip_task().await;
         });
-        *cluster_manager.running.lock().unwrap() = Some((chitchat_handle, gossip_task));
+        *cluster_manager.running.lock().unwrap() = Some((chitchat_handle, Some(gossip_task)));
 
         info!("Cluster manager initialized for node: {}", config.node_id);
 
@@ -492,7 +531,13 @@ impl ClusterManager {
         info!("Gossip task started for node: {}", self.node_id);
 
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = self.gossip_shutdown.cancelled() => {
+                    info!("Gossip task stopped for node: {}", self.node_id);
+                    return;
+                }
+                _ = interval.tick() => {}
+            }
             debug!("Gossip task tick for node: {}", self.node_id);
 
             if let Some(chitchat_arc) = &self.chitchat {
@@ -527,6 +572,242 @@ impl ClusterManager {
                 );
             }
         }
+    }
+
+    /// Register the runtime handler for demotion and replica re-pointing, and
+    /// immediately run any transition that fired before it was attached.
+    pub async fn set_role_handler(&self, handler: RoleTransitionHandler) {
+        let pending = {
+            *self.role_handler.lock().unwrap() = Some(handler.clone());
+            self.pending_transition.lock().unwrap().take()
+        };
+        if let Some(transition) = pending {
+            handler(transition).await;
+        }
+    }
+
+    /// Mark every shard as not synced in memory (stops `READONLY` reads and
+    /// switches gossip role to `ReplicaSyncing` on next gossip update).
+    pub fn reset_replica_synced(&self) {
+        for flag in self.replica_synced.lock().unwrap().iter_mut() {
+            *flag = false;
+        }
+    }
+
+    /// Publish the current state, role, and epochs to gossip.
+    pub async fn publish_gossip(&self) -> Result<(), String> {
+        self.update_gossip_data().await
+    }
+
+    /// Pre-check for `CLUSTER FAILOVER TAKEOVER` before stopping sync tasks.
+    pub fn can_takeover(&self) -> Result<(), String> {
+        let state = self.state.read().unwrap();
+        if !state.is_replica() {
+            return Err("ERR You should send CLUSTER FAILOVER to a replica".to_string());
+        }
+        let Some(ref primary) = state.primary else {
+            return Err("ERR Replica has no configured primary".to_string());
+        };
+        if !state.slots.has_slots_of(primary) {
+            return Err("ERR Primary owns no slots to take over".to_string());
+        }
+        Ok(())
+    }
+
+    /// Promotion commit point for `CLUSTER FAILOVER TAKEOVER`: under
+    /// `write_lock`, bump `current_epoch`, persist `role = primary` with the
+    /// old primary's slots bound to self at the new epoch, run `on_persisted`
+    /// (per-shard writer promotion), install in-memory state, and gossip.
+    pub async fn promote_takeover<F, Fut>(&self, on_persisted: F) -> Result<u64, String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<(), String>>,
+    {
+        let _guard = self.write_lock.lock().await;
+        let mut candidate = self.state.read().unwrap().clone();
+        if !candidate.is_replica() {
+            return Err("ERR You should send CLUSTER FAILOVER to a replica".to_string());
+        }
+        let Some(old_primary) = candidate.primary.clone() else {
+            return Err("ERR Replica has no configured primary".to_string());
+        };
+        let taken = candidate.slots.slots_of(&old_primary);
+        if taken.is_empty() {
+            return Err("ERR Primary owns no slots to take over".to_string());
+        }
+        let new_epoch = candidate.current_epoch + 1;
+        candidate.current_epoch = new_epoch;
+        candidate.config_epoch = new_epoch;
+        candidate.role = PersistedRole::Primary;
+        candidate.primary = None;
+        for &slot in &taken {
+            candidate.slots.set(slot, self.node_id.clone(), new_epoch);
+        }
+        self.gossip_data_for(&candidate, &taken)
+            .map_err(|e| format!("ERR {e}"))?;
+
+        // Commit point: persist cluster state before per-shard promotion or serving.
+        self.persist_state(&candidate)
+            .await
+            .map_err(|e| format!("ERR {e}"))?;
+
+        // Run per-shard promotion while holding `write_lock` and before exposing
+        // the primary role in memory, so neither writes nor BLOBASAUR.SYNC see
+        // primary before every shard has its new replid.
+        on_persisted().await.map_err(|e| format!("ERR {e}"))?;
+
+        *self.state.write().unwrap() = candidate;
+        self.reset_replica_synced();
+        drop(_guard);
+
+        if let Err(e) = self.update_gossip_data().await {
+            error!("Failed to gossip promoted state: {}", e);
+        }
+        info!(
+            "Node {} promoted to primary at epoch {} taking {} slots from {}",
+            self.node_id,
+            new_epoch,
+            taken.len(),
+            old_primary
+        );
+        Ok(new_epoch)
+    }
+
+    /// Commit demotion after shard writer barriers finish: persist
+    /// `role = replica, primary = winner` atomically with the updated slot table.
+    pub async fn finish_demotion(
+        &self,
+        lost_slots: &HashSet<u16>,
+        fallback_winner: &str,
+    ) -> Result<Option<String>, String> {
+        let _guard = self.write_lock.lock().await;
+        let mut candidate = self.state.read().unwrap().clone();
+        if candidate.role != PersistedRole::Primary || candidate.slots.has_slots_of(&self.node_id) {
+            return Ok(None);
+        }
+        let winner = lost_slots
+            .iter()
+            .filter_map(|&slot| candidate.slots.get(slot))
+            .filter(|b| b.node_id != self.node_id)
+            .max_by(|a, b| {
+                a.epoch
+                    .cmp(&b.epoch)
+                    .then_with(|| b.node_id.cmp(&a.node_id))
+            })
+            .map(|b| b.node_id.clone())
+            .unwrap_or_else(|| fallback_winner.to_string());
+        candidate.role = PersistedRole::Replica;
+        candidate.primary = Some(winner.clone());
+        candidate.config_epoch = 0;
+        self.persist_state(&candidate).await?;
+        *self.state.write().unwrap() = candidate;
+        self.reset_replica_synced();
+        drop(_guard);
+        info!("Node {} demoted to replica of {}", self.node_id, winner);
+        Ok(Some(winner))
+    }
+
+    /// Commit replica re-pointing after sync tasks stop and shards are marked
+    /// unsynced: persist `primary = new_primary` atomically with the slot table.
+    pub async fn finish_repoint(
+        &self,
+        old_primary: &str,
+        new_primary: &str,
+    ) -> Result<Option<String>, String> {
+        let _guard = self.write_lock.lock().await;
+        let mut candidate = self.state.read().unwrap().clone();
+        if candidate.role != PersistedRole::Replica
+            || candidate.primary.as_deref() != Some(old_primary)
+        {
+            return Ok(None);
+        }
+        candidate.primary = Some(new_primary.to_string());
+        candidate.config_epoch = 0;
+        self.persist_state(&candidate).await?;
+        *self.state.write().unwrap() = candidate;
+        self.reset_replica_synced();
+        drop(_guard);
+        info!(
+            "Replica {} re-pointed from {} to {}",
+            self.node_id, old_primary, new_primary
+        );
+        Ok(Some(new_primary.to_string()))
+    }
+
+    /// Validate `CLUSTER REPLICATE <target_id>` preconditions.
+    pub async fn validate_replicate_target(
+        &self,
+        target_id: &str,
+    ) -> Result<ReplicateCheck, String> {
+        if target_id == self.node_id {
+            return Err("ERR Can't replicate myself".to_string());
+        }
+        let nodes = self.nodes.read().await;
+        let state = self.state.read().unwrap();
+        match nodes.get(target_id) {
+            Some(peer) if peer.role != NodeRole::Primary => {
+                return Err("ERR I can only replicate a master, not a replica.".to_string());
+            }
+            Some(_) => {}
+            None if state.slots.has_slots_of(target_id) => {}
+            None => return Err(format!("ERR Unknown node {target_id}")),
+        }
+        match state.role {
+            PersistedRole::Primary => {
+                if state.slots.has_slots_of(&self.node_id) {
+                    return Err(
+                        "ERR To set a master the node must be empty and without assigned slots."
+                            .to_string(),
+                    );
+                }
+                Ok(ReplicateCheck::FromEmptyPrimary)
+            }
+            PersistedRole::Replica => {
+                if state.primary.as_deref() == Some(target_id) {
+                    Ok(ReplicateCheck::AlreadyFollowing)
+                } else {
+                    Ok(ReplicateCheck::SwitchReplica)
+                }
+            }
+        }
+    }
+
+    /// Re-validate under `write_lock` and persist `role = replica, primary = target_id`.
+    pub async fn commit_replicate(&self, target_id: &str) -> Result<(), String> {
+        let _guard = self.write_lock.lock().await;
+        if target_id == self.node_id {
+            return Err("ERR Can't replicate myself".to_string());
+        }
+        let nodes = self.nodes.read().await;
+        let mut candidate = self.state.read().unwrap().clone();
+        match nodes.get(target_id) {
+            Some(peer) if peer.role != NodeRole::Primary => {
+                return Err("ERR I can only replicate a master, not a replica.".to_string());
+            }
+            Some(_) => {}
+            None if candidate.slots.has_slots_of(target_id) => {}
+            None => return Err(format!("ERR Unknown node {target_id}")),
+        }
+        drop(nodes);
+
+        if candidate.role == PersistedRole::Primary && candidate.slots.has_slots_of(&self.node_id) {
+            return Err(
+                "ERR To set a master the node must be empty and without assigned slots."
+                    .to_string(),
+            );
+        }
+        candidate.role = PersistedRole::Replica;
+        candidate.primary = Some(target_id.to_string());
+        candidate.config_epoch = 0;
+        self.persist_state(&candidate)
+            .await
+            .map_err(|e| format!("ERR {e}"))?;
+        *self.state.write().unwrap() = candidate;
+        self.reset_replica_synced();
+        drop(_guard);
+
+        info!("Node {} now replicates {}", self.node_id, target_id);
+        Ok(())
     }
 
     /// Apply a fresh snapshot of live gossip peers: update peer view, adopt
@@ -609,8 +890,20 @@ impl ClusterManager {
         let _guard = self.write_lock.lock().await;
         let is_bootstrapping = self.bootstrapping.load(Ordering::Acquire);
         let mut state = self.state.read().unwrap().clone();
-        let had_own_slots =
-            state.role == PersistedRole::Primary && state.slots.has_slots_of(&self.node_id);
+        let old_own_slots = if state.role == PersistedRole::Primary {
+            state.slots.slots_of(&self.node_id)
+        } else {
+            HashSet::new()
+        };
+        let old_primary = if state.role == PersistedRole::Replica {
+            state.primary.clone()
+        } else {
+            None
+        };
+        let old_primary_slots = old_primary
+            .as_deref()
+            .map(|p| state.slots.slots_of(p))
+            .unwrap_or_default();
 
         let mut changed = false;
         let mut gossip_changed = false;
@@ -633,6 +926,7 @@ impl ClusterManager {
             .collect();
         primary_peers.sort_by(|a, b| a.id.cmp(&b.id));
 
+        let mut last_taker: Option<String> = None;
         for peer in &primary_peers {
             let outcome =
                 state
@@ -643,19 +937,64 @@ impl ClusterManager {
             }
             if outcome.lost_own_slots {
                 gossip_changed = true;
+                last_taker = Some(peer.id.clone());
             }
         }
 
-        if !is_bootstrapping && had_own_slots && !state.slots.has_slots_of(&self.node_id) {
-            error!(
-                "Primary {} lost its last slot; serving no slots (runtime demotion not yet implemented)",
-                self.node_id
-            );
-        }
+        let transition = if !is_bootstrapping
+            && state.role == PersistedRole::Primary
+            && !old_own_slots.is_empty()
+            && !state.slots.has_slots_of(&self.node_id)
+        {
+            let winner = last_taker.or_else(|| {
+                old_own_slots
+                    .iter()
+                    .filter_map(|&slot| state.slots.get(slot))
+                    .max_by(|a, b| {
+                        a.epoch
+                            .cmp(&b.epoch)
+                            .then_with(|| b.node_id.cmp(&a.node_id))
+                    })
+                    .map(|b| b.node_id.clone())
+            });
+            winner.map(|winner| {
+                warn!(
+                    "Primary {} lost its last slot to {}; starting demotion",
+                    self.node_id, winner
+                );
+                RoleTransition::Demote {
+                    lost_slots: old_own_slots,
+                    winner,
+                }
+            })
+        } else if !is_bootstrapping && let Some(ref primary) = old_primary {
+            let new_owner = old_primary_slots
+                .iter()
+                .filter_map(|&slot| state.slots.get(slot))
+                .filter(|b| b.node_id != *primary && b.node_id != self.node_id)
+                .max_by(|a, b| {
+                    a.epoch
+                        .cmp(&b.epoch)
+                        .then_with(|| b.node_id.cmp(&a.node_id))
+                })
+                .map(|b| b.node_id.clone());
+            new_owner.map(|new_primary| {
+                info!(
+                    "Replica {} saw primary {}'s slots move to {}; re-pointing",
+                    self.node_id, primary, new_primary
+                );
+                RoleTransition::Repoint {
+                    old_primary: primary.clone(),
+                    new_primary,
+                }
+            })
+        } else {
+            None
+        };
 
         // Redis epoch collision rule: when two primaries share a config_epoch,
         // the lexicographically smaller node id bumps current_epoch and takes it.
-        if !is_bootstrapping && state.role == PersistedRole::Primary {
+        if !is_bootstrapping && transition.is_none() && state.role == PersistedRole::Primary {
             let collides = primary_peers
                 .iter()
                 .any(|peer| peer.config_epoch == state.config_epoch && self.node_id < peer.id);
@@ -673,8 +1012,40 @@ impl ClusterManager {
             }
         }
 
+        if let Some(transition) = transition {
+            // Update in-memory state immediately so lost slots route MOVED at
+            // once (and a re-pointing replica stops serving READONLY reads),
+            // while deferring disk persistence until the transition handler
+            // commits the new role/primary atomically with the slot table.
+            if matches!(transition, RoleTransition::Repoint { .. }) {
+                self.reset_replica_synced();
+                gossip_changed = true;
+            }
+            *self.state.write().unwrap() = state;
+            let handler = self.role_handler.lock().unwrap().clone();
+            if handler.is_none() {
+                *self.pending_transition.lock().unwrap() = Some(transition.clone());
+            }
+            drop(_guard);
+
+            if gossip_changed
+                && !is_bootstrapping
+                && let Err(e) = self.update_gossip_data().await
+            {
+                error!("Failed to gossip updated epochs/slots: {}", e);
+            }
+            if let Some(handler) = handler {
+                handler(transition).await;
+            }
+            return;
+        }
+
+        let has_pending = self.pending_transition.lock().unwrap().is_some();
         if changed {
-            if !is_bootstrapping && let Err(e) = self.persist_state(&state).await {
+            if !is_bootstrapping
+                && !has_pending
+                && let Err(e) = self.persist_state(&state).await
+            {
                 error!("Failed to persist cluster state after gossip update: {}", e);
                 return;
             }
@@ -1432,14 +1803,31 @@ impl ClusterManager {
             config,
             chitchat: None,
             running: Arc::new(Mutex::new(None)),
+            gossip_shutdown: CancellationToken::new(),
+            role_handler: Arc::new(Mutex::new(None)),
+            pending_transition: Arc::new(Mutex::new(None)),
             local_addr: "127.0.0.1:6379".parse().unwrap(),
             namespace_strategy: NamespaceDistributionStrategy::default(),
             replica_synced: Arc::new(Mutex::new(vec![false; num_shards])),
         }
     }
 
+    /// Stops the background gossip processing task cooperatively so any
+    /// in-progress role transition completes cleanly before writers drain.
+    pub async fn stop_gossip_task(&self) {
+        self.gossip_shutdown.cancel();
+        let task = {
+            let mut running = self.running.lock().unwrap();
+            running.as_mut().and_then(|(_, task)| task.take())
+        };
+        if let Some(task) = task {
+            let _ = task.await;
+        }
+    }
+
     /// Stops gossip: the node stops advertising itself and frees its UDP port.
     pub async fn shutdown(&self) {
+        self.stop_gossip_task().await;
         if let Some(chitchat_arc) = &self.chitchat {
             chitchat_arc
                 .lock()
@@ -1449,12 +1837,10 @@ impl ClusterManager {
         }
         info!("Shutting down cluster manager");
         let running = self.running.lock().unwrap().take();
-        if let Some((handle, gossip_task)) = running {
-            gossip_task.abort();
-            let _ = gossip_task.await;
-            if let Err(e) = handle.shutdown().await {
-                warn!("Failed to stop gossip: {}", e);
-            }
+        if let Some((handle, _)) = running
+            && let Err(e) = handle.shutdown().await
+        {
+            warn!("Failed to stop gossip: {}", e);
         }
     }
 }
@@ -1488,6 +1874,9 @@ impl Clone for ClusterManager {
             config: self.config.clone(),
             chitchat: self.chitchat.clone(),
             running: Arc::clone(&self.running),
+            gossip_shutdown: self.gossip_shutdown.clone(),
+            role_handler: Arc::clone(&self.role_handler),
+            pending_transition: Arc::clone(&self.pending_transition),
             local_addr: self.local_addr,
             namespace_strategy: self.namespace_strategy,
             replica_synced: Arc::clone(&self.replica_synced),
@@ -1730,6 +2119,9 @@ mod tests {
             config,
             chitchat: None,
             running: Arc::new(Mutex::new(None)),
+            gossip_shutdown: CancellationToken::new(),
+            role_handler: Arc::new(Mutex::new(None)),
+            pending_transition: Arc::new(Mutex::new(None)),
             local_addr: "0.0.0.0:6379".parse().unwrap(),
             namespace_strategy: NamespaceDistributionStrategy::default(),
             replica_synced: Arc::new(Mutex::new(vec![false; 2])),
@@ -2219,6 +2611,9 @@ mod tests {
             config,
             chitchat: None,
             running: Arc::new(Mutex::new(None)),
+            gossip_shutdown: CancellationToken::new(),
+            role_handler: Arc::new(Mutex::new(None)),
+            pending_transition: Arc::new(Mutex::new(None)),
             local_addr: "127.0.0.1:6401".parse().unwrap(),
             namespace_strategy: NamespaceDistributionStrategy::default(),
             replica_synced: Arc::new(Mutex::new(vec![false; 1])),
@@ -2512,7 +2907,8 @@ mod tests {
         assert_eq!(persisted.slots.get(1).unwrap().node_id, "node-b");
         assert_eq!(persisted.slots.get(1).unwrap().epoch, 5);
 
-        // Losing the last slot (slot 0): serves nothing, routes MOVED to winner.
+        // Losing the last slot (slot 0): serves nothing, routes MOVED to winner,
+        // and records a Demote transition for the runtime handler.
         let take_last = ClusterNode {
             slots: [0, 1].into_iter().collect(),
             current_epoch: 6,
@@ -2526,8 +2922,50 @@ mod tests {
             mgr.route(0, false, false).await,
             Route::Moved("MOVED 0 10.0.0.2:6379".to_string())
         );
-        // Role stays primary (demotion is step 2).
-        assert!(!mgr.is_replica());
+        let pending = mgr.pending_transition.lock().unwrap().take();
+        assert_eq!(
+            pending,
+            Some(RoleTransition::Demote {
+                lost_slots: [0].into_iter().collect(),
+                winner: "node-b".to_string(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn replica_detects_repoint_when_primary_slots_move_at_higher_epoch() {
+        let mgr = into_replica(
+            manager_with(&[], &[("node-b", "10.0.0.2:6379", &[0, 1])]),
+            "node-b",
+            true,
+        );
+        {
+            let mut st = mgr.state.write().unwrap();
+            st.current_epoch = 2;
+            st.slots.rebind_owner_epoch("node-b", 2);
+        }
+        let winner = ClusterNode {
+            id: "node-c".to_string(),
+            addr: "10.0.0.3:6379".parse().unwrap(),
+            slots: [0, 1].into_iter().collect(),
+            _state: "master".to_string(),
+            role: NodeRole::Primary,
+            primary: None,
+            current_epoch: 3,
+            config_epoch: 3,
+        };
+        mgr.process_peers([("node-c".to_string(), winner)].into())
+            .await;
+
+        assert_eq!(mgr.role(), NodeRole::ReplicaSyncing);
+        let pending = mgr.pending_transition.lock().unwrap().take();
+        assert_eq!(
+            pending,
+            Some(RoleTransition::Repoint {
+                old_primary: "node-b".to_string(),
+                new_primary: "node-c".to_string(),
+            })
+        );
     }
 
     #[tokio::test]

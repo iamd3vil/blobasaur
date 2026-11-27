@@ -3,8 +3,8 @@ use crate::cluster::{ClusterManager, ClusterShard, Route, SlotRange};
 use crate::config::Cfg;
 use crate::metrics::Timer;
 use crate::redis::{
-    HExpireCondition, ParseError, RedisCommand, VacuumCommandMode, VacuumShardTarget,
-    decode_request, parse_command, serialize_frame,
+    ClusterFailoverMode, HExpireCondition, ParseError, RedisCommand, VacuumCommandMode,
+    VacuumShardTarget, decode_request, parse_command, serialize_frame,
 };
 use crate::replication;
 use crate::shard_manager::{
@@ -107,21 +107,9 @@ pub async fn run(
         )));
     }
 
-    // A replica keeps one stream per shard open to its primary. They stop with
-    // the connections, before the writers drain.
-    let replicas: Vec<_> = if state.cfg.replication_enabled() && state.is_replica() {
-        (0..cfg.num_shards)
-            .map(|i| {
-                tokio::spawn(crate::replication::replica_sync_task(
-                    state.clone(),
-                    i,
-                    shutdown.clone(),
-                ))
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
+    // Attach runtime role-transition handling (demotion, replica re-pointing)
+    // and start replica sync tasks if this node is currently a replica.
+    state.attach_cluster_runtime().await;
 
     // Start HTTP metrics server if enabled
     if let Some(handle) = prometheus_handle {
@@ -169,9 +157,14 @@ pub async fn run(
         );
     }
 
-    for replica in replicas {
-        let _ = replica.await;
+    // Stop gossip processing before stopping replica sync and writers so no
+    // new role transition starts during shutdown, while letting any in-flight
+    // transition finish its writer barriers cleanly.
+    if let Some(cluster_manager) = &state.cluster_manager {
+        cluster_manager.stop_gossip_task().await;
     }
+
+    state.replica_sync.stop().await;
 
     // Cleanup stops between chunks on the same token. It commits too, so the
     // shards are only quiet once it has exited as well.
@@ -663,6 +656,12 @@ async fn handle_redis_command_inner(
         }
         RedisCommand::ClusterKeySlot { key } => {
             handle_cluster_keyslot(stream, key).await?;
+        }
+        RedisCommand::ClusterFailover { mode } => {
+            handle_cluster_failover(stream, state, mode).await?;
+        }
+        RedisCommand::ClusterReplicate { node_id } => {
+            handle_cluster_replicate(stream, state, node_id).await?;
         }
         RedisCommand::Ttl { key } => {
             let mut gate = state
@@ -2450,6 +2449,44 @@ async fn handle_cluster_keyslot(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let slot = ClusterManager::calculate_slot(&key);
     let response = BytesFrame::Integer(slot as i64);
+    stream.write_all(&serialize_frame(&response)).await?;
+    Ok(())
+}
+
+async fn handle_cluster_failover(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+    mode: ClusterFailoverMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = if state.cluster_manager.is_none() {
+        BytesFrame::Error("ERR This instance has cluster support disabled".into())
+    } else {
+        match mode {
+            ClusterFailoverMode::Default => BytesFrame::Error(
+                "ERR CLUSTER FAILOVER without TAKEOVER is not yet implemented".into(),
+            ),
+            ClusterFailoverMode::Force => {
+                BytesFrame::Error("ERR CLUSTER FAILOVER FORCE is not yet implemented".into())
+            }
+            ClusterFailoverMode::Takeover => match state.promote_takeover().await {
+                Ok(()) => BytesFrame::SimpleString("OK".into()),
+                Err(e) => BytesFrame::Error(e.into()),
+            },
+        }
+    };
+    stream.write_all(&serialize_frame(&response)).await?;
+    Ok(())
+}
+
+async fn handle_cluster_replicate(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+    node_id: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = match state.replicate_node(node_id).await {
+        Ok(()) => BytesFrame::SimpleString("OK".into()),
+        Err(e) => BytesFrame::Error(e.into()),
+    };
     stream.write_all(&serialize_frame(&response)).await?;
     Ok(())
 }

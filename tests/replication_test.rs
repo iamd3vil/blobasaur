@@ -1450,14 +1450,10 @@ async fn planned_failover_promotes_the_replica_without_losing_writes() {
     .await;
     drop(client);
 
-    // Step 4 (interim until CLUSTER FAILOVER TAKEOVER lands): stop the primary,
-    // remove the replica's persisted cluster state so it re-bootstraps from the
-    // primary config, and restart it with the slots.
+    // Step 4: stop the primary and promote the replica at runtime with TAKEOVER.
     primary.stop().await;
-    replica.stop().await;
-    std::fs::remove_file(rdir.path().join(blobasaur::cluster::CLUSTER_STATE_FILE)).unwrap();
-    let promoted = start(rdir.path(), &Opts::primary("r", SHARDS)).await;
-    let mut client = Client::connect(promoted.addr).await;
+    let mut client = Client::connect(replica.addr).await;
+    ok(&mut client, &["CLUSTER", "FAILOVER", "TAKEOVER"]).await;
     for i in 0..20 {
         let (key, value) = (k(&format!("k{i}_")), format!("v{i}"));
         assert_eq!(
@@ -1470,5 +1466,5 @@ async fn planned_failover_promotes_the_replica_without_losing_writes() {
     assert!(marks.iter().all(|(replid, _)| *replid != target[0].0));
     ok(&mut client, &["SET", &k("after"), "promoted"]).await;
 
-    promoted.stop().await;
+    replica.stop().await;
 }
