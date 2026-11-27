@@ -163,6 +163,8 @@ pub enum RedisCommand {
         num_shards: usize,
         compression: String,
     },
+    /// Replica election vote request sent to slot-owning primaries.
+    BlobasaurFailoverAuth(crate::cluster::FailoverAuthRequest),
     Hello {
         protover: Option<u64>,
     },
@@ -211,6 +213,7 @@ impl RedisCommand {
             RedisCommand::BlobasaurVacuum { .. } => "BLOBASAUR.VACUUM".to_string(),
             RedisCommand::BlobasaurWatermark => "BLOBASAUR.WATERMARK".to_string(),
             RedisCommand::BlobasaurSync { .. } => "BLOBASAUR.SYNC".to_string(),
+            RedisCommand::BlobasaurFailoverAuth(_) => "BLOBASAUR.FAILOVER-AUTH".to_string(),
             RedisCommand::Hello { .. } => "HELLO".to_string(),
             RedisCommand::Client { .. }
             | RedisCommand::ClientGetName
@@ -805,6 +808,7 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
         }
         "BLOBASAUR.VACUUM" => parse_blobasaur_vacuum_command(&elements),
         "BLOBASAUR.SYNC" => parse_blobasaur_sync_command(&elements),
+        "BLOBASAUR.FAILOVER-AUTH" => parse_blobasaur_failover_auth_command(&elements),
         "BLOBASAUR.WATERMARK" => {
             if elements.len() != 1 {
                 return Err(ParseError::Invalid(
@@ -876,6 +880,58 @@ fn parse_blobasaur_sync_command(elements: &[BytesFrame]) -> Result<RedisCommand,
         num_shards: number(&elements[4], "num_shards")?,
         compression: extract_string(&elements[5])?,
     })
+}
+
+fn parse_blobasaur_failover_auth_command(
+    elements: &[BytesFrame],
+) -> Result<RedisCommand, ParseError> {
+    if elements.len() != 6 && elements.len() != 7 {
+        return Err(ParseError::Invalid(
+            "BLOBASAUR.FAILOVER-AUTH syntax: BLOBASAUR.FAILOVER-AUTH <candidate> <epoch> <failed-primary> <primary-config-epoch> <slot-ranges> [MANUAL]"
+                .to_string(),
+        ));
+    }
+    let candidate = extract_string(&elements[1])?;
+    if candidate.is_empty() {
+        return Err(ParseError::Invalid("candidate cannot be empty".to_string()));
+    }
+    let epoch_str = extract_string(&elements[2])?;
+    let epoch: u64 = epoch_str
+        .parse()
+        .map_err(|_| ParseError::Invalid(format!("Invalid epoch '{epoch_str}'")))?;
+    let failed_primary = extract_string(&elements[3])?;
+    if failed_primary.is_empty() {
+        return Err(ParseError::Invalid(
+            "failed-primary cannot be empty".to_string(),
+        ));
+    }
+    let p_epoch_str = extract_string(&elements[4])?;
+    let primary_config_epoch: u64 = p_epoch_str.parse().map_err(|_| {
+        ParseError::Invalid(format!("Invalid primary-config-epoch '{p_epoch_str}'"))
+    })?;
+    let slot_ranges = extract_string(&elements[5])?;
+    let slots = crate::cluster::parse_slot_ranges(&slot_ranges).map_err(ParseError::Invalid)?;
+    let manual = if elements.len() == 7 {
+        let flag = extract_string(&elements[6])?;
+        if !flag.eq_ignore_ascii_case("MANUAL") {
+            return Err(ParseError::Invalid(format!(
+                "Invalid BLOBASAUR.FAILOVER-AUTH flag '{flag}', expected MANUAL"
+            )));
+        }
+        true
+    } else {
+        false
+    };
+    Ok(RedisCommand::BlobasaurFailoverAuth(
+        crate::cluster::FailoverAuthRequest {
+            candidate,
+            epoch,
+            failed_primary,
+            primary_config_epoch,
+            slots,
+            manual,
+        },
+    ))
 }
 
 fn parse_blobasaur_vacuum_command(elements: &[BytesFrame]) -> Result<RedisCommand, ParseError> {
@@ -1675,6 +1731,85 @@ mod tests {
             &["BLOBASAUR.SYNC", "0", "id", "0", "1"][..],
             &["BLOBASAUR.SYNC", "x", "id", "0", "1", "none"][..],
             &["BLOBASAUR.SYNC", "0", "id", "-1", "1", "none"][..],
+        ] {
+            assert!(parse_command(command_frame(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn test_parse_blobasaur_failover_auth() {
+        let cmd = parse_command(command_frame(&[
+            "BLOBASAUR.FAILOVER-AUTH",
+            "r1",
+            "5",
+            "p1",
+            "2",
+            "0-3,10",
+        ]))
+        .unwrap();
+        assert_eq!(cmd.name(), "BLOBASAUR.FAILOVER-AUTH");
+        match cmd {
+            RedisCommand::BlobasaurFailoverAuth(req) => {
+                assert_eq!(req.candidate, "r1");
+                assert_eq!(req.epoch, 5);
+                assert_eq!(req.failed_primary, "p1");
+                assert_eq!(req.primary_config_epoch, 2);
+                assert_eq!(req.slots, [0, 1, 2, 3, 10].into_iter().collect());
+                assert!(!req.manual);
+            }
+            other => panic!("expected BlobasaurFailoverAuth, got {other:?}"),
+        }
+
+        let manual_cmd = parse_command(command_frame(&[
+            "BLOBASAUR.FAILOVER-AUTH",
+            "r1",
+            "6",
+            "p1",
+            "2",
+            "0-5",
+            "manual",
+        ]))
+        .unwrap();
+        match manual_cmd {
+            RedisCommand::BlobasaurFailoverAuth(req) => assert!(req.manual),
+            other => panic!("expected BlobasaurFailoverAuth, got {other:?}"),
+        }
+
+        for bad in [
+            &["BLOBASAUR.FAILOVER-AUTH", "r1", "5", "p1", "2"][..],
+            &["BLOBASAUR.FAILOVER-AUTH", "", "5", "p1", "2", "0-5"][..],
+            &[
+                "BLOBASAUR.FAILOVER-AUTH",
+                "r1",
+                "notanint",
+                "p1",
+                "2",
+                "0-5",
+            ][..],
+            &["BLOBASAUR.FAILOVER-AUTH", "r1", "5", "", "2", "0-5"][..],
+            &["BLOBASAUR.FAILOVER-AUTH", "r1", "5", "p1", "bad", "0-5"][..],
+            &["BLOBASAUR.FAILOVER-AUTH", "r1", "5", "p1", "2", ""][..],
+            &["BLOBASAUR.FAILOVER-AUTH", "r1", "5", "p1", "2", "10-5"][..],
+            &["BLOBASAUR.FAILOVER-AUTH", "r1", "5", "p1", "2", "16384"][..],
+            &[
+                "BLOBASAUR.FAILOVER-AUTH",
+                "r1",
+                "5",
+                "p1",
+                "2",
+                "0-5",
+                "EXTRA",
+            ][..],
+            &[
+                "BLOBASAUR.FAILOVER-AUTH",
+                "r1",
+                "5",
+                "p1",
+                "2",
+                "0-5",
+                "MANUAL",
+                "X",
+            ][..],
         ] {
             assert!(parse_command(command_frame(bad)).is_err(), "{bad:?}");
         }

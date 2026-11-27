@@ -164,6 +164,7 @@ pub async fn run(
         cluster_manager.stop_gossip_task().await;
     }
 
+    state.stop_election_task().await;
     state.wait_role_transitions().await;
 
     state.replica_sync.stop().await;
@@ -697,6 +698,9 @@ async fn handle_redis_command_inner(
         }
         RedisCommand::BlobasaurSync { .. } => {
             unreachable!("handle_connection hands BLOBASAUR.SYNC to the replication stream")
+        }
+        RedisCommand::BlobasaurFailoverAuth(req) => {
+            handle_blobasaur_failover_auth(stream, state, req).await?;
         }
         RedisCommand::Hello { protover } => {
             handle_hello(stream, protover).await?;
@@ -2465,16 +2469,33 @@ async fn handle_cluster_failover(
     } else {
         match mode {
             ClusterFailoverMode::Default => BytesFrame::Error(
-                "ERR CLUSTER FAILOVER without TAKEOVER is not yet implemented".into(),
+                "ERR CLUSTER FAILOVER without FORCE or TAKEOVER is not yet implemented".into(),
             ),
-            ClusterFailoverMode::Force => {
-                BytesFrame::Error("ERR CLUSTER FAILOVER FORCE is not yet implemented".into())
-            }
+            ClusterFailoverMode::Force => match state.promote_failover_force().await {
+                Ok(()) => BytesFrame::SimpleString("OK".into()),
+                Err(e) => BytesFrame::Error(e.into()),
+            },
             ClusterFailoverMode::Takeover => match state.promote_takeover().await {
                 Ok(()) => BytesFrame::SimpleString("OK".into()),
                 Err(e) => BytesFrame::Error(e.into()),
             },
         }
+    };
+    stream.write_all(&serialize_frame(&response)).await?;
+    Ok(())
+}
+
+async fn handle_blobasaur_failover_auth(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+    req: crate::cluster::FailoverAuthRequest,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = match state.cluster_manager.as_ref() {
+        None => BytesFrame::Error("ERR This instance has cluster support disabled".into()),
+        Some(cluster) => match cluster.handle_failover_auth(&req).await {
+            Ok(epoch) => BytesFrame::SimpleString(format!("VOTE {epoch}").into()),
+            Err(reason) => BytesFrame::Error(format!("ERR {reason}").into()),
+        },
     };
     stream.write_all(&serialize_frame(&response)).await?;
     Ok(())

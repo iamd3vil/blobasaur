@@ -377,6 +377,8 @@ struct Node {
     advertise: SocketAddr,
     seeds: Vec<String>,
     replica_of: Option<&'static str>,
+    slot_range: Option<(u16, u16)>,
+    node_timeout_ms: Option<u64>,
     mode: WriteMode,
     /// Where the Prometheus endpoint listens, if enabled.
     metrics: Option<SocketAddr>,
@@ -397,6 +399,8 @@ impl Node {
             advertise: addr,
             seeds: Vec::new(),
             replica_of: None,
+            slot_range: None,
+            node_timeout_ms: None,
             mode: WriteMode::Sync,
             metrics: None,
             env: Vec::new(),
@@ -418,7 +422,7 @@ impl Node {
             "data_dir = \"{}\"\nnum_shards = {SHARDS}\n{}\
              addr = \"{}\"\nshutdown_timeout_secs = 20\ncleanup_interval_secs = 1\n{}\
              [cluster]\nenabled = true\nnode_id = \"{}\"\nseeds = [{}]\nport = {}\n\
-             gossip_interval_ms = 100\nadvertise_addr = \"{}\"\n\
+             gossip_interval_ms = 100\nadvertise_addr = \"{}\"\n{}\
              [replication]\ntombstone_retention_secs = {RETENTION_SECS}\n",
             self.data().display(),
             self.mode.config(),
@@ -430,11 +434,19 @@ impl Node {
             seeds.join(", "),
             self.gossip_port,
             self.advertise,
+            self.node_timeout_ms
+                .map(|ms| format!("node_timeout_ms = {ms}\n"))
+                .unwrap_or_default(),
         );
         match self.replica_of {
             Some(primary) => toml.push_str(&format!("replica_of = \"{primary}\"\n")),
-            // A primary owns every slot, so clients never see MOVED.
-            None => toml.push_str("[[cluster.slot_ranges]]\nstart = 0\nend = 16383\n"),
+            // A primary owns every slot unless a specific range is configured.
+            None => {
+                let (start, end) = self.slot_range.unwrap_or((0, 16383));
+                toml.push_str(&format!(
+                    "[[cluster.slot_ranges]]\nstart = {start}\nend = {end}\n"
+                ));
+            }
         }
         let path = self.dir.join("config.toml");
         std::fs::write(&path, toml).unwrap();
@@ -1873,6 +1885,502 @@ async fn power_loss_on_the_primary(mode: WriteMode) {
     );
 }
 
+/// Returns `(node_id, flags, master_id, config_epoch, slot_ranges)` parsed from `CLUSTER NODES`.
+fn parse_cluster_nodes_lines(text: &str) -> Vec<(String, String, String, u64, String)> {
+    text.lines()
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 8 {
+                return None;
+            }
+            let slots = if parts.len() > 8 {
+                parts[8..].join(" ")
+            } else {
+                String::new()
+            };
+            Some((
+                parts[0].to_string(),
+                parts[2].to_string(),
+                parts[3].to_string(),
+                parts[6].parse().ok()?,
+                slots,
+            ))
+        })
+        .collect()
+}
+
+/// Targets that all hash into `[slot_start, slot_end]`.
+fn slot_targets(client: usize, slot_start: u16, slot_end: u16) -> Vec<Target> {
+    let pick = |prefix: String, count: usize| -> Vec<String> {
+        let mut out = Vec::with_capacity(count);
+        for i in 0u32.. {
+            let k = format!("{prefix}_{i}");
+            let slot = blobasaur::cluster::ClusterManager::calculate_slot(&k);
+            if slot >= slot_start && slot <= slot_end {
+                out.push(k);
+                if out.len() == count {
+                    return out;
+                }
+            }
+        }
+        unreachable!()
+    };
+    let mut all: Vec<Target> = pick(format!("fc{client}k"), 3)
+        .into_iter()
+        .map(|name| Target { ns: None, name })
+        .collect();
+    for ns in ["n0", "n1"] {
+        for name in pick(format!("fc{client}{ns}f"), 2) {
+            all.push(Target { ns: Some(ns), name });
+        }
+    }
+    all
+}
+
+/// Client writer that routes writes to the current primary of shard 0 (following
+/// `primary_rx` updates and `-MOVED` redirects across automatic failovers).
+#[allow(clippy::too_many_arguments)]
+async fn failover_client(
+    id: usize,
+    mut primary_rx: watch::Receiver<SocketAddr>,
+    mut rng: Rng,
+    stop: Arc<AtomicBool>,
+    registry: Registry,
+    journal: Arc<Journal>,
+) -> Vec<Rec> {
+    let all = slot_targets(id, 0, 5460);
+    let mut target_addr = *primary_rx.borrow();
+    let mut conn: Option<Conn> = None;
+    let mut recs: Vec<Rec> = Vec::new();
+    let mut n = 0u64;
+    while !stop.load(Ordering::Relaxed) {
+        if primary_rx.has_changed().unwrap_or(false) {
+            let latest = *primary_rx.borrow_and_update();
+            if latest != target_addr {
+                target_addr = latest;
+                conn = None;
+            }
+        }
+        if conn.is_none() {
+            match Conn::open(target_addr).await {
+                Ok(c) => conn = Some(c),
+                Err(_) => {
+                    sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+            }
+        }
+        let target = &all[rng.below(all.len())];
+        let roll = rng.below(100);
+        n += 1;
+        let value = format!("vf-{id}-{n}");
+        let name = target.name.as_str();
+        let (effect, args): (Effect, Vec<&str>) = match (target.ns, roll) {
+            (None, 0..70) => (Effect::Put(value.clone()), vec!["SET", name, &value]),
+            (None, _) => (Effect::Del, vec!["DEL", name]),
+            (Some(ns), 0..70) => (Effect::Put(value.clone()), vec!["HSET", ns, name, &value]),
+            (Some(ns), _) => (Effect::Del, vec!["HDEL", ns, name]),
+        };
+        let ident = target.ident();
+        if let Effect::Put(v) = &effect {
+            registry.lock().unwrap().insert(v.clone(), ident.clone());
+        }
+        let outcome = match conn.as_mut().unwrap().cmd(&args).await {
+            Ok(Resp::Err(e)) => {
+                if let Some(moved_addr) = e
+                    .strip_prefix("MOVED ")
+                    .and_then(|rest| rest.split_whitespace().nth(1))
+                    .and_then(|a| a.parse::<SocketAddr>().ok())
+                {
+                    target_addr = moved_addr;
+                    conn = None;
+                }
+                Outcome::Failed
+            }
+            Ok(_) => Outcome::Ok,
+            Err(_) => {
+                conn = None;
+                Outcome::Indeterminate
+            }
+        };
+        recs.push(Rec {
+            ident,
+            effect,
+            outcome,
+            seq: journal.tick(),
+        });
+        sleep(rng.ms(0, 5)).await;
+    }
+    recs
+}
+
+/// Automatic failover under concurrent writes: 3 primaries + 2 replicas of p1.
+/// Repeatedly `kill -9` the current primary of slots 0-5460 during writes, let
+/// elections promote a surviving replica, restart the killed node so it demotes
+/// and resyncs, and check:
+/// - every write acknowledged and replicated before each kill survives;
+/// - all three shard-0 nodes converge to identical data with zero phantoms;
+/// - no two nodes ever own a slot at the same epoch (`UniqueClaims`).
+async fn auto_failover(mode: WriteMode) {
+    let seed = seed();
+    let name = format!("auto_failover[{}]", mode.label());
+    eprintln!("[chaos] scenario {name}: BLOBASAUR_CHAOS_SEED={seed}");
+    let started = Instant::now();
+    let root = TempDir::new().unwrap();
+
+    let mut p1 = Node::new(root.path(), "p1");
+    let mut p2 = Node::new(root.path(), "p2");
+    let mut p3 = Node::new(root.path(), "p3");
+    let mut r1 = Node::new(root.path(), "r1");
+    let mut r2 = Node::new(root.path(), "r2");
+
+    p1.slot_range = Some((0, 5460));
+    p2.slot_range = Some((5461, 10922));
+    p3.slot_range = Some((10923, 16383));
+    r1.replica_of = Some("p1");
+    r2.replica_of = Some("p1");
+
+    let g1 = format!("127.0.0.1:{}", p1.gossip_port);
+    let g2 = format!("127.0.0.1:{}", p2.gossip_port);
+    let g3 = format!("127.0.0.1:{}", p3.gossip_port);
+    p1.seeds = vec![g2.clone(), g3.clone()];
+    p2.seeds = vec![g1.clone(), g3.clone()];
+    p3.seeds = vec![g1.clone(), g2.clone()];
+    r1.seeds = vec![g1.clone(), g2.clone(), g3.clone()];
+    r2.seeds = vec![g1.clone(), g2.clone(), g3.clone()];
+
+    for node in [&mut p1, &mut p2, &mut p3, &mut r1, &mut r2] {
+        node.mode = mode;
+        node.node_timeout_ms = Some(1000);
+    }
+
+    tokio::join!(p1.must_start(), p2.must_start(), p3.must_start());
+    tokio::join!(r1.must_start(), r2.must_start());
+
+    let p2_addr = p2.addr;
+    let p3_addr = p3.addr;
+    let mut shard0 = [p1, r1, r2]; // index 0 = current primary initially ("p1")
+    let all_addrs: Vec<(String, SocketAddr)> = shard0
+        .iter()
+        .map(|n| (n.name.to_string(), n.addr))
+        .chain([("p2".to_string(), p2_addr), ("p3".to_string(), p3_addr)])
+        .collect();
+
+    // Wait for cluster ok and both initial replicas synced.
+    wait_for(
+        "initial 5-node cluster ok and replicas synced",
+        30,
+        || async {
+            let Ok(mut c) = Conn::open(p2_addr).await else {
+                return false;
+            };
+            let Ok(Resp::Bulk(Some(info))) = c.cmd(&["CLUSTER", "INFO"]).await else {
+                return false;
+            };
+            if !String::from_utf8_lossy(&info).contains("cluster_state:ok") {
+                return false;
+            }
+            for idx in [1, 2] {
+                if !watermark(shard0[idx].addr)
+                    .await
+                    .is_ok_and(|m| m.iter().all(|(_, lsn)| lsn != "not-synced"))
+                {
+                    return false;
+                }
+            }
+            true
+        },
+    )
+    .await;
+
+    // Background UniqueClaims checker: polls CLUSTER NODES across all reachable
+    // nodes and records every `(slot, epoch) -> owner` claim.
+    let stop_monitor = Arc::new(AtomicBool::new(false));
+    let monitor_stop = stop_monitor.clone();
+    let monitor_addrs = all_addrs.clone();
+    let monitor_task = tokio::spawn(async move {
+        let mut seen_claims: HashMap<(u16, u64), String> = HashMap::new();
+        let mut violations: Vec<String> = Vec::new();
+        while !monitor_stop.load(Ordering::Relaxed) {
+            for (observer, addr) in &monitor_addrs {
+                let Ok(mut conn) = Conn::open(*addr).await else {
+                    continue;
+                };
+                let Ok(Resp::Bulk(Some(raw))) = conn.cmd(&["CLUSTER", "NODES"]).await else {
+                    continue;
+                };
+                let text = String::from_utf8_lossy(&raw);
+                for (id, flags, _, epoch, slots) in parse_cluster_nodes_lines(&text) {
+                    if !flags.contains("master") || slots.is_empty() {
+                        continue;
+                    }
+                    let Ok(parsed) = blobasaur::cluster::parse_slot_ranges(&slots) else {
+                        continue;
+                    };
+                    // Sample representative slots per range to keep the check fast while
+                    // covering every distinct owner/epoch boundary.
+                    let mut sorted: Vec<u16> = parsed.into_iter().collect();
+                    sorted.sort_unstable();
+                    let sample_slots =
+                        [sorted[0], sorted[sorted.len() / 2], *sorted.last().unwrap()];
+                    for slot in sample_slots {
+                        match seen_claims.get(&(slot, epoch)) {
+                            Some(prev) if prev != &id => {
+                                violations.push(format!(
+                                    "slot {slot} epoch {epoch}: claimed by both {prev} and {id} (seen on {observer})"
+                                ));
+                            }
+                            None => {
+                                seen_claims.insert((slot, epoch), id.clone());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        violations
+    });
+
+    let journal = Arc::new(Journal::default());
+    let registry = Registry::default();
+    let (primary_tx, primary_rx) = watch::channel(shard0[0].addr);
+    let stop_writers = Arc::new(AtomicBool::new(false));
+    let writer_tasks: Vec<JoinHandle<Vec<Rec>>> = (0..CLIENTS)
+        .map(|id| {
+            tokio::spawn(failover_client(
+                id,
+                primary_rx.clone(),
+                Rng::new(seed ^ ((id as u64 + 1) << 32)),
+                stop_writers.clone(),
+                registry.clone(),
+                journal.clone(),
+            ))
+        })
+        .collect();
+
+    let mut cur_primary_idx = 0usize;
+    let mut lifetimes = vec![Lifetime {
+        start: journal.tick(),
+        end: None,
+        graceful: false,
+    }];
+    let mut replicated_marks: Vec<(u64, u64)> = Vec::new();
+    let cycles = 3usize;
+
+    for cycle in 0..cycles {
+        sleep(Duration::from_millis(600)).await;
+
+        // Replicated durability point: every op acked before `sent` is committed
+        // on the current primary AND replicated to every surviving replica.
+        let sent = journal.tick();
+        let target = watermark(shard0[cur_primary_idx].addr)
+            .await
+            .expect("current primary WATERMARK");
+        let replicas: Vec<usize> = (0..3).filter(|&i| i != cur_primary_idx).collect();
+        wait_for(
+            &format!("cycle {cycle}: both replicas reach primary watermark"),
+            30,
+            || async {
+                for &idx in &replicas {
+                    if !watermark(shard0[idx].addr)
+                        .await
+                        .is_ok_and(|m| reached(&m, &target))
+                    {
+                        return false;
+                    }
+                }
+                true
+            },
+        )
+        .await;
+        replicated_marks.push((sent, journal.tick()));
+
+        // Let writes keep flowing briefly so in-flight writes race with the crash.
+        sleep(Duration::from_millis(150)).await;
+
+        let killed_name = shard0[cur_primary_idx].name;
+        eprintln!("[chaos] {name} cycle {cycle}: kill -9 primary {killed_name}");
+        shard0[cur_primary_idx].kill9();
+        lifetimes.last_mut().unwrap().end = Some(journal.tick());
+
+        // Wait for automatic failover to elect one of the two surviving replicas.
+        let new_primary_idx = Mutex::new(None);
+        wait_for(
+            &format!("cycle {cycle}: automatic failover replaces {killed_name}"),
+            20,
+            || async {
+                let Ok(mut c) = Conn::open(p2_addr).await else {
+                    return false;
+                };
+                let Ok(Resp::Bulk(Some(raw))) = c.cmd(&["CLUSTER", "NODES"]).await else {
+                    return false;
+                };
+                let text = String::from_utf8_lossy(&raw);
+                let lines = parse_cluster_nodes_lines(&text);
+                for &idx in &replicas {
+                    let candidate = shard0[idx].name;
+                    if lines.iter().any(|(id, flags, _, _, slots)| {
+                        id == candidate && flags.contains("master") && slots == "0-5460"
+                    }) {
+                        *new_primary_idx.lock().unwrap() = Some(idx);
+                        return true;
+                    }
+                }
+                false
+            },
+        )
+        .await;
+
+        let winner_idx = new_primary_idx.into_inner().unwrap().unwrap();
+        let winner_name = shard0[winner_idx].name;
+        eprintln!("[chaos] {name} cycle {cycle}: {winner_name} won automatic failover");
+        primary_tx.send_replace(shard0[winner_idx].addr);
+        lifetimes.push(Lifetime {
+            start: journal.tick(),
+            end: None,
+            graceful: false,
+        });
+
+        // Restart the killed old primary: it must demote to a replica of winner and resync.
+        shard0[cur_primary_idx].must_start().await;
+        let new_replicas: Vec<usize> = (0..3).filter(|&i| i != winner_idx).collect();
+        wait_for(
+            &format!("cycle {cycle}: restarted {killed_name} demoted and both replicas synced"),
+            30,
+            || async {
+                let Ok(mut c) = Conn::open(shard0[cur_primary_idx].addr).await else {
+                    return false;
+                };
+                let Ok(Resp::Bulk(Some(raw))) = c.cmd(&["CLUSTER", "NODES"]).await else {
+                    return false;
+                };
+                let text = String::from_utf8_lossy(&raw);
+                let demoted = parse_cluster_nodes_lines(&text).into_iter().any(
+                    |(id, flags, master, _, slots)| {
+                        id == killed_name
+                            && flags.contains("slave")
+                            && master == winner_name
+                            && slots.is_empty()
+                    },
+                );
+                if !demoted {
+                    return false;
+                }
+                for &idx in &new_replicas {
+                    if !watermark(shard0[idx].addr)
+                        .await
+                        .is_ok_and(|m| m.iter().all(|(_, lsn)| lsn != "not-synced"))
+                    {
+                        return false;
+                    }
+                }
+                true
+            },
+        )
+        .await;
+
+        cur_primary_idx = winner_idx;
+    }
+
+    // Stop writers, let final primary and its two replicas converge, stop monitor.
+    stop_writers.store(true, Ordering::Relaxed);
+    let mut recs = Vec::new();
+    for task in writer_tasks {
+        recs.extend(task.await.expect("failover client panicked"));
+    }
+
+    let final_target = watermark(shard0[cur_primary_idx].addr)
+        .await
+        .expect("final primary WATERMARK");
+    let final_replicas: Vec<usize> = (0..3).filter(|&i| i != cur_primary_idx).collect();
+    wait_for("final replicas converge to final primary", 30, || async {
+        for &idx in &final_replicas {
+            if !watermark(shard0[idx].addr)
+                .await
+                .is_ok_and(|m| reached(&m, &final_target))
+            {
+                return false;
+            }
+        }
+        true
+    })
+    .await;
+
+    stop_monitor.store(true, Ordering::Relaxed);
+    let epoch_violations = monitor_task.await.expect("epoch monitor panicked");
+    assert_none(
+        "UniqueClaims (no two nodes own a slot at the same epoch)",
+        epoch_violations,
+    );
+
+    // Stop all nodes cleanly (final primary lifetime is graceful).
+    for &idx in &final_replicas {
+        shard0[idx].stop().await;
+    }
+    shard0[cur_primary_idx].stop().await;
+    {
+        let last = lifetimes.last_mut().unwrap();
+        last.end = Some(journal.tick());
+        last.graceful = true;
+    }
+    p3.stop().await;
+    p2.stop().await;
+
+    // Check UniqueClaims on persisted cluster-state.json files as well.
+    let mut disk_claims: HashMap<(u16, u64), String> = HashMap::new();
+    for node in [&shard0[0], &shard0[1], &shard0[2], &p2, &p3] {
+        let state = blobasaur::cluster::ClusterState::load(
+            &node.data().join(blobasaur::cluster::CLUSTER_STATE_FILE),
+            node.name,
+        )
+        .unwrap();
+        for run in state.slots.runs() {
+            for slot in [run.start, run.end] {
+                if let Some(prev) = disk_claims.get(&(slot, run.config_epoch)) {
+                    assert_eq!(
+                        prev, &run.node_id,
+                        "persisted UniqueClaims violation on slot {slot} epoch {}",
+                        run.config_epoch
+                    );
+                } else {
+                    disk_claims.insert((slot, run.config_epoch), run.node_id.clone());
+                }
+            }
+        }
+    }
+
+    // Durability check: every write acknowledged AND replicated before a kill
+    // (or in the final cleanly-stopped primary lifetime) must survive.
+    let durability = Durability {
+        asynchronous: true,
+        lifetimes,
+        marks: replicated_marks,
+    };
+    let durable_count = recs.iter().filter(|r| durability.durable(r)).count();
+    eprintln!(
+        "[chaos] {name}: {}; {durable_count} durable replicated ops across {cycles} kills; {:?}",
+        outcomes(&recs),
+        started.elapsed()
+    );
+    assert!(durable_count > 0, "expected durable replicated ops");
+
+    let primary_data = read_data(&shard0[cur_primary_idx].data()).await;
+    assert_none(
+        "durability on final promoted primary after repeated kills",
+        durability_violations(&recs, &primary_data, &durability),
+    );
+    assert_none(
+        "phantoms on final promoted primary",
+        phantom_violations(&primary_data, &registry),
+    );
+    for &idx in &final_replicas {
+        let rep_data = read_data(&shard0[idx].data()).await;
+        assert_converged(&primary_data, &rep_data);
+    }
+}
+
 /// Each scenario as `<scenario>::sync` and `<scenario>::async_write`.
 macro_rules! both_modes {
     ($($scenario:ident),* $(,)?) => {$(
@@ -1896,4 +2404,5 @@ both_modes!(
     planned_failover,
     unplanned_failover,
     power_loss_on_the_primary,
+    auto_failover,
 );

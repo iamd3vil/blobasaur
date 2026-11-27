@@ -107,7 +107,6 @@ pub struct ClusterConfig {
     pub node_timeout_ms: Option<u64>,
     /// Multiplier on `node_timeout_ms` bounding how stale a replica may be and
     /// still run an election. 0 disables the check. Default: 10.
-    #[allow(dead_code)]
     pub replica_validity_factor: Option<u64>,
 }
 
@@ -158,7 +157,6 @@ impl ClusterConfig {
     }
 
     /// Replica validity factor for elections (default: 10; 0 disables the check).
-    #[allow(dead_code)]
     pub fn replica_validity_factor(&self) -> u64 {
         self.replica_validity_factor.unwrap_or(10)
     }

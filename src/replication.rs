@@ -914,6 +914,20 @@ pub async fn serve_sync(
     result
 }
 
+/// Idle watermark cadence: 10 s normally, capped at `max(200 ms, node_timeout / 2)`
+/// in clustered mode so `replica_validity_factor` always sees fresh frames while
+/// the primary is alive.
+fn stream_heartbeat(state: &AppState) -> Duration {
+    match state.cfg.cluster.as_ref().filter(|c| c.enabled) {
+        Some(cluster) => {
+            let half_timeout = Duration::from_millis(cluster.node_timeout_ms() / 2)
+                .max(Duration::from_millis(200));
+            HEARTBEAT.min(half_timeout)
+        }
+        None => HEARTBEAT,
+    }
+}
+
 /// Sends everything after `cursor`, then waits for more.
 async fn stream_pages(
     stream: &mut TcpStream,
@@ -924,6 +938,7 @@ async fn stream_pages(
 ) -> io::Result<()> {
     // Subscribed before the first scan, so a commit during it isn't missed.
     let mut commits = state.commit_watch[shard].subscribe();
+    let heartbeat = stream_heartbeat(state);
     loop {
         loop {
             let page = read_page(&state.db_pools[shard], cursor)
@@ -946,7 +961,7 @@ async fn stream_pages(
         let mut hangup = [0u8; 1];
         tokio::select! {
             _ = commits.changed() => {}
-            _ = sleep(HEARTBEAT) => {}
+            _ = sleep(heartbeat) => {}
             _ = stream.read(&mut hangup) => return Ok(()),
         }
     }
@@ -1118,6 +1133,7 @@ pub async fn replica_sync_task(state: Arc<AppState>, shard: usize, shutdown: Can
         metrics: ShardMetrics::new(shard),
         tick: interval(Duration::from_secs(1)),
         last_watermark_ms: None,
+        replid: String::new(),
         backoff: BACKOFF_MIN,
         state,
         shard,
@@ -1140,6 +1156,8 @@ struct Replica {
     /// The primary's clock at the last applied watermark. Unset until the first
     /// session reads it back (or starts counting from now), and restarted by a reset.
     last_watermark_ms: Option<i64>,
+    /// Current replication history id of this shard.
+    replid: String,
     backoff: Duration,
     cancel: CancellationToken,
 }
@@ -1220,7 +1238,9 @@ impl Replica {
             let stored = (watermark_ms > 0).then_some(watermark_ms as i64);
             self.last_watermark_ms = Some(stored.unwrap_or_else(|| Utc::now().timestamp_millis()));
         }
-        Ok((replid.unwrap_or_default(), applied))
+        let replid = replid.unwrap_or_default();
+        self.replid = replid.clone();
+        Ok((replid, applied))
     }
 
     /// One connection to the primary: handshake, then either a reset (`RESYNC`)
@@ -1310,6 +1330,9 @@ impl Replica {
                 decode_bytes_mut(&mut buf).map_err(|e| format!("bad frame: {e:?}"))?
             {
                 let frame = Frame::from_resp(frame)?;
+                if let Some(cluster) = &self.state.cluster_manager {
+                    cluster.record_replica_frame(self.shard, std::time::Instant::now());
+                }
                 bytes += frame.data_len();
                 let watermark = matches!(frame, Frame::Watermark { .. });
                 frames.push(frame);
@@ -1354,13 +1377,6 @@ impl Replica {
         }
     }
 
-    /// Tells the cluster whether the shard holds a full copy, for the gossiped role.
-    async fn set_synced(&self, synced: bool) {
-        if let Some(cluster) = &self.state.cluster_manager {
-            cluster.set_shard_synced(self.shard, synced).await;
-        }
-    }
-
     /// Hands `frames` to the shard's writer and waits for the commit.
     async fn apply(&mut self, frames: Vec<Frame>) -> Result<(), String> {
         let rows = frames.iter().filter(|f| f.lsn().is_some()).count() as u64;
@@ -1379,11 +1395,21 @@ impl Replica {
             applied.map(|lsn| lsn as u64),
             caught_up.map(|(watermark, _)| watermark as u64),
         );
-        if let Some((_, unix_ms)) = caught_up {
+        if let Some((watermark, unix_ms)) = caught_up {
             self.last_watermark_ms = Some(unix_ms);
             self.publish_staleness();
-            if !self.cancel.is_cancelled() {
-                self.set_synced(true).await;
+            if !self.cancel.is_cancelled()
+                && let Some(cluster) = &self.state.cluster_manager
+            {
+                cluster
+                    .update_replica_shard_progress(
+                        self.shard,
+                        &self.replid,
+                        watermark as u64,
+                        true,
+                        std::time::Instant::now(),
+                    )
+                    .await;
             }
         }
         Ok(())
@@ -1407,7 +1433,10 @@ impl Replica {
         if self.cancel.is_cancelled() {
             return Ok(());
         }
-        self.set_synced(false).await;
+        self.replid = replid.to_string();
+        if let Some(cluster) = &self.state.cluster_manager {
+            cluster.reset_shard_replica_state(self.shard, replid).await;
+        }
         let (responder, committed) = oneshot::channel();
         let op = ShardWriteOperation::Reset {
             replid: replid.to_string(),
@@ -2093,6 +2122,7 @@ mod tests {
             metrics: ShardMetrics::new(0),
             tick: interval(Duration::from_secs(1)),
             last_watermark_ms: None,
+            replid: String::new(),
             backoff: BACKOFF_MIN,
             cancel: CancellationToken::new(),
         };

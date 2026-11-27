@@ -1,6 +1,12 @@
+mod election;
 mod failure;
 mod state;
 
+pub use election::{
+    ElectionPlan, ElectionStats, FailoverAuthRequest, PromotionKind, ShardReplState,
+    VoteCollectionOutcome, collect_votes, election_delay, election_timeout, parse_slot_ranges,
+    random_jitter_ms, retry_backoff, vote_backoff,
+};
 use failure::{FailureTracker, PeerHeartbeatView};
 #[allow(unused_imports)]
 pub use state::{
@@ -59,6 +65,7 @@ pub struct ClusterNode {
     pub primary: Option<String>,
     pub current_epoch: u64,
     pub config_epoch: u64,
+    pub shard_repl: Vec<ShardReplState>,
 }
 
 /// What a node gossips about its place in replication.
@@ -167,6 +174,7 @@ struct KnownPeer {
     role: NodeRole,
     primary: Option<String>,
     config_epoch: u64,
+    shard_repl: Vec<ShardReplState>,
 }
 
 /// Reads the newest generation carrying `node_info` for every peer in chitchat's
@@ -199,6 +207,7 @@ fn peer_snapshots(chitchat: &Chitchat, self_id: &str) -> HashMap<String, PeerSna
                         primary: gossip_data.primary,
                         current_epoch: gossip_data.current_epoch,
                         config_epoch: gossip_data.config_epoch,
+                        shard_repl: gossip_data.shard_repl,
                     };
                     let heartbeat_view = PeerHeartbeatView {
                         generation_id: chitchat_id.generation_id,
@@ -259,6 +268,7 @@ fn live_peers(chitchat: &Chitchat, self_id: &str) -> HashMap<String, ClusterNode
                             primary: gossip_data.primary,
                             current_epoch: gossip_data.current_epoch,
                             config_epoch: gossip_data.config_epoch,
+                            shard_repl: gossip_data.shard_repl,
                         };
                         nodes_map.insert(chitchat_id.node_id.clone(), cluster_node);
                     } else {
@@ -314,6 +324,9 @@ struct NodeGossipData {
     /// Node ids this node has marked failed (FAIL).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fail: Vec<String>,
+    /// Per-shard replication replid and `caught_up_lsn` for election ranking.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shard_repl: Vec<ShardReplState>,
 }
 
 impl NodeGossipData {
@@ -330,6 +343,7 @@ impl NodeGossipData {
         config_epoch: u64,
         pfail: Vec<String>,
         fail: Vec<String>,
+        shard_repl: Vec<ShardReplState>,
     ) -> Result<Self, String> {
         let mut list: Vec<u16> = slots.iter().copied().collect();
         list.sort_unstable();
@@ -344,6 +358,7 @@ impl NodeGossipData {
             config_epoch,
             pfail,
             fail,
+            shard_repl,
         };
         let size = |data: &Self| serde_json::to_string(data).map_or(usize::MAX, |json| json.len());
         if size(&both) <= GOSSIP_VALUE_MAX {
@@ -457,6 +472,18 @@ pub struct ClusterManager {
     namespace_strategy: NamespaceDistributionStrategy,
     /// Per-shard synced flags for a replica; role is `Replica` once all are true.
     replica_synced: Arc<Mutex<Vec<bool>>>,
+    /// Per-shard replication replid and `caught_up_lsn` gossiped for ranking.
+    shard_repl: Arc<Mutex<Vec<ShardReplState>>>,
+    /// Set when `shard_repl` changes so the next gossip tick republishes it.
+    shard_repl_dirty: Arc<AtomicBool>,
+    /// Monotonic time each shard last received a frame from its primary.
+    last_frame_at: Arc<Mutex<Vec<Option<Instant>>>>,
+    /// Monotonic start time of each active per-primary vote backoff (`last_vote_for`).
+    vote_backoff_at: Arc<Mutex<HashMap<String, Instant>>>,
+    /// Lightweight election and voting counters for `CLUSTER INFO`.
+    election_stats: Arc<ElectionStats>,
+    /// Wakes the automatic election loop on topology/FAIL/sync updates.
+    election_notify: Arc<tokio::sync::Notify>,
 }
 
 impl ClusterManager {
@@ -480,12 +507,22 @@ impl ClusterManager {
         let known_peers = Arc::new(std::sync::RwLock::new(HashMap::new()));
         let gossip_interval = Duration::from_millis(config.gossip_interval_ms.unwrap_or(1000));
         let node_timeout = Duration::from_millis(config.node_timeout_ms());
+        let init_now = Instant::now();
         let failure = Arc::new(std::sync::RwLock::new(FailureTracker::new(
             config.node_id.clone(),
             node_timeout,
-            Instant::now(),
+            init_now,
         )));
         let replica_synced = Arc::new(Mutex::new(vec![false; num_shards]));
+        let shard_repl = Arc::new(Mutex::new(vec![ShardReplState::default(); num_shards]));
+        let last_frame_at = Arc::new(Mutex::new(vec![None; num_shards]));
+        let mut vote_backoff_map = HashMap::new();
+        for (failed_primary, &epoch) in &initial_state.last_vote_for {
+            if epoch > 0 {
+                vote_backoff_map.insert(failed_primary.clone(), init_now);
+            }
+        }
+        let vote_backoff_at = Arc::new(Mutex::new(vote_backoff_map));
 
         // Set up chitchat for gossip protocol
         let gossip_addr = SocketAddr::new(gossip_bind_addr.ip(), config.port);
@@ -546,6 +583,7 @@ impl ClusterManager {
             initial_state.config_epoch,
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         )?;
 
         let gossip_data_json = serde_json::to_string(&initial_gossip_data)
@@ -591,6 +629,12 @@ impl ClusterManager {
             local_addr: redis_addr,
             namespace_strategy: NamespaceDistributionStrategy::default(),
             replica_synced,
+            shard_repl,
+            shard_repl_dirty: Arc::new(AtomicBool::new(false)),
+            last_frame_at,
+            vote_backoff_at,
+            election_stats: Arc::new(ElectionStats::default()),
+            election_notify: Arc::new(tokio::sync::Notify::new()),
         };
 
         // Start gossip processing task
@@ -635,6 +679,98 @@ impl ClusterManager {
     /// slot-owning primaries for `node_timeout_ms`).
     pub fn is_in_minority(&self) -> bool {
         self.failure.read().unwrap().is_in_minority()
+    }
+
+    /// Configured cluster node timeout (`node_timeout_ms`).
+    pub fn node_timeout(&self) -> Duration {
+        Duration::from_millis(self.config.node_timeout_ms())
+    }
+
+    /// Notification woken whenever gossip/FAIL/sync state changes.
+    pub fn election_notify(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.election_notify)
+    }
+
+    /// Records the current `replid` of `shard` for gossiped ranking/history checks.
+    pub fn set_shard_replid(&self, shard: usize, replid: &str) {
+        let is_replica = self.is_replica();
+        let mut guard = self.shard_repl.lock().unwrap();
+        if let Some(entry) = guard.get_mut(shard) {
+            let mut changed = false;
+            if entry.replid != replid {
+                entry.replid = replid.to_string();
+                changed = true;
+            }
+            if !is_replica && entry.caught_up_lsn != 0 {
+                entry.caught_up_lsn = 0;
+                changed = true;
+            }
+            if changed {
+                self.shard_repl_dirty.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    /// Records that `shard` received a replication frame from its primary at `at`.
+    pub fn record_replica_frame(&self, shard: usize, at: Instant) {
+        if let Some(slot) = self.last_frame_at.lock().unwrap().get_mut(shard) {
+            *slot = Some(at);
+        }
+    }
+
+    /// Replica: records `(replid, caught_up_lsn, synced, last_frame_at)` for `shard`,
+    /// gossiping immediately if overall synced status flipped.
+    pub async fn update_replica_shard_progress(
+        &self,
+        shard: usize,
+        replid: &str,
+        caught_up_lsn: u64,
+        synced: bool,
+        at: Instant,
+    ) {
+        if !self.is_replica() {
+            return;
+        }
+        self.record_replica_frame(shard, at);
+        {
+            let mut guard = self.shard_repl.lock().unwrap();
+            if let Some(entry) = guard.get_mut(shard)
+                && (entry.replid != replid || entry.caught_up_lsn != caught_up_lsn)
+            {
+                entry.replid = replid.to_string();
+                entry.caught_up_lsn = caught_up_lsn;
+                self.shard_repl_dirty.store(true, Ordering::Release);
+            }
+        }
+        self.set_shard_synced(shard, synced).await;
+    }
+
+    /// Replica: clears frame time and caught-up LSN for `shard` on `RESYNC` reset.
+    pub async fn reset_shard_replica_state(&self, shard: usize, new_replid: &str) {
+        if let Some(slot) = self.last_frame_at.lock().unwrap().get_mut(shard) {
+            *slot = None;
+        }
+        {
+            let mut guard = self.shard_repl.lock().unwrap();
+            if let Some(entry) = guard.get_mut(shard) {
+                entry.replid = new_replid.to_string();
+                entry.caught_up_lsn = 0;
+                self.shard_repl_dirty.store(true, Ordering::Release);
+            }
+        }
+        self.set_shard_synced(shard, false).await;
+    }
+
+    pub fn record_election_won(&self) {
+        self.election_stats
+            .elections_won
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_election_failed(&self) {
+        self.election_stats
+            .elections_failed
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     async fn persist_state(&self, state: &ClusterState) -> Result<(), String> {
@@ -744,6 +880,13 @@ impl ClusterManager {
         for flag in self.replica_synced.lock().unwrap().iter_mut() {
             *flag = false;
         }
+        for slot in self.last_frame_at.lock().unwrap().iter_mut() {
+            *slot = None;
+        }
+        for entry in self.shard_repl.lock().unwrap().iter_mut() {
+            entry.caught_up_lsn = 0;
+        }
+        self.shard_repl_dirty.store(true, Ordering::Release);
     }
 
     /// Publish the current state, role, and epochs to gossip.
@@ -751,8 +894,8 @@ impl ClusterManager {
         self.update_gossip_data().await
     }
 
-    /// Pre-check for `CLUSTER FAILOVER TAKEOVER` before stopping sync tasks.
-    pub fn can_takeover(&self) -> Result<(), String> {
+    /// Pre-check for promotion (`TAKEOVER` or won election) before stopping sync tasks.
+    pub fn can_promote(&self, kind: &PromotionKind) -> Result<(), String> {
         if self.persist_halted.load(Ordering::Acquire) {
             return Err("ERR Node is shutting down after incomplete takeover".to_string());
         }
@@ -766,17 +909,411 @@ impl ClusterManager {
         let Some(ref primary) = state.primary else {
             return Err("ERR Replica has no configured primary".to_string());
         };
-        if !state.slots.has_slots_of(primary) {
-            return Err("ERR Primary owns no slots to take over".to_string());
+        match kind {
+            PromotionKind::Takeover => {
+                if !state.slots.has_slots_of(primary) {
+                    return Err("ERR Primary owns no slots to take over".to_string());
+                }
+            }
+            PromotionKind::Elected {
+                election_epoch,
+                failed_primary,
+                primary_config_epoch,
+                expected_slots,
+            } => {
+                if primary != failed_primary {
+                    return Err(format!(
+                        "ERR Replica now follows {primary}, no longer {failed_primary}"
+                    ));
+                }
+                let current_slots = state.slots.slots_of(failed_primary);
+                if current_slots.is_empty() || current_slots != *expected_slots {
+                    return Err("ERR Failed primary's slots changed before promotion".to_string());
+                }
+                if state.slots.max_epoch_for(failed_primary) != *primary_config_epoch {
+                    return Err(
+                        "ERR Failed primary's slot epoch changed before promotion".to_string()
+                    );
+                }
+                if *election_epoch <= *primary_config_epoch {
+                    return Err("ERR Election epoch is not newer than primary epoch".to_string());
+                }
+            }
         }
         Ok(())
     }
 
-    /// Promotion commit point for `CLUSTER FAILOVER TAKEOVER`: under
-    /// `write_lock`, bump `current_epoch`, persist `role = primary` with the
-    /// old primary's slots bound to self at the new epoch, run `on_persisted`
-    /// (per-shard writer promotion), install in-memory state, and gossip.
-    pub async fn promote_takeover<F, Fut>(&self, on_persisted: F) -> Result<u64, PromoteError>
+    /// Pre-check for `CLUSTER FAILOVER TAKEOVER` before stopping sync tasks.
+    pub fn can_takeover(&self) -> Result<(), String> {
+        self.can_promote(&PromotionKind::Takeover)
+    }
+
+    /// Check whether this node is currently eligible to start an automatic
+    /// failover election (FAILOVER.md "Election"):
+    /// - replica (not repointing, not bootstrapping, not shutting down);
+    /// - its primary is FAIL in this node's view and owns slots in its table;
+    /// - every shard is synced under the primary's replids;
+    /// - every shard received a frame within `node_timeout_ms * replica_validity_factor`
+    ///   before the failure (when factor > 0).
+    pub async fn check_election_eligibility(&self) -> Option<String> {
+        if self.persist_halted.load(Ordering::Acquire) || self.bootstrapping.load(Ordering::Acquire)
+        {
+            return None;
+        }
+        let primary_id = {
+            let state = self.state.read().unwrap();
+            if !state.is_replica() || state.repointing_to.is_some() {
+                return None;
+            }
+            let primary = state.primary.clone()?;
+            if !state.slots.has_slots_of(&primary) {
+                return None;
+            }
+            primary
+        };
+        let failed_at = self.failure.read().unwrap().failed_at(&primary_id)?;
+        {
+            let synced = self.replica_synced.lock().unwrap();
+            if synced.is_empty() || !synced.iter().all(|s| *s) {
+                return None;
+            }
+        }
+        let local_repl = self.shard_repl.lock().unwrap().clone();
+        if local_repl.is_empty() || local_repl.iter().any(|s| s.replid.is_empty()) {
+            return None;
+        }
+        if let Some(primary_repl) = self.primary_known_repl(&primary_id).await
+            && !election::replids_match(&local_repl, &primary_repl)
+        {
+            return None;
+        }
+        let validity_factor = self.config.replica_validity_factor();
+        if validity_factor > 0 {
+            let max_age = Duration::from_millis(
+                self.config
+                    .node_timeout_ms()
+                    .saturating_mul(validity_factor),
+            );
+            let failure_time = failed_at
+                .checked_sub(self.node_timeout())
+                .unwrap_or(failed_at);
+            let frames = self.last_frame_at.lock().unwrap();
+            if frames.len() != local_repl.len() {
+                return None;
+            }
+            for frame_at in frames.iter() {
+                let last = (*frame_at)?;
+                if failure_time.saturating_duration_since(last) > max_age {
+                    return None;
+                }
+            }
+        }
+        Some(primary_id)
+    }
+
+    async fn primary_known_repl(&self, primary_id: &str) -> Option<Vec<ShardReplState>> {
+        let from_live = {
+            let nodes = self.nodes.read().await;
+            nodes.get(primary_id).map(|n| n.shard_repl.clone())
+        };
+        from_live
+            .filter(|v| !v.is_empty() && v.iter().all(|s| !s.replid.is_empty()))
+            .or_else(|| {
+                self.known_peers
+                    .read()
+                    .unwrap()
+                    .get(primary_id)
+                    .map(|p| p.shard_repl.clone())
+                    .filter(|v| !v.is_empty() && v.iter().all(|s| !s.replid.is_empty()))
+            })
+    }
+
+    /// Compute this replica's rank among live synced replicas of `primary_id`
+    /// that share the primary's per-shard replids. Rank 0 = highest sum of
+    /// `caught_up_lsn`, ties broken by smaller `node_id`.
+    pub async fn compute_replica_rank(&self, primary_id: &str) -> usize {
+        let local_repl = self.shard_repl.lock().unwrap().clone();
+        let expected_repl = self
+            .primary_known_repl(primary_id)
+            .await
+            .unwrap_or_else(|| local_repl.clone());
+        let self_lsn = election::total_caught_up_lsn(&local_repl);
+        let nodes = self.nodes.read().await;
+        let failure = self.failure.read().unwrap();
+        let peers: Vec<(String, u128)> = nodes
+            .values()
+            .filter(|peer| {
+                peer.role == NodeRole::Replica
+                    && peer.primary.as_deref() == Some(primary_id)
+                    && !failure.is_failed(&peer.id)
+                    && election::replids_match(&peer.shard_repl, &expected_repl)
+            })
+            .map(|peer| {
+                (
+                    peer.id.clone(),
+                    election::total_caught_up_lsn(&peer.shard_repl),
+                )
+            })
+            .collect();
+        election::compute_rank(&self.node_id, self_lsn, &peers)
+    }
+
+    /// Start an election attempt: under `write_lock`, validate replica state,
+    /// increment `current_epoch`, persist atomically BEFORE sending any vote
+    /// requests, and return the [`ElectionPlan`].
+    pub async fn prepare_election(&self, manual: bool) -> Result<ElectionPlan, String> {
+        let _guard = self.write_lock.lock().await;
+        if self.persist_halted.load(Ordering::Acquire) {
+            return Err("ERR Node is shutting down after incomplete takeover".to_string());
+        }
+        if self.bootstrapping.load(Ordering::Acquire) {
+            return Err("ERR Node is still bootstrapping".to_string());
+        }
+        let mut candidate = self.state.read().unwrap().clone();
+        if !candidate.is_replica() {
+            return Err("ERR You should send CLUSTER FAILOVER to a replica".to_string());
+        }
+        if candidate.repointing_to.is_some() {
+            return Err("ERR Replica is re-pointing to a new primary".to_string());
+        }
+        let Some(failed_primary) = candidate.primary.clone() else {
+            return Err("ERR Replica has no configured primary".to_string());
+        };
+        if !manual && !self.is_failed(&failed_primary) {
+            return Err(format!("ERR Primary {failed_primary} is not marked FAIL"));
+        }
+        let slots = candidate.slots.slots_of(&failed_primary);
+        if slots.is_empty() {
+            return Err("ERR Primary owns no slots to take over".to_string());
+        }
+        let primary_config_epoch = candidate.slots.max_epoch_for(&failed_primary);
+        let owners = candidate.slots.owners();
+        let quorum = owners.len() / 2 + 1;
+
+        let election_epoch = candidate.current_epoch + 1;
+        candidate.current_epoch = election_epoch;
+        self.persist_state(&candidate)
+            .await
+            .map_err(|e| format!("ERR {e}"))?;
+        *self.state.write().unwrap() = candidate;
+
+        let targets = {
+            let nodes = self.nodes.read().await;
+            let known = self.known_peers.read().unwrap();
+            let mut targets = Vec::new();
+            for owner in &owners {
+                if owner == &self.node_id {
+                    continue;
+                }
+                if let Some(addr) = nodes
+                    .get(owner)
+                    .map(|p| p.addr)
+                    .or_else(|| known.get(owner).map(|p| p.addr))
+                {
+                    targets.push((owner.clone(), addr));
+                }
+            }
+            targets
+        };
+        drop(_guard);
+
+        self.election_stats
+            .elections_started
+            .fetch_add(1, Ordering::Relaxed);
+        if let Err(e) = self.update_gossip_data().await {
+            debug!("Failed to gossip incremented election epoch: {}", e);
+        }
+
+        info!(
+            candidate = %self.node_id,
+            epoch = election_epoch,
+            failed_primary = %failed_primary,
+            primary_config_epoch,
+            owners = owners.len(),
+            quorum,
+            targets = targets.len(),
+            manual,
+            "Starting failover election"
+        );
+
+        Ok(ElectionPlan {
+            candidate: self.node_id.clone(),
+            epoch: election_epoch,
+            failed_primary,
+            primary_config_epoch,
+            slots,
+            owners,
+            targets,
+            quorum,
+            manual,
+        })
+    }
+
+    /// Evaluate and cast a vote for `BLOBASAUR.FAILOVER-AUTH` (`Vote` in
+    /// `specs/Failover.tla`), persisting `current_epoch`, `last_vote_epoch`, and
+    /// `last_vote_for` atomically BEFORE returning `Ok(epoch)`.
+    pub async fn handle_failover_auth(&self, req: &FailoverAuthRequest) -> Result<u64, String> {
+        self.handle_failover_auth_at(req, Instant::now()).await
+    }
+
+    pub(crate) async fn handle_failover_auth_at(
+        &self,
+        req: &FailoverAuthRequest,
+        now: Instant,
+    ) -> Result<u64, String> {
+        let _guard = self.write_lock.lock().await;
+        let refuse = |reason: String| -> Result<u64, String> {
+            self.election_stats
+                .votes_refused
+                .fetch_add(1, Ordering::Relaxed);
+            info!(
+                voter = %self.node_id,
+                candidate = %req.candidate,
+                epoch = req.epoch,
+                failed_primary = %req.failed_primary,
+                manual = req.manual,
+                reason = %reason,
+                "Refused failover vote"
+            );
+            Err(reason)
+        };
+
+        if self.persist_halted.load(Ordering::Acquire) {
+            return refuse("voter is shutting down".to_string());
+        }
+        if self.bootstrapping.load(Ordering::Acquire) {
+            return refuse("voter is still bootstrapping".to_string());
+        }
+
+        let state = self.state.read().unwrap().clone();
+        if state.role != PersistedRole::Primary || state.demoting_to.is_some() {
+            return refuse("voter is not a primary".to_string());
+        }
+        if !state.slots.has_slots_of(&self.node_id) {
+            return refuse("voter owns no slots".to_string());
+        }
+        if req.epoch < state.current_epoch {
+            return refuse(format!(
+                "requested epoch {} < current_epoch {}",
+                req.epoch, state.current_epoch
+            ));
+        }
+        if req.epoch <= state.last_vote_epoch {
+            return refuse(format!(
+                "already voted in epoch {} (requested {})",
+                state.last_vote_epoch, req.epoch
+            ));
+        }
+
+        // Candidate must be a replica of `failed_primary` per gossip.
+        let is_known_replica = {
+            let nodes = self.nodes.read().await;
+            nodes.get(&req.candidate).is_some_and(|peer| {
+                peer.role != NodeRole::Primary
+                    && peer.primary.as_deref() == Some(req.failed_primary.as_str())
+            })
+        };
+        if !is_known_replica {
+            return refuse(format!(
+                "candidate {} is not a known replica of {} in gossip",
+                req.candidate, req.failed_primary
+            ));
+        }
+
+        // Primary must be FAIL in this node's view unless MANUAL.
+        if !req.manual && !self.is_failed(&req.failed_primary) {
+            return refuse(format!("primary {} is not marked FAIL", req.failed_primary));
+        }
+
+        // Persisted vote backoff: at most one vote per failed primary per 2 * node_timeout_ms.
+        let backoff = vote_backoff(self.node_timeout());
+        if state
+            .last_vote_for
+            .get(&req.failed_primary)
+            .copied()
+            .unwrap_or(0)
+            > 0
+        {
+            let mut backoff_map = self.vote_backoff_at.lock().unwrap();
+            match backoff_map.get(&req.failed_primary).copied() {
+                Some(voted_at) if now.saturating_duration_since(voted_at) < backoff => {
+                    return refuse(format!(
+                        "already voted for a replica of {} within vote backoff ({:?})",
+                        req.failed_primary, backoff
+                    ));
+                }
+                None => {
+                    // Fail-safe if persisted entry existed without an in-memory timestamp.
+                    backoff_map.insert(req.failed_primary.clone(), now);
+                    return refuse(format!(
+                        "already voted for a replica of {} within vote backoff ({:?})",
+                        req.failed_primary, backoff
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+
+        // Per-slot epoch check: candidate must not be working from an older config.
+        if req.slots.is_empty() {
+            return refuse("request listed no slots".to_string());
+        }
+        for &slot in &req.slots {
+            if let Some(binding) = state.slots.get(slot)
+                && binding.epoch > req.primary_config_epoch
+            {
+                return refuse(format!(
+                    "slot {} has newer epoch {} > primary-config-epoch {}",
+                    slot, binding.epoch, req.primary_config_epoch
+                ));
+            }
+        }
+
+        // All checks passed: adopt epoch, record vote & backoff, persist BEFORE replying.
+        let mut next = state;
+        let epoch_advanced = req.epoch > next.current_epoch;
+        next.current_epoch = req.epoch;
+        next.last_vote_epoch = req.epoch;
+        next.last_vote_for
+            .insert(req.failed_primary.clone(), req.epoch);
+        if let Err(e) = self.persist_state(&next).await {
+            return refuse(format!("failed to persist vote: {e}"));
+        }
+        *self.state.write().unwrap() = next;
+        self.vote_backoff_at
+            .lock()
+            .unwrap()
+            .insert(req.failed_primary.clone(), now);
+        self.election_stats
+            .votes_granted
+            .fetch_add(1, Ordering::Relaxed);
+        drop(_guard);
+
+        if epoch_advanced && let Err(e) = self.update_gossip_data().await {
+            debug!("Failed to gossip adopted epoch after vote: {}", e);
+        }
+
+        info!(
+            voter = %self.node_id,
+            candidate = %req.candidate,
+            epoch = req.epoch,
+            failed_primary = %req.failed_primary,
+            manual = req.manual,
+            "Granted failover vote"
+        );
+        Ok(req.epoch)
+    }
+
+    /// Promotion commit point shared by `CLUSTER FAILOVER TAKEOVER` and won
+    /// elections: under `write_lock`, validate preconditions, persist
+    /// `role = primary` with the old primary's slots bound to self at the
+    /// target epoch, run `on_persisted` (per-shard writer promotion), install
+    /// in-memory state, and gossip.
+    pub async fn promote<F, Fut>(
+        &self,
+        kind: PromotionKind,
+        on_persisted: F,
+    ) -> Result<u64, PromoteError>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<(), String>>,
@@ -803,14 +1340,49 @@ impl ClusterManager {
                 "ERR Replica has no configured primary".to_string(),
             ));
         };
-        let taken = candidate.slots.slots_of(&old_primary);
-        if taken.is_empty() {
-            return Err(PromoteError::BeforeCommit(
-                "ERR Primary owns no slots to take over".to_string(),
-            ));
-        }
-        let new_epoch = candidate.current_epoch + 1;
-        candidate.current_epoch = new_epoch;
+        let (taken, new_epoch) = match kind {
+            PromotionKind::Takeover => {
+                let taken = candidate.slots.slots_of(&old_primary);
+                if taken.is_empty() {
+                    return Err(PromoteError::BeforeCommit(
+                        "ERR Primary owns no slots to take over".to_string(),
+                    ));
+                }
+                let new_epoch = candidate.current_epoch + 1;
+                candidate.current_epoch = new_epoch;
+                (taken, new_epoch)
+            }
+            PromotionKind::Elected {
+                election_epoch,
+                failed_primary,
+                primary_config_epoch,
+                expected_slots,
+            } => {
+                if old_primary != failed_primary {
+                    return Err(PromoteError::BeforeCommit(format!(
+                        "ERR Replica now follows {old_primary}, no longer {failed_primary}"
+                    )));
+                }
+                let current_slots = candidate.slots.slots_of(&failed_primary);
+                if current_slots.is_empty() || current_slots != expected_slots {
+                    return Err(PromoteError::BeforeCommit(
+                        "ERR Failed primary's slots changed before promotion".to_string(),
+                    ));
+                }
+                if candidate.slots.max_epoch_for(&failed_primary) != primary_config_epoch {
+                    return Err(PromoteError::BeforeCommit(
+                        "ERR Failed primary's slot epoch changed before promotion".to_string(),
+                    ));
+                }
+                if election_epoch <= primary_config_epoch {
+                    return Err(PromoteError::BeforeCommit(
+                        "ERR Election epoch is not newer than primary epoch".to_string(),
+                    ));
+                }
+                candidate.current_epoch = candidate.current_epoch.max(election_epoch);
+                (expected_slots, election_epoch)
+            }
+        };
         candidate.config_epoch = new_epoch;
         candidate.role = PersistedRole::Primary;
         candidate.primary = None;
@@ -1019,6 +1591,7 @@ impl ClusterManager {
                         role: snap.node.role,
                         primary: snap.node.primary.clone(),
                         config_epoch: snap.node.config_epoch,
+                        shard_repl: snap.node.shard_repl.clone(),
                     },
                 );
             }
@@ -1251,6 +1824,27 @@ impl ClusterManager {
             }
         }
 
+        // Expire persisted per-primary vote backoffs whose 2 * node_timeout window elapsed.
+        if !is_bootstrapping && !state.last_vote_for.is_empty() {
+            let backoff = vote_backoff(self.node_timeout());
+            let mut backoff_map = self.vote_backoff_at.lock().unwrap();
+            let expired: Vec<String> = state
+                .last_vote_for
+                .keys()
+                .filter(|primary| {
+                    backoff_map
+                        .get(*primary)
+                        .is_some_and(|&voted_at| now.saturating_duration_since(voted_at) >= backoff)
+                })
+                .cloned()
+                .collect();
+            for primary in expired {
+                state.last_vote_for.remove(&primary);
+                backoff_map.remove(&primary);
+                changed = true;
+            }
+        }
+
         let pending_transition = if is_bootstrapping {
             None
         } else {
@@ -1281,7 +1875,7 @@ impl ClusterManager {
                 &mut failure_outcome,
             );
         }
-        if failure_outcome.gossip_changed {
+        if failure_outcome.gossip_changed || self.shard_repl_dirty.swap(false, Ordering::AcqRel) {
             gossip_changed = true;
         }
         for id in &failure_outcome.newly_pfail {
@@ -1323,6 +1917,7 @@ impl ClusterManager {
         {
             handler(transition);
         }
+        self.election_notify.notify_one();
     }
 
     #[cfg(test)]
@@ -1418,8 +2013,11 @@ impl ClusterManager {
             flags[shard] = synced;
             before != flags.iter().all(|s| *s)
         };
-        if changed && let Err(e) = self.update_gossip_data().await {
-            error!("Failed to gossip the new role: {}", e);
+        if changed {
+            if let Err(e) = self.update_gossip_data().await {
+                error!("Failed to gossip the new role: {}", e);
+            }
+            self.election_notify.notify_one();
         }
     }
 
@@ -1713,7 +2311,7 @@ impl ClusterManager {
     }
 
     /// Collapse a slot set into sorted, inclusive `(start, end)` runs
-    fn slot_runs(slots: &HashSet<u16>) -> Vec<(u16, u16)> {
+    pub(crate) fn slot_runs(slots: &HashSet<u16>) -> Vec<(u16, u16)> {
         let mut sorted: Vec<u16> = slots.iter().copied().collect();
         sorted.sort_unstable();
 
@@ -2003,6 +2601,11 @@ impl ClusterManager {
              cluster_size:{}\n\
              cluster_current_epoch:{}\n\
              cluster_my_epoch:{}\n\
+             cluster_elections_started:{}\n\
+             cluster_elections_won:{}\n\
+             cluster_elections_failed:{}\n\
+             cluster_votes_granted:{}\n\
+             cluster_votes_refused:{}\n\
              cluster_stats_messages_sent:0\n\
              cluster_stats_messages_received:0\n",
             cluster_state,
@@ -2013,7 +2616,14 @@ impl ClusterManager {
             known_nodes.len(),
             slot_owners.len(),
             state.current_epoch,
-            state.config_epoch
+            state.config_epoch,
+            self.election_stats
+                .elections_started
+                .load(Ordering::Relaxed),
+            self.election_stats.elections_won.load(Ordering::Relaxed),
+            self.election_stats.elections_failed.load(Ordering::Relaxed),
+            self.election_stats.votes_granted.load(Ordering::Relaxed),
+            self.election_stats.votes_refused.load(Ordering::Relaxed),
         )
     }
 
@@ -2122,6 +2732,17 @@ impl ClusterManager {
             let failure = self.failure.read().unwrap();
             (failure.pfail_list(), failure.fail_list())
         };
+        let shard_repl = {
+            let repl = self.shard_repl.lock().unwrap();
+            if repl
+                .iter()
+                .any(|s| !s.replid.is_empty() || s.caught_up_lsn > 0)
+            {
+                repl.clone()
+            } else {
+                Vec::new()
+            }
+        };
         NodeGossipData::new(
             format!("{}:{}", local_ip, local_port),
             own_slots,
@@ -2131,6 +2752,7 @@ impl ClusterManager {
             state.config_epoch,
             pfail,
             fail,
+            shard_repl,
         )
     }
 
@@ -2228,6 +2850,12 @@ impl ClusterManager {
             local_addr: "127.0.0.1:6379".parse().unwrap(),
             namespace_strategy: NamespaceDistributionStrategy::default(),
             replica_synced: Arc::new(Mutex::new(vec![false; num_shards])),
+            shard_repl: Arc::new(Mutex::new(vec![ShardReplState::default(); num_shards])),
+            shard_repl_dirty: Arc::new(AtomicBool::new(false)),
+            last_frame_at: Arc::new(Mutex::new(vec![None; num_shards])),
+            vote_backoff_at: Arc::new(Mutex::new(HashMap::new())),
+            election_stats: Arc::new(ElectionStats::default()),
+            election_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -2300,6 +2928,12 @@ impl Clone for ClusterManager {
             local_addr: self.local_addr,
             namespace_strategy: self.namespace_strategy,
             replica_synced: Arc::clone(&self.replica_synced),
+            shard_repl: Arc::clone(&self.shard_repl),
+            shard_repl_dirty: Arc::clone(&self.shard_repl_dirty),
+            last_frame_at: Arc::clone(&self.last_frame_at),
+            vote_backoff_at: Arc::clone(&self.vote_backoff_at),
+            election_stats: Arc::clone(&self.election_stats),
+            election_notify: Arc::clone(&self.election_notify),
         }
     }
 }
@@ -2523,6 +3157,7 @@ mod tests {
                     role: NodeRole::Primary,
                     primary: None,
                     config_epoch: 0,
+                    shard_repl: Vec::new(),
                 },
             );
             failure.seed_live_peer(id, now);
@@ -2540,6 +3175,7 @@ mod tests {
                     primary: None,
                     current_epoch: 0,
                     config_epoch: 0,
+                    shard_repl: Vec::new(),
                 },
             );
         }
@@ -2561,6 +3197,12 @@ mod tests {
             local_addr: "0.0.0.0:6379".parse().unwrap(),
             namespace_strategy: NamespaceDistributionStrategy::default(),
             replica_synced: Arc::new(Mutex::new(vec![false; 2])),
+            shard_repl: Arc::new(Mutex::new(vec![ShardReplState::default(); 2])),
+            shard_repl_dirty: Arc::new(AtomicBool::new(false)),
+            last_frame_at: Arc::new(Mutex::new(vec![None; 2])),
+            vote_backoff_at: Arc::new(Mutex::new(HashMap::new())),
+            election_stats: Arc::new(ElectionStats::default()),
+            election_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -2584,6 +3226,7 @@ mod tests {
                 role,
                 primary: Some(of.to_string()),
                 config_epoch: 0,
+                shard_repl: Vec::new(),
             },
         );
         manager
@@ -2602,6 +3245,7 @@ mod tests {
                 primary: Some(of.to_string()),
                 current_epoch: 0,
                 config_epoch: 0,
+                shard_repl: Vec::new(),
             },
         );
     }
@@ -2683,6 +3327,7 @@ mod tests {
             0,
             vec![],
             vec![],
+            vec![],
         )
         .unwrap();
         assert_eq!(data.slots, vec![0, 1, 2, 9]);
@@ -2711,6 +3356,7 @@ mod tests {
             0,
             vec![],
             vec![],
+            vec![],
         )
         .unwrap();
         assert_eq!(at_limit.slots.len(), 9000);
@@ -2731,6 +3377,7 @@ mod tests {
             0,
             vec![],
             vec![],
+            vec![],
         )
         .unwrap();
         assert_eq!(high.slots.len(), 9000);
@@ -2741,6 +3388,7 @@ mod tests {
             None,
             0,
             0,
+            vec![],
             vec![],
             vec![],
         )
@@ -2772,6 +3420,7 @@ mod tests {
             0,
             vec![],
             vec![],
+            vec![],
         )
         .unwrap();
         assert!(data.slot_ranges.is_empty());
@@ -2795,6 +3444,7 @@ mod tests {
         assert_eq!((data.current_epoch, data.config_epoch), (0, 0));
         assert!(data.pfail.is_empty());
         assert!(data.fail.is_empty());
+        assert!(data.shard_repl.is_empty());
 
         // Ranges win over a stale list.
         let new = r#"{"addr":"a:1","slots":[1],"slot_ranges":[[10,12]],"state":"master"}"#;
@@ -2810,6 +3460,10 @@ mod tests {
             0,
             vec!["node-b".into()],
             vec!["node-c".into()],
+            vec![ShardReplState {
+                replid: "abc".into(),
+                caught_up_lsn: 42,
+            }],
         )
         .unwrap();
         let json = serde_json::to_string(&replica).unwrap();
@@ -3115,6 +3769,12 @@ mod tests {
             local_addr: "127.0.0.1:6401".parse().unwrap(),
             namespace_strategy: NamespaceDistributionStrategy::default(),
             replica_synced: Arc::new(Mutex::new(vec![false; 1])),
+            shard_repl: Arc::new(Mutex::new(vec![ShardReplState::default(); 1])),
+            shard_repl_dirty: Arc::new(AtomicBool::new(false)),
+            last_frame_at: Arc::new(Mutex::new(vec![None; 1])),
+            vote_backoff_at: Arc::new(Mutex::new(HashMap::new())),
+            election_stats: Arc::new(ElectionStats::default()),
+            election_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -3148,6 +3808,7 @@ mod tests {
                 primary: None,
                 current_epoch: 1,
                 config_epoch: 1,
+                shard_repl: Vec::new(),
             },
         );
         manager.process_peers(peers).await;
@@ -3317,6 +3978,7 @@ mod tests {
             primary: None,
             current_epoch: 0,
             config_epoch: 0,
+            shard_repl: Vec::new(),
         };
         let peer_a = ClusterNode {
             id: "node-a".to_string(),
@@ -3327,6 +3989,7 @@ mod tests {
             primary: None,
             current_epoch: 0,
             config_epoch: 0,
+            shard_repl: Vec::new(),
         };
 
         // node-a < node-b at config_epoch 0: node-a bumps to 1 and persists.
@@ -3373,6 +4036,7 @@ mod tests {
             primary: None,
             current_epoch: 2,
             config_epoch: 2,
+            shard_repl: Vec::new(),
         };
         // Note: node-a < node-b would trigger collision at epoch 2, so test with node-z < self
         // or test strictly lower epoch here:
@@ -3450,6 +4114,7 @@ mod tests {
             primary: None,
             current_epoch: 3,
             config_epoch: 3,
+            shard_repl: Vec::new(),
         };
         mgr.process_peers([("node-c".to_string(), winner)].into())
             .await;
@@ -3640,6 +4305,7 @@ mod tests {
                 primary: None,
                 current_epoch: 2,
                 config_epoch: 2,
+                shard_repl: Vec::new(),
             },
         );
         manager.process_peers(peers.clone()).await;
@@ -3686,6 +4352,7 @@ mod tests {
                     primary: None,
                     current_epoch: epoch,
                     config_epoch: epoch,
+                    shard_repl: Vec::new(),
                 },
                 heartbeat_view: PeerHeartbeatView {
                     generation_id: generation,
@@ -3904,5 +4571,529 @@ mod tests {
             .await;
         assert!(!replica.is_in_minority());
         assert_eq!(replica.route(0, true, true).await, Route::Local);
+    }
+
+    fn reload_test_manager_from_disk(
+        path: PathBuf,
+        node_id: &str,
+        timeout_ms: u64,
+        now: Instant,
+    ) -> ClusterManager {
+        let loaded = ClusterState::load(&path, node_id).unwrap();
+        let mut vote_backoff_map = HashMap::new();
+        for (failed_primary, &epoch) in &loaded.last_vote_for {
+            if epoch > 0 {
+                vote_backoff_map.insert(failed_primary.clone(), now);
+            }
+        }
+        let mut mgr = full_cluster_manager(node_id, 0..=0, timeout_ms, now);
+        mgr.state_path = Some(path);
+        *mgr.state.write().unwrap() = loaded;
+        *mgr.vote_backoff_at.lock().unwrap() = vote_backoff_map;
+        mgr
+    }
+
+    fn auth_req(
+        candidate: &str,
+        epoch: u64,
+        failed_primary: &str,
+        primary_config_epoch: u64,
+        slots: std::ops::RangeInclusive<u16>,
+        manual: bool,
+    ) -> FailoverAuthRequest {
+        FailoverAuthRequest {
+            candidate: candidate.to_string(),
+            epoch,
+            failed_primary: failed_primary.to_string(),
+            primary_config_epoch,
+            slots: slots.collect(),
+            manual,
+        }
+    }
+
+    #[tokio::test]
+    async fn vote_rules_cover_every_refusal_reason() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let t0 = Instant::now();
+        let mut voter = full_cluster_manager("p2", 5461..=10922, 1000, t0);
+        voter.state_path = Some(dir.path().join(CLUSTER_STATE_FILE));
+        {
+            let mut st = voter.state.write().unwrap();
+            st.current_epoch = 4;
+            st.config_epoch = 2;
+            st.slots.rebind_owner_epoch("p2", 2);
+            for s in 0..=5460 {
+                st.slots.set(s, "p1", 3);
+            }
+            for s in 10923..=16383 {
+                st.slots.set(s, "p3", 4);
+            }
+        }
+        add_replica(&voter, "r1", "10.0.0.10:6379", "p1", NodeRole::Replica).await;
+        add_replica(&voter, "r2", "10.0.0.11:6379", "p1", NodeRole::Replica).await;
+        add_replica(&voter, "r3", "10.0.0.12:6379", "p3", NodeRole::Replica).await;
+
+        // 1. Primary not marked FAIL (non-manual) -> refused.
+        let err = voter
+            .handle_failover_auth_at(&auth_req("r1", 5, "p1", 3, 0..=5460, false), t0)
+            .await
+            .unwrap_err();
+        assert!(err.contains("not marked FAIL"), "{err}");
+
+        // Mark p1 FAIL.
+        voter
+            .failure
+            .write()
+            .unwrap()
+            .mark_failed_for_test("p1", t0);
+
+        // 2. epoch < current_epoch -> refused.
+        let err = voter
+            .handle_failover_auth_at(&auth_req("r1", 3, "p1", 3, 0..=5460, false), t0)
+            .await
+            .unwrap_err();
+        assert!(err.contains("current_epoch"), "{err}");
+
+        // 3. Unknown candidate or replica of another primary -> refused.
+        let err = voter
+            .handle_failover_auth_at(&auth_req("ghost", 5, "p1", 3, 0..=5460, false), t0)
+            .await
+            .unwrap_err();
+        assert!(err.contains("not a known replica"), "{err}");
+        let err = voter
+            .handle_failover_auth_at(&auth_req("r3", 5, "p1", 3, 0..=5460, false), t0)
+            .await
+            .unwrap_err();
+        assert!(err.contains("not a known replica"), "{err}");
+
+        // 4. Stale primary-config-epoch (slot epoch 3 > requested 2) -> refused.
+        let err = voter
+            .handle_failover_auth_at(&auth_req("r1", 5, "p1", 2, 0..=5460, false), t0)
+            .await
+            .unwrap_err();
+        assert!(err.contains("newer epoch"), "{err}");
+
+        // 5. All checks pass -> granted, epoch adopted & persisted.
+        assert_eq!(
+            voter
+                .handle_failover_auth_at(&auth_req("r1", 5, "p1", 3, 0..=5460, false), t0)
+                .await
+                .unwrap(),
+            5
+        );
+        let st = voter.state_snapshot();
+        assert_eq!(st.current_epoch, 5);
+        assert_eq!(st.last_vote_epoch, 5);
+        assert_eq!(st.last_vote_for.get("p1").copied(), Some(5));
+
+        // 6. Duplicate epoch (epoch <= last_vote_epoch) -> refused.
+        let err = voter
+            .handle_failover_auth_at(&auth_req("r2", 5, "p1", 3, 0..=5460, false), t0)
+            .await
+            .unwrap_err();
+        assert!(err.contains("already voted"), "{err}");
+
+        // 7. Higher epoch within 2 * node_timeout backoff for same failed primary -> refused.
+        let err = voter
+            .handle_failover_auth_at(
+                &auth_req("r2", 6, "p1", 3, 0..=5460, false),
+                t0 + Duration::from_millis(1999),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("vote backoff"), "{err}");
+
+        // 8. Different failed primary with MANUAL (no FAIL needed) still allowed at epoch 6.
+        assert_eq!(
+            voter
+                .handle_failover_auth_at(
+                    &auth_req("r3", 6, "p3", 4, 10923..=16383, true),
+                    t0 + Duration::from_millis(500),
+                )
+                .await
+                .unwrap(),
+            6
+        );
+
+        // 9. After 2 * node_timeout elapses, p1's backoff expires -> vote at epoch 7 granted.
+        assert_eq!(
+            voter
+                .handle_failover_auth_at(
+                    &auth_req("r2", 7, "p1", 3, 0..=5460, false),
+                    t0 + Duration::from_millis(2000),
+                )
+                .await
+                .unwrap(),
+            7
+        );
+
+        // 10. Replica voter -> refused.
+        let replica_voter = into_replica(full_cluster_manager("rx", 0..=0, 1000, t0), "p1", true);
+        let err = replica_voter
+            .handle_failover_auth_at(&auth_req("r1", 8, "p1", 3, 0..=5460, true), t0)
+            .await
+            .unwrap_err();
+        assert!(err.contains("not a primary"), "{err}");
+
+        // 11. Slotless primary voter -> refused.
+        let slotless = full_cluster_manager("p-empty", 0..=0, 1000, t0);
+        slotless.state.write().unwrap().slots.clear(0);
+        let err = slotless
+            .handle_failover_auth_at(&auth_req("r1", 8, "p1", 3, 0..=5460, true), t0)
+            .await
+            .unwrap_err();
+        assert!(err.contains("owns no slots"), "{err}");
+
+        // 12. Demoting primary voter -> refused.
+        voter.state.write().unwrap().demoting_to = Some("r1".to_string());
+        let err = voter
+            .handle_failover_auth_at(
+                &auth_req("r2", 8, "p1", 3, 0..=5460, true),
+                t0 + Duration::from_millis(5000),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("not a primary"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn vote_and_backoff_persist_across_restart() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state_path = dir.path().join(CLUSTER_STATE_FILE);
+        let t0 = Instant::now();
+        let mut voter = full_cluster_manager("p2", 5461..=10922, 1000, t0);
+        voter.state_path = Some(state_path.clone());
+        {
+            let mut st = voter.state.write().unwrap();
+            for s in 0..=5460 {
+                st.slots.set(s, "p1", 1);
+            }
+        }
+        add_replica(&voter, "r1", "10.0.0.10:6379", "p1", NodeRole::Replica).await;
+        add_replica(&voter, "r2", "10.0.0.11:6379", "p1", NodeRole::Replica).await;
+        voter
+            .failure
+            .write()
+            .unwrap()
+            .mark_failed_for_test("p1", t0);
+
+        // Cast vote at epoch 5; must already be on disk before returning.
+        assert_eq!(
+            voter
+                .handle_failover_auth_at(&auth_req("r1", 5, "p1", 1, 0..=5460, false), t0)
+                .await
+                .unwrap(),
+            5
+        );
+        let on_disk = ClusterState::load(&state_path, "p2").unwrap();
+        assert_eq!(on_disk.current_epoch, 5);
+        assert_eq!(on_disk.last_vote_epoch, 5);
+        assert_eq!(on_disk.last_vote_for.get("p1").copied(), Some(5));
+
+        // Simulate restart at t0 + 100ms by reloading from disk.
+        let t_restart = t0 + Duration::from_millis(100);
+        let restarted = reload_test_manager_from_disk(state_path.clone(), "p2", 1000, t_restart);
+        add_replica(&restarted, "r1", "10.0.0.10:6379", "p1", NodeRole::Replica).await;
+        add_replica(&restarted, "r2", "10.0.0.11:6379", "p1", NodeRole::Replica).await;
+        restarted
+            .failure
+            .write()
+            .unwrap()
+            .mark_failed_for_test("p1", t_restart);
+
+        // Same epoch is blocked by persisted last_vote_epoch.
+        let err = restarted
+            .handle_failover_auth_at(
+                &auth_req("r2", 5, "p1", 1, 0..=5460, false),
+                t_restart + Duration::from_millis(10),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("already voted"), "{err}");
+
+        // Next epoch within 2 * node_timeout is blocked by persisted last_vote_for backoff.
+        let err = restarted
+            .handle_failover_auth_at(
+                &auth_req("r2", 6, "p1", 1, 0..=5460, false),
+                t_restart + Duration::from_millis(1999),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("vote backoff"), "{err}");
+
+        // Once backoff expires after restart, a vote in epoch 6 is allowed.
+        assert_eq!(
+            restarted
+                .handle_failover_auth_at(
+                    &auth_req("r2", 6, "p1", 1, 0..=5460, false),
+                    t_restart + Duration::from_millis(2000),
+                )
+                .await
+                .unwrap(),
+            6
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_votes_are_serialized() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let t0 = Instant::now();
+        let mut voter = full_cluster_manager("p2", 5461..=10922, 1000, t0);
+        voter.state_path = Some(dir.path().join(CLUSTER_STATE_FILE));
+        {
+            let mut st = voter.state.write().unwrap();
+            for s in 0..=5460 {
+                st.slots.set(s, "p1", 1);
+            }
+        }
+        add_replica(&voter, "r1", "10.0.0.10:6379", "p1", NodeRole::Replica).await;
+        add_replica(&voter, "r2", "10.0.0.11:6379", "p1", NodeRole::Replica).await;
+        voter
+            .failure
+            .write()
+            .unwrap()
+            .mark_failed_for_test("p1", t0);
+
+        let req1 = auth_req("r1", 5, "p1", 1, 0..=5460, false);
+        let req2 = auth_req("r2", 5, "p1", 1, 0..=5460, false);
+        let (res1, res2) = tokio::join!(
+            voter.handle_failover_auth_at(&req1, t0),
+            voter.handle_failover_auth_at(&req2, t0),
+        );
+        assert_eq!(
+            [res1.is_ok(), res2.is_ok()]
+                .into_iter()
+                .filter(|ok| *ok)
+                .count(),
+            1,
+            "exactly one concurrent vote must succeed: res1={res1:?}, res2={res2:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn majority_counting_includes_dead_owner_in_denominator() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        async fn spawn_mock_voter(reply: &'static str) -> SocketAddr {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    let mut buf = [0u8; 512];
+                    let _ = stream.read(&mut buf).await;
+                    let _ = stream.write_all(reply.as_bytes()).await;
+                }
+            });
+            addr
+        }
+
+        // Bind a dead port (dropped immediately so connections fail fast).
+        let dead_addr = {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap()
+        };
+
+        let owners: BTreeSet<String> = ["p1", "p2", "p3"].into_iter().map(String::from).collect();
+        let slots: HashSet<u16> = (0..=5460).collect();
+
+        // 1) 3 owners (p1 dead, p2 votes +VOTE 5, p3 refuses): 1 < quorum 2 -> NoMajority.
+        let p2_ok = spawn_mock_voter("+VOTE 5\r\n").await;
+        let p3_err = spawn_mock_voter("-ERR primary p1 is not marked FAIL\r\n").await;
+        let plan = ElectionPlan {
+            candidate: "r1".into(),
+            epoch: 5,
+            failed_primary: "p1".into(),
+            primary_config_epoch: 1,
+            slots: slots.clone(),
+            owners: owners.clone(),
+            targets: vec![
+                ("p1".into(), dead_addr),
+                ("p2".into(), p2_ok),
+                ("p3".into(), p3_err),
+            ],
+            quorum: 2,
+            manual: false,
+        };
+        let shutdown = CancellationToken::new();
+        let outcome = collect_votes(&plan, Duration::from_secs(2), &shutdown, || false).await;
+        assert!(
+            matches!(outcome, VoteCollectionOutcome::NoMajority { ref votes, quorum: 2 } if votes.len() == 1),
+            "{outcome:?}"
+        );
+
+        // 2) Wrong epoch reply (+VOTE 4) must not count toward epoch 5.
+        let p2_ok = spawn_mock_voter("+VOTE 5\r\n").await;
+        let p3_wrong_epoch = spawn_mock_voter("+VOTE 4\r\n").await;
+        let plan_wrong = ElectionPlan {
+            targets: vec![
+                ("p1".into(), dead_addr),
+                ("p2".into(), p2_ok),
+                ("p3".into(), p3_wrong_epoch),
+            ],
+            ..plan.clone()
+        };
+        let outcome = collect_votes(&plan_wrong, Duration::from_secs(2), &shutdown, || false).await;
+        assert!(
+            matches!(outcome, VoteCollectionOutcome::NoMajority { ref votes, quorum: 2 } if votes.len() == 1),
+            "{outcome:?}"
+        );
+
+        // 3) Both p2 and p3 vote +VOTE 5 -> 2 >= quorum 2 -> Won!
+        let p2_ok = spawn_mock_voter("+VOTE 5\r\n").await;
+        let p3_ok = spawn_mock_voter("+VOTE 5\r\n").await;
+        let plan_win = ElectionPlan {
+            targets: vec![
+                ("p1".into(), dead_addr),
+                ("p2".into(), p2_ok),
+                ("p3".into(), p3_ok),
+            ],
+            ..plan
+        };
+        let outcome = collect_votes(&plan_win, Duration::from_secs(2), &shutdown, || false).await;
+        assert!(
+            matches!(outcome, VoteCollectionOutcome::Won { ref votes } if votes.len() == 2),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn eligibility_and_rank_respect_synced_replids_and_validity_factor() {
+        let t0 = Instant::now();
+        let mut mgr = into_replica(
+            manager_with_id("r-b", &[], &[("p1", "10.0.0.1:6379", &[0, 1])]),
+            "p1",
+            false,
+        );
+        mgr.config.node_timeout_ms = Some(1000);
+        mgr.config.replica_validity_factor = Some(2); // max_age = 2000ms before failure
+
+        // Primary gossips its 2-shard replids.
+        let p1_repl = vec![
+            ShardReplState {
+                replid: "rep-0".into(),
+                caught_up_lsn: 0,
+            },
+            ShardReplState {
+                replid: "rep-1".into(),
+                caught_up_lsn: 0,
+            },
+        ];
+        mgr.known_peers
+            .write()
+            .unwrap()
+            .get_mut("p1")
+            .unwrap()
+            .shard_repl = p1_repl.clone();
+
+        // Mark p1 FAIL at t0 + 5000ms (estimated failure_time = t0 + 4000ms).
+        let fail_t = t0 + Duration::from_millis(5000);
+        mgr.failure
+            .write()
+            .unwrap()
+            .mark_failed_for_test("p1", fail_t);
+
+        // Unsynced -> ineligible.
+        assert_eq!(mgr.check_election_eligibility().await, None);
+
+        // Sync both shards with stale frames (at t0 + 1000ms -> 3000ms before failure_time > 2000ms).
+        mgr.update_replica_shard_progress(0, "rep-0", 100, true, t0 + Duration::from_millis(1000))
+            .await;
+        mgr.update_replica_shard_progress(1, "rep-1", 50, true, t0 + Duration::from_millis(1000))
+            .await;
+        assert_eq!(mgr.check_election_eligibility().await, None);
+
+        // With replica_validity_factor = 0, staleness check is disabled -> eligible!
+        mgr.config.replica_validity_factor = Some(0);
+        assert_eq!(
+            mgr.check_election_eligibility().await.as_deref(),
+            Some("p1")
+        );
+
+        // Re-enable factor = 2 and update frames to t0 + 3500ms (500ms before failure_time <= 2000ms).
+        mgr.config.replica_validity_factor = Some(2);
+        mgr.update_replica_shard_progress(0, "rep-0", 100, true, t0 + Duration::from_millis(3500))
+            .await;
+        mgr.update_replica_shard_progress(1, "rep-1", 50, true, t0 + Duration::from_millis(3500))
+            .await;
+        assert_eq!(
+            mgr.check_election_eligibility().await.as_deref(),
+            Some("p1")
+        );
+
+        // Mismatched replid on shard 1 -> ineligible.
+        mgr.update_replica_shard_progress(1, "wrong", 50, true, t0 + Duration::from_millis(3500))
+            .await;
+        assert_eq!(mgr.check_election_eligibility().await, None);
+        mgr.update_replica_shard_progress(1, "rep-1", 50, true, t0 + Duration::from_millis(3500))
+            .await;
+
+        // Rank test: r-b has total 150.
+        // Add r-c with higher total 200 (same replids) -> r-b becomes rank 1.
+        // Add r-a with tied total 150 ("r-a" < "r-b") -> r-b becomes rank 2.
+        // Add r-wrong with huge total 9999 but mismatched replid -> ignored!
+        // Add r-unsynced with huge total 9999 but ReplicaSyncing -> ignored!
+        for (id, role, repl) in [
+            (
+                "r-c",
+                NodeRole::Replica,
+                vec![
+                    ShardReplState {
+                        replid: "rep-0".into(),
+                        caught_up_lsn: 120,
+                    },
+                    ShardReplState {
+                        replid: "rep-1".into(),
+                        caught_up_lsn: 80,
+                    },
+                ],
+            ),
+            (
+                "r-a",
+                NodeRole::Replica,
+                vec![
+                    ShardReplState {
+                        replid: "rep-0".into(),
+                        caught_up_lsn: 75,
+                    },
+                    ShardReplState {
+                        replid: "rep-1".into(),
+                        caught_up_lsn: 75,
+                    },
+                ],
+            ),
+            (
+                "r-wrong",
+                NodeRole::Replica,
+                vec![
+                    ShardReplState {
+                        replid: "other".into(),
+                        caught_up_lsn: 9999,
+                    },
+                    ShardReplState {
+                        replid: "rep-1".into(),
+                        caught_up_lsn: 0,
+                    },
+                ],
+            ),
+            (
+                "r-unsynced",
+                NodeRole::ReplicaSyncing,
+                vec![
+                    ShardReplState {
+                        replid: "rep-0".into(),
+                        caught_up_lsn: 9999,
+                    },
+                    ShardReplState {
+                        replid: "rep-1".into(),
+                        caught_up_lsn: 0,
+                    },
+                ],
+            ),
+        ] {
+            add_replica(&mgr, id, "10.0.0.20:6379", "p1", role).await;
+            mgr.nodes.write().await.get_mut(id).unwrap().shard_repl = repl;
+        }
+        assert_eq!(mgr.compute_replica_rank("p1").await, 2);
     }
 }

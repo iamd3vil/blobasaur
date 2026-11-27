@@ -462,3 +462,24 @@ func TestClusterClientSurvivesTakeover(t *testing.T) {
 	expect(t, "GET post-takeover", cluster.Get(ctx, afterKey), "after-takeover")
 	expect(t, "GET directly on promoted replica", replica.Get(ctx, afterKey), "after-takeover")
 }
+
+// A ClusterClient reads pre-failover keys and writes/reads new keys on a failed-over
+// primary's slots after automatic failover. Run by tests/failover_elect_test.rs.
+func TestClusterClientAfterAutoFailover(t *testing.T) {
+	addrsEnv := os.Getenv("BLOBASAUR_CLUSTER_ADDRS")
+	slotKey := os.Getenv("BLOBASAUR_SLOT_KEY")
+	expectedVal := os.Getenv("BLOBASAUR_EXPECT_VAL")
+	if addrsEnv == "" || slotKey == "" || expectedVal == "" {
+		t.Skip("needs a cluster; run via tests/failover_elect_test.rs")
+	}
+
+	cluster := redis.NewClusterClient(&redis.ClusterOptions{
+		Addrs: strings.Split(addrsEnv, ","),
+	})
+	t.Cleanup(func() { cluster.Close() })
+
+	expect(t, "GET pre-failover key", cluster.Get(ctx, slotKey), expectedVal)
+	afterKey := "{" + slotKey + "}:goredis-after"
+	expect(t, "SET post-failover key", cluster.Set(ctx, afterKey, "after-auto-failover", 0), "OK")
+	expect(t, "GET post-failover key", cluster.Get(ctx, afterKey), "after-auto-failover")
+}

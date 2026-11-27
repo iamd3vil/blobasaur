@@ -122,6 +122,21 @@ impl FailureTracker {
         self.failed.contains_key(node_id)
     }
 
+    pub(crate) fn failed_at(&self, node_id: &str) -> Option<Instant> {
+        self.failed.get(node_id).map(|rec| rec.failed_at)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_failed_for_test(&mut self, node_id: &str, at: Instant) {
+        self.failed.insert(
+            node_id.to_string(),
+            FailRecord {
+                failed_at: at,
+                reachable_since: None,
+            },
+        );
+    }
+
     pub(crate) fn is_in_minority(&self) -> bool {
         self.in_minority
     }

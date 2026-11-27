@@ -19,7 +19,11 @@ use tokio_util::task::TaskTracker;
 use crate::compression::{self, Compressor};
 // Import ShardWriteOperation from shard_manager
 use crate::{
-    cluster::{ClusterManager, PromoteError, ReplicateCheck, RoleTransition},
+    cluster::{
+        ClusterManager, PromoteError, PromotionKind, ReplicateCheck, RoleTransition,
+        VoteCollectionOutcome, collect_votes, election_delay, election_timeout, random_jitter_ms,
+        retry_backoff,
+    },
     config::Cfg,
     metrics::{Metrics, ShardMetrics},
     replication,
@@ -102,6 +106,10 @@ pub struct AppState {
     pub replica_sync: replication::ReplicaSyncSupervisor,
     /// Serializes runtime role transitions (promotion, demotion, re-pointing, REPLICATE).
     role_change_lock: Mutex<()>,
+    /// Serializes failover elections (automatic and `CLUSTER FAILOVER FORCE`).
+    election_lock: Mutex<()>,
+    /// Background automatic failover election task on clustered nodes.
+    election_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Ensures at most one gossip-triggered role transition task runs at a time.
     transition_running: Arc<AtomicBool>,
     /// Tracks spawned gossip-triggered role transition tasks so shutdown waits for them.
@@ -489,6 +497,8 @@ impl AppState {
             replids,
             replica_sync: replication::ReplicaSyncSupervisor::new(),
             role_change_lock: Mutex::new(()),
+            election_lock: Mutex::new(()),
+            election_task: Mutex::new(None),
             transition_running: Arc::new(AtomicBool::new(false)),
             transition_tasks: TaskTracker::new(),
             server_shutdown: std::sync::Mutex::new(None),
@@ -502,6 +512,13 @@ impl AppState {
             {
                 state.set_replid(i, &replid);
             }
+        }
+        if enabled
+            && !state.is_replica()
+            && let Some(cluster) = &state.cluster_manager
+            && let Err(e) = cluster.publish_gossip().await
+        {
+            tracing::warn!("Failed to gossip initial primary replids: {}", e);
         }
         Ok(state)
     }
@@ -522,6 +539,9 @@ impl AppState {
         }
         info(replid).set(1.0);
         *current = Some(replid.to_string());
+        if let Some(cluster) = &self.cluster_manager {
+            cluster.set_shard_replid(shard, replid);
+        }
     }
 
     /// Cached stored-key count for one shard.
@@ -598,6 +618,26 @@ impl AppState {
             .is_some_and(ClusterManager::is_repointing);
         if self.cfg.replication_enabled() && self.is_replica() && !repointing {
             self.replica_sync.start(self.clone()).await;
+        }
+        if self.cluster_manager.is_some() && self.cfg.replication_enabled() {
+            let state = self.clone();
+            let shutdown = self
+                .server_shutdown
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_default();
+            let handle = tokio::spawn(async move {
+                state.auto_election_loop(shutdown).await;
+            });
+            *self.election_task.lock().await = Some(handle);
+        }
+    }
+
+    /// Waits for the background automatic election task to stop on shutdown.
+    pub async fn stop_election_task(&self) {
+        if let Some(handle) = self.election_task.lock().await.take() {
+            let _ = handle.await;
         }
     }
 
@@ -719,6 +759,260 @@ impl AppState {
     /// with a new `replid` per shard through the shard writers, then serve and
     /// gossip.
     pub async fn promote_takeover(self: &Arc<Self>) -> Result<(), String> {
+        self.promote_with_kind(PromotionKind::Takeover)
+            .await
+            .map(|_| ())
+    }
+
+    /// `CLUSTER FAILOVER FORCE`: run a manual failover election immediately
+    /// (no FAIL mark needed, no rank delay), and promote on majority.
+    pub async fn promote_failover_force(self: &Arc<Self>) -> Result<(), String> {
+        self.run_election(true).await.map(|_| ())
+    }
+
+    /// Run one failover election attempt (automatic when `manual == false`,
+    /// `CLUSTER FAILOVER FORCE` when `manual == true`).
+    pub async fn run_election(self: &Arc<Self>, manual: bool) -> Result<u64, String> {
+        let Some(cluster) = self.cluster_manager.as_ref() else {
+            return Err("ERR This instance has cluster support disabled".to_string());
+        };
+        if !self.cfg.replication_enabled() {
+            return Err("ERR replication is not enabled on this node".to_string());
+        }
+
+        let _election_guard = self.election_lock.lock().await;
+        cluster.can_takeover()?;
+        self.ensure_all_shards_synced().await?;
+
+        let plan = cluster.prepare_election(manual).await?;
+        let shutdown = self
+            .server_shutdown
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_default();
+        let timeout = election_timeout(cluster.node_timeout());
+        let outcome = collect_votes(&plan, timeout, &shutdown, || {
+            !cluster.is_replica()
+                || cluster.is_repointing()
+                || cluster.primary_id().as_deref() != Some(plan.failed_primary.as_str())
+        })
+        .await;
+
+        match outcome {
+            VoteCollectionOutcome::Won { votes } => {
+                tracing::info!(
+                    candidate = %plan.candidate,
+                    epoch = plan.epoch,
+                    failed_primary = %plan.failed_primary,
+                    votes = votes.len(),
+                    quorum = plan.quorum,
+                    manual,
+                    "Won failover election; promoting"
+                );
+                let kind = PromotionKind::Elected {
+                    election_epoch: plan.epoch,
+                    failed_primary: plan.failed_primary.clone(),
+                    primary_config_epoch: plan.primary_config_epoch,
+                    expected_slots: plan.slots.clone(),
+                };
+                match self.promote_with_kind(kind).await {
+                    Ok(epoch) => {
+                        cluster.record_election_won();
+                        Ok(epoch)
+                    }
+                    Err(e) => {
+                        cluster.record_election_failed();
+                        tracing::warn!(
+                            candidate = %plan.candidate,
+                            epoch = plan.epoch,
+                            error = %e,
+                            "Promotion after winning election failed"
+                        );
+                        Err(e)
+                    }
+                }
+            }
+            VoteCollectionOutcome::NoMajority { votes, quorum } => {
+                cluster.record_election_failed();
+                tracing::warn!(
+                    candidate = %plan.candidate,
+                    epoch = plan.epoch,
+                    failed_primary = %plan.failed_primary,
+                    votes = votes.len(),
+                    quorum,
+                    manual,
+                    "Failover election gave up without majority"
+                );
+                Err(format!(
+                    "ERR Failover election failed: got {} of {} required votes",
+                    votes.len(),
+                    quorum
+                ))
+            }
+            VoteCollectionOutcome::Aborted => {
+                cluster.record_election_failed();
+                tracing::info!(
+                    candidate = %plan.candidate,
+                    epoch = plan.epoch,
+                    failed_primary = %plan.failed_primary,
+                    manual,
+                    "Failover election aborted"
+                );
+                Err("ERR Failover election aborted".to_string())
+            }
+        }
+    }
+
+    /// Background automatic failover loop: watches eligibility, arms with
+    /// `500 ms + random(0..500 ms) + rank * 1000 ms`, re-arms if a better
+    /// replica appears, and retries no sooner than `max(4 * node_timeout, 4 s)`
+    /// after the start of the previous attempt.
+    async fn auto_election_loop(self: Arc<Self>, shutdown: CancellationToken) {
+        struct ArmedElection {
+            primary: String,
+            jitter_ms: u64,
+            rank: usize,
+            armed_at: std::time::Instant,
+            deadline: std::time::Instant,
+        }
+
+        let Some(cluster) = self.cluster_manager.as_ref() else {
+            return;
+        };
+        let notify = cluster.election_notify();
+        let mut armed: Option<ArmedElection> = None;
+        let mut last_attempt: Option<(String, std::time::Instant)> = None;
+
+        while !shutdown.is_cancelled() {
+            let now = std::time::Instant::now();
+            let Some(primary) = cluster.check_election_eligibility().await else {
+                armed = None;
+                if let Some((ref prev_primary, _)) = last_attempt
+                    && (!cluster.is_failed(prev_primary)
+                        || cluster.primary_id().as_deref() != Some(prev_primary.as_str()))
+                {
+                    last_attempt = None;
+                }
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    _ = notify.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                }
+                continue;
+            };
+
+            if let Some((ref prev_primary, prev_start)) = last_attempt
+                && prev_primary == &primary
+            {
+                let retry_at = prev_start + retry_backoff(cluster.node_timeout());
+                if now < retry_at {
+                    armed = None;
+                    let wait = (retry_at - now).min(Duration::from_millis(100));
+                    tokio::select! {
+                        _ = shutdown.cancelled() => return,
+                        _ = notify.notified() => {}
+                        _ = tokio::time::sleep(wait) => {}
+                    }
+                    continue;
+                }
+            }
+
+            let rank = cluster.compute_replica_rank(&primary).await;
+            match armed.as_mut() {
+                Some(a) if a.primary == primary => {
+                    if rank > a.rank {
+                        // A better replica appeared: re-arm from now at the new rank.
+                        let jitter_ms = random_jitter_ms();
+                        let delay = election_delay(rank, jitter_ms);
+                        tracing::info!(
+                            node = %cluster.node_id(),
+                            primary = %primary,
+                            old_rank = a.rank,
+                            new_rank = rank,
+                            delay_ms = delay.as_millis() as u64,
+                            "Better replica appeared; re-arming automatic failover election"
+                        );
+                        a.jitter_ms = jitter_ms;
+                        a.rank = rank;
+                        a.armed_at = now;
+                        a.deadline = now + delay;
+                    } else if rank < a.rank {
+                        a.rank = rank;
+                        a.deadline = a.armed_at + election_delay(rank, a.jitter_ms);
+                    }
+                }
+                _ => {
+                    let jitter_ms = random_jitter_ms();
+                    let delay = election_delay(rank, jitter_ms);
+                    tracing::info!(
+                        node = %cluster.node_id(),
+                        primary = %primary,
+                        rank,
+                        delay_ms = delay.as_millis() as u64,
+                        "Armed automatic failover election"
+                    );
+                    armed = Some(ArmedElection {
+                        primary: primary.clone(),
+                        jitter_ms,
+                        rank,
+                        armed_at: now,
+                        deadline: now + delay,
+                    });
+                }
+            }
+
+            let deadline = armed.as_ref().unwrap().deadline;
+            let armed_rank = armed.as_ref().unwrap().rank;
+            if now >= deadline {
+                // Recompute rank right before starting; if a better replica appeared, re-arm.
+                let final_rank = cluster.compute_replica_rank(&primary).await;
+                if final_rank > armed_rank {
+                    let a = armed.as_mut().unwrap();
+                    let jitter_ms = random_jitter_ms();
+                    let delay = election_delay(final_rank, jitter_ms);
+                    tracing::info!(
+                        node = %cluster.node_id(),
+                        primary = %primary,
+                        old_rank = armed_rank,
+                        new_rank = final_rank,
+                        delay_ms = delay.as_millis() as u64,
+                        "Better replica appeared before election start; re-arming"
+                    );
+                    a.jitter_ms = jitter_ms;
+                    a.rank = final_rank;
+                    a.armed_at = now;
+                    a.deadline = now + delay;
+                    continue;
+                }
+                armed = None;
+                let attempt_started = std::time::Instant::now();
+                last_attempt = Some((primary.clone(), attempt_started));
+                match self.run_election(false).await {
+                    Ok(_) => {
+                        last_attempt = None;
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            node = %cluster.node_id(),
+                            primary = %primary,
+                            error = %e,
+                            "Automatic failover election attempt did not promote"
+                        );
+                    }
+                }
+            } else {
+                let wait = (deadline - now).min(Duration::from_millis(100));
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    _ = notify.notified() => {}
+                    _ = tokio::time::sleep(wait) => {}
+                }
+            }
+        }
+    }
+
+    async fn promote_with_kind(self: &Arc<Self>, kind: PromotionKind) -> Result<u64, String> {
         let Some(cluster) = self.cluster_manager.as_ref() else {
             return Err("ERR This instance has cluster support disabled".to_string());
         };
@@ -727,7 +1021,7 @@ impl AppState {
         }
 
         let _role_guard = self.role_change_lock.lock().await;
-        cluster.can_takeover()?;
+        cluster.can_promote(&kind)?;
         self.ensure_all_shards_synced().await?;
 
         // 1. Stop replica sync tasks and wait so no Apply/Reset is queued behind promotion.
@@ -747,7 +1041,7 @@ impl AppState {
         const PROMOTE_SHARD_MAX_ATTEMPTS: usize = 5;
         let shard_senders = &self.shard_senders;
         let result = cluster
-            .promote_takeover(|| async {
+            .promote(kind, || async {
                 let mut pending: Vec<usize> = (0..shard_senders.len()).collect();
                 let mut delay = Duration::from_millis(100);
                 let mut last_err = String::new();
@@ -807,7 +1101,7 @@ impl AppState {
             .await;
 
         match result {
-            Ok(_) => Ok(()),
+            Ok(epoch) => Ok(epoch),
             Err(PromoteError::BeforeCommit(e)) => {
                 if self.is_replica() {
                     self.replica_sync.start(self.clone()).await;
