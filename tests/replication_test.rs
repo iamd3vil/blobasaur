@@ -6,7 +6,8 @@ use std::future::Future;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use blobasaur::cluster::ClusterManager;
@@ -1265,26 +1266,40 @@ async fn a_client_that_stops_reading_redirects_does_not_block_a_resync() {
         .map(|i| format!("down{i}"))
         .find(|k| ClusterManager::calculate_slot(k) > OWNED_SLOTS)
         .unwrap();
-    // A small receive buffer, so the server's reply writes block quickly.
+    // Small socket buffers, so the server's reply writes block quickly.
     let socket = tokio::net::TcpSocket::new_v4().unwrap();
     socket.set_recv_buffer_size(4096).unwrap();
+    socket.set_send_buffer_size(4096).unwrap();
     let mut blocked = socket.connect(replica.addr).await.unwrap();
-    let mut pipeline = b"*1\r\n$8\r\nREADONLY\r\n".to_vec();
     let get = format!("*2\r\n$3\r\nGET\r\n${}\r\n{key}\r\n", key.len());
-    for _ in 0..200_000 {
-        pipeline.extend_from_slice(get.as_bytes());
-    }
-    let writer = tokio::spawn(async move {
-        let _ = blocked.write_all(&pipeline).await;
-        blocked
+    let chunk = get.repeat(100);
+    let sent = Arc::new(AtomicU64::new(0));
+    // Writes until the server stops reading. A fixed-size pipeline can fit
+    // entirely in the kernel's socket buffers, which proves nothing.
+    let writer = tokio::spawn({
+        let sent = sent.clone();
+        async move {
+            blocked
+                .write_all(b"*1\r\n$8\r\nREADONLY\r\n")
+                .await
+                .unwrap();
+            while blocked.write_all(chunk.as_bytes()).await.is_ok() {
+                sent.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+            }
+            blocked
+        }
     });
 
-    // Give the server time to fill the socket and block on a reply.
-    sleep(Duration::from_secs(1)).await;
-    assert!(
-        !writer.is_finished(),
-        "the server never blocked on the client"
-    );
+    // The server is blocked on a reply once the client can't send any more.
+    wait_for("the server to block on the client", || {
+        let sent = sent.clone();
+        async move {
+            let before = sent.load(Ordering::Relaxed);
+            sleep(Duration::from_millis(500)).await;
+            before > 0 && sent.load(Ordering::Relaxed) == before
+        }
+    })
+    .await;
     // A new replid on the primary makes the replica reset, which needs the gate.
     primary.stop().await;
     let primary = start(
