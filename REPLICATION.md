@@ -460,9 +460,11 @@ cluster_manager.route(slot, is_read, conn_readonly) -> Route
 - **Replica**: `Local` if the connection sent `READONLY`, the command is a read
   (GET, EXISTS, TTL, HGET, HEXISTS), the slot belongs to its primary, and the
   replica is in `replica` role. Otherwise `Moved` to the owner.
-- **No known live owner**: `ClusterDown` (`-CLUSTERDOWN`). Today the request
-  falls through and runs locally, because `get_node_for_slot` returns `None`
-  both for "mine" and for "nobody's".
+- **Owner out of gossip but not FAIL**: `Moved` to its last-known address, as
+  in Redis.
+- **Owner FAIL, or never seen**: `ClusterDown` (`-CLUSTERDOWN`). Previously the
+  request fell through and ran locally, because `get_node_for_slot` returned
+  `None` both for "mine" and for "nobody's".
 
 `READONLY` / `READWRITE` set a per-connection flag. Replica reads are eventually
 consistent; there is no read-your-writes guarantee.

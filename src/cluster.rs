@@ -1069,8 +1069,8 @@ impl ClusterManager {
     /// - replica (not repointing, not bootstrapping, not shutting down);
     /// - its primary is FAIL in this node's view and owns slots in its table;
     /// - every shard is synced under the primary's replids;
-    /// - every shard received a frame within `node_timeout_ms * replica_validity_factor`
-    ///   before the failure (when factor > 0).
+    /// - every shard received a frame within heartbeat period +
+    ///   `node_timeout_ms * replica_validity_factor` before the failure (when factor > 0).
     ///
     /// `Err(Some(reason))`: the primary is FAIL but this replica can't stand
     /// (Redis's "Currently unable to failover"). `Err(None)`: no failover is due.
@@ -1113,11 +1113,14 @@ impl ClusterManager {
         }
         let validity_factor = self.config.replica_validity_factor();
         if validity_factor > 0 {
-            let max_age = Duration::from_millis(
-                self.config
-                    .node_timeout_ms()
-                    .saturating_mul(validity_factor),
-            );
+            // Redis adds `repl-ping-replica-period`; the stream heartbeat is ours.
+            let max_age =
+                crate::replication::cluster_stream_heartbeat(self.config.node_timeout_ms())
+                    + Duration::from_millis(
+                        self.config
+                            .node_timeout_ms()
+                            .saturating_mul(validity_factor),
+                    );
             let failure_time = failed_at
                 .checked_sub(self.node_timeout())
                 .unwrap_or(failed_at);
@@ -2107,9 +2110,14 @@ impl ClusterManager {
         if self.is_failed(&binding.node_id) {
             return Route::ClusterDown;
         }
-        let nodes = self.nodes.read().await;
-        let Some(owner) = nodes.get(&binding.node_id) else {
-            return Route::ClusterDown;
+        // Like Redis, keep redirecting to a primary gossip has lost sight of
+        // until it's FAIL, using its last-known address.
+        let owner_addr = match self.nodes.read().await.get(&binding.node_id) {
+            Some(owner) => owner.addr,
+            None => match self.known_peers.read().unwrap().get(&binding.node_id) {
+                Some(peer) => peer.addr,
+                None => return Route::ClusterDown,
+            },
         };
         if is_read
             && conn_readonly
@@ -2124,7 +2132,7 @@ impl ClusterManager {
                 Route::Local
             };
         }
-        Route::Moved(format!("MOVED {} {}", slot, owner.addr))
+        Route::Moved(format!("MOVED {} {}", slot, owner_addr))
     }
 
     /// The role this node gossips.
@@ -2485,6 +2493,7 @@ impl ClusterManager {
         let (local_ip, local_port) = local_endpoint(&self.config, self.local_addr);
         let nodes = self.nodes.read().await;
         let state = self.state.read().unwrap().clone();
+        let known_peers = self.known_peers.read().unwrap().clone();
         let fail_set: HashSet<String> = self
             .failure
             .read()
@@ -2525,11 +2534,14 @@ impl ClusterManager {
             let (ip, port) = if owner_id == self.node_id && state.role == PersistedRole::Primary {
                 (local_ip.clone(), local_port)
             } else if !fail_set.contains(&owner_id)
-                && let Some(peer) = nodes.get(&owner_id)
+                && let Some(addr) = nodes
+                    .get(&owner_id)
+                    .map(|p| p.addr)
+                    .or_else(|| known_peers.get(&owner_id).map(|p| p.addr))
             {
-                (peer.addr.ip().to_string(), peer.addr.port())
+                (addr.ip().to_string(), addr.port())
             } else {
-                // Owner is down or FAIL: slot is currently CLUSTERDOWN, omit from CLUSTER SLOTS.
+                // Owner is FAIL or was never seen: slot is CLUSTERDOWN, omit from CLUSTER SLOTS.
                 continue;
             };
             ranges.push(SlotRange {
@@ -2631,19 +2643,6 @@ impl ClusterManager {
                     replication_offset: 0,
                     health: "online",
                 }
-            } else if !fail_set.contains(&owner_id)
-                && let Some(peer) = nodes.get(&owner_id)
-            {
-                let ip = peer.addr.ip().to_string();
-                ClusterShardNode {
-                    id: peer.id.clone(),
-                    port: peer.addr.port(),
-                    endpoint: ip.clone(),
-                    ip,
-                    role: "master",
-                    replication_offset: 0,
-                    health: "online",
-                }
             } else if let Some(addr) = nodes
                 .get(&owner_id)
                 .map(|p| p.addr)
@@ -2657,7 +2656,12 @@ impl ClusterManager {
                     ip,
                     role: "master",
                     replication_offset: 0,
-                    health: "failed",
+                    // Like Redis, out of gossip is still online until FAIL.
+                    health: if fail_set.contains(&owner_id) {
+                        "failed"
+                    } else {
+                        "online"
+                    },
                 }
             } else {
                 continue;
@@ -3939,14 +3943,27 @@ mod tests {
             Some("MOVED 9706 127.0.0.1:6402")
         );
 
-        // When the peer leaves gossip, its bindings stay in the slot table,
-        // while requests to its slots return ClusterDown.
+        // When the peer leaves gossip, its bindings stay in the slot table and
+        // requests still redirect to its last-known address, as in Redis.
         manager.process_peers(HashMap::new()).await;
         assert_eq!(
             manager.state_snapshot().slots.get(9706).unwrap().node_id,
             "node-b"
         );
+        assert_eq!(
+            manager.route(9706, false, false).await,
+            Route::Moved(format!("MOVED 9706 {}", peer_addr))
+        );
+        assert_eq!(manager.get_cluster_slots().await.len(), 2);
+
+        // Once it's FAIL, its slots are CLUSTERDOWN.
+        manager
+            .failure
+            .write()
+            .unwrap()
+            .mark_failed_for_test("node-b", Instant::now());
         assert_eq!(manager.route(9706, false, false).await, Route::ClusterDown);
+        assert_eq!(manager.get_cluster_slots().await.len(), 1);
         assert_eq!(
             manager
                 .route(9706, false, false)
@@ -4310,7 +4327,8 @@ mod tests {
         assert_eq!(shards[1].nodes[1].health, "online");
 
         // When node-b leaves gossip, its slots remain bound in CLUSTER NODES
-        // as disconnected and in CLUSTER SHARDS as failed, and CLUSTER SLOTS omits it.
+        // as disconnected. CLUSTER SHARDS (online) and CLUSTER SLOTS keep it at
+        // its last-known address until it's FAIL, matching routing.
         manager.process_peers(HashMap::new()).await;
         let nodes = manager.get_cluster_nodes().await;
         assert!(
@@ -4319,9 +4337,19 @@ mod tests {
         );
         let shards_after = manager.get_cluster_shards().await;
         assert_eq!(shards_after[1].nodes[0].id, "node-b");
-        assert_eq!(shards_after[1].nodes[0].health, "failed");
+        assert_eq!(shards_after[1].nodes[0].health, "online");
         let slots_after = manager.get_cluster_slots().await;
-        assert!(slots_after.iter().all(|r| r.node_id == "node-a"));
+        assert!(slots_after.iter().any(|r| r.node_id == "node-b"));
+
+        manager
+            .failure
+            .write()
+            .unwrap()
+            .mark_failed_for_test("node-b", Instant::now());
+        assert_eq!(
+            manager.get_cluster_shards().await[1].nodes[0].health,
+            "failed"
+        );
     }
 
     #[tokio::test]
@@ -5156,7 +5184,7 @@ mod tests {
             false,
         );
         mgr.config.node_timeout_ms = Some(1000);
-        mgr.config.replica_validity_factor = Some(2); // max_age = 2000ms before failure
+        mgr.config.replica_validity_factor = Some(2); // max_age = 500ms + 2000ms before failure
 
         // Primary gossips its 2-shard replids.
         let p1_repl = vec![
@@ -5186,7 +5214,7 @@ mod tests {
         // Unsynced -> ineligible.
         assert_eq!(mgr.check_election_eligibility().await, None);
 
-        // Sync both shards with stale frames (at t0 + 1000ms -> 3000ms before failure_time > 2000ms).
+        // Sync both shards with stale frames (at t0 + 1000ms -> 3000ms before failure_time > 2500ms).
         mgr.update_replica_shard_progress(0, "rep-0", 100, true, t0 + Duration::from_millis(1000))
             .await;
         mgr.update_replica_shard_progress(1, "rep-1", 50, true, t0 + Duration::from_millis(1000))
@@ -5200,8 +5228,19 @@ mod tests {
             Some("p1")
         );
 
-        // Re-enable factor = 2 and update frames to t0 + 3500ms (500ms before failure_time <= 2000ms).
+        // Re-enable factor = 2. max_age also counts the 500ms heartbeat (Redis's
+        // ping period): 2300ms before failure_time is within 2500ms.
         mgr.config.replica_validity_factor = Some(2);
+        mgr.update_replica_shard_progress(0, "rep-0", 100, true, t0 + Duration::from_millis(1700))
+            .await;
+        mgr.update_replica_shard_progress(1, "rep-1", 50, true, t0 + Duration::from_millis(1700))
+            .await;
+        assert_eq!(
+            mgr.check_election_eligibility().await.as_deref(),
+            Some("p1")
+        );
+
+        // Frames at t0 + 3500ms (500ms before failure_time).
         mgr.update_replica_shard_progress(0, "rep-0", 100, true, t0 + Duration::from_millis(3500))
             .await;
         mgr.update_replica_shard_progress(1, "rep-1", 50, true, t0 + Duration::from_millis(3500))

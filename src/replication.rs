@@ -919,13 +919,13 @@ pub async fn serve_sync(
 /// the primary is alive.
 fn stream_heartbeat(state: &AppState) -> Duration {
     match state.cfg.cluster.as_ref().filter(|c| c.enabled) {
-        Some(cluster) => {
-            let half_timeout = Duration::from_millis(cluster.node_timeout_ms() / 2)
-                .max(Duration::from_millis(200));
-            HEARTBEAT.min(half_timeout)
-        }
+        Some(cluster) => cluster_stream_heartbeat(cluster.node_timeout_ms()),
         None => HEARTBEAT,
     }
+}
+
+pub(crate) fn cluster_stream_heartbeat(node_timeout_ms: u64) -> Duration {
+    HEARTBEAT.min(Duration::from_millis(node_timeout_ms / 2).max(Duration::from_millis(200)))
 }
 
 /// Sends everything after `cursor`, then waits for more.

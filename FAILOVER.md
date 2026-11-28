@@ -82,8 +82,9 @@ changes only by these rules (Redis' "last failover wins"):
 - A primary claims slot `s` with epoch `e`. If `s` is unbound, or bound with a
   lower epoch, rebind `s` to the claimant. Equal epochs can't happen once
   collisions are resolved (below).
-- Bindings are kept for nodes that are down. A slot bound to a failed node gets
-  `-CLUSTERDOWN`, as today. A returning node's old, lower-epoch claim can't take
+- Bindings are kept for nodes that are down. A slot bound to a node that's out
+  of gossip but not FAIL still redirects to its last-known address, as in
+  Redis. A slot bound to a FAIL node gets `-CLUSTERDOWN`. A returning node's old, lower-epoch claim can't take
   the slot back. This replaces today's "only live nodes own slots".
 
 Routing reads the table instead of scanning live peers' claims.
@@ -118,9 +119,10 @@ A replica starts an election when all of these hold:
 
 - its primary is FAIL and owned slots;
 - every shard is synced (`synced = 1`) under its primary's replids;
-- every shard received a frame from the primary within
-  `node_timeout_ms * replica_validity_factor` (default 10; 0 disables the
-  check), so a replica that was cut off long before the failure doesn't take
+- every shard received a frame from the primary within the stream heartbeat
+  (`max(200 ms, node_timeout_ms / 2)`, capped at 10 s; Redis's
+  `repl-ping-replica-period`) plus `node_timeout_ms * replica_validity_factor`
+  (default 10; 0 disables the check), so a replica that was cut off long before the failure doesn't take
   over with stale data.
 
 **Delay**: `500 ms + random(0..500 ms) + rank * 1000 ms`. Rank 0 is the replica
