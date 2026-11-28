@@ -1361,10 +1361,19 @@ impl AppState {
         let notify = cluster.election_notify();
         let mut armed: Option<ArmedElection> = None;
         let mut last_attempt: Option<(String, std::time::Instant)> = None;
+        let mut cant_failover: Option<&'static str> = None;
 
         while !shutdown.is_cancelled() {
             let now = std::time::Instant::now();
-            let Some(primary) = cluster.check_election_eligibility().await else {
+            let eligibility = cluster.election_eligibility().await;
+            let reason = eligibility.as_ref().err().copied().flatten();
+            if reason != cant_failover {
+                if let Some(reason) = reason {
+                    tracing::warn!(node = %cluster.node_id(), "Currently unable to failover: {reason}");
+                }
+                cant_failover = reason;
+            }
+            let Ok(primary) = eligibility else {
                 armed = None;
                 if let Some((ref prev_primary, _)) = last_attempt
                     && (!cluster.is_failed(prev_primary)

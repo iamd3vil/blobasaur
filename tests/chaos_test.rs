@@ -2091,9 +2091,9 @@ async fn auto_failover(mode: WriteMode) {
                 let state_txt = std::fs::read_to_string(state).unwrap_or_default();
                 eprintln!("[chaos] ---- {node} state {}\n{state_txt}", state.display());
                 eprintln!(
-                    "[chaos] ---- {node} log {} (last 60 lines)\n{}",
+                    "[chaos] ---- {node} log {} (last 300 lines)\n{}",
                     log.display(),
-                    tail(log, 60)
+                    tail(log, 300)
                 );
             }
         }
@@ -2594,9 +2594,9 @@ async fn manual_failover(mode: WriteMode) {
                 let state_txt = std::fs::read_to_string(state).unwrap_or_default();
                 eprintln!("[chaos] ---- {node} state {}\n{state_txt}", state.display());
                 eprintln!(
-                    "[chaos] ---- {node} log {} (last 60 lines)\n{}",
+                    "[chaos] ---- {node} log {} (last 300 lines)\n{}",
                     log.display(),
-                    tail(log, 60)
+                    tail(log, 300)
                 );
             }
         }

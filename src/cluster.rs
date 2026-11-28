@@ -1069,44 +1069,57 @@ impl ClusterManager {
         self.can_promote(&PromotionKind::Takeover)
     }
 
-    /// Check whether this node is currently eligible to start an automatic
-    /// failover election (FAILOVER.md "Election"):
+    #[cfg(test)]
+    pub async fn check_election_eligibility(&self) -> Option<String> {
+        self.election_eligibility().await.ok()
+    }
+
+    /// Whether this node may start an automatic failover election
+    /// (FAILOVER.md "Election"), returning its failed primary:
     /// - replica (not repointing, not bootstrapping, not shutting down);
     /// - its primary is FAIL in this node's view and owns slots in its table;
     /// - every shard is synced under the primary's replids;
     /// - every shard received a frame within `node_timeout_ms * replica_validity_factor`
     ///   before the failure (when factor > 0).
-    pub async fn check_election_eligibility(&self) -> Option<String> {
+    ///
+    /// `Err(Some(reason))`: the primary is FAIL but this replica can't stand
+    /// (Redis's "Currently unable to failover"). `Err(None)`: no failover is due.
+    pub async fn election_eligibility(&self) -> Result<String, Option<&'static str>> {
         if self.persist_halted.load(Ordering::Acquire) || self.bootstrapping.load(Ordering::Acquire)
         {
-            return None;
+            return Err(None);
         }
         let primary_id = {
             let state = self.state.read().unwrap();
             if !state.is_replica() || state.repointing_to.is_some() {
-                return None;
+                return Err(None);
             }
-            let primary = state.primary.clone()?;
+            let primary = state.primary.clone().ok_or(None)?;
             if !state.slots.has_slots_of(&primary) {
-                return None;
+                return Err(None);
             }
             primary
         };
-        let failed_at = self.failure.read().unwrap().failed_at(&primary_id)?;
+        let failed_at = self
+            .failure
+            .read()
+            .unwrap()
+            .failed_at(&primary_id)
+            .ok_or(None)?;
         {
             let synced = self.replica_synced.lock().unwrap();
             if synced.is_empty() || !synced.iter().all(|s| *s) {
-                return None;
+                return Err(Some("not every shard is synced"));
             }
         }
         let local_repl = self.shard_repl.lock().unwrap().clone();
         if local_repl.is_empty() || local_repl.iter().any(|s| s.replid.is_empty()) {
-            return None;
+            return Err(Some("a shard has no replid"));
         }
         if let Some(primary_repl) = self.primary_known_repl(&primary_id).await
             && !election::replids_match(&local_repl, &primary_repl)
         {
-            return None;
+            return Err(Some("replids differ from the primary's"));
         }
         let validity_factor = self.config.replica_validity_factor();
         if validity_factor > 0 {
@@ -1120,16 +1133,18 @@ impl ClusterManager {
                 .unwrap_or(failed_at);
             let frames = self.last_frame_at.lock().unwrap();
             if frames.len() != local_repl.len() {
-                return None;
+                return Err(Some("frame times don't cover every shard"));
             }
             for frame_at in frames.iter() {
-                let last = (*frame_at)?;
+                let Some(last) = *frame_at else {
+                    return Err(Some("a shard never received a frame"));
+                };
                 if failure_time.saturating_duration_since(last) > max_age {
-                    return None;
+                    return Err(Some("data is too old (replica_validity_factor)"));
                 }
             }
         }
-        Some(primary_id)
+        Ok(primary_id)
     }
 
     async fn primary_known_repl(&self, primary_id: &str) -> Option<Vec<ShardReplState>> {
