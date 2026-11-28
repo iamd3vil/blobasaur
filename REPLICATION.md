@@ -404,11 +404,13 @@ fails. Today it logs the error and runs without a cluster manager.
 
 - `role`: `primary` | `replica-syncing` | `replica`
 - `primary`: `Option<String>`, the node id being replicated
-- `slot_ranges`: the node's slots as `[start, end]` ranges. One UDP datagram
-  can't carry a list of all 16384 slots, so ranges are the primary form; the
-  legacy `slots` list is still emitted while the whole gossip value stays
-  under 56000 bytes (chitchat's datagram is 65507 bytes), and omitted above
-  that, with a one-time warning. See the upgrade notes in `CLUSTERING.md`.
+- `slot_ranges`: the node's slots as `[start, end]` ranges. The old `slots`
+  list is sent only when very scattered slots make the ranges longer than
+  56000 bytes (chitchat's datagram is 65507 bytes). Sending the list as well
+  made a primary's value about 30 KB, and datagrams that size overflowed UDP
+  receive buffers under load, so heartbeats were lost. Nodes from before
+  replication read only the list, so they can't share a cluster with this
+  version. See the upgrade notes in `CLUSTERING.md`.
 
 Replicas gossip no slots, so slot ownership logic is unaffected. The replica's
 sync task resolves the primary's address from gossip and reconnects when it

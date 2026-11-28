@@ -549,15 +549,9 @@ docker-compose logs | grep -i gossip
 ## Upgrade Notes
 
 Nodes gossip their slots as ranges. Nodes from before this encoding read only a
-full list of slots, so a node also gossips that list for them as long as its
-whole gossip entry stays under 56000 bytes. That fits about 9000 slots, and fewer
-when scattered, since the ranges grow too. Past that
-(for example a node owning all 16384 slots) only the ranges fit in one gossip
-datagram, and the node logs a warning once. An older peer then sees that node as
-owning no slots, and runs requests for them locally instead of redirecting.
-
-Upgrade every peer before giving one node an assignment too large for the list.
-Rolling upgrades with smaller assignments need no care.
+full list of slots, so they see a node of this version as owning no slots, and
+run requests for them locally instead of redirecting. Mixed-version clusters
+aren't supported: stop every node, upgrade them all, then start them.
 
 **Two-primary clusters and minority fencing:** With minority write fencing enabled, a cluster with exactly two slot-owning primaries has a quorum of 2 (`2 / 2 + 1`). If one primary goes down or is partitioned, the surviving primary can reach only 1 of 2 primaries and will stop serving its own slots (`-CLUSTERDOWN`, `cluster_state:fail`) after `node_timeout_ms`, matching Redis Cluster. Run either a single primary (quorum 1, never in a minority) or at least three primaries so the cluster can survive losing one primary.
 

@@ -20,7 +20,7 @@ use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chitchat::{
@@ -293,21 +293,24 @@ fn live_peers(chitchat: &Chitchat, self_id: &str) -> HashMap<String, ClusterNode
     nodes_map
 }
 
-/// The largest `node_info` value we gossip with the legacy `slots` list. chitchat
-/// drops a value that doesn't fit one 65507-byte datagram, shared with the digest
-/// (about 60 bytes per node) and the node record, and asserts one item is at most
-/// `u16::MAX` bytes. This leaves about 9.5 KB for those. 9000 slots take under 55 KB.
+/// The largest `node_info` value we gossip. chitchat drops a value that doesn't
+/// fit one 65507-byte datagram, shared with the digest (about 60 bytes per node)
+/// and the node record, and asserts one item is at most `u16::MAX` bytes. This
+/// leaves about 9.5 KB for those.
 const GOSSIP_VALUE_MAX: usize = 56_000;
 
 /// Gossip data structure for sharing node information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct NodeGossipData {
     pub addr: String,
-    /// Every owned slot. Only for old nodes, which read nothing else; empty when
-    /// only the ranges fit `GOSSIP_VALUE_MAX`. Can be dropped in a later release.
+    /// Every owned slot, sent only when the ranges don't fit `GOSSIP_VALUE_MAX`
+    /// (very scattered slots). Not sent alongside the ranges: a list of a third
+    /// of the slots is about 30 KB, and datagrams that size overflowed UDP
+    /// receive buffers under load, losing heartbeats.
+    #[serde(default)]
     pub slots: Vec<u16>,
     /// Owned slots as inclusive `(start, end)` runs. Read in preference to `slots`;
-    /// empty when the list alone fits but not both.
+    /// empty when the list is sent instead.
     #[serde(default)]
     pub slot_ranges: Vec<(u16, u16)>,
     pub state: String,
@@ -331,9 +334,9 @@ struct NodeGossipData {
 }
 
 impl NodeGossipData {
-    /// Encodes `slots` as both a list and ranges if that fits `GOSSIP_VALUE_MAX`,
-    /// else as whichever one alone fits, preferring the list old nodes can read.
-    /// Errors if neither fits: peers would never receive the value.
+    /// Encodes `slots` as ranges, or as a list when that is shorter and the
+    /// ranges don't fit `GOSSIP_VALUE_MAX`. Errors if neither fits: peers would
+    /// never receive the value.
     #[allow(clippy::too_many_arguments)]
     fn new(
         addr: String,
@@ -346,11 +349,9 @@ impl NodeGossipData {
         fail: Vec<String>,
         shard_repl: Vec<ShardReplState>,
     ) -> Result<Self, String> {
-        let mut list: Vec<u16> = slots.iter().copied().collect();
-        list.sort_unstable();
-        let both = Self {
+        let ranges = Self {
             addr,
-            slots: list,
+            slots: Vec::new(),
             slot_ranges: ClusterManager::slot_runs(slots),
             state: "master".to_string(),
             role,
@@ -362,37 +363,26 @@ impl NodeGossipData {
             shard_repl,
         };
         let size = |data: &Self| serde_json::to_string(data).map_or(usize::MAX, |json| json.len());
-        if size(&both) <= GOSSIP_VALUE_MAX {
-            return Ok(both);
+        if size(&ranges) <= GOSSIP_VALUE_MAX {
+            return Ok(ranges);
         }
-        // Scattered slots: the ranges can be longer than the list.
-        let list_only = Self {
+        let mut list: Vec<u16> = slots.iter().copied().collect();
+        list.sort_unstable();
+        let list = Self {
+            slots: list,
             slot_ranges: Vec::new(),
-            ..both.clone()
+            ..ranges
         };
-        if size(&list_only) <= GOSSIP_VALUE_MAX {
-            return Ok(list_only);
-        }
-        let ranges_only = Self {
-            slots: Vec::new(),
-            ..both
-        };
-        let ranges_size = size(&ranges_only);
-        if ranges_size > GOSSIP_VALUE_MAX {
+        let list_size = size(&list);
+        if list_size > GOSSIP_VALUE_MAX {
             return Err(format!(
-                "this node's {} slots are too scattered to gossip ({} bytes as ranges, limit {})",
+                "this node's {} slots are too scattered to gossip ({} bytes as a list, limit {})",
                 slots.len(),
-                ranges_size,
+                list_size,
                 GOSSIP_VALUE_MAX
             ));
         }
-        static WARNED: Once = Once::new();
-        WARNED.call_once(|| {
-            warn!(
-                "This node's slots are too many to gossip as a list: peers older than this version can't see them. Upgrade every peer before giving a node this many slots"
-            )
-        });
-        Ok(ranges_only)
+        Ok(list)
     }
 
     fn owned_slots(&self) -> HashSet<u16> {
@@ -3481,7 +3471,7 @@ mod tests {
     }
 
     #[test]
-    fn test_gossip_encodes_ranges_and_legacy_slots() {
+    fn test_gossip_encodes_slots_as_ranges() {
         let slots: HashSet<u16> = [0, 1, 2, 9].into_iter().collect();
         let data = NodeGossipData::new(
             "10.0.0.1:6379".into(),
@@ -3495,7 +3485,7 @@ mod tests {
             vec![],
         )
         .unwrap();
-        assert_eq!(data.slots, vec![0, 1, 2, 9]);
+        assert!(data.slots.is_empty());
         assert_eq!(data.slot_ranges, vec![(0, 2), (9, 9)]);
         let json = serde_json::to_string(&data).unwrap();
         assert_eq!(
@@ -3505,16 +3495,11 @@ mod tests {
             slots
         );
 
-        // While the value fits a datagram the legacy list is sent too, and an old
-        // node reads it; above that only the ranges.
-        #[derive(Deserialize)]
-        struct Legacy {
-            slots: Vec<u16>,
-        }
-        let all = |n: u16| (0..n).collect::<HashSet<u16>>();
-        let at_limit = NodeGossipData::new(
+        // A third of the slots stays small: the full list would be about 30 KB.
+        let third: HashSet<u16> = (0..5461).collect();
+        let data = NodeGossipData::new(
             "a:1".into(),
-            &all(9000),
+            &third,
             NodeRole::Primary,
             None,
             0,
@@ -3524,57 +3509,20 @@ mod tests {
             vec![],
         )
         .unwrap();
-        assert_eq!(at_limit.slots.len(), 9000);
-        let json = serde_json::to_string(&at_limit).unwrap();
-        assert!(json.len() <= GOSSIP_VALUE_MAX, "{} bytes", json.len());
-        assert_eq!(
-            serde_json::from_str::<Legacy>(&json).unwrap().slots.len(),
-            9000
-        );
-        // The worst case for 9000 slots: all five digits.
-        let high: HashSet<u16> = (7384..16384).collect();
-        let high = NodeGossipData::new(
-            "a:1".into(),
-            &high,
-            NodeRole::Primary,
-            None,
-            0,
-            0,
-            vec![],
-            vec![],
-            vec![],
-        )
-        .unwrap();
-        assert_eq!(high.slots.len(), 9000);
-        let full = NodeGossipData::new(
-            "a:1".into(),
-            &all(16384),
-            NodeRole::Primary,
-            None,
-            0,
-            0,
-            vec![],
-            vec![],
-            vec![],
-        )
-        .unwrap();
-        assert!(full.slots.is_empty());
-        assert_eq!(full.slot_ranges, vec![(0, 16383)]);
-        let json = serde_json::to_string(&full).unwrap();
+        let json = serde_json::to_string(&data).unwrap();
         assert!(json.len() < 1000, "{} bytes", json.len());
         assert_eq!(
             serde_json::from_str::<NodeGossipData>(&json)
                 .unwrap()
-                .owned_slots()
-                .len(),
-            16384
+                .owned_slots(),
+            third
         );
     }
 
     #[test]
     fn test_gossip_falls_back_to_whichever_encoding_fits() {
-        // Every other slot: the ranges are longer than the list, so the list
-        // alone is sent (and old nodes can still read it).
+        // Every other slot: the ranges don't fit but the list does, so the list
+        // is sent instead.
         let alternating: HashSet<u16> = (0..16384).step_by(2).collect();
         let data = NodeGossipData::new(
             "a:1".into(),
