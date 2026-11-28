@@ -226,6 +226,16 @@ impl Client {
 /// tests take turns.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Node logs go to libtest's per-test capture, printed only when a test fails.
+/// Single-threaded test runtimes keep every node task on the test thread.
+fn init_logs() {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_ansi(false)
+        .with_max_level(tracing_subscriber::filter::LevelFilter::INFO)
+        .try_init();
+}
+
 async fn wait_for<F, Fut>(what: &str, mut cond: F)
 where
     F: FnMut() -> Fut,
@@ -326,6 +336,7 @@ async fn shard_replids(dir: &Path, shards: usize) -> Vec<String> {
 #[tokio::test]
 async fn five_node_cluster_takeover_repoints_replica_and_demotes_live_primary() {
     let _serial = SERIAL.lock().await;
+    init_logs();
     const SHARDS: usize = 2;
     let d1 = TempDir::new().unwrap();
     let d2 = TempDir::new().unwrap();
@@ -613,6 +624,7 @@ async fn five_node_cluster_takeover_repoints_replica_and_demotes_live_primary() 
 #[tokio::test]
 async fn stopped_old_primary_with_unreplicated_writes_demotes_and_resyncs_on_restart() {
     let _serial = SERIAL.lock().await;
+    init_logs();
     const SHARDS: usize = 2;
     let d1 = TempDir::new().unwrap();
     let d2 = TempDir::new().unwrap();
@@ -802,6 +814,7 @@ async fn stopped_old_primary_with_unreplicated_writes_demotes_and_resyncs_on_res
 #[tokio::test]
 async fn takeover_refused_when_replica_is_not_synced() {
     let _serial = SERIAL.lock().await;
+    init_logs();
     let dp = TempDir::new().unwrap();
     let dr = TempDir::new().unwrap();
     let (gp, gr) = (free_udp_port(), free_udp_port());
@@ -862,6 +875,7 @@ async fn takeover_refused_when_replica_is_not_synced() {
 #[tokio::test]
 async fn cluster_replicate_happy_path_and_refusals() {
     let _serial = SERIAL.lock().await;
+    init_logs();
     const SHARDS: usize = 2;
     let d1 = TempDir::new().unwrap();
     let d2 = TempDir::new().unwrap();
@@ -1059,6 +1073,7 @@ async fn cluster_replicate_happy_path_and_refusals() {
 #[tokio::test]
 async fn crash_window_after_promotion_persist_completes_on_restart() {
     let _serial = SERIAL.lock().await;
+    init_logs();
     const SHARDS: usize = 2;
     let dp = TempDir::new().unwrap();
     let dr = TempDir::new().unwrap();
@@ -1162,6 +1177,7 @@ async fn crash_window_after_promotion_persist_completes_on_restart() {
 #[tokio::test(flavor = "multi_thread")]
 async fn go_redis_cluster_client_keeps_working_across_takeover() {
     let _serial = SERIAL.lock().await;
+    init_logs();
     if std::env::var_os("BLOBASAUR_SKIP_GO_TESTS").is_some() {
         eprintln!("BLOBASAUR_SKIP_GO_TESTS is set; skipping go-redis client tests");
         return;
@@ -1286,6 +1302,7 @@ async fn exec_sql(dir: &Path, shard: usize, sql: &str) {
 #[tokio::test]
 async fn demotion_retries_after_transient_failure_and_delslots_stays_primary() {
     let _serial = SERIAL.lock().await;
+    init_logs();
     const SHARDS: usize = 2;
 
     // Part 1: A primary that becomes slotless via CLUSTER DELSLOTS has no
@@ -1425,6 +1442,7 @@ async fn demotion_retries_after_transient_failure_and_delslots_stays_primary() {
 #[tokio::test]
 async fn demotion_crash_after_slot_loss_never_serves_lost_slots_and_finishes_on_restart() {
     let _serial = SERIAL.lock().await;
+    init_logs();
     const SHARDS: usize = 2;
     let dp = TempDir::new().unwrap();
     let dr = TempDir::new().unwrap();
@@ -1559,6 +1577,7 @@ async fn demotion_crash_after_slot_loss_never_serves_lost_slots_and_finishes_on_
 #[tokio::test]
 async fn takeover_retries_transient_shard_promote_failure_without_serving_early() {
     let _serial = SERIAL.lock().await;
+    init_logs();
     const SHARDS: usize = 2;
     let dp = TempDir::new().unwrap();
     let dr = TempDir::new().unwrap();
@@ -1680,6 +1699,7 @@ async fn takeover_retries_transient_shard_promote_failure_without_serving_early(
 #[tokio::test]
 async fn takeover_persistent_shard_promote_failure_shuts_down_and_recovers_on_restart() {
     let _serial = SERIAL.lock().await;
+    init_logs();
     const SHARDS: usize = 2;
     let dp = TempDir::new().unwrap();
     let dr = TempDir::new().unwrap();
