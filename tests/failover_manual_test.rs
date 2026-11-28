@@ -34,6 +34,12 @@ use tokio_util::sync::CancellationToken;
 const SHARDS: usize = 2;
 const NODE_TIMEOUT_MS: u64 = 1000;
 
+/// Each test runs 3-4 nodes in-process with a 1 s `node_timeout` (the default
+/// is 15 s). Run in parallel on a 4-vCPU CI runner, their runtimes starved each
+/// other's gossip past that timeout, so nodes falsely went PFAIL/FAIL. The
+/// tests take turns instead.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn free_udp_port() -> u16 {
     static ISSUED: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
     loop {
@@ -682,16 +688,19 @@ async fn run_manual_failover_under_writes(async_write: bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manual_failover_zero_loss_sync_writes() {
+    let _serial = SERIAL.lock().await;
     run_manual_failover_under_writes(false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manual_failover_zero_loss_async_writes() {
+    let _serial = SERIAL.lock().await;
     run_manual_failover_under_writes(true).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manual_failover_abort_on_stalled_catchup_and_in_progress_refusal() {
+    let _serial = SERIAL.lock().await;
     let d1 = TempDir::new().unwrap();
     let d2 = TempDir::new().unwrap();
     let d3 = TempDir::new().unwrap();
@@ -980,6 +989,7 @@ async fn manual_failover_abort_on_stalled_catchup_and_in_progress_refusal() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manual_failover_refuses_primary_and_unsynced_replica() {
+    let _serial = SERIAL.lock().await;
     let d1 = TempDir::new().unwrap();
     let d2 = TempDir::new().unwrap();
     let d3 = TempDir::new().unwrap();
@@ -1100,6 +1110,7 @@ async fn manual_failover_refuses_primary_and_unsynced_replica() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn goredis_cluster_client_survives_manual_failover() {
+    let _serial = SERIAL.lock().await;
     if std::env::var_os("BLOBASAUR_SKIP_GO_TESTS").is_some() {
         eprintln!("BLOBASAUR_SKIP_GO_TESTS is set; skipping go-redis manual failover test");
         return;
@@ -1226,6 +1237,7 @@ async fn goredis_cluster_client_survives_manual_failover() {
 ///   every acknowledged write is readable from `r1` afterwards.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manual_failover_zero_loss_when_claim_reaches_old_primary_late() {
+    let _serial = SERIAL.lock().await;
     let d1 = TempDir::new().unwrap();
     let d2 = TempDir::new().unwrap();
     let d3 = TempDir::new().unwrap();
@@ -1520,6 +1532,7 @@ async fn manual_failover_zero_loss_when_claim_reaches_old_primary_late() {
 /// - `BLOBASAUR.MFABORT r1` from the owning replica ends the pause immediately.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manual_failover_mfabort_ends_pause_promptly_and_ignores_stale_replica() {
+    let _serial = SERIAL.lock().await;
     let d1 = TempDir::new().unwrap();
     let d2 = TempDir::new().unwrap();
     let d3 = TempDir::new().unwrap();
