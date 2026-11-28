@@ -63,6 +63,7 @@ Blobasaur is a high-performance, sharded blob storage server written in Rust. It
 - **🏷️ Metadata Tracking**: Automatic tracking of creation time, update time, expiration, and version numbers
 - **⏰ TTL Support**: Redis-compatible key expiration with `SET EX/PX`, `TTL`, and `EXPIRE` commands plus automatic background cleanup
 - **🌐 Redis Cluster Support**: Full cluster protocol support with automatic node discovery and client redirection
+- **🛡️ Replication**: Asynchronous replicas for disaster recovery and read scaling, with manual failover (see [REPLICATION.md](REPLICATION.md) and [CLUSTERING.md](CLUSTERING.md#replication))
 - **⚙️ Highly Configurable**: Flexible configuration for shards, compression, batching, and performance tuning
 
 ## Installation

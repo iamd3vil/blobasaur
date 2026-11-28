@@ -1,11 +1,12 @@
 use crate::AppState;
-use crate::cluster::ClusterManager;
+use crate::cluster::{ClusterManager, ClusterShard, Route, SlotRange};
 use crate::config::Cfg;
 use crate::metrics::Timer;
 use crate::redis::{
-    HExpireCondition, ParseError, RedisCommand, VacuumCommandMode, VacuumShardTarget,
-    decode_request, parse_command, serialize_frame,
+    ClusterFailoverMode, HExpireCondition, ParseError, RedisCommand, VacuumCommandMode,
+    VacuumShardTarget, decode_request, parse_command, serialize_frame,
 };
+use crate::replication;
 use crate::shard_manager::{
     self, Pending, ShardWriteOperation, ShardWriter, VacuumMode, VacuumResult, VacuumStats,
 };
@@ -15,7 +16,7 @@ use redis_protocol::resp2::types::BytesFrame;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::oneshot;
+use tokio::sync::{RwLockReadGuard, oneshot};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -23,9 +24,11 @@ use tokio_util::task::TaskTracker;
 /// without losing acknowledged writes:
 /// 1. stop accepting connections,
 /// 2. stop reading new commands and let in-flight ones reply,
-/// 3. drain every shard writer (commit all queued ops) and await it,
+/// 3. drain every shard writer (commit all queued ops) and await it, and stop
+///    and await the expiry cleanup tasks,
 /// 4. stop background tasks and the cluster manager,
-/// 5. checkpoint the WAL and close the pools.
+/// 5. checkpoint the WAL and close the pools,
+/// 6. mark each shard as cleanly stopped (see [`crate::replication`]).
 ///
 /// Returns an error if shard writers could not drain within
 /// `shutdown_timeout_secs`; acknowledged writes may have been lost then.
@@ -72,12 +75,15 @@ pub async fn run(
                 inflight_hcache: state.inflight_hcache.clone(),
                 metrics: state.metrics.clone(),
                 key_count: state.shard_key_counts[i].clone(),
+                commit_watch: state.commit_watch[i].clone(),
+                replication: cfg.replication_enabled(),
                 shutdown: writers_shutdown.clone(),
             },
         )));
     }
 
     let mut background = Vec::new();
+    let mut cleanups = Vec::with_capacity(cfg.num_shards);
 
     // Spawn cleanup tasks for each shard
     for (i, write_pool) in state.write_db_pools.iter().enumerate() {
@@ -85,7 +91,7 @@ pub async fn run(
         // connection: taking turns with the writer instead of holding the SQLite
         // write lock from another connection, which made writer batches fail
         // with SQLITE_BUSY.
-        background.push(tokio::spawn(shard_manager::shard_cleanup_task(
+        cleanups.push(tokio::spawn(shard_manager::shard_cleanup_task(
             i,
             write_pool.clone(),
             cfg.cleanup_interval_secs(),
@@ -93,8 +99,17 @@ pub async fn run(
             state.inflight_cache.clone(),
             state.inflight_hcache.clone(),
             state.shard_key_counts[i].clone(),
+            state.commit_watch[i].clone(),
+            state.repl_pins[i].clone(),
+            cfg.replication_enabled()
+                .then(|| cfg.tombstone_retention_secs()),
+            writers_shutdown.clone(),
         )));
     }
+
+    // Attach runtime role-transition handling (demotion, replica re-pointing)
+    // and start replica sync tasks if this node is currently a replica.
+    state.attach_cluster_runtime(shutdown.clone()).await;
 
     // Start HTTP metrics server if enabled
     if let Some(handle) = prometheus_handle {
@@ -131,6 +146,8 @@ pub async fn run(
         drain_timeout
     );
 
+    // Wake any client writes currently paused for manual failover so connections drain promptly.
+    state.end_write_pause();
     connections.close();
     if tokio::time::timeout_at(deadline, connections.wait())
         .await
@@ -142,6 +159,21 @@ pub async fn run(
         );
     }
 
+    // Stop gossip processing before waiting on spawned role transitions,
+    // stopping replica sync, and draining writers so no new transition starts
+    // during shutdown while any in-flight transition finishes cleanly.
+    if let Some(cluster_manager) = &state.cluster_manager {
+        cluster_manager.stop_gossip_task().await;
+    }
+
+    state.stop_election_task().await;
+    state.wait_manual_failovers().await;
+    state.wait_role_transitions().await;
+
+    state.replica_sync.stop().await;
+
+    // Cleanup stops between chunks on the same token. It commits too, so the
+    // shards are only quiet once it has exited as well.
     writers_shutdown.cancel();
     let mut drain_failed = false;
     for (shard_id, writer) in writers.iter_mut().enumerate() {
@@ -168,7 +200,14 @@ pub async fn run(
         }
     }
 
-    for task in &background {
+    for (shard_id, task) in cleanups.iter_mut().enumerate() {
+        if !matches!(tokio::time::timeout_at(deadline, task).await, Ok(Ok(()))) {
+            tracing::error!("Shard {} cleanup task did not stop cleanly", shard_id);
+            drain_failed = true;
+        }
+    }
+
+    for task in background.iter().chain(&cleanups) {
         task.abort();
     }
     if let Some(cluster_manager) = &state.cluster_manager {
@@ -181,13 +220,15 @@ pub async fn run(
         ));
     }
 
+    let mut checkpointed = Vec::with_capacity(cfg.num_shards);
     for (shard_id, pool) in state.write_db_pools.iter().enumerate() {
-        if let Err(e) = shard_manager::wal_checkpoint_truncate(pool).await {
-            tracing::warn!(
+        match shard_manager::wal_checkpoint_truncate(pool).await {
+            Ok(()) => checkpointed.push(shard_id),
+            Err(e) => tracing::warn!(
                 "Shard {} WAL checkpoint on shutdown failed: {}",
                 shard_id,
                 e
-            );
+            ),
         }
     }
     for pool in state
@@ -197,6 +238,17 @@ pub async fn run(
         .chain(&state.check_db_pools)
     {
         pool.close().await;
+    }
+    // Nothing can commit anymore. A shard whose checkpoint failed may not be
+    // fully on disk, so it stays marked as not stopped cleanly.
+    for shard_id in checkpointed {
+        if let Err(e) = state.mark_clean_shutdown(shard_id).await {
+            tracing::error!(
+                "Shard {} clean shutdown marker not written: {}",
+                shard_id,
+                e
+            );
+        }
     }
 
     server_result.map_err(|e| miette!("Failed to run Redis server: {}", e))?;
@@ -267,6 +319,8 @@ async fn handle_connection(
     let mut buffer = BytesMut::with_capacity(READ_CHUNK);
     let mut grown_to = READ_CHUNK;
     let mut client_name = None;
+    // Set by READONLY: a replica may serve this connection's reads.
+    let mut conn_readonly = false;
 
     loop {
         // Run every complete request already buffered before reading more.
@@ -291,10 +345,34 @@ async fn handle_connection(
             release_large_buffer(&mut buffer, &mut grown_to);
 
             match parse_command(request) {
+                // A replica's stream takes over the connection.
+                Ok(RedisCommand::BlobasaurSync {
+                    shard,
+                    replid,
+                    lsn,
+                    num_shards,
+                    compression,
+                }) => {
+                    let request = replication::SyncRequest {
+                        shard,
+                        replid,
+                        lsn,
+                        num_shards,
+                        compression,
+                    };
+                    replication::serve_sync(stream, &state, &shutdown, request).await?;
+                    return Ok(());
+                }
                 Ok(command) => {
                     let quit = matches!(command, RedisCommand::Quit);
-                    if let Err(e) =
-                        handle_redis_command(&mut stream, &state, &mut client_name, command).await
+                    if let Err(e) = handle_redis_command(
+                        &mut stream,
+                        &state,
+                        &mut client_name,
+                        command,
+                        &mut conn_readonly,
+                    )
+                    .await
                     {
                         tracing::error!("Error handling command: {}", e);
                         return Err(e);
@@ -369,16 +447,47 @@ struct ShardVacuumDispatchResult {
     vacuum_result: Option<VacuumResult>,
 }
 
+/// Checks that this node serves the slot `slot` computes for a read (which a
+/// replica serves if the connection sent `READONLY`). Otherwise replies MOVED
+/// or CLUSTERDOWN and returns false. A redirect drops the replica read `gate`
+/// before replying: a client that stops reading must not hold up a resync.
+async fn route_read_or_reply(
+    stream: &mut TcpStream,
+    state: &AppState,
+    is_read: bool,
+    conn_readonly: bool,
+    gate: &mut Option<RwLockReadGuard<'_, ()>>,
+    slot: impl FnOnce(&ClusterManager) -> u16,
+) -> std::io::Result<bool> {
+    let Some(ref cluster_manager) = state.cluster_manager else {
+        return Ok(true);
+    };
+    let route = cluster_manager
+        .route(slot(cluster_manager), is_read, conn_readonly)
+        .await;
+    let error = match route {
+        Route::Local => return Ok(true),
+        Route::Moved(redirect) => redirect,
+        Route::ClusterDown => "CLUSTERDOWN Hash slot not served".to_string(),
+    };
+    *gate = None;
+    let response = BytesFrame::Error(error.into());
+    stream.write_all(&serialize_frame(&response)).await?;
+    Ok(false)
+}
+
 async fn handle_redis_command(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
     client_name: &mut Option<Bytes>,
     command: RedisCommand,
+    conn_readonly: &mut bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let timer = Timer::start();
     let cmd_name = command.name();
 
-    let result = handle_redis_command_inner(stream, state, client_name, command).await;
+    let result =
+        handle_redis_command_inner(stream, state, client_name, command, conn_readonly).await;
 
     // Record command metrics
     state.metrics.record_command(&cmd_name, timer.start);
@@ -394,10 +503,21 @@ async fn check_key_route(state: &AppState, key: &str) -> Result<(), BytesFrame> 
     let Some(cluster_manager) = state.cluster_manager.as_ref() else {
         return Ok(());
     };
-    match cluster_manager.route_key(key).await.into_error() {
+    match cluster_manager
+        .route(ClusterManager::calculate_slot(key), false, false)
+        .await
+        .into_error()
+    {
         Some(err) => Err(BytesFrame::Error(err.into())),
         None => Ok(()),
     }
+}
+
+fn hash_slot(state: &AppState, namespace: &str, key: &str) -> u16 {
+    state
+        .cluster_manager
+        .as_ref()
+        .map_or(0, |cm| cm.calculate_slot_for_hash(namespace, key))
 }
 
 async fn check_hash_route(state: &AppState, namespace: &str, key: &str) -> Result<(), BytesFrame> {
@@ -405,7 +525,11 @@ async fn check_hash_route(state: &AppState, namespace: &str, key: &str) -> Resul
         return Ok(());
     };
     match cluster_manager
-        .route_hash(namespace, key)
+        .route(
+            cluster_manager.calculate_slot_for_hash(namespace, key),
+            false,
+            false,
+        )
         .await
         .into_error()
     {
@@ -419,35 +543,45 @@ async fn handle_redis_command_inner(
     state: &Arc<AppState>,
     client_name: &mut Option<Bytes>,
     command: RedisCommand,
+    conn_readonly: &mut bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let readonly = *conn_readonly;
     match command {
         RedisCommand::Get { key } => {
-            if let Err(response) = check_key_route(state, &key).await {
-                stream.write_all(&serialize_frame(&response)).await?;
+            let mut gate = state
+                .replica_read_gate(state.get_shard(&key), readonly)
+                .await;
+            if !route_read_or_reply(stream, state, true, readonly, &mut gate, |_| {
+                ClusterManager::calculate_slot(&key)
+            })
+            .await?
+            {
                 return Ok(());
             }
-            handle_get(stream, state, key).await?;
+            handle_get(stream, state, key, gate).await?;
         }
         RedisCommand::Set {
             key,
             value,
             ttl_seconds,
         } => {
-            if let Err(response) = check_key_route(state, &key).await {
-                stream.write_all(&serialize_frame(&response)).await?;
-                return Ok(());
-            }
             handle_set(stream, state, key, value, ttl_seconds).await?;
         }
         RedisCommand::Del { keys } => {
             handle_del_multiple(stream, state, keys).await?;
         }
         RedisCommand::Exists { key } => {
-            if let Err(response) = check_key_route(state, &key).await {
-                stream.write_all(&serialize_frame(&response)).await?;
+            let mut gate = state
+                .replica_read_gate(state.get_shard(&key), readonly)
+                .await;
+            if !route_read_or_reply(stream, state, true, readonly, &mut gate, |_| {
+                ClusterManager::calculate_slot(&key)
+            })
+            .await?
+            {
                 return Ok(());
             }
-            handle_exists(stream, state, key).await?;
+            handle_exists(stream, state, key, gate).await?;
         }
         RedisCommand::Ping { message } => {
             handle_ping(stream, message).await?;
@@ -455,17 +589,11 @@ async fn handle_redis_command_inner(
         RedisCommand::Info { section } => {
             handle_info(stream, state, section).await?;
         }
-        RedisCommand::CommandCount => {
-            // Count top-level commands in parse_command_array, including BLOBASAUR.VACUUM.
-            stream
-                .write_all(&serialize_frame(&BytesFrame::Integer(21)))
-                .await?;
-        }
-        RedisCommand::Command => {
-            handle_command(stream).await?;
+        RedisCommand::Command { args } => {
+            handle_command(stream, &args).await?;
         }
         RedisCommand::HGet { namespace, key } => {
-            handle_hget(stream, state, namespace, key).await?;
+            handle_hget(stream, state, readonly, namespace, key).await?;
         }
         RedisCommand::HSet {
             namespace,
@@ -487,7 +615,7 @@ async fn handle_redis_command_inner(
             handle_hdel(stream, state, namespace, key).await?;
         }
         RedisCommand::HExists { namespace, key } => {
-            handle_hexists(stream, state, namespace, key).await?;
+            handle_hexists(stream, state, readonly, namespace, key).await?;
         }
         RedisCommand::HExpire {
             key,
@@ -505,6 +633,9 @@ async fn handle_redis_command_inner(
         } => {
             handle_hexpireat(stream, state, key, unix_time_seconds, condition, fields).await?;
         }
+        RedisCommand::ClusterMyId => {
+            handle_cluster_myid(stream, state).await?;
+        }
         RedisCommand::ClusterNodes => {
             handle_cluster_nodes(stream, state).await?;
         }
@@ -513,6 +644,9 @@ async fn handle_redis_command_inner(
         }
         RedisCommand::ClusterSlots => {
             handle_cluster_slots(stream, state).await?;
+        }
+        RedisCommand::ClusterShards => {
+            handle_cluster_shards(stream, state).await?;
         }
         RedisCommand::ClusterAddSlots { slots } => {
             handle_cluster_addslots(stream, state, slots).await?;
@@ -523,18 +657,26 @@ async fn handle_redis_command_inner(
         RedisCommand::ClusterKeySlot { key } => {
             handle_cluster_keyslot(stream, key).await?;
         }
+        RedisCommand::ClusterFailover { mode } => {
+            handle_cluster_failover(stream, state, mode).await?;
+        }
+        RedisCommand::ClusterReplicate { node_id } => {
+            handle_cluster_replicate(stream, state, node_id).await?;
+        }
         RedisCommand::Ttl { key } => {
-            if let Err(response) = check_key_route(state, &key).await {
-                stream.write_all(&serialize_frame(&response)).await?;
+            let mut gate = state
+                .replica_read_gate(state.get_shard(&key), readonly)
+                .await;
+            if !route_read_or_reply(stream, state, true, readonly, &mut gate, |_| {
+                ClusterManager::calculate_slot(&key)
+            })
+            .await?
+            {
                 return Ok(());
             }
-            handle_ttl(stream, state, key).await?;
+            handle_ttl(stream, state, key, gate).await?;
         }
         RedisCommand::Expire { key, seconds } => {
-            if let Err(response) = check_key_route(state, &key).await {
-                stream.write_all(&serialize_frame(&response)).await?;
-                return Ok(());
-            }
             handle_expire(stream, state, key, seconds).await?;
         }
         RedisCommand::BlobasaurVacuum {
@@ -544,6 +686,21 @@ async fn handle_redis_command_inner(
             dry_run,
         } => {
             handle_blobasaur_vacuum(stream, state, target, mode, budget_mb, dry_run).await?;
+        }
+        RedisCommand::BlobasaurWatermark => {
+            handle_blobasaur_watermark(stream, state).await?;
+        }
+        RedisCommand::BlobasaurSync { .. } => {
+            unreachable!("handle_connection hands BLOBASAUR.SYNC to the replication stream")
+        }
+        RedisCommand::BlobasaurFailoverAuth(req) => {
+            handle_blobasaur_failover_auth(stream, state, req).await?;
+        }
+        RedisCommand::BlobasaurMfStart { replica_id } => {
+            handle_blobasaur_mfstart(stream, state, replica_id).await?;
+        }
+        RedisCommand::BlobasaurMfAbort { replica_id } => {
+            handle_blobasaur_mfabort(stream, state, replica_id).await?;
         }
         RedisCommand::Hello { protover } => {
             handle_hello(stream, protover).await?;
@@ -563,6 +720,11 @@ async fn handle_redis_command_inner(
         }
         RedisCommand::Quit => {
             // handle_connection closes the connection after this reply.
+            let response = BytesFrame::SimpleString("OK".into());
+            stream.write_all(&serialize_frame(&response)).await?;
+        }
+        RedisCommand::ReadOnly | RedisCommand::ReadWrite => {
+            *conn_readonly = matches!(command, RedisCommand::ReadOnly);
             let response = BytesFrame::SimpleString("OK".into());
             stream.write_all(&serialize_frame(&response)).await?;
         }
@@ -611,6 +773,7 @@ async fn handle_get(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
     key: String,
+    gate: Option<RwLockReadGuard<'_, ()>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Capture before checking inflight_cache so a reader that missed the cache
     // evaluates SQLite expiry at the same point in time, preventing an
@@ -651,13 +814,14 @@ async fn handle_get(
     .bind(&key)
     .bind(read_ts);
     let shard_metrics = &state.shard_senders[shard_index].metrics;
-    match async {
+    let fetched = async {
         query
             .fetch_optional(&mut *shard_metrics.acquire(pool, "read").await?)
             .await
     }
-    .await
-    {
+    .await;
+    drop(gate);
+    match fetched {
         Ok(Some(row)) => {
             state.metrics.record_read("get", "sqlite", "hit");
             // Decompress if needed
@@ -690,6 +854,24 @@ async fn handle_set(
     value: Bytes,
     ttl_seconds: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let response = set_reply(state, key, value, ttl_seconds).await?;
+    stream.write_all(&serialize_frame(&response)).await?;
+    Ok(())
+}
+
+/// SET's reply; releases the write pause gate before writing to the socket.
+async fn set_reply(
+    state: &Arc<AppState>,
+    key: String,
+    value: Bytes,
+    ttl_seconds: Option<u64>,
+) -> Result<BytesFrame, Box<dyn std::error::Error>> {
+    let slot = ClusterManager::calculate_slot(&key);
+    let _write_guard = state.enter_write(&[slot]).await;
+    if let Err(response) = check_key_route(state, &key).await {
+        return Ok(response);
+    }
+
     let shard_index = state.get_shard(&key);
     let sender = &state.shard_senders[shard_index];
 
@@ -725,15 +907,13 @@ async fn handle_set(
                 "Failed to send ASYNC SET operation to shard {}",
                 shard_index
             );
-            let response = BytesFrame::Error("ERR internal error".into());
-            stream.write_all(&serialize_frame(&response)).await?;
             state.metrics.record_error("storage");
+            Ok(BytesFrame::Error("ERR internal error".into()))
         } else {
             state.metrics.value_size_set_bytes.record(value_len);
             state.metrics.stored_value_size_set_bytes.record(stored_len);
-            let response = BytesFrame::SimpleString("OK".into());
-            stream.write_all(&serialize_frame(&response)).await?;
             state.metrics.record_storage_operation();
+            Ok(BytesFrame::SimpleString("OK".into()))
         }
     } else {
         // Calculate expires_at timestamp if TTL is provided
@@ -751,35 +931,29 @@ async fn handle_set(
 
         if sender.send(operation).await.is_err() {
             tracing::error!("Failed to send SET operation to shard {}", shard_index);
-            let response = BytesFrame::Error("ERR internal error".into());
-            stream.write_all(&serialize_frame(&response)).await?;
             state.metrics.record_error("storage");
+            Ok(BytesFrame::Error("ERR internal error".into()))
         } else {
             match responder_rx.await {
                 Ok(Ok(())) => {
                     state.metrics.value_size_set_bytes.record(value_len);
                     state.metrics.stored_value_size_set_bytes.record(stored_len);
-                    let response = BytesFrame::SimpleString("OK".into());
-                    stream.write_all(&serialize_frame(&response)).await?;
                     state.metrics.record_storage_operation();
+                    Ok(BytesFrame::SimpleString("OK".into()))
                 }
                 Ok(Err(e)) => {
                     tracing::error!("Shard writer failed for SET: {}", e);
-                    let response = BytesFrame::Error("ERR database error".into());
-                    stream.write_all(&serialize_frame(&response)).await?;
                     state.metrics.record_error("storage");
+                    Ok(BytesFrame::Error("ERR database error".into()))
                 }
                 Err(_) => {
                     tracing::error!("Shard writer task cancelled or panicked for SET");
-                    let response = BytesFrame::Error("ERR internal error".into());
-                    stream.write_all(&serialize_frame(&response)).await?;
                     state.metrics.record_error("storage");
+                    Ok(BytesFrame::Error("ERR internal error".into()))
                 }
             }
         }
     }
-
-    Ok(())
 }
 
 async fn handle_del_multiple(
@@ -795,6 +969,12 @@ async fn handle_del_multiple(
 /// DEL's reply. Like every command that takes key locks, it releases them
 /// before the reply is written, so a client slow to read can't hold them.
 async fn del_reply(state: &Arc<AppState>, mut keys: Vec<String>) -> BytesFrame {
+    let slots: Vec<u16> = keys
+        .iter()
+        .map(|key| ClusterManager::calculate_slot(key))
+        .collect();
+    let _write_guard = state.enter_write(&slots).await;
+
     // Route every key before deleting any, so a redirect or unserved slot leaves them all.
     for key in &keys {
         if let Err(response) = check_key_route(state, key).await {
@@ -900,6 +1080,7 @@ async fn handle_exists(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
     key: String,
+    gate: Option<RwLockReadGuard<'_, ()>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let read_ts = chrono::Utc::now().timestamp();
 
@@ -916,14 +1097,14 @@ async fn handle_exists(
     let shard_index = state.get_shard(&key);
     let pool = &state.db_pools[shard_index];
 
-    match sqlx::query(
-        "SELECT 1 FROM blobs WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
-    )
-    .bind(&key)
-    .bind(read_ts)
-    .fetch_optional(pool)
-    .await
-    {
+    let fetched =
+        sqlx::query("SELECT 1 FROM blobs WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)")
+            .bind(&key)
+            .bind(read_ts)
+            .fetch_optional(pool)
+            .await;
+    drop(gate);
+    match fetched {
         Ok(Some(_)) => {
             let response = BytesFrame::Integer(1);
             stream.write_all(&serialize_frame(&response)).await?;
@@ -1032,10 +1213,87 @@ async fn handle_info(
     Ok(())
 }
 
-async fn handle_command(stream: &mut TcpStream) -> Result<(), Box<dyn std::error::Error>> {
-    // Return a minimal COMMAND response - just an empty array for now
-    // A full implementation would return detailed command information
-    let response = BytesFrame::Array(vec![]);
+/// COMMAND metadata: name, arity, flags, first key, last key, key step.
+type CommandInfo = (&'static str, i64, &'static [&'static str], i64, i64, i64);
+
+/// Cluster clients route by the first key and send only `readonly` commands to
+/// replicas. Hash commands that Blobasaur routes by field (HGET, HEXISTS, HSET,
+/// HDEL) use position 2. The field position of HSETEX, HEXPIRE and HEXPIREAT
+/// depends on their options, so they stay at 1.
+#[rustfmt::skip]
+const COMMANDS: &[CommandInfo] = &[
+    ("get", 2, &["readonly", "fast"], 1, 1, 1),
+    ("set", -3, &["write", "denyoom"], 1, 1, 1),
+    ("del", -2, &["write"], 1, -1, 1),
+    ("exists", 2, &["readonly", "fast"], 1, 1, 1),
+    ("ttl", 2, &["readonly", "fast"], 1, 1, 1),
+    ("expire", 3, &["write", "fast"], 1, 1, 1),
+    ("hget", 3, &["readonly", "fast"], 2, 2, 1),
+    ("hexists", 3, &["readonly", "fast"], 2, 2, 1),
+    ("hset", 4, &["write", "denyoom", "fast"], 2, 2, 1),
+    ("hdel", 3, &["write", "fast"], 2, 2, 1),
+    ("hsetex", -6, &["write", "denyoom", "fast"], 1, 1, 1),
+    ("hexpire", -6, &["write", "fast"], 1, 1, 1),
+    ("hexpireat", -6, &["write", "fast"], 1, 1, 1),
+    ("ping", -1, &["fast"], 0, 0, 0),
+    ("info", -1, &[], 0, 0, 0),
+    ("command", -1, &[], 0, 0, 0),
+    ("cluster", -2, &[], 0, 0, 0),
+    ("hello", -1, &["fast"], 0, 0, 0),
+    ("client", -2, &[], 0, 0, 0),
+    ("quit", -1, &["fast"], 0, 0, 0),
+    ("readonly", 1, &["fast"], 0, 0, 0),
+    ("readwrite", 1, &["fast"], 0, 0, 0),
+    ("blobasaur.vacuum", -7, &["admin"], 0, 0, 0),
+    ("blobasaur.watermark", 1, &["admin"], 0, 0, 0),
+];
+
+fn command_info_frame(info: &CommandInfo) -> BytesFrame {
+    let (name, arity, flags, first_key, last_key, step) = *info;
+    BytesFrame::Array(vec![
+        BytesFrame::BulkString(name.into()),
+        BytesFrame::Integer(arity),
+        BytesFrame::Array(
+            flags
+                .iter()
+                .map(|flag| BytesFrame::SimpleString((*flag).into()))
+                .collect(),
+        ),
+        BytesFrame::Integer(first_key),
+        BytesFrame::Integer(last_key),
+        BytesFrame::Integer(step),
+    ])
+}
+
+async fn handle_command(
+    stream: &mut TcpStream,
+    args: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let subcommand = args
+        .first()
+        .map_or("INFO".to_string(), |arg| arg.to_ascii_uppercase());
+    let response = match subcommand.as_str() {
+        "INFO" if args.len() <= 1 => {
+            BytesFrame::Array(COMMANDS.iter().map(command_info_frame).collect())
+        }
+        "COUNT" if args.len() == 1 => BytesFrame::Integer(COMMANDS.len() as i64),
+        "COUNT" => {
+            BytesFrame::Error("ERR wrong number of arguments for 'command|count' command".into())
+        }
+        "DOCS" => BytesFrame::Array(vec![]),
+        "INFO" => BytesFrame::Array(
+            args[1..]
+                .iter()
+                .map(|name| {
+                    COMMANDS
+                        .iter()
+                        .find(|info| info.0.eq_ignore_ascii_case(name))
+                        .map_or(BytesFrame::Null, command_info_frame)
+                })
+                .collect(),
+        ),
+        _ => BytesFrame::Error(format!("ERR unknown subcommand '{}'", args[0]).into()),
+    };
     stream.write_all(&serialize_frame(&response)).await?;
     Ok(())
 }
@@ -1190,6 +1448,7 @@ async fn hash_field_live_expires_at(
 async fn handle_hget(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
+    conn_readonly: bool,
     namespace: String,
     key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1197,9 +1456,15 @@ async fn handle_hget(
         return Ok(());
     }
 
+    let mut gate = state
+        .replica_read_gate(state.get_shard(&key), conn_readonly)
+        .await;
     // Check if we should handle this hash operation locally in a cluster
-    if let Err(response) = check_hash_route(state, &namespace, &key).await {
-        stream.write_all(&serialize_frame(&response)).await?;
+    if !route_read_or_reply(stream, state, true, conn_readonly, &mut gate, |cm| {
+        cm.calculate_slot_for_hash(&namespace, &key)
+    })
+    .await?
+    {
         return Ok(());
     }
 
@@ -1246,13 +1511,14 @@ async fn handle_hget(
         .bind(&key)
         .bind(read_ts);
     let shard_metrics = &state.shard_senders[shard_index].metrics;
-    match async {
+    let fetched = async {
         query
             .fetch_optional(&mut *shard_metrics.acquire(pool, "read").await?)
             .await
     }
-    .await
-    {
+    .await;
+    drop(gate);
+    match fetched {
         Ok(Some(row)) => {
             state.metrics.record_read("hget", "sqlite", "hit");
             // Decompress if needed
@@ -1308,6 +1574,9 @@ async fn hset_reply(
     key: String,
     value: Bytes,
 ) -> Result<BytesFrame, Box<dyn std::error::Error>> {
+    let slot = hash_slot(state, &namespace, &key);
+    let _write_guard = state.enter_write(&[slot]).await;
+
     // Check if we should handle this hash operation locally in a cluster
     if let Err(response) = check_hash_route(state, &namespace, &key).await {
         return Ok(response);
@@ -1447,6 +1716,12 @@ async fn hsetex_reply(
     fields: Vec<(String, Bytes)>,
 ) -> Result<BytesFrame, Box<dyn std::error::Error>> {
     use crate::redis::protocol::ExpireOption;
+
+    let slots: Vec<u16> = fields
+        .iter()
+        .map(|(field_key, _)| hash_slot(state, &namespace, field_key))
+        .collect();
+    let _write_guard = state.enter_write(&slots).await;
 
     // Route every field before locking or checking FNX/FXX, so a redirect or
     // unserved slot leaves the hash untouched and isn't masked by another field.
@@ -1660,6 +1935,9 @@ async fn handle_hdel(
 
 /// HDEL's reply; it releases its key lock before the reply is written, as DEL.
 async fn hdel_reply(state: &Arc<AppState>, namespace: String, key: String) -> BytesFrame {
+    let slot = hash_slot(state, &namespace, &key);
+    let _write_guard = state.enter_write(&[slot]).await;
+
     // Check if we should handle this hash operation locally in a cluster
     if let Err(response) = check_hash_route(state, &namespace, &key).await {
         return response;
@@ -1765,6 +2043,7 @@ async fn delete_hash_field(
 async fn handle_hexists(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
+    conn_readonly: bool,
     namespace: String,
     key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1772,9 +2051,15 @@ async fn handle_hexists(
         return Ok(());
     }
 
+    let mut gate = state
+        .replica_read_gate(state.get_shard(&key), conn_readonly)
+        .await;
     // Check if we should handle this hash operation locally in a cluster
-    if let Err(response) = check_hash_route(state, &namespace, &key).await {
-        stream.write_all(&serialize_frame(&response)).await?;
+    if !route_read_or_reply(stream, state, true, conn_readonly, &mut gate, |cm| {
+        cm.calculate_slot_for_hash(&namespace, &key)
+    })
+    .await?
+    {
         return Ok(());
     }
 
@@ -1803,12 +2088,13 @@ async fn handle_hexists(
         table_name
     );
 
-    match sqlx::query(&query)
+    let fetched = sqlx::query(&query)
         .bind(&key)
         .bind(read_ts)
         .fetch_optional(pool)
-        .await
-    {
+        .await;
+    drop(gate);
+    match fetched {
         Ok(Some(_)) => {
             let response = BytesFrame::Integer(1);
             stream.write_all(&serialize_frame(&response)).await?;
@@ -1937,6 +2223,12 @@ async fn hexpire_reply(
     condition: Option<HExpireCondition>,
     fields: Vec<String>,
 ) -> BytesFrame {
+    let slots: Vec<u16> = fields
+        .iter()
+        .map(|field_key| hash_slot(state, &namespace, field_key))
+        .collect();
+    let _write_guard = state.enter_write(&slots).await;
+
     // Route every field before expiring any, so a redirect or unserved slot leaves them all.
     for field_key in &fields {
         if let Err(response) = check_hash_route(state, &namespace, field_key).await {
@@ -1996,6 +2288,19 @@ async fn hexpire_reply(
 }
 
 // Cluster command handlers
+async fn handle_cluster_myid(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = if let Some(ref cluster_manager) = state.cluster_manager {
+        BytesFrame::BulkString(cluster_manager.node_id().to_string().into())
+    } else {
+        BytesFrame::Error("ERR This instance has cluster support disabled".into())
+    };
+    stream.write_all(&serialize_frame(&response)).await?;
+    Ok(())
+}
+
 async fn handle_cluster_nodes(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
@@ -2027,87 +2332,106 @@ async fn handle_cluster_info(
     Ok(())
 }
 
+/// Redis CLUSTER SLOTS format: `[start, end, [ip, port, node_id]]` per range.
+fn cluster_slots_frame(ranges: &[SlotRange]) -> BytesFrame {
+    BytesFrame::Array(
+        ranges
+            .iter()
+            .map(|range| {
+                let node = |ip: &str, port: u16, id: &str| {
+                    BytesFrame::Array(vec![
+                        BytesFrame::BulkString(ip.to_string().into()),
+                        BytesFrame::Integer(port as i64),
+                        BytesFrame::BulkString(id.to_string().into()),
+                    ])
+                };
+                // The primary, then its replicas.
+                let mut entry = vec![
+                    BytesFrame::Integer(range.start as i64),
+                    BytesFrame::Integer(range.end as i64),
+                    node(&range.ip, range.port, &range.node_id),
+                ];
+                entry.extend(
+                    range
+                        .replicas
+                        .iter()
+                        .map(|(ip, port, id)| node(ip, *port, id)),
+                );
+                BytesFrame::Array(entry)
+            })
+            .collect(),
+    )
+}
+
 async fn handle_cluster_slots(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(ref cluster_manager) = state.cluster_manager {
-        let local_slots = cluster_manager.get_local_slots().await;
-
-        // Build Redis CLUSTER SLOTS response
-        // Format: Array of [start_slot, end_slot, [master_ip, master_port]]
-        let mut slot_ranges = Vec::new();
-
-        if !local_slots.is_empty() {
-            let mut sorted_slots: Vec<u16> = local_slots.iter().copied().collect();
-            sorted_slots.sort();
-
-            let mut start = sorted_slots[0];
-            let mut end = sorted_slots[0];
-
-            for &slot in &sorted_slots[1..] {
-                if slot == end + 1 {
-                    end = slot;
-                } else {
-                    // Add completed range
-                    let advertise_addr = state
-                        .cfg
-                        .cluster
-                        .as_ref()
-                        .and_then(|c| c.advertise_addr.clone())
-                        .unwrap_or("127.0.0.1:6379".to_string());
-                    let parts: Vec<&str> = advertise_addr.split(':').collect();
-                    let ip = parts.first().cloned().unwrap_or("127.0.0.1").to_string();
-                    let port = parts
-                        .get(1)
-                        .and_then(|p| p.parse::<i64>().ok())
-                        .unwrap_or(6379);
-
-                    let range = BytesFrame::Array(vec![
-                        BytesFrame::Integer(start as i64),
-                        BytesFrame::Integer(end as i64),
-                        BytesFrame::Array(vec![
-                            BytesFrame::BulkString(ip.into()),
-                            BytesFrame::Integer(port),
-                        ]),
-                    ]);
-                    slot_ranges.push(range);
-                    start = slot;
-                    end = slot;
-                }
-            }
-
-            let advertise_addr = state
-                .cfg
-                .cluster
-                .as_ref()
-                .and_then(|c| c.advertise_addr.clone())
-                .unwrap_or("127.0.0.1:6379".to_string());
-            let parts: Vec<&str> = advertise_addr.split(':').collect();
-            let ip = parts.first().cloned().unwrap_or("127.0.0.1").to_string();
-            let port = parts
-                .get(1)
-                .and_then(|p| p.parse::<i64>().ok())
-                .unwrap_or(6379);
-
-            // Add the last range
-            let range = BytesFrame::Array(vec![
-                BytesFrame::Integer(start as i64),
-                BytesFrame::Integer(end as i64),
-                BytesFrame::Array(vec![
-                    BytesFrame::BulkString(ip.into()),
-                    BytesFrame::Integer(port),
-                ]),
-            ]);
-            slot_ranges.push(range);
-        }
-
-        let response = BytesFrame::Array(slot_ranges);
-        stream.write_all(&serialize_frame(&response)).await?;
+    let response = if let Some(ref cluster_manager) = state.cluster_manager {
+        cluster_slots_frame(&cluster_manager.get_cluster_slots().await)
     } else {
-        let response = BytesFrame::Error("ERR This instance has cluster support disabled".into());
-        stream.write_all(&serialize_frame(&response)).await?;
-    }
+        BytesFrame::Error("ERR This instance has cluster support disabled".into())
+    };
+    stream.write_all(&serialize_frame(&response)).await?;
+    Ok(())
+}
+
+/// Redis 7 CLUSTER SHARDS reply in RESP2: array of alternating key/value arrays
+/// with `"slots"` (`[start, end, ...]`) and `"nodes"` (array of node maps).
+fn cluster_shards_frame(shards: &[ClusterShard]) -> BytesFrame {
+    let bulk = |s: &str| BytesFrame::BulkString(s.to_string().into());
+    BytesFrame::Array(
+        shards
+            .iter()
+            .map(|shard| {
+                let mut slot_items = Vec::with_capacity(shard.slots.len() * 2);
+                for &(start, end) in &shard.slots {
+                    slot_items.push(BytesFrame::Integer(start as i64));
+                    slot_items.push(BytesFrame::Integer(end as i64));
+                }
+                let node_items = shard
+                    .nodes
+                    .iter()
+                    .map(|node| {
+                        BytesFrame::Array(vec![
+                            bulk("id"),
+                            bulk(&node.id),
+                            bulk("port"),
+                            BytesFrame::Integer(node.port as i64),
+                            bulk("ip"),
+                            bulk(&node.ip),
+                            bulk("endpoint"),
+                            bulk(&node.endpoint),
+                            bulk("role"),
+                            bulk(node.role),
+                            bulk("replication-offset"),
+                            BytesFrame::Integer(node.replication_offset),
+                            bulk("health"),
+                            bulk(node.health),
+                        ])
+                    })
+                    .collect();
+                BytesFrame::Array(vec![
+                    bulk("slots"),
+                    BytesFrame::Array(slot_items),
+                    bulk("nodes"),
+                    BytesFrame::Array(node_items),
+                ])
+            })
+            .collect(),
+    )
+}
+
+async fn handle_cluster_shards(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = if let Some(ref cluster_manager) = state.cluster_manager {
+        cluster_shards_frame(&cluster_manager.get_cluster_shards().await)
+    } else {
+        BytesFrame::Error("ERR This instance has cluster support disabled".into())
+    };
+    stream.write_all(&serialize_frame(&response)).await?;
     Ok(())
 }
 
@@ -2124,7 +2448,7 @@ async fn handle_cluster_addslots(
             }
             Err(e) => {
                 tracing::error!("Failed to add slots: {}", e);
-                let response = BytesFrame::Error("ERR failed to add slots".into());
+                let response = BytesFrame::Error(e.to_string().into());
                 stream.write_all(&serialize_frame(&response)).await?;
             }
         }
@@ -2148,7 +2472,7 @@ async fn handle_cluster_delslots(
             }
             Err(e) => {
                 tracing::error!("Failed to remove slots: {}", e);
-                let response = BytesFrame::Error("ERR failed to remove slots".into());
+                let response = BytesFrame::Error(e.to_string().into());
                 stream.write_all(&serialize_frame(&response)).await?;
             }
         }
@@ -2169,10 +2493,93 @@ async fn handle_cluster_keyslot(
     Ok(())
 }
 
+async fn handle_cluster_failover(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+    mode: ClusterFailoverMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = if state.cluster_manager.is_none() {
+        BytesFrame::Error("ERR This instance has cluster support disabled".into())
+    } else {
+        match mode {
+            ClusterFailoverMode::Default => match state.start_manual_failover().await {
+                Ok(()) => BytesFrame::SimpleString("OK".into()),
+                Err(e) => BytesFrame::Error(e.into()),
+            },
+            ClusterFailoverMode::Force => match state.promote_failover_force().await {
+                Ok(()) => BytesFrame::SimpleString("OK".into()),
+                Err(e) => BytesFrame::Error(e.into()),
+            },
+            ClusterFailoverMode::Takeover => match state.promote_takeover().await {
+                Ok(()) => BytesFrame::SimpleString("OK".into()),
+                Err(e) => BytesFrame::Error(e.into()),
+            },
+        }
+    };
+    stream.write_all(&serialize_frame(&response)).await?;
+    Ok(())
+}
+
+async fn handle_blobasaur_failover_auth(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+    req: crate::cluster::FailoverAuthRequest,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = match state.cluster_manager.as_ref() {
+        None => BytesFrame::Error("ERR This instance has cluster support disabled".into()),
+        Some(cluster) => match cluster.handle_failover_auth(&req).await {
+            Ok(epoch) => BytesFrame::SimpleString(format!("VOTE {epoch}").into()),
+            Err(reason) => BytesFrame::Error(format!("ERR {reason}").into()),
+        },
+    };
+    stream.write_all(&serialize_frame(&response)).await?;
+    Ok(())
+}
+
+async fn handle_blobasaur_mfstart(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+    replica_id: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = match state.handle_manual_failover_start(&replica_id).await {
+        Ok(shards) => watermark_reply_frame(shards),
+        Err(e) => BytesFrame::Error(e.into()),
+    };
+    stream.write_all(&serialize_frame(&response)).await?;
+    Ok(())
+}
+
+async fn handle_blobasaur_mfabort(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+    replica_id: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = match state.handle_manual_failover_abort(&replica_id).await {
+        Ok(()) => BytesFrame::SimpleString("OK".into()),
+        Err(e) => BytesFrame::Error(e.into()),
+    };
+    stream.write_all(&serialize_frame(&response)).await?;
+    Ok(())
+}
+
+async fn handle_cluster_replicate(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+    node_id: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = match state.replicate_node(node_id).await {
+        Ok(()) => BytesFrame::SimpleString("OK".into()),
+        Err(e) => BytesFrame::Error(e.into()),
+    };
+    stream.write_all(&serialize_frame(&response)).await?;
+    Ok(())
+}
+
 async fn handle_ttl(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
     key: String,
+    gate: Option<RwLockReadGuard<'_, ()>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let now = chrono::Utc::now();
 
@@ -2197,14 +2604,15 @@ async fn handle_ttl(
     let shard_index = state.get_shard(&key);
     let pool = &state.db_pools[shard_index];
 
-    match sqlx::query_as::<_, (Option<i64>,)>(
+    let fetched = sqlx::query_as::<_, (Option<i64>,)>(
         "SELECT expires_at FROM blobs WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)",
     )
     .bind(&key)
     .bind(now.timestamp())
     .fetch_optional(pool)
-    .await
-    {
+    .await;
+    drop(gate);
+    match fetched {
         Ok(Some((expires_at,))) => {
             let ttl = match expires_at {
                 // Counted from `now` rounded up, as expiry_from sets it, so
@@ -2245,6 +2653,12 @@ async fn handle_expire(
 /// EXPIRE's reply; it releases its key lock before the reply is written, as
 /// DEL.
 async fn expire_reply(state: &Arc<AppState>, key: String, seconds: u64) -> BytesFrame {
+    let slot = ClusterManager::calculate_slot(&key);
+    let _write_guard = state.enter_write(&[slot]).await;
+    if let Err(response) = check_key_route(state, &key).await {
+        return response;
+    }
+
     let shard_index = state.get_shard(&key);
     let sender = &state.shard_senders[shard_index];
 
@@ -2500,6 +2914,42 @@ fn client_disconnected(stream: &TcpStream) -> bool {
     }
 }
 
+fn watermark_reply_frame(shards: Vec<(String, String)>) -> BytesFrame {
+    BytesFrame::Array(
+        shards
+            .into_iter()
+            .enumerate()
+            .map(|(shard, (replid, lsn))| {
+                BytesFrame::Array(vec![
+                    BytesFrame::Integer(shard as i64),
+                    BytesFrame::BulkString(replid.into()),
+                    BytesFrame::BulkString(lsn.into()),
+                ])
+            })
+            .collect(),
+    )
+}
+
+async fn handle_blobasaur_watermark(
+    stream: &mut TcpStream,
+    state: &Arc<AppState>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let shards = if state.cfg.replication_enabled() {
+        futures::future::try_join_all(
+            (0..state.shard_senders.len()).map(|shard| replication::shard_watermark(state, shard)),
+        )
+        .await
+    } else {
+        Err(miette::miette!("replication is not enabled"))
+    };
+    let response = match shards {
+        Ok(shards) => watermark_reply_frame(shards),
+        Err(e) => BytesFrame::Error(format!("ERR {}", e).into()),
+    };
+    stream.write_all(&serialize_frame(&response)).await?;
+    Ok(())
+}
+
 async fn handle_blobasaur_vacuum(
     stream: &mut TcpStream,
     state: &Arc<AppState>,
@@ -2679,12 +3129,14 @@ mod tests {
                 batch_timeout_ms: Some(0),
                 write_queue_capacity: None,
                 addr: None,
+                replication: None,
                 cluster: None,
                 metrics: None,
                 shutdown_timeout_secs: None,
                 max_request_size_mb: None,
                 cleanup_chunk_size: None,
                 cleanup_interval_secs: None,
+                new_replid: false,
                 sqlite: None,
             };
 
@@ -2733,6 +3185,8 @@ mod tests {
                             inflight_hcache: state.inflight_hcache.clone(),
                             metrics: state.metrics.clone(),
                             key_count: state.shard_key_counts[i].clone(),
+                            commit_watch: state.commit_watch[i].clone(),
+                            replication: state.cfg.replication_enabled(),
                             shutdown: CancellationToken::new(),
                         },
                     )));
@@ -2762,12 +3216,14 @@ mod tests {
             batch_timeout_ms: Some(0),
             write_queue_capacity: None,
             addr: None,
+            replication: None,
             cluster: None,
             metrics: None,
             shutdown_timeout_secs: None,
             max_request_size_mb: None,
             cleanup_chunk_size: None,
             cleanup_interval_secs: None,
+            new_replid: false,
             sqlite: Some(SqliteConfig {
                 cache_size_mb: None,
                 busy_timeout_ms: Some(250),
@@ -2864,6 +3320,118 @@ mod tests {
             }
             other => panic!("Expected error containing {}, got {:?}", expected, other),
         }
+    }
+
+    fn text(frame: &BytesFrame) -> String {
+        match frame {
+            BytesFrame::BulkString(s) | BytesFrame::SimpleString(s) => {
+                String::from_utf8_lossy(s).into_owned()
+            }
+            other => panic!("Expected string, got {:?}", other),
+        }
+    }
+
+    fn int(frame: &BytesFrame) -> i64 {
+        match frame {
+            BytesFrame::Integer(v) => *v,
+            other => panic!("Expected integer, got {:?}", other),
+        }
+    }
+
+    fn items(frame: &BytesFrame) -> &[BytesFrame] {
+        match frame {
+            BytesFrame::Array(items) => items,
+            other => panic!("Expected array, got {:?}", other),
+        }
+    }
+
+    async fn command_reply(ctx: &TestContext, args: &[&str]) -> BytesFrame {
+        let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+        respond_with(ctx, |_, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_command(&mut stream, &args).await
+            })
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn command_reply_has_routing_metadata() {
+        let ctx = TestContext::new(false).await;
+
+        let reply = command_reply(&ctx, &[]).await;
+        assert_eq!(items(&reply).len(), COMMANDS.len());
+        for entry in items(&reply) {
+            assert_eq!(items(entry).len(), 6);
+        }
+
+        // name, arity, flags, first key, last key, step
+        let info = command_reply(&ctx, &["INFO", "HGET", "nosuch", "get"]).await;
+        let [hget, missing, get] = items(&info) else {
+            panic!("expected 3 entries, got {:?}", info);
+        };
+        let hget = items(hget);
+        assert_eq!(text(&hget[0]), "hget");
+        assert_eq!(int(&hget[1]), 3);
+        assert_eq!(text(&items(&hget[2])[0]), "readonly");
+        assert_eq!(
+            (int(&hget[3]), int(&hget[4]), int(&hget[5])),
+            (2, 2, 1),
+            "HGET is routed by its field"
+        );
+        assert_null(missing.clone());
+        assert_eq!(text(&items(get)[0]), "get");
+
+        // Reads are the only commands go-redis may send to a replica.
+        let readonly: Vec<&str> = COMMANDS
+            .iter()
+            .filter(|c| c.2.contains(&"readonly"))
+            .map(|c| c.0)
+            .collect();
+        assert_eq!(readonly, ["get", "exists", "ttl", "hget", "hexists"]);
+        let key_pos = |name: &str| COMMANDS.iter().find(|c| c.0 == name).unwrap().3;
+        for name in ["hset", "hdel", "hexists"] {
+            assert_eq!(key_pos(name), 2, "{name}");
+        }
+        for name in ["hsetex", "hexpire", "hexpireat"] {
+            assert_eq!(key_pos(name), 1, "{name}");
+        }
+
+        assert_integer_response(command_reply(&ctx, &["count"]).await, COMMANDS.len() as i64);
+        assert_array_len(command_reply(&ctx, &["DOCS"]).await, 0);
+        assert_error_contains(command_reply(&ctx, &["nope"]).await, "unknown subcommand");
+
+        ctx.shutdown().await;
+    }
+
+    #[test]
+    fn cluster_slots_frame_matches_redis_format() {
+        let ranges = [SlotRange {
+            start: 0,
+            end: 5460,
+            node_id: "node-1".to_string(),
+            ip: "10.0.0.1".to_string(),
+            port: 6379,
+            replicas: vec![("10.0.0.2".to_string(), 6380, "node-1b".to_string())],
+        }];
+
+        let frame = cluster_slots_frame(&ranges);
+        let [range] = items(&frame) else {
+            panic!("expected one range, got {:?}", frame);
+        };
+        let range = items(range);
+        assert_eq!((int(&range[0]), int(&range[1])), (0, 5460));
+        let node = items(&range[2]);
+        assert_eq!(text(&node[0]), "10.0.0.1");
+        assert_eq!(int(&node[1]), 6379);
+        assert_eq!(text(&node[2]), "node-1");
+        // The replica follows the primary.
+        assert_eq!(range.len(), 4);
+        let replica = items(&range[3]);
+        assert_eq!(text(&replica[0]), "10.0.0.2");
+        assert_eq!(int(&replica[1]), 6380);
+        assert_eq!(text(&replica[2]), "node-1b");
     }
 
     #[test]
@@ -3017,7 +3585,7 @@ mod tests {
     async fn hget_value(ctx: &TestContext, namespace: &str, field: &str) -> BytesFrame {
         let (namespace, field) = (namespace.to_string(), field.to_string());
         respond_with(ctx, |state, mut stream| {
-            Box::pin(async move { handle_hget(&mut stream, &state, namespace, field).await })
+            Box::pin(async move { handle_hget(&mut stream, &state, false, namespace, field).await })
         })
         .await
     }
@@ -3319,14 +3887,14 @@ mod tests {
             // HEXISTS and HEXPIRE stay isolated too.
             let frame = respond_with(&ctx, |state, mut stream| {
                 Box::pin(async move {
-                    handle_hexists(&mut stream, &state, "users".into(), "alice".into()).await
+                    handle_hexists(&mut stream, &state, false, "users".into(), "alice".into()).await
                 })
             })
             .await;
             assert_integer_response(frame, 0);
             let frame = respond_with(&ctx, |state, mut stream| {
                 Box::pin(async move {
-                    handle_hexists(&mut stream, &state, "Users".into(), "alice".into()).await
+                    handle_hexists(&mut stream, &state, false, "Users".into(), "alice".into()).await
                 })
             })
             .await;
@@ -3700,6 +4268,7 @@ mod tests {
                 handle_hget(
                     &mut stream,
                     &state,
+                    false,
                     "has-dash".to_string(),
                     "field".to_string(),
                 )
@@ -3730,6 +4299,7 @@ mod tests {
                 handle_hexists(
                     &mut stream,
                     &state,
+                    false,
                     "has-dash".to_string(),
                     "field".to_string(),
                 )
@@ -3783,7 +4353,7 @@ mod tests {
         let frame = respond_with(&ctx, |state, stream| {
             Box::pin(async move {
                 let mut stream = stream;
-                handle_get(&mut stream, &state, "k1".to_string()).await
+                handle_get(&mut stream, &state, "k1".to_string(), None).await
             })
         })
         .await;
@@ -3792,7 +4362,7 @@ mod tests {
         let frame = respond_with(&ctx, |state, stream| {
             Box::pin(async move {
                 let mut stream = stream;
-                handle_get(&mut stream, &state, "missing".to_string()).await
+                handle_get(&mut stream, &state, "missing".to_string(), None).await
             })
         })
         .await;
@@ -4189,6 +4759,7 @@ mod tests {
                 handle_hget(
                     &mut stream,
                     &state,
+                    false,
                     "never_written".to_string(),
                     "f".to_string(),
                 )
@@ -4203,6 +4774,7 @@ mod tests {
                 handle_hexists(
                     &mut stream,
                     &state,
+                    false,
                     "never_written".to_string(),
                     "f".to_string(),
                 )
@@ -4245,14 +4817,23 @@ mod tests {
             .await;
 
         let frame = respond_with(&ctx, |state, mut stream| {
-            Box::pin(async move { handle_exists(&mut stream, &state, "queued".to_string()).await })
+            Box::pin(
+                async move { handle_exists(&mut stream, &state, "queued".to_string(), None).await },
+            )
         })
         .await;
         assert_integer_response(frame, 1);
 
         let frame = respond_with(&ctx, |state, mut stream| {
             Box::pin(async move {
-                handle_hexists(&mut stream, &state, "ns".to_string(), "field".to_string()).await
+                handle_hexists(
+                    &mut stream,
+                    &state,
+                    false,
+                    "ns".to_string(),
+                    "field".to_string(),
+                )
+                .await
             })
         })
         .await;
@@ -4293,7 +4874,9 @@ mod tests {
         assert_integer_response(frame, 1);
 
         let frame = respond_with(&ctx, |state, mut stream| {
-            Box::pin(async move { handle_exists(&mut stream, &state, "queued".to_string()).await })
+            Box::pin(
+                async move { handle_exists(&mut stream, &state, "queued".to_string(), None).await },
+            )
         })
         .await;
         assert_integer_response(frame, 0);
@@ -4337,17 +4920,17 @@ mod tests {
         .await;
         assert_integer_response(frame, 1);
         let frame = respond_with(&ctx, |state, mut stream| {
-            Box::pin(async move { handle_get(&mut stream, &state, "k".to_string()).await })
+            Box::pin(async move { handle_get(&mut stream, &state, "k".to_string(), None).await })
         })
         .await;
         assert_null(frame);
         let frame = respond_with(&ctx, |state, mut stream| {
-            Box::pin(async move { handle_exists(&mut stream, &state, "k".to_string()).await })
+            Box::pin(async move { handle_exists(&mut stream, &state, "k".to_string(), None).await })
         })
         .await;
         assert_integer_response(frame, 0);
         let frame = respond_with(&ctx, |state, mut stream| {
-            Box::pin(async move { handle_ttl(&mut stream, &state, "k".to_string()).await })
+            Box::pin(async move { handle_ttl(&mut stream, &state, "k".to_string(), None).await })
         })
         .await;
         assert_integer_response(frame, -2);
@@ -4368,14 +4951,28 @@ mod tests {
         assert_integer_response(frame, 1);
         let frame = respond_with(&ctx, |state, mut stream| {
             Box::pin(async move {
-                handle_hget(&mut stream, &state, "ns".to_string(), "f".to_string()).await
+                handle_hget(
+                    &mut stream,
+                    &state,
+                    false,
+                    "ns".to_string(),
+                    "f".to_string(),
+                )
+                .await
             })
         })
         .await;
         assert_null(frame);
         let frame = respond_with(&ctx, |state, mut stream| {
             Box::pin(async move {
-                handle_hexists(&mut stream, &state, "ns".to_string(), "f".to_string()).await
+                handle_hexists(
+                    &mut stream,
+                    &state,
+                    false,
+                    "ns".to_string(),
+                    "f".to_string(),
+                )
+                .await
             })
         })
         .await;
@@ -4431,13 +5028,20 @@ mod tests {
         assert!(!ctx.state.inflight_cache.contains_key("k"));
         assert!(!ctx.state.inflight_hcache.contains_key("ns:f"));
         let frame = respond_with(&ctx, |state, mut stream| {
-            Box::pin(async move { handle_get(&mut stream, &state, "k".to_string()).await })
+            Box::pin(async move { handle_get(&mut stream, &state, "k".to_string(), None).await })
         })
         .await;
         assert_null(frame);
         let frame = respond_with(&ctx, |state, mut stream| {
             Box::pin(async move {
-                handle_hget(&mut stream, &state, "ns".to_string(), "f".to_string()).await
+                handle_hget(
+                    &mut stream,
+                    &state,
+                    false,
+                    "ns".to_string(),
+                    "f".to_string(),
+                )
+                .await
             })
         })
         .await;
@@ -4630,7 +5234,14 @@ mod tests {
     async fn hget_frame(ctx: &TestContext, field: &'static str) -> BytesFrame {
         respond_with(ctx, move |state, mut stream| {
             Box::pin(async move {
-                handle_hget(&mut stream, &state, "ns".to_string(), field.to_string()).await
+                handle_hget(
+                    &mut stream,
+                    &state,
+                    false,
+                    "ns".to_string(),
+                    field.to_string(),
+                )
+                .await
             })
         })
         .await
@@ -4850,7 +5461,7 @@ mod tests {
         let frame = respond_with(&ctx, |state, stream| {
             Box::pin(async move {
                 let mut stream = stream;
-                handle_exists(&mut stream, &state, "absent".to_string()).await
+                handle_exists(&mut stream, &state, "absent".to_string(), None).await
             })
         })
         .await;
@@ -4882,7 +5493,14 @@ mod tests {
         let frame = respond_with(&ctx, |state, stream| {
             Box::pin(async move {
                 let mut stream = stream;
-                handle_hget(&mut stream, &state, "ns".to_string(), "field1".to_string()).await
+                handle_hget(
+                    &mut stream,
+                    &state,
+                    false,
+                    "ns".to_string(),
+                    "field1".to_string(),
+                )
+                .await
             })
         })
         .await;
@@ -4891,7 +5509,14 @@ mod tests {
         let frame = respond_with(&ctx, |state, stream| {
             Box::pin(async move {
                 let mut stream = stream;
-                handle_hexists(&mut stream, &state, "ns".to_string(), "field1".to_string()).await
+                handle_hexists(
+                    &mut stream,
+                    &state,
+                    false,
+                    "ns".to_string(),
+                    "field1".to_string(),
+                )
+                .await
             })
         })
         .await;
@@ -4918,7 +5543,14 @@ mod tests {
         let frame = respond_with(&ctx, |state, stream| {
             Box::pin(async move {
                 let mut stream = stream;
-                handle_hexists(&mut stream, &state, "ns".to_string(), "field1".to_string()).await
+                handle_hexists(
+                    &mut stream,
+                    &state,
+                    false,
+                    "ns".to_string(),
+                    "field1".to_string(),
+                )
+                .await
             })
         })
         .await;
@@ -4927,7 +5559,14 @@ mod tests {
         let frame = respond_with(&ctx, |state, stream| {
             Box::pin(async move {
                 let mut stream = stream;
-                handle_hget(&mut stream, &state, "ns".to_string(), "field1".to_string()).await
+                handle_hget(
+                    &mut stream,
+                    &state,
+                    false,
+                    "ns".to_string(),
+                    "field1".to_string(),
+                )
+                .await
             })
         })
         .await;
@@ -4943,7 +5582,7 @@ mod tests {
         let frame = respond_with(&ctx, |state, stream| {
             Box::pin(async move {
                 let mut stream = stream;
-                handle_ttl(&mut stream, &state, "nope".to_string()).await
+                handle_ttl(&mut stream, &state, "nope".to_string(), None).await
             })
         })
         .await;
@@ -4967,7 +5606,7 @@ mod tests {
         let frame = respond_with(&ctx, |state, stream| {
             Box::pin(async move {
                 let mut stream = stream;
-                handle_ttl(&mut stream, &state, "ttl_key".to_string()).await
+                handle_ttl(&mut stream, &state, "ttl_key".to_string(), None).await
             })
         })
         .await;
@@ -4985,7 +5624,7 @@ mod tests {
         let frame = respond_with(&ctx, |state, stream| {
             Box::pin(async move {
                 let mut stream = stream;
-                handle_ttl(&mut stream, &state, "ttl_key".to_string()).await
+                handle_ttl(&mut stream, &state, "ttl_key".to_string(), None).await
             })
         })
         .await;
@@ -5052,10 +5691,10 @@ mod tests {
         let frame = respond_with(&ctx, |_, stream| {
             Box::pin(async move {
                 let mut stream = stream;
-                handle_command(&mut stream).await
+                handle_command(&mut stream, &[]).await
             })
         });
-        assert_array_len(frame.await, 0);
+        assert_array_len(frame.await, COMMANDS.len());
 
         let frame = respond_with(&ctx, |_, stream| {
             Box::pin(async move {
@@ -5068,9 +5707,14 @@ mod tests {
         let frame = respond_with(&ctx, |state, stream| {
             Box::pin(async move {
                 let mut stream = stream;
-                let _ =
-                    handle_redis_command_inner(&mut stream, &state, &mut None, RedisCommand::Quit)
-                        .await;
+                let _ = handle_redis_command_inner(
+                    &mut stream,
+                    &state,
+                    &mut None,
+                    RedisCommand::Quit,
+                    &mut false,
+                )
+                .await;
                 Ok(())
             })
         });
@@ -5096,6 +5740,7 @@ mod tests {
                         budget_mb: 16,
                         dry_run: true,
                     },
+                    &mut false,
                 )
                 .await
             })
@@ -5145,6 +5790,7 @@ mod tests {
                         budget_mb: 8,
                         dry_run: true,
                     },
+                    &mut false,
                 )
                 .await
             })
@@ -5389,7 +6035,14 @@ mod tests {
         let frame = respond_with(&ctx, |state, stream| {
             Box::pin(async move {
                 let mut stream = stream;
-                handle_hget(&mut stream, &state, "ns".to_string(), "field1".to_string()).await
+                handle_hget(
+                    &mut stream,
+                    &state,
+                    false,
+                    "ns".to_string(),
+                    "field1".to_string(),
+                )
+                .await
             })
         })
         .await;
@@ -5459,7 +6112,14 @@ mod tests {
         let frame = respond_with(&ctx, |state, stream| {
             Box::pin(async move {
                 let mut stream = stream;
-                handle_hget(&mut stream, &state, "ns".to_string(), "field1".to_string()).await
+                handle_hget(
+                    &mut stream,
+                    &state,
+                    false,
+                    "ns".to_string(),
+                    "field1".to_string(),
+                )
+                .await
             })
         })
         .await;
@@ -5508,7 +6168,7 @@ mod tests {
         set_expires_at(&ctx, "blobs", "k", past()).await;
 
         assert_integer_response(run!(ctx, handle_expire("k".into(), 100)), 0);
-        assert_null(run!(ctx, handle_get("k".into())));
+        assert_null(run!(ctx, handle_get("k".into(), None)));
         assert_integer_response(run!(ctx, handle_del_multiple(vec!["k".into()])), 0);
         ctx.shutdown().await;
     }
@@ -5576,7 +6236,7 @@ mod tests {
         respond_with(ctx, |state, stream| {
             Box::pin(async move {
                 let mut stream = stream;
-                handle_redis_command(&mut stream, &state, &mut None, command).await
+                handle_redis_command(&mut stream, &state, &mut None, command, &mut false).await
             })
         })
         .await
@@ -5794,7 +6454,14 @@ mod tests {
         let frame = respond_with(&ctx, |state, stream| {
             Box::pin(async move {
                 let mut stream = stream;
-                handle_hget(&mut stream, &state, "ns".to_string(), "field1".to_string()).await
+                handle_hget(
+                    &mut stream,
+                    &state,
+                    false,
+                    "ns".to_string(),
+                    "field1".to_string(),
+                )
+                .await
             })
         })
         .await;
@@ -5827,6 +6494,22 @@ mod tests {
             Box::pin(async move {
                 let mut stream = stream;
                 handle_cluster_addslots(&mut stream, &state, vec![1, 2, 3]).await
+            })
+        });
+        assert_error_contains(frame.await, "cluster support disabled");
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_cluster_myid(&mut stream, &state).await
+            })
+        });
+        assert_error_contains(frame.await, "cluster support disabled");
+
+        let frame = respond_with(&ctx, |state, stream| {
+            Box::pin(async move {
+                let mut stream = stream;
+                handle_cluster_shards(&mut stream, &state).await
             })
         });
         assert_error_contains(frame.await, "cluster support disabled");
@@ -5869,6 +6552,8 @@ mod tests {
                 max_request_size_mb: None,
                 cleanup_chunk_size: None,
                 cleanup_interval_secs: None,
+                new_replid: false,
+                replication: None,
                 sqlite: Some(SqliteConfig {
                     cache_size_mb: None,
                     busy_timeout_ms: Some(10_000),
@@ -5922,7 +6607,7 @@ mod tests {
                 let frame = respond_with(&ctx, |state, stream| {
                     Box::pin(async move {
                         let mut stream = stream;
-                        handle_get(&mut stream, &state, key).await
+                        handle_get(&mut stream, &state, key, None).await
                     })
                 })
                 .await;
@@ -5963,7 +6648,7 @@ mod tests {
                 let frame = respond_with(&ctx, |state, stream| {
                     Box::pin(async move {
                         let mut stream = stream;
-                        handle_hget(&mut stream, &state, "ns".to_string(), field).await
+                        handle_hget(&mut stream, &state, false, "ns".to_string(), field).await
                     })
                 })
                 .await;
@@ -6012,17 +6697,19 @@ mod tests {
         assert_simple_string(frame, "OK");
 
         let frame = respond_with(&ctx, |state, mut stream| {
-            Box::pin(async move { handle_get(&mut stream, &state, "new".to_string()).await })
+            Box::pin(async move { handle_get(&mut stream, &state, "new".to_string(), None).await })
         })
         .await;
         assert_bulk_string(frame, b"v");
         let frame = respond_with(&ctx, |state, mut stream| {
-            Box::pin(async move { handle_exists(&mut stream, &state, "new".to_string()).await })
+            Box::pin(
+                async move { handle_exists(&mut stream, &state, "new".to_string(), None).await },
+            )
         })
         .await;
         assert_integer_response(frame, 1);
         let frame = respond_with(&ctx, |state, mut stream| {
-            Box::pin(async move { handle_ttl(&mut stream, &state, "new".to_string()).await })
+            Box::pin(async move { handle_ttl(&mut stream, &state, "new".to_string(), None).await })
         })
         .await;
         match frame {
@@ -6046,7 +6733,7 @@ mod tests {
         .await;
         assert_simple_string(frame, "OK");
         let frame = respond_with(&ctx, |state, mut stream| {
-            Box::pin(async move { handle_ttl(&mut stream, &state, "old".to_string()).await })
+            Box::pin(async move { handle_ttl(&mut stream, &state, "old".to_string(), None).await })
         })
         .await;
         assert_integer_response(frame, -1);
@@ -6076,17 +6763,19 @@ mod tests {
             .await;
 
         let frame = respond_with(&ctx, |state, mut stream| {
-            Box::pin(async move { handle_get(&mut stream, &state, "gone".to_string()).await })
+            Box::pin(async move { handle_get(&mut stream, &state, "gone".to_string(), None).await })
         })
         .await;
         assert_null(frame);
         let frame = respond_with(&ctx, |state, mut stream| {
-            Box::pin(async move { handle_exists(&mut stream, &state, "gone".to_string()).await })
+            Box::pin(
+                async move { handle_exists(&mut stream, &state, "gone".to_string(), None).await },
+            )
         })
         .await;
         assert_integer_response(frame, 0);
         let frame = respond_with(&ctx, |state, mut stream| {
-            Box::pin(async move { handle_ttl(&mut stream, &state, "gone".to_string()).await })
+            Box::pin(async move { handle_ttl(&mut stream, &state, "gone".to_string(), None).await })
         })
         .await;
         assert_integer_response(frame, -2);
@@ -6100,14 +6789,28 @@ mod tests {
 
         let frame = respond_with(&ctx, |state, mut stream| {
             Box::pin(async move {
-                handle_hget(&mut stream, &state, "ns".to_string(), "gone_f".to_string()).await
+                handle_hget(
+                    &mut stream,
+                    &state,
+                    false,
+                    "ns".to_string(),
+                    "gone_f".to_string(),
+                )
+                .await
             })
         })
         .await;
         assert_null(frame);
         let frame = respond_with(&ctx, |state, mut stream| {
             Box::pin(async move {
-                handle_hexists(&mut stream, &state, "ns".to_string(), "gone_f".to_string()).await
+                handle_hexists(
+                    &mut stream,
+                    &state,
+                    false,
+                    "ns".to_string(),
+                    "gone_f".to_string(),
+                )
+                .await
             })
         })
         .await;
@@ -6190,7 +6893,7 @@ mod tests {
         wait_for_commit(&ctx.state.inflight_cache, "old").await;
 
         let frame = respond_with(&ctx, |state, mut stream| {
-            Box::pin(async move { handle_ttl(&mut stream, &state, "new".to_string()).await })
+            Box::pin(async move { handle_ttl(&mut stream, &state, "new".to_string(), None).await })
         })
         .await;
         match frame {
@@ -6198,7 +6901,7 @@ mod tests {
             other => panic!("Expected integer TTL, got {other:?}"),
         }
         let frame = respond_with(&ctx, |state, mut stream| {
-            Box::pin(async move { handle_ttl(&mut stream, &state, "old".to_string()).await })
+            Box::pin(async move { handle_ttl(&mut stream, &state, "old".to_string(), None).await })
         })
         .await;
         assert_integer_response(frame, -1);
@@ -6275,17 +6978,17 @@ mod tests {
         assert!(ctx.state.inflight_cache.get("k").await.is_none());
 
         let frame = respond_with(&ctx, |state, mut stream| {
-            Box::pin(async move { handle_get(&mut stream, &state, "k".to_string()).await })
+            Box::pin(async move { handle_get(&mut stream, &state, "k".to_string(), None).await })
         })
         .await;
         assert_null(frame);
         let frame = respond_with(&ctx, |state, mut stream| {
-            Box::pin(async move { handle_exists(&mut stream, &state, "k".to_string()).await })
+            Box::pin(async move { handle_exists(&mut stream, &state, "k".to_string(), None).await })
         })
         .await;
         assert_integer_response(frame, 0);
         let frame = respond_with(&ctx, |state, mut stream| {
-            Box::pin(async move { handle_ttl(&mut stream, &state, "k".to_string()).await })
+            Box::pin(async move { handle_ttl(&mut stream, &state, "k".to_string(), None).await })
         })
         .await;
         assert_integer_response(frame, -2);
@@ -6329,7 +7032,14 @@ mod tests {
         );
         let frame = respond_with(&ctx, |state, mut stream| {
             Box::pin(async move {
-                handle_hget(&mut stream, &state, "ns".to_string(), "f".to_string()).await
+                handle_hget(
+                    &mut stream,
+                    &state,
+                    false,
+                    "ns".to_string(),
+                    "f".to_string(),
+                )
+                .await
             })
         })
         .await;
@@ -6358,7 +7068,9 @@ mod tests {
         .await;
         assert_integer_response(frame, 1);
         let frame = respond_with(&ctx, |state, mut stream| {
-            Box::pin(async move { handle_ttl(&mut stream, &state, "k_ttl".to_string()).await })
+            Box::pin(
+                async move { handle_ttl(&mut stream, &state, "k_ttl".to_string(), None).await },
+            )
         })
         .await;
         match frame {
@@ -6394,7 +7106,7 @@ mod tests {
         let (mut server_stream, client_stream) = tcp_pair().await;
         let state = ctx.state.clone();
         let get_task = tokio::spawn(async move {
-            handle_get(&mut server_stream, &state, "k".to_string())
+            handle_get(&mut server_stream, &state, "k".to_string(), None)
                 .await
                 .unwrap();
         });
@@ -6490,7 +7202,14 @@ mod tests {
         // Before commit, HGET already observes the field as expired (nil).
         let frame = respond_with(&ctx, |state, mut stream| {
             Box::pin(async move {
-                handle_hget(&mut stream, &state, "ns".to_string(), "f".to_string()).await
+                handle_hget(
+                    &mut stream,
+                    &state,
+                    false,
+                    "ns".to_string(),
+                    "f".to_string(),
+                )
+                .await
             })
         })
         .await;
@@ -6507,7 +7226,14 @@ mod tests {
 
         let frame = respond_with(&ctx, |state, mut stream| {
             Box::pin(async move {
-                handle_hget(&mut stream, &state, "ns".to_string(), "f".to_string()).await
+                handle_hget(
+                    &mut stream,
+                    &state,
+                    false,
+                    "ns".to_string(),
+                    "f".to_string(),
+                )
+                .await
             })
         })
         .await;

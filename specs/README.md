@@ -33,6 +33,30 @@ Models Blobasaur's cluster routing and Chitchat gossip protocol (`src/cluster.rs
 - **Safety**: `TypeOK`, `SingleSlotOwner`, `NoOrphanedWrites` (#35), `NoSelfRedirect`, deadlock freedom.
 - **Liveness**: `GossipEventuallyConverges` (`<>[]TopologyConverged`), `RoutingEventuallyAccurate` (`<>[]RoutingAccurate`).
 
+## 3. `Replication.tla`
+
+Models primary -> replica replication for one shard (`src/replication.rs`, the `repl_log` writes in `src/shard_manager.rs`, `REPLICATION.md`):
+
+- **Change index**: one `repl_log` entry per key, `INSERT OR REPLACE` with an `AUTOINCREMENT` LSN, tombstones for `DEL` and expiry cleanup, tombstone trimming bounded by stream pins, and `trimmed_through`.
+- **Handshake** (`can_continue`): `CONTINUE` vs `RESYNC` on replid, `trimmed_through` and the committed watermark.
+- **Stream** (`read_page`): pages of entries after the cursor with their current rows in one read transaction, ending with a watermark at the head of the log.
+- **Replica**: `apply_frames` and `reset` as single transactions, and the replica's own expiry cleanup.
+- **Faults**: dropped connections, primary process crash, primary power loss (commits since the last fsync are lost), replica power loss, graceful stop with the `clean_shutdown` marker, and the boot-id replid rotation in `init_shard`.
+
+Abstractions: one shard, one table, one replica; each write is its own commit; a TTL is expired or not, the same on both clocks.
+
+### Properties verified
+- **Safety**: `TypeOK`, `CaughtUpMeansEqual` (when a replica commits watermark `W`, its live rows equal the primary's live rows as of LSN `W` under the same replid; planned failover relies on this), `ReplicaNeverAhead`, `LsnsUnique`, `SyncedMeansCaughtUp`, `PagesMatchReplid`, `StreamImpliesConnection`, deadlock freedom.
+- **Liveness**: `ReplicaEventuallyConverges` (`<>[]Converged`: once faults and writes stop, the replica is caught up to the primary's watermark with its live rows).
+
+## 4. `Failover.tla`
+
+Models the automatic failover in `FAILOVER.md`, which follows Redis Cluster: `configEpoch`-versioned slot claims in per-node slot tables merged by gossip, FAIL agreement, replica elections voted by a majority of slot-owning primaries (`last_vote_epoch` and a persisted vote backoff), promotion, demotion of a returning primary, and re-pointing of the other replicas. Three primaries, two replicas of one of them, crashes, restarts, partitions and aborted elections. FAIL can be marked only while a majority of primaries can't reach the node; data is not modeled.
+
+### Properties verified
+- **Safety**: `TypeOK`, `OneWinnerPerEpoch`, `WinnerReplacesCurrentOwner` (a winner never takes slots from a superseded claim, which would drop the current owner's writes), `UniqueClaims`, `TableEpochsNeverDecrease` (action property: a returning old primary never takes its slots back).
+- **Liveness**: `EventuallyConverges` (once faults stop, all live nodes agree on the table, every slot has a live primary and every replica is synced; a replica replaces a primary that never returns).
+
 ## Configs
 
 | Spec | Config | Purpose | Expected |
@@ -46,6 +70,23 @@ Models Blobasaur's cluster routing and Chitchat gossip protocol (`src/cluster.rs
 | `ClusterGossip.tla` | `ClusterGossip.cfg` | 3-node cluster with crashes, partitions, slot handoffs — safety + liveness | Pass |
 | `ClusterGossip.tla` | `ClusterGossip_Bug35.cfg` | Enables pre-#35 local fallback on unserved slots | Fails `NoOrphanedWrites` (#35) |
 | `ClusterGossip.tla` | `ClusterGossip_BugPublishRace.cfg` | Enables unlocked `update_gossip_data()` race (`src/cluster.rs:573-628`) | Fails `GossipEventuallyConverges` |
+| `Replication.tla` | `Replication.cfg` | Writes, cleanup, trims, disconnects, crashes and power loss on both sides — safety + liveness | Pass |
+| `Replication.tla` | `Replication_Large.cfg` | Same with 3 writes; about 25 minutes on 16 cores, not in CI (`./specs/check.sh replication-large`) | Pass |
+| `Failover.tla` | `Failover.cfg` | Two replicas competing, one fault, two election epochs — safety | Pass |
+| `Failover.tla` | `Failover_Liveness.cfg` | One replica; `p1` may crash for good — safety + liveness | Pass |
+| `Failover.tla` | `Failover_Large.cfg` | Two faults; about 30 minutes on 16 cores, not in CI (`./specs/check.sh failover-large`) | Pass |
+| `Failover.tla` | `Failover_BugNoVoteBackoff.cfg` | Votes again for the same failed primary before the first winner's claim arrives | Fails `WinnerReplacesCurrentOwner` |
+| `Failover.tla` | `Failover_BugNoSlotEpochCheck.cfg` | Votes without comparing the request's slot epochs | Fails `WinnerReplacesCurrentOwner` |
+| `Failover.tla` | `Failover_BugTableIgnoresEpoch.cfg` | Gossip overwrites slot bindings regardless of epoch | Fails `TableEpochsNeverDecrease` |
+| `Failover.tla` | `Failover_BugVolatileVotes.cfg` | `last_vote_epoch` and the vote backoff lost on restart; about 10 minutes, not in CI | Fails `OneWinnerPerEpoch` |
+| `Replication.tla` | `Replication_BugUpsertKeepsLsn.cfg` | `ON CONFLICT DO UPDATE` instead of `INSERT OR REPLACE`: a rewrite keeps its LSN | Fails `CaughtUpMeansEqual` |
+| `Replication.tla` | `Replication_BugNoAutoincrement.cfg` | `repl_log` without `AUTOINCREMENT` reuses a trimmed tombstone's LSN | Fails `CaughtUpMeansEqual` |
+| `Replication.tla` | `Replication_BugTrimIgnoresPins.cfg` | Trims tombstones above an active stream's cursor | Fails `CaughtUpMeansEqual` |
+| `Replication.tla` | `Replication_BugSkipTrimmedThroughCheck.cfg` | Handshake answers `CONTINUE` to a cursor below `trimmed_through` | Fails `CaughtUpMeansEqual` |
+| `Replication.tla` | `Replication_BugNoReplidRotation.cfg` | Keeps the replid after a power loss | Fails `CaughtUpMeansEqual` |
+| `Replication.tla` | `Replication_BugCommitAfterCleanMarker.cfg` | Writes `clean_shutdown = 1` while the writer can still commit | Fails `CaughtUpMeansEqual` |
+| `Replication.tla` | `Replication_BugVolatileStartupMarker.cfg` | Writes `clean_shutdown = 0` at startup without `synchronous = FULL` | Fails `CaughtUpMeansEqual` |
+| `Replication.tla` | `Replication_BugReplicaCursorNotAtomic.cfg` | Makes `applied_lsn` durable apart from the replica's rows | Fails `CaughtUpMeansEqual` |
 
 ## Running locally
 

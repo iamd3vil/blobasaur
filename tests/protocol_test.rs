@@ -32,6 +32,7 @@ async fn start(max_request_size_mb: Option<u64>) -> Server {
         batch_timeout_ms: None,
         write_queue_capacity: None,
         addr: None,
+        replication: None,
         cluster: None,
         metrics: None,
         sqlite: None,
@@ -39,6 +40,7 @@ async fn start(max_request_size_mb: Option<u64>) -> Server {
         max_request_size_mb,
         cleanup_chunk_size: None,
         cleanup_interval_secs: None,
+        new_replid: false,
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -252,7 +254,7 @@ async fn command_count_and_ping_check_their_arguments() {
     let server = start(None).await;
     assert_eq!(
         server.call(&[b"COMMAND", b"COUNT"]).await.as_deref(),
-        Some(":21")
+        Some(":24")
     );
     for args in [
         [b"COMMAND".as_slice(), b"COUNT", b"extra"],

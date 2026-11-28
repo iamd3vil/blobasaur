@@ -7,28 +7,55 @@ use sqlx::{Connection, SqliteConnection, SqlitePool};
 use std::fs;
 use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
-use tokio::sync::{Mutex, MutexGuard, Semaphore, mpsc};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::time::Duration;
+use tokio::sync::{
+    Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, Semaphore, mpsc, oneshot, watch,
+};
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use crate::compression::{self, Compressor};
 // Import ShardWriteOperation from shard_manager
 use crate::{
-    cluster::ClusterManager,
+    cluster::{
+        CLUSTER_MF_PAUSE_MULT, CLUSTER_MF_TIMEOUT, ClusterManager, PromoteError, PromotionKind,
+        ReplicateCheck, RoleTransition, VoteCollectionOutcome, collect_votes, election_delay,
+        election_timeout, random_jitter_ms, retry_backoff, send_mfabort, send_mfstart,
+    },
     config::Cfg,
     metrics::{Metrics, ShardMetrics},
+    replication,
     shard_manager::{
         ALL_KEY_TABLES_QUERY, Pending, ShardSender, ShardWriteOperation, wal_checkpoint_truncate,
     },
 };
 
-const CREATE_BLOBS_TABLE: &str = "CREATE TABLE IF NOT EXISTS blobs (
+pub(crate) const CREATE_BLOBS_TABLE: &str = "CREATE TABLE IF NOT EXISTS blobs (
     key TEXT PRIMARY KEY,
     data BLOB,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     expires_at INTEGER,
     version INTEGER NOT NULL DEFAULT 0
+)";
+
+/// The change index: one row per key, holding the LSN of its last change.
+/// AUTOINCREMENT keeps LSNs from being reused after a row is deleted, and
+/// writers use INSERT OR REPLACE so a rewritten key gets a new LSN.
+pub(crate) const CREATE_REPL_LOG: &str = "CREATE TABLE IF NOT EXISTS repl_log (
+    lsn INTEGER PRIMARY KEY AUTOINCREMENT,
+    tbl TEXT NOT NULL,
+    key TEXT NOT NULL,
+    deleted INTEGER NOT NULL,
+    at INTEGER NOT NULL,
+    UNIQUE (tbl, key)
+)";
+
+pub(crate) const CREATE_REPL_STATE: &str = "CREATE TABLE IF NOT EXISTS repl_state (
+    k TEXT PRIMARY KEY,
+    v
 )";
 
 #[derive(Hash)]
@@ -63,8 +90,148 @@ pub struct AppState {
     pub metrics: Metrics,
     /// Held by commands that check a key before writing it; see [`KeyLocks`].
     pub key_locks: KeyLocks,
+    /// Per shard, the highest committed `repl_log` LSN. Published by whoever
+    /// commits, so subscribers can wake on new changes.
+    pub commit_watch: Vec<Arc<watch::Sender<u64>>>,
+    /// Per shard, the cursors of the replication streams being served; see
+    /// [`replication::ShardPins`].
+    pub repl_pins: Vec<Arc<replication::ShardPins>>,
+    /// Per shard, on a replica: READONLY reads hold it shared from before their
+    /// readiness check until their data is read, and a resync holds it exclusive
+    /// while it unsyncs and wipes the shard, so no admitted read sees the wipe.
+    replica_gates: Vec<RwLock<()>>,
+    /// Per shard, the replid that `blobasaur_replication_info` last reported.
+    replids: Vec<std::sync::Mutex<Option<String>>>,
+    /// Supervises per-shard replica sync tasks across runtime role changes.
+    pub replica_sync: replication::ReplicaSyncSupervisor,
+    /// Serializes runtime role transitions (promotion, demotion, re-pointing, REPLICATE).
+    role_change_lock: Mutex<()>,
+    /// Serializes failover elections (automatic and `CLUSTER FAILOVER FORCE`).
+    election_lock: Mutex<()>,
+    /// Background automatic failover election task on clustered nodes.
+    election_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Ensures at most one gossip-triggered role transition task runs at a time.
+    transition_running: Arc<AtomicBool>,
+    /// Tracks spawned gossip-triggered role transition tasks so shutdown waits for them.
+    transition_tasks: TaskTracker,
+    /// Ensures at most one coordinated `CLUSTER FAILOVER` (default mode) runs at a time.
+    manual_failover_running: Arc<AtomicBool>,
+    /// Tracks background manual failover tasks so shutdown waits for them.
+    manual_failover_tasks: TaskTracker,
+    /// Coordinates temporary primary write pauses during `BLOBASAUR.MFSTART`.
+    write_pause: WritePause,
+    /// Server shutdown token, attached once the server starts; cancelled if a
+    /// post-commit TAKEOVER cannot finish promoting every shard.
+    server_shutdown: std::sync::Mutex<Option<CancellationToken>>,
+    /// Cancelled whenever this node leaves the primary role, closing active
+    /// outbound `BLOBASAUR.SYNC` streams.
+    primary_stream_cancel: std::sync::Mutex<CancellationToken>,
 
     ring: HashRing<ShardNode>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PauseState {
+    deadline: tokio::time::Instant,
+    owner: String,
+}
+
+struct WritePause {
+    /// Serializes `BLOBASAUR.MFSTART` / `BLOBASAUR.MFABORT` control updates.
+    control: Mutex<()>,
+    /// Active pause deadline and owning replica id (`None` when not paused).
+    state_tx: Arc<watch::Sender<Option<PauseState>>>,
+    /// In-flight local writes hold a shared read guard from before route checks
+    /// until their shard ops are queued/committed. `MFSTART` takes a brief
+    /// exclusive write guard after activating the pause so no write admitted
+    /// earlier can queue after the shard barriers.
+    inflight: RwLock<()>,
+    /// Auto-expiry timer handle for the active pause.
+    timer: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl WritePause {
+    fn new() -> Self {
+        let (state_tx, _) = watch::channel(None);
+        Self {
+            control: Mutex::new(()),
+            state_tx: Arc::new(state_tx),
+            inflight: RwLock::new(()),
+            timer: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn activate(&self, deadline: tokio::time::Instant, owner: String) {
+        let target = PauseState { deadline, owner };
+        self.state_tx.send_replace(Some(target.clone()));
+        let tx = Arc::clone(&self.state_tx);
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep_until(deadline).await;
+            tx.send_if_modified(|current| {
+                if current.as_ref() == Some(&target) {
+                    *current = None;
+                    true
+                } else {
+                    false
+                }
+            });
+        });
+        if let Some(prev) = self.timer.lock().unwrap().replace(handle) {
+            prev.abort();
+        }
+    }
+
+    fn clear(&self) {
+        if let Some(prev) = self.timer.lock().unwrap().take() {
+            prev.abort();
+        }
+        self.state_tx.send_if_modified(|current| {
+            if current.is_some() {
+                *current = None;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    /// Ends the active pause only if it belongs to `replica_id`. Caller must
+    /// hold `control` so this cannot race with a concurrent `activate`.
+    fn clear_if_owner(&self, replica_id: &str) -> bool {
+        let mut cleared = false;
+        self.state_tx.send_if_modified(|current| {
+            if current.as_ref().is_some_and(|p| p.owner == replica_id) {
+                *current = None;
+                cleared = true;
+                true
+            } else {
+                false
+            }
+        });
+        if cleared && let Some(prev) = self.timer.lock().unwrap().take() {
+            prev.abort();
+        }
+        cleared
+    }
+
+    fn clear_if_deadline(&self, deadline: tokio::time::Instant) {
+        self.state_tx.send_if_modified(|current| {
+            if current.as_ref().is_some_and(|p| p.deadline == deadline) {
+                *current = None;
+                true
+            } else {
+                false
+            }
+        });
+    }
+}
+
+struct TransitionGuard(Arc<AtomicBool>);
+
+impl Drop for TransitionGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 /// Makes a command's existence check and its write one step per key.
@@ -135,6 +302,10 @@ impl AppState {
         cfg: Cfg,
         shard_receivers_out: &mut Vec<mpsc::Receiver<ShardWriteOperation>>,
     ) -> Result<Self> {
+        if cfg.replica_of().is_some() && !cfg.cluster.as_ref().is_some_and(|c| c.enabled) {
+            return Err(miette!("replication requires [cluster] to be enabled"));
+        }
+
         let mut shard_senders_vec = Vec::new();
         // Clear the output vector first to ensure it's empty
         shard_receivers_out.clear();
@@ -151,6 +322,22 @@ impl AppState {
 
         // Validate the number of shards in the data directory
         validate_shard_count(&cfg.data_dir, cfg.num_shards)?;
+
+        // Load persisted cluster state if present, or prepare bootstrap state from config.
+        // Role and primary come from this state (not the config) for shard init and runtime.
+        let loaded_cluster =
+            if let Some(cluster_config) = cfg.cluster.as_ref().filter(|c| c.enabled) {
+                Some(
+                    crate::cluster::load_or_bootstrap(
+                        std::path::Path::new(&cfg.data_dir),
+                        cluster_config,
+                        cfg.replica_of(),
+                    )
+                    .map_err(|e| miette!("{}", e))?,
+                )
+            } else {
+                None
+            };
 
         // Initialize metrics early so startup storage checks can emit counters.
         let metrics = Metrics::new();
@@ -192,9 +379,42 @@ impl AppState {
             crate::shard_manager::migrate_shard_schema(&mut conn, i)
                 .await
                 .map_err(|e| miette!("failed to migrate schema in shard {} DB: {}", i, e))?;
+            for ddl in [CREATE_REPL_LOG, CREATE_REPL_STATE] {
+                sqlx::query(ddl).execute(&mut conn).await.map_err(|e| {
+                    miette!("failed to create change index in shard {} DB: {}", i, e)
+                })?;
+            }
             conn.close()
                 .await
                 .map_err(|e| miette!("failed to close shard {} DB: {}", i, e))?;
+        }
+
+        // Index pre-existing rows and settle the replid before any writer runs.
+        // Without replication this only marks the index as stale.
+        let enabled = cfg.replication_enabled();
+        let replica = loaded_cluster
+            .as_ref()
+            .is_some_and(|loaded| loaded.state.is_replica());
+        let is_demoting = loaded_cluster
+            .as_ref()
+            .is_some_and(|loaded| loaded.state.demoting_to.is_some());
+        // Also without replication: a half-copied replica must not serve as a primary.
+        if !replica && !is_demoting {
+            let options: Vec<_> = (0..cfg.num_shards)
+                .map(|i| build_sqlite_connect_options(&cfg, i))
+                .collect();
+            replication::ensure_promotable(&options).await?;
+        }
+        let mut commit_watch = Vec::with_capacity(cfg.num_shards);
+        for i in 0..cfg.num_shards {
+            let options = build_sqlite_connect_options(&cfg, i);
+            let lsn =
+                replication::init_shard(&options, enabled, cfg.new_replid, replica || is_demoting)
+                    .await
+                    .map_err(|e| {
+                        miette!("failed to initialize change index of shard {}: {}", i, e)
+                    })?;
+            commit_watch.push(Arc::new(watch::channel(lsn).0));
         }
 
         let mut db_pools_futures = vec![];
@@ -301,31 +521,45 @@ impl AppState {
         let inflight_hcache = Cache::builder().build();
 
         // Initialize cluster manager if clustering is enabled
-        let cluster_manager = if let Some(ref cluster_config) = cfg.cluster {
-            if cluster_config.enabled {
-                let gossip_bind_addr = format!("0.0.0.0:{}", cluster_config.port)
-                    .parse()
-                    .expect("Invalid cluster bind address");
+        let cluster_manager = if let (Some(cluster_config), Some(loaded)) =
+            (cfg.cluster.as_ref().filter(|c| c.enabled), loaded_cluster)
+        {
+            let gossip_bind_addr = format!("0.0.0.0:{}", cluster_config.port)
+                .parse()
+                .expect("Invalid cluster bind address");
 
-                let redis_addr = cfg
-                    .addr
-                    .as_deref()
-                    .unwrap_or("0.0.0.0:6379")
-                    .parse()
-                    .expect("Invalid Redis server address");
+            let redis_addr = cfg
+                .addr
+                .as_deref()
+                .unwrap_or("0.0.0.0:6379")
+                .parse()
+                .expect("Invalid Redis server address");
 
-                match ClusterManager::new(cluster_config, gossip_bind_addr, redis_addr).await {
-                    Ok(manager) => {
-                        tracing::info!("Cluster manager initialized successfully");
-                        Some(manager)
+            let manager = ClusterManager::new(
+                cluster_config,
+                gossip_bind_addr,
+                redis_addr,
+                loaded,
+                cfg.num_shards,
+            )
+            .await;
+            match manager {
+                Ok(manager) => {
+                    // A slot conflict stops startup, replication or not.
+                    if let Err(e) = manager.claim_slots().await {
+                        manager.shutdown().await;
+                        return Err(miette!("slot conflict: {}", e));
                     }
-                    Err(e) => {
-                        tracing::error!("Failed to initialize cluster manager: {}", e);
-                        None
-                    }
+                    tracing::info!("Cluster manager initialized successfully");
+                    Some(manager)
                 }
-            } else {
-                None
+                Err(e) if cfg.replication.is_some() => {
+                    return Err(miette!("failed to initialize cluster manager: {}", e));
+                }
+                Err(e) => {
+                    tracing::error!("Failed to initialize cluster manager: {}", e);
+                    None
+                }
             }
         } else {
             None
@@ -341,7 +575,12 @@ impl AppState {
             ring.add(ShardNode(i as u64));
         }
 
-        Ok(AppState {
+        let repl_pins = (0..cfg.num_shards).map(|_| Arc::default()).collect();
+        let replica_gates = (0..cfg.num_shards).map(|_| RwLock::new(())).collect();
+        let replids = (0..cfg.num_shards)
+            .map(|_| std::sync::Mutex::new(None))
+            .collect();
+        let state = AppState {
             cfg,
             shard_senders: shard_senders_vec,
             db_pools,
@@ -354,8 +593,60 @@ impl AppState {
             compressor,
             metrics,
             key_locks: KeyLocks::default(),
+            commit_watch,
+            repl_pins,
+            replica_gates,
+            replids,
+            replica_sync: replication::ReplicaSyncSupervisor::new(),
+            role_change_lock: Mutex::new(()),
+            election_lock: Mutex::new(()),
+            election_task: Mutex::new(None),
+            transition_running: Arc::new(AtomicBool::new(false)),
+            transition_tasks: TaskTracker::new(),
+            manual_failover_running: Arc::new(AtomicBool::new(false)),
+            manual_failover_tasks: TaskTracker::new(),
+            write_pause: WritePause::new(),
+            server_shutdown: std::sync::Mutex::new(None),
+            primary_stream_cancel: std::sync::Mutex::new(CancellationToken::new()),
             ring,
-        })
+        };
+        // A new replica has none until its first sync.
+        for (i, pool) in state.db_pools.iter().enumerate().filter(|_| enabled) {
+            if let Ok((replid, ..)) = replication::primary_state(pool).await
+                && !replid.is_empty()
+            {
+                state.set_replid(i, &replid);
+            }
+        }
+        if enabled
+            && !state.is_replica()
+            && let Some(cluster) = &state.cluster_manager
+            && let Err(e) = cluster.publish_gossip().await
+        {
+            tracing::warn!("Failed to gossip initial primary replids: {}", e);
+        }
+        Ok(state)
+    }
+
+    /// Reports `replid` as the shard's current one in `blobasaur_replication_info`,
+    /// and zeroes the series of the one it replaces.
+    pub fn set_replid(&self, shard: usize, replid: &str) {
+        let mut current = self.replids[shard].lock().unwrap();
+        let info = |replid: &str| {
+            metrics::gauge!(
+                "blobasaur_replication_info",
+                "shard" => shard.to_string(),
+                "replid" => replid.to_string()
+            )
+        };
+        if let Some(old) = current.as_deref().filter(|old| *old != replid) {
+            info(old).set(0.0);
+        }
+        info(replid).set(1.0);
+        *current = Some(replid.to_string());
+        if let Some(cluster) = &self.cluster_manager {
+            cluster.set_shard_replid(shard, replid);
+        }
     }
 
     /// Cached stored-key count for one shard.
@@ -373,16 +664,1143 @@ impl AppState {
             .sum()
     }
 
+    /// Records that shard `shard_id` stopped cleanly; see
+    /// [`replication::mark_clean_shutdown`]. Its pools must be closed first.
+    pub async fn mark_clean_shutdown(&self, shard_id: usize) -> Result<()> {
+        if !self.cfg.replication_enabled() {
+            return Ok(());
+        }
+        replication::mark_clean_shutdown(&build_sqlite_connect_options(&self.cfg, shard_id)).await
+    }
+
+    /// Whether this node's runtime role (from cluster state) is replica.
+    pub fn is_replica(&self) -> bool {
+        self.cluster_manager
+            .as_ref()
+            .is_some_and(ClusterManager::is_replica)
+    }
+
+    /// Node id of the primary this node follows, if its runtime role is replica.
+    pub fn replica_of(&self) -> Option<String> {
+        self.cluster_manager
+            .as_ref()
+            .and_then(ClusterManager::primary_id)
+    }
+
+    /// Token cancelled when this node leaves the primary role, stopping active
+    /// outbound `BLOBASAUR.SYNC` streams.
+    pub fn primary_stream_cancel(&self) -> CancellationToken {
+        self.primary_stream_cancel.lock().unwrap().clone()
+    }
+
+    /// Cancel all active outbound `BLOBASAUR.SYNC` streams and arm a fresh token.
+    pub fn cancel_primary_streams(&self) {
+        let old = std::mem::replace(
+            &mut *self.primary_stream_cancel.lock().unwrap(),
+            CancellationToken::new(),
+        );
+        old.cancel();
+    }
+
+    /// Attaches the non-blocking runtime demotion/re-pointing handler to the
+    /// cluster manager and starts replica sync tasks if this node is a replica
+    /// without a pending re-point.
+    pub async fn attach_cluster_runtime(self: &Arc<Self>, shutdown: CancellationToken) {
+        *self.server_shutdown.lock().unwrap() = Some(shutdown);
+        if let Some(cluster_manager) = &self.cluster_manager {
+            let weak = Arc::downgrade(self);
+            let handler: crate::cluster::RoleTransitionHandler = Arc::new(move |transition| {
+                let Some(state) = weak.upgrade() else {
+                    return;
+                };
+                state.spawn_role_transition(transition);
+            });
+            cluster_manager.set_role_handler(handler);
+        }
+        let repointing = self
+            .cluster_manager
+            .as_ref()
+            .is_some_and(ClusterManager::is_repointing);
+        if self.cfg.replication_enabled() && self.is_replica() && !repointing {
+            self.replica_sync.start(self.clone()).await;
+        }
+        if self.cluster_manager.is_some() && self.cfg.replication_enabled() {
+            let state = self.clone();
+            let shutdown = self
+                .server_shutdown
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_default();
+            let handle = tokio::spawn(async move {
+                state.auto_election_loop(shutdown).await;
+            });
+            *self.election_task.lock().await = Some(handle);
+        }
+    }
+
+    /// Waits for the background automatic election task to stop on shutdown.
+    pub async fn stop_election_task(&self) {
+        if let Some(handle) = self.election_task.lock().await.take() {
+            let _ = handle.await;
+        }
+    }
+
+    /// Spawns a role-transition task unless one is already running.
+    fn spawn_role_transition(self: &Arc<Self>, transition: RoleTransition) {
+        if matches!(transition, RoleTransition::Demote) {
+            // Wake any writes paused for manual failover immediately so they
+            // re-route and receive MOVED to the newly promoted primary.
+            self.end_write_pause();
+        }
+        if self
+            .transition_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let guard = TransitionGuard(self.transition_running.clone());
+        let state = self.clone();
+        self.transition_tasks.spawn(async move {
+            let _guard = guard;
+            match transition {
+                RoleTransition::Demote => state.complete_demotion().await,
+                RoleTransition::Repoint => state.complete_repoint().await,
+            }
+        });
+    }
+
+    /// Prevents new transition tasks from starting and waits for any running
+    /// transition to finish before writers shut down.
+    pub async fn wait_role_transitions(&self) {
+        self.transition_tasks.close();
+        self.transition_tasks.wait().await;
+    }
+
+    /// Prevents new manual failover tasks from starting and waits for any
+    /// in-flight manual failover task to finish on shutdown.
+    pub async fn wait_manual_failovers(&self) {
+        self.manual_failover_tasks.close();
+        self.manual_failover_tasks.wait().await;
+    }
+
+    /// Returns the server's shutdown token (or a never-cancelled token in unit tests).
+    fn shutdown_token(&self) -> CancellationToken {
+        self.server_shutdown
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_default()
+    }
+
+    /// Ends any active primary write pause immediately (on demotion or shutdown).
+    pub fn end_write_pause(&self) {
+        self.write_pause.clear();
+    }
+
+    fn should_pause_write_slots(&self, slots: &[u16]) -> bool {
+        self.cluster_manager
+            .as_ref()
+            .is_some_and(|cm| slots.iter().any(|&slot| cm.owns_slot(slot)))
+    }
+
+    /// Gate entered by every write command before cluster routing and held until
+    /// all of the command's shard write ops have been queued (async) or committed
+    /// (sync). While a primary write pause (`BLOBASAUR.MFSTART`) is active for
+    /// any slot in `slots`, blocks until the pause expires, the primary demotes,
+    /// or the server shuts down, then lets the write proceed into normal routing.
+    pub async fn enter_write(&self, slots: &[u16]) -> RwLockReadGuard<'_, ()> {
+        if self.cluster_manager.is_none() {
+            return self.write_pause.inflight.read().await;
+        }
+        let shutdown = self.shutdown_token();
+        loop {
+            if self.write_pause.state_tx.borrow().is_some()
+                && !shutdown.is_cancelled()
+                && self.should_pause_write_slots(slots)
+            {
+                let mut rx = self.write_pause.state_tx.subscribe();
+                loop {
+                    let Some(deadline) = rx.borrow_and_update().as_ref().map(|p| p.deadline) else {
+                        break;
+                    };
+                    if shutdown.is_cancelled() || !self.should_pause_write_slots(slots) {
+                        break;
+                    }
+                    tokio::select! {
+                        _ = shutdown.cancelled() => break,
+                        _ = tokio::time::sleep_until(deadline) => {
+                            self.write_pause.clear_if_deadline(deadline);
+                            break;
+                        }
+                        changed = rx.changed() => {
+                            if changed.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                if shutdown.is_cancelled() {
+                    return self.write_pause.inflight.read().await;
+                }
+            }
+
+            let guard = self.write_pause.inflight.read().await;
+            if self.write_pause.state_tx.borrow().is_some()
+                && !shutdown.is_cancelled()
+                && self.should_pause_write_slots(slots)
+            {
+                drop(guard);
+                continue;
+            }
+            return guard;
+        }
+    }
+
+    /// Primary side of `BLOBASAUR.MFSTART <replica-id>`: pause local writes for
+    /// `CLUSTER_MF_TIMEOUT * CLUSTER_MF_PAUSE_MULT` (10 s), drain already-admitted
+    /// write handlers, run a writer barrier on every shard, and return each
+    /// shard's `(replid, lsn)`.
+    ///
+    /// Pausing for `2 * CLUSTER_MF_TIMEOUT` while the replica gives up at
+    /// `CLUSTER_MF_TIMEOUT` (5 s) ensures a late pre-deadline promotion commit
+    /// cannot race with the pause expiring before gossip delivers the winner's
+    /// higher-epoch claim to this primary.
+    pub async fn handle_manual_failover_start(
+        &self,
+        replica_id: &str,
+    ) -> Result<Vec<(String, String)>, String> {
+        let Some(cluster) = self.cluster_manager.as_ref() else {
+            return Err("ERR This instance has cluster support disabled".to_string());
+        };
+        if !self.cfg.replication_enabled() {
+            return Err("ERR replication is not enabled on this node".to_string());
+        }
+        cluster.validate_mfstart(replica_id).await?;
+
+        let _control = self.write_pause.control.lock().await;
+        cluster.validate_mfstart(replica_id).await?;
+
+        let now = tokio::time::Instant::now();
+        let drain_deadline = now + CLUSTER_MF_TIMEOUT;
+        let pause_duration = CLUSTER_MF_TIMEOUT.saturating_mul(CLUSTER_MF_PAUSE_MULT);
+        let pause_deadline = now + pause_duration;
+        self.write_pause
+            .activate(pause_deadline, replica_id.to_string());
+
+        let drain_and_barrier = async {
+            // Wait for every write handler that entered before the pause to
+            // finish queueing its shard op(s) so the barriers below cover them.
+            let inflight =
+                tokio::time::timeout_at(drain_deadline, self.write_pause.inflight.write())
+                    .await
+                    .map_err(|_| {
+                        "ERR Timed out draining in-flight writes for manual failover".to_string()
+                    })?;
+            drop(inflight);
+
+            cluster.validate_mfstart(replica_id).await?;
+
+            let shards = tokio::time::timeout_at(
+                drain_deadline,
+                futures::future::try_join_all(
+                    (0..self.shard_senders.len())
+                        .map(|shard| replication::shard_watermark(self, shard)),
+                ),
+            )
+            .await
+            .map_err(|_| "ERR Timed out running shard barriers for manual failover".to_string())?
+            .map_err(|e| format!("ERR {e}"))?;
+
+            cluster.validate_mfstart(replica_id).await?;
+            Ok::<Vec<(String, String)>, String>(shards)
+        }
+        .await;
+
+        match drain_and_barrier {
+            Ok(shards) => {
+                tracing::info!(
+                    primary = %cluster.node_id(),
+                    replica = %replica_id,
+                    pause_ms = pause_duration.as_millis() as u64,
+                    watermarks = ?shards,
+                    "Paused primary writes for manual failover"
+                );
+                Ok(shards)
+            }
+            Err(e) => {
+                self.write_pause.clear_if_deadline(pause_deadline);
+                Err(e)
+            }
+        }
+    }
+
+    /// Primary side of `BLOBASAUR.MFABORT <replica-id>`: end the active write
+    /// pause early only if it was started by `replica_id`.
+    pub async fn handle_manual_failover_abort(&self, replica_id: &str) -> Result<(), String> {
+        let Some(cluster) = self.cluster_manager.as_ref() else {
+            return Err("ERR This instance has cluster support disabled".to_string());
+        };
+        let _control = self.write_pause.control.lock().await;
+        if self.write_pause.clear_if_owner(replica_id) {
+            tracing::info!(
+                primary = %cluster.node_id(),
+                replica = %replica_id,
+                "Ended primary write pause early on MFABORT"
+            );
+        } else {
+            tracing::debug!(
+                primary = %cluster.node_id(),
+                replica = %replica_id,
+                "Ignored stale MFABORT (pause not owned by replica)"
+            );
+        }
+        Ok(())
+    }
+
+    /// Initiates a clean server shutdown.
+    fn trigger_shutdown(&self) {
+        if let Some(token) = self.server_shutdown.lock().unwrap().as_ref() {
+            token.cancel();
+        }
+    }
+
+    /// Queues a writer barrier on every shard and waits until all of them pass.
+    pub async fn barrier_all_shards(&self) -> Result<(), String> {
+        let mut receivers = Vec::with_capacity(self.shard_senders.len());
+        for (shard, sender) in self.shard_senders.iter().enumerate() {
+            let (responder, done) = oneshot::channel();
+            sender
+                .send(ShardWriteOperation::Barrier { responder })
+                .await
+                .map_err(|_| format!("shard {shard} writer is gone"))?;
+            receivers.push((shard, done));
+        }
+        for (shard, done) in receivers {
+            done.await
+                .map_err(|_| format!("shard {shard} writer is gone"))?;
+        }
+        Ok(())
+    }
+
+    /// Sets `repl_state.role = replica` and `synced = 0` on every shard through
+    /// its writer queue.
+    async fn demote_all_shards(&self) -> Result<(), String> {
+        let mut receivers = Vec::with_capacity(self.shard_senders.len());
+        for (shard, sender) in self.shard_senders.iter().enumerate() {
+            let (responder, done) = oneshot::channel();
+            sender
+                .send(ShardWriteOperation::Demote { responder })
+                .await
+                .map_err(|_| format!("shard {shard} writer is gone"))?;
+            receivers.push((shard, done));
+        }
+        for (shard, done) in receivers {
+            done.await
+                .map_err(|_| format!("shard {shard} writer is gone"))??;
+        }
+        Ok(())
+    }
+
+    /// Checks that every shard DB currently has `repl_state.synced = 1`.
+    async fn ensure_all_shards_synced(&self) -> Result<(), String> {
+        for (shard, pool) in self.db_pools.iter().enumerate() {
+            let synced = replication::is_shard_synced(pool)
+                .await
+                .map_err(|e| format!("ERR failed to read shard {shard} sync state: {e}"))?;
+            if !synced {
+                return Err(format!("ERR Cannot promote: shard {shard} is not synced"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns true if any shard DB currently holds a live (unexpired) row in
+    /// `blobs` or any `blobs_*` table. Call after `barrier_all_shards`.
+    async fn has_live_keys(&self) -> Result<bool, String> {
+        let now = chrono::Utc::now().timestamp();
+        for (shard, pool) in self.db_pools.iter().enumerate() {
+            let tables: Vec<(String,)> = sqlx::query_as(ALL_KEY_TABLES_QUERY)
+                .fetch_all(pool)
+                .await
+                .map_err(|e| format!("ERR failed to list tables in shard {shard}: {e}"))?;
+            for (table,) in tables {
+                let escaped = table.replace('"', "\"\"");
+                let query = format!(
+                    "SELECT 1 FROM \"{escaped}\" WHERE expires_at IS NULL OR expires_at > ? LIMIT 1"
+                );
+                let found: Option<(i64,)> = sqlx::query_as(&query)
+                    .bind(now)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(|e| {
+                        format!("ERR failed to check keys in shard {shard} table {table}: {e}")
+                    })?;
+                if found.is_some() {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// `CLUSTER FAILOVER TAKEOVER`: stop replica sync tasks, persist the
+    /// promoted cluster state (commit point), set `repl_state.role = primary`
+    /// with a new `replid` per shard through the shard writers, then serve and
+    /// gossip.
+    pub async fn promote_takeover(self: &Arc<Self>) -> Result<(), String> {
+        self.promote_with_kind(PromotionKind::Takeover)
+            .await
+            .map(|_| ())
+    }
+
+    /// `CLUSTER FAILOVER` (default mode): validate synchronously on a synced
+    /// replica, then run the coordinated zero-loss failover in the background
+    /// and return `Ok(())` immediately (Redis semantics).
+    pub async fn start_manual_failover(self: &Arc<Self>) -> Result<(), String> {
+        let Some(cluster) = self.cluster_manager.as_ref() else {
+            return Err("ERR This instance has cluster support disabled".to_string());
+        };
+        if !self.cfg.replication_enabled() {
+            return Err("ERR replication is not enabled on this node".to_string());
+        }
+        cluster.can_takeover()?;
+        self.ensure_all_shards_synced().await?;
+
+        if self
+            .manual_failover_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err("ERR Manual failover already in progress".to_string());
+        }
+        let guard = TransitionGuard(self.manual_failover_running.clone());
+        cluster.record_manual_failover_started();
+
+        let state = self.clone();
+        self.manual_failover_tasks.spawn(async move {
+            let _guard = guard;
+            state.run_manual_failover().await;
+        });
+        Ok(())
+    }
+
+    async fn run_manual_failover(self: Arc<Self>) {
+        let Some(cluster) = self.cluster_manager.as_ref() else {
+            return;
+        };
+        // Zero-loss timing invariant (matches Redis Cluster):
+        //   replica deadline (CLUSTER_MF_TIMEOUT = 5 s, started before MFSTART)
+        //   < primary pause (CLUSTER_MF_TIMEOUT * CLUSTER_MF_PAUSE_MULT = 10 s, started after MFSTART)
+        //     minus gossip claim propagation.
+        // The replica must neither start its election nor commit promotion past
+        // `mf_deadline`, leaving the remaining ~5 s of primary pause for the
+        // winner's claim to reach the old primary and trigger demotion.
+        let mf_deadline = std::time::Instant::now() + CLUSTER_MF_TIMEOUT;
+        let shutdown = self.shutdown_token();
+
+        let mut paused_primary_addr: Option<std::net::SocketAddr> = None;
+        match self
+            .run_manual_failover_inner(cluster, mf_deadline, &shutdown, &mut paused_primary_addr)
+            .await
+        {
+            Ok(epoch) => {
+                cluster.record_manual_failover_succeeded();
+                tracing::info!(
+                    node = %cluster.node_id(),
+                    epoch,
+                    "Coordinated manual failover completed"
+                );
+            }
+            Err(reason) => {
+                cluster.record_manual_failover_aborted();
+                tracing::warn!(
+                    node = %cluster.node_id(),
+                    reason = %reason,
+                    "Coordinated manual failover aborted"
+                );
+                // Best-effort MFABORT so an aborted failover releases the
+                // primary's 10 s pause promptly instead of waiting for expiry.
+                // Skip if promotion already committed on this node.
+                if let Some(primary_addr) = paused_primary_addr
+                    && cluster.is_replica()
+                    && let Err(abort_err) =
+                        send_mfabort(primary_addr, cluster.node_id(), Duration::from_secs(2)).await
+                {
+                    tracing::debug!(
+                        replica = %cluster.node_id(),
+                        primary_addr = %primary_addr,
+                        error = %abort_err,
+                        "Best-effort MFABORT to primary failed; primary pause will expire on timeout"
+                    );
+                }
+            }
+        }
+    }
+
+    async fn run_manual_failover_inner(
+        self: &Arc<Self>,
+        cluster: &ClusterManager,
+        mf_deadline: std::time::Instant,
+        shutdown: &CancellationToken,
+        paused_primary_addr: &mut Option<std::net::SocketAddr>,
+    ) -> Result<u64, String> {
+        let primary_id = cluster
+            .primary_id()
+            .ok_or_else(|| "replica has no configured primary".to_string())?;
+        let primary_addr = cluster
+            .peer_addr(&primary_id)
+            .await
+            .ok_or_else(|| format!("primary {primary_id} address is not known in gossip"))?;
+
+        tracing::info!(
+            replica = %cluster.node_id(),
+            primary = %primary_id,
+            primary_addr = %primary_addr,
+            timeout_ms = CLUSTER_MF_TIMEOUT.as_millis() as u64,
+            "Starting coordinated manual failover handshake"
+        );
+
+        let target = send_mfstart(
+            primary_addr,
+            cluster.node_id(),
+            self.cfg.num_shards,
+            mf_deadline,
+            shutdown,
+        )
+        .await
+        .map_err(|e| format!("MFSTART handshake with {primary_id} failed: {e}"))?;
+        *paused_primary_addr = Some(primary_addr);
+
+        let progress_notify = cluster.repl_progress_notify();
+        let tokio_deadline = tokio::time::Instant::from_std(mf_deadline);
+        loop {
+            if shutdown.is_cancelled() {
+                return Err("aborted by server shutdown".to_string());
+            }
+            if !cluster.is_replica()
+                || cluster.is_repointing()
+                || cluster.primary_id().as_deref() != Some(primary_id.as_str())
+            {
+                return Err("replica role or primary changed during catch-up".to_string());
+            }
+            let notified = progress_notify.notified();
+            if cluster.replica_caught_up_to(&target) {
+                break;
+            }
+            if std::time::Instant::now() >= mf_deadline {
+                let snap = cluster.replica_progress_snapshot();
+                return Err(format!(
+                    "timed out after {:?} waiting for caught_up_lsn to reach primary watermark {:?} (replica state: {:?})",
+                    CLUSTER_MF_TIMEOUT, target, snap
+                ));
+            }
+            tokio::select! {
+                _ = shutdown.cancelled() => return Err("aborted by server shutdown".to_string()),
+                _ = tokio::time::sleep_until(tokio_deadline) => {}
+                _ = notified => {}
+            }
+        }
+
+        if std::time::Instant::now() >= mf_deadline {
+            return Err(format!(
+                "timed out after {:?} before starting election",
+                CLUSTER_MF_TIMEOUT
+            ));
+        }
+
+        tracing::info!(
+            replica = %cluster.node_id(),
+            primary = %primary_id,
+            watermarks = ?target,
+            "Replica caught up to primary watermark; starting MANUAL election"
+        );
+        self.run_election_with_deadline(true, Some(mf_deadline))
+            .await
+    }
+
+    /// `CLUSTER FAILOVER FORCE`: run a manual failover election immediately
+    /// (no FAIL mark needed, no rank delay), and promote on majority.
+    pub async fn promote_failover_force(self: &Arc<Self>) -> Result<(), String> {
+        self.run_election(true).await.map(|_| ())
+    }
+
+    /// Run one failover election attempt (automatic when `manual == false`,
+    /// `CLUSTER FAILOVER FORCE` when `manual == true`).
+    pub async fn run_election(self: &Arc<Self>, manual: bool) -> Result<u64, String> {
+        self.run_election_with_deadline(manual, None).await
+    }
+
+    async fn run_election_with_deadline(
+        self: &Arc<Self>,
+        manual: bool,
+        max_deadline: Option<std::time::Instant>,
+    ) -> Result<u64, String> {
+        let Some(cluster) = self.cluster_manager.as_ref() else {
+            return Err("ERR This instance has cluster support disabled".to_string());
+        };
+        if !self.cfg.replication_enabled() {
+            return Err("ERR replication is not enabled on this node".to_string());
+        }
+
+        let _election_guard = match max_deadline {
+            Some(cap) => tokio::time::timeout_at(
+                tokio::time::Instant::from_std(cap),
+                self.election_lock.lock(),
+            )
+            .await
+            .map_err(|_| "ERR Manual failover timed out waiting for election lock".to_string())?,
+            None => self.election_lock.lock().await,
+        };
+        if max_deadline.is_some_and(|cap| std::time::Instant::now() >= cap) {
+            return Err("ERR Manual failover timed out before starting election".to_string());
+        }
+
+        cluster.can_takeover()?;
+        self.ensure_all_shards_synced().await?;
+
+        let plan = cluster.prepare_election(manual).await?;
+        let shutdown = self.shutdown_token();
+        // Measure the election deadline before sending the first vote request
+        // (earlier than any voter's vote time), and enforce it both during vote
+        // collection and right before the promotion commit point.
+        let mut deadline = std::time::Instant::now() + election_timeout(cluster.node_timeout());
+        if let Some(cap) = max_deadline {
+            deadline = deadline.min(cap);
+        }
+        let outcome = collect_votes(&plan, deadline, &shutdown, || {
+            !cluster.is_replica()
+                || cluster.is_repointing()
+                || cluster.primary_id().as_deref() != Some(plan.failed_primary.as_str())
+        })
+        .await;
+
+        match outcome {
+            VoteCollectionOutcome::Won { votes } => {
+                tracing::info!(
+                    candidate = %plan.candidate,
+                    epoch = plan.epoch,
+                    failed_primary = %plan.failed_primary,
+                    votes = votes.len(),
+                    quorum = plan.quorum,
+                    manual,
+                    "Won failover election; promoting"
+                );
+                let kind = PromotionKind::Elected {
+                    election_epoch: plan.epoch,
+                    failed_primary: plan.failed_primary.clone(),
+                    primary_config_epoch: plan.primary_config_epoch,
+                    expected_slots: plan.slots.clone(),
+                    deadline,
+                };
+                match self.promote_with_kind(kind).await {
+                    Ok(epoch) => {
+                        cluster.record_election_won();
+                        Ok(epoch)
+                    }
+                    Err(e) => {
+                        cluster.record_election_failed();
+                        tracing::warn!(
+                            candidate = %plan.candidate,
+                            epoch = plan.epoch,
+                            error = %e,
+                            "Promotion after winning election failed"
+                        );
+                        Err(e)
+                    }
+                }
+            }
+            VoteCollectionOutcome::NoMajority { votes, quorum } => {
+                cluster.record_election_failed();
+                tracing::warn!(
+                    candidate = %plan.candidate,
+                    epoch = plan.epoch,
+                    failed_primary = %plan.failed_primary,
+                    votes = votes.len(),
+                    quorum,
+                    manual,
+                    "Failover election gave up without majority"
+                );
+                Err(format!(
+                    "ERR Failover election failed: got {} of {} required votes",
+                    votes.len(),
+                    quorum
+                ))
+            }
+            VoteCollectionOutcome::Aborted => {
+                cluster.record_election_failed();
+                tracing::info!(
+                    candidate = %plan.candidate,
+                    epoch = plan.epoch,
+                    failed_primary = %plan.failed_primary,
+                    manual,
+                    "Failover election aborted"
+                );
+                Err("ERR Failover election aborted".to_string())
+            }
+        }
+    }
+
+    /// Background automatic failover loop: watches eligibility, arms with
+    /// `500 ms + random(0..500 ms) + rank * 1000 ms`, re-arms if a better
+    /// replica appears, and retries no sooner than `max(4 * node_timeout, 4 s)`
+    /// after the start of the previous attempt.
+    async fn auto_election_loop(self: Arc<Self>, shutdown: CancellationToken) {
+        struct ArmedElection {
+            primary: String,
+            jitter_ms: u64,
+            rank: usize,
+            armed_at: std::time::Instant,
+            deadline: std::time::Instant,
+        }
+
+        let Some(cluster) = self.cluster_manager.as_ref() else {
+            return;
+        };
+        let notify = cluster.election_notify();
+        let mut armed: Option<ArmedElection> = None;
+        let mut last_attempt: Option<(String, std::time::Instant)> = None;
+        let mut cant_failover: Option<&'static str> = None;
+
+        while !shutdown.is_cancelled() {
+            let now = std::time::Instant::now();
+            let eligibility = cluster.election_eligibility().await;
+            let reason = eligibility.as_ref().err().copied().flatten();
+            if reason != cant_failover {
+                if let Some(reason) = reason {
+                    tracing::warn!(node = %cluster.node_id(), "Currently unable to failover: {reason}");
+                }
+                cant_failover = reason;
+            }
+            let Ok(primary) = eligibility else {
+                armed = None;
+                if let Some((ref prev_primary, _)) = last_attempt
+                    && (!cluster.is_failed(prev_primary)
+                        || cluster.primary_id().as_deref() != Some(prev_primary.as_str()))
+                {
+                    last_attempt = None;
+                }
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    _ = notify.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                }
+                continue;
+            };
+
+            if let Some((ref prev_primary, prev_start)) = last_attempt
+                && prev_primary == &primary
+            {
+                let retry_at = prev_start + retry_backoff(cluster.node_timeout());
+                if now < retry_at {
+                    armed = None;
+                    let wait = (retry_at - now).min(Duration::from_millis(100));
+                    tokio::select! {
+                        _ = shutdown.cancelled() => return,
+                        _ = notify.notified() => {}
+                        _ = tokio::time::sleep(wait) => {}
+                    }
+                    continue;
+                }
+            }
+
+            let rank = cluster.compute_replica_rank(&primary).await;
+            match armed.as_mut() {
+                Some(a) if a.primary == primary => {
+                    if rank > a.rank {
+                        // A better replica appeared: re-arm from now at the new rank.
+                        let jitter_ms = random_jitter_ms();
+                        let delay = election_delay(rank, jitter_ms);
+                        tracing::info!(
+                            node = %cluster.node_id(),
+                            primary = %primary,
+                            old_rank = a.rank,
+                            new_rank = rank,
+                            delay_ms = delay.as_millis() as u64,
+                            "Better replica appeared; re-arming automatic failover election"
+                        );
+                        a.jitter_ms = jitter_ms;
+                        a.rank = rank;
+                        a.armed_at = now;
+                        a.deadline = now + delay;
+                    } else if rank < a.rank {
+                        a.rank = rank;
+                        a.deadline = a.armed_at + election_delay(rank, a.jitter_ms);
+                    }
+                }
+                _ => {
+                    let jitter_ms = random_jitter_ms();
+                    let delay = election_delay(rank, jitter_ms);
+                    tracing::info!(
+                        node = %cluster.node_id(),
+                        primary = %primary,
+                        rank,
+                        delay_ms = delay.as_millis() as u64,
+                        "Armed automatic failover election"
+                    );
+                    armed = Some(ArmedElection {
+                        primary: primary.clone(),
+                        jitter_ms,
+                        rank,
+                        armed_at: now,
+                        deadline: now + delay,
+                    });
+                }
+            }
+
+            let deadline = armed.as_ref().unwrap().deadline;
+            let armed_rank = armed.as_ref().unwrap().rank;
+            if now >= deadline {
+                // Recompute rank right before starting; if a better replica appeared, re-arm.
+                let final_rank = cluster.compute_replica_rank(&primary).await;
+                if final_rank > armed_rank {
+                    let a = armed.as_mut().unwrap();
+                    let jitter_ms = random_jitter_ms();
+                    let delay = election_delay(final_rank, jitter_ms);
+                    tracing::info!(
+                        node = %cluster.node_id(),
+                        primary = %primary,
+                        old_rank = armed_rank,
+                        new_rank = final_rank,
+                        delay_ms = delay.as_millis() as u64,
+                        "Better replica appeared before election start; re-arming"
+                    );
+                    a.jitter_ms = jitter_ms;
+                    a.rank = final_rank;
+                    a.armed_at = now;
+                    a.deadline = now + delay;
+                    continue;
+                }
+                armed = None;
+                let attempt_started = std::time::Instant::now();
+                last_attempt = Some((primary.clone(), attempt_started));
+                match self.run_election(false).await {
+                    Ok(_) => {
+                        last_attempt = None;
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            node = %cluster.node_id(),
+                            primary = %primary,
+                            error = %e,
+                            "Automatic failover election attempt did not promote"
+                        );
+                    }
+                }
+            } else {
+                let wait = (deadline - now).min(Duration::from_millis(100));
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    _ = notify.notified() => {}
+                    _ = tokio::time::sleep(wait) => {}
+                }
+            }
+        }
+    }
+
+    async fn promote_with_kind(self: &Arc<Self>, kind: PromotionKind) -> Result<u64, String> {
+        let Some(cluster) = self.cluster_manager.as_ref() else {
+            return Err("ERR This instance has cluster support disabled".to_string());
+        };
+        if !self.cfg.replication_enabled() {
+            return Err("ERR replication is not enabled on this node".to_string());
+        }
+
+        let _role_guard = self.role_change_lock.lock().await;
+        cluster.can_promote(&kind)?;
+        self.ensure_all_shards_synced().await?;
+
+        // 1. Stop replica sync tasks and wait so no Apply/Reset is queued behind promotion.
+        self.replica_sync.stop().await;
+
+        // Re-check synced after stopping sync tasks in case a Reset ran right before stop.
+        if let Err(e) = self.ensure_all_shards_synced().await {
+            if self.is_replica() {
+                self.replica_sync.start(self.clone()).await;
+            }
+            return Err(e);
+        }
+
+        // 2-4. Persist cluster state (commit point), promote every shard through
+        // its writer in a synchronous=FULL transaction (retrying failed shards
+        // with backoff), then expose & gossip.
+        const PROMOTE_SHARD_MAX_ATTEMPTS: usize = 5;
+        let shard_senders = &self.shard_senders;
+        let result = cluster
+            .promote(kind, || async {
+                let mut pending: Vec<usize> = (0..shard_senders.len()).collect();
+                let mut delay = Duration::from_millis(100);
+                let mut last_err = String::new();
+                for attempt in 1..=PROMOTE_SHARD_MAX_ATTEMPTS {
+                    let mut receivers = Vec::with_capacity(pending.len());
+                    for &shard in &pending {
+                        let (responder, done) = oneshot::channel();
+                        if shard_senders[shard]
+                            .send(ShardWriteOperation::Promote { responder })
+                            .await
+                            .is_err()
+                        {
+                            last_err = format!("shard {shard} writer is gone");
+                            receivers.push((shard, None));
+                        } else {
+                            receivers.push((shard, Some(done)));
+                        }
+                    }
+                    let mut still_pending = Vec::new();
+                    for (shard, done) in receivers {
+                        match done {
+                            None => still_pending.push(shard),
+                            Some(done) => match done.await {
+                                Ok(Ok(replid)) => self.set_replid(shard, &replid),
+                                Ok(Err(e)) => {
+                                    last_err = format!("shard {shard} promote failed: {e}");
+                                    still_pending.push(shard);
+                                }
+                                Err(_) => {
+                                    last_err = format!("shard {shard} writer is gone");
+                                    still_pending.push(shard);
+                                }
+                            },
+                        }
+                    }
+                    pending = still_pending;
+                    if pending.is_empty() {
+                        return Ok(());
+                    }
+                    tracing::warn!(
+                        attempt,
+                        max_attempts = PROMOTE_SHARD_MAX_ATTEMPTS,
+                        remaining_shards = ?pending,
+                        error = %last_err,
+                        "Per-shard TAKEOVER promotion failed after cluster state commit; retrying"
+                    );
+                    if attempt < PROMOTE_SHARD_MAX_ATTEMPTS {
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(Duration::from_secs(2));
+                    }
+                }
+                Err(format!(
+                    "ERR Promotion committed in cluster-state.json but shards {:?} failed after {} attempts ({}); shutting down for startup recovery",
+                    pending, PROMOTE_SHARD_MAX_ATTEMPTS, last_err
+                ))
+            })
+            .await;
+
+        match result {
+            Ok(epoch) => Ok(epoch),
+            Err(PromoteError::BeforeCommit(e)) => {
+                if self.is_replica() {
+                    self.replica_sync.start(self.clone()).await;
+                }
+                Err(e)
+            }
+            Err(PromoteError::AfterCommit(e)) => {
+                // Past the commit point: never revert to replica or restart sync
+                // tasks. Shut down cleanly so restart completes promotion via
+                // `replication::init_shard`.
+                tracing::error!(
+                    "TAKEOVER failed past cluster-state.json commit point: {}. Shutting down cleanly so startup completes promotion.",
+                    e
+                );
+                self.trigger_shutdown();
+                Err(e)
+            }
+        }
+    }
+
+    /// Level-triggered demotion: while `role == primary && demoting_to.is_some()`,
+    /// drain writer barriers, cancel outbound primary sync streams, mark shards
+    /// as unsynced replicas, atomically persist `role = replica, primary = winner`
+    /// clearing `demoting_to`, gossip, and start replica sync tasks. Any failure
+    /// leaves `demoting_to` set so a later gossip tick retries.
+    pub async fn complete_demotion(self: &Arc<Self>) {
+        let Some(cluster) = self.cluster_manager.as_ref() else {
+            return;
+        };
+        let _role_guard = self.role_change_lock.lock().await;
+        if !cluster.is_demoting() {
+            return;
+        }
+        self.end_write_pause();
+
+        // 1. Drain everything that passed the route check before slots were dropped.
+        if let Err(e) = self.barrier_all_shards().await {
+            tracing::error!("Demotion barrier failed (will retry): {}", e);
+            return;
+        }
+
+        // 2. Close any outbound streams this node was serving as a primary.
+        self.cancel_primary_streams();
+
+        // 3. Per shard through the writer: role = replica, synced = 0.
+        if let Err(e) = self.demote_all_shards().await {
+            tracing::error!(
+                "Failed to mark shards as replica during demotion (will retry): {}",
+                e
+            );
+            return;
+        }
+
+        // 4. Atomically clear `demoting_to` and persist `role = replica, primary = winner`.
+        let winner = match cluster.finish_demotion().await {
+            Ok(Some(winner)) => winner,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::error!(
+                    "Failed to persist demoted cluster state (will retry): {}",
+                    e
+                );
+                return;
+            }
+        };
+
+        if let Err(e) = cluster.publish_gossip().await {
+            tracing::error!("Failed to gossip demoted role: {}", e);
+        }
+
+        // 5. Start replica sync tasks against the new primary.
+        if self.cfg.replication_enabled() {
+            self.replica_sync.start(self.clone()).await;
+        } else {
+            tracing::warn!(
+                "Demoted to replica of {}, but [replication] is disabled so sync tasks will not start",
+                winner
+            );
+        }
+    }
+
+    /// Level-triggered replica re-pointing: while `role == replica &&
+    /// repointing_to.is_some()`, stop sync tasks, mark shards unsynced,
+    /// atomically persist `primary = new_primary` clearing `repointing_to`,
+    /// gossip, and start sync tasks against the new primary.
+    pub async fn complete_repoint(self: &Arc<Self>) {
+        let Some(cluster) = self.cluster_manager.as_ref() else {
+            return;
+        };
+        let _role_guard = self.role_change_lock.lock().await;
+        if !cluster.is_repointing() {
+            return;
+        }
+
+        self.replica_sync.stop().await;
+        cluster.reset_replica_synced();
+
+        if let Err(e) = self.demote_all_shards().await {
+            tracing::error!(
+                "Failed to mark shards unsynced during re-point (will retry): {}",
+                e
+            );
+            return;
+        }
+
+        match cluster.finish_repoint().await {
+            Ok(Some(_)) => {}
+            Ok(None) => return,
+            Err(e) => {
+                tracing::error!(
+                    "Failed to persist re-pointed cluster state (will retry): {}",
+                    e
+                );
+                return;
+            }
+        }
+
+        if let Err(e) = cluster.publish_gossip().await {
+            tracing::error!("Failed to gossip re-pointed replica state: {}", e);
+        }
+
+        if self.cfg.replication_enabled() {
+            self.replica_sync.restart(self.clone()).await;
+        }
+    }
+
+    /// `CLUSTER REPLICATE <node-id>`: make this node a replica of `target_id`
+    /// at runtime (Redis semantics).
+    pub async fn replicate_node(self: &Arc<Self>, target_id: String) -> Result<(), String> {
+        let Some(cluster) = self.cluster_manager.as_ref() else {
+            return Err("ERR This instance has cluster support disabled".to_string());
+        };
+        if !self.cfg.replication_enabled() {
+            return Err("ERR replication is not enabled on this node".to_string());
+        }
+
+        let _role_guard = self.role_change_lock.lock().await;
+        match cluster.validate_replicate_target(&target_id).await? {
+            ReplicateCheck::AlreadyFollowing => Ok(()),
+            ReplicateCheck::FromEmptyPrimary => {
+                self.barrier_all_shards()
+                    .await
+                    .map_err(|e| format!("ERR {e}"))?;
+                if self.has_live_keys().await? {
+                    return Err(
+                        "ERR To set a master the node must be empty and without assigned slots."
+                            .to_string(),
+                    );
+                }
+                cluster.commit_replicate(&target_id).await?;
+                self.cancel_primary_streams();
+                self.demote_all_shards()
+                    .await
+                    .map_err(|e| format!("ERR {e}"))?;
+                if let Err(e) = cluster.publish_gossip().await {
+                    tracing::error!("Failed to gossip replicated state: {}", e);
+                }
+                self.replica_sync.start(self.clone()).await;
+                Ok(())
+            }
+            ReplicateCheck::SwitchReplica => {
+                self.replica_sync.stop().await;
+                cluster.reset_replica_synced();
+                if let Err(e) = self.demote_all_shards().await {
+                    self.replica_sync.restart(self.clone()).await;
+                    return Err(format!("ERR {e}"));
+                }
+                if let Err(e) = cluster.commit_replicate(&target_id).await {
+                    self.replica_sync.restart(self.clone()).await;
+                    return Err(e);
+                }
+                if let Err(e) = cluster.publish_gossip().await {
+                    tracing::error!("Failed to gossip switched replica state: {}", e);
+                }
+                self.replica_sync.restart(self.clone()).await;
+                Ok(())
+            }
+        }
+    }
+
     /// Set the gauges that are sampled rather than updated in place: queue
     /// depth, pool connections, and cached per-shard key counts. Called on
     /// each metrics scrape.
     pub fn record_gauges(&self) {
+        let is_replica = self.is_replica();
         for (i, sender) in self.shard_senders.iter().enumerate() {
             let shard = i.to_string();
             metrics::gauge!("blobasaur_keys", "shard" => shard.clone())
                 .set(self.shard_key_count(i) as f64);
             metrics::gauge!("blobasaur_write_queue_depth", "shard" => shard.clone())
                 .set(sender.queue_depth() as f64);
+            if self.cfg.replication_enabled() {
+                let (active_role, inactive_role) = if is_replica {
+                    ("replica", "primary")
+                } else {
+                    metrics::gauge!("blobasaur_replication_latest_lsn", "shard" => shard.clone())
+                        .set(*self.commit_watch[i].borrow() as f64);
+                    ("primary", "replica")
+                };
+                metrics::gauge!(
+                    "blobasaur_replication_role",
+                    "shard" => shard.clone(),
+                    "role" => active_role
+                )
+                .set(1.0);
+                metrics::gauge!(
+                    "blobasaur_replication_role",
+                    "shard" => shard.clone(),
+                    "role" => inactive_role
+                )
+                .set(0.0);
+            }
             for (name, pool) in [
                 ("read", &self.db_pools[i]),
                 ("write", &self.write_db_pools[i]),
@@ -401,6 +1819,25 @@ impl AppState {
                 }
             }
         }
+    }
+
+    /// A replica's READONLY read takes this before it is routed, and holds it
+    /// until its DB read is done. Primaries and other connections take nothing.
+    pub async fn replica_read_gate(
+        &self,
+        shard: usize,
+        conn_readonly: bool,
+    ) -> Option<RwLockReadGuard<'_, ()>> {
+        if conn_readonly && self.is_replica() {
+            Some(self.replica_gates[shard].read().await)
+        } else {
+            None
+        }
+    }
+
+    /// Held by a resync of `shard` from unsyncing it until the wipe has committed.
+    pub async fn replica_reset_gate(&self, shard: usize) -> RwLockWriteGuard<'_, ()> {
+        self.replica_gates[shard].write().await
     }
 
     pub fn get_shard(&self, key: &str) -> usize {
@@ -677,9 +2114,12 @@ fn validate_shard_count(data_dir: &str, expected_shards: usize) -> Result<()> {
         ));
     }
 
-    // If the directory is empty, that's also fine - no validation needed
+    // If the directory is empty (or holds only cluster-state.json and its temp files),
+    // no shards exist yet.
     if let Ok(entries) = fs::read_dir(data_path)
-        && entries.count() == 0
+        && entries
+            .flatten()
+            .all(|e| crate::cluster::is_cluster_state_file(&e.file_name()))
     {
         return Ok(());
     }
@@ -757,12 +2197,14 @@ mod tests {
             batch_timeout_ms: Some(0),
             write_queue_capacity: None,
             addr: None,
+            replication: None,
             cluster: None,
             metrics: None,
             shutdown_timeout_secs: None,
             max_request_size_mb: None,
             cleanup_chunk_size: None,
             cleanup_interval_secs: None,
+            new_replid: false,
             sqlite: None,
         }
     }
@@ -871,6 +2313,38 @@ mod tests {
             .execute(&mut writer)
             .await
             .expect("failed to release write lock");
+    }
+
+    #[tokio::test]
+    async fn replication_info_follows_the_replid() {
+        use crate::metrics::rendered_value;
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let mut cfg = test_cfg(temp_dir.path().to_string_lossy().into_owned(), 1);
+        cfg.replication = Some(crate::config::ReplicationConfig {
+            replica_of: None,
+            tombstone_retention_secs: None,
+        });
+        let mut receivers = Vec::new();
+        let state = AppState::new(cfg, &mut receivers).await.unwrap();
+        let series =
+            |replid: &str| format!(r#"blobasaur_replication_info{{shard="0",replid="{replid}"}}"#);
+
+        // A primary reports the replid it started with.
+        let stored: String = sqlx::query_scalar("SELECT v FROM repl_state WHERE k = 'replid'")
+            .fetch_one(&state.db_pools[0])
+            .await
+            .unwrap();
+        let output = recorder.handle().render();
+        assert_eq!(rendered_value(&output, &series(&stored)), 1.0);
+
+        // A new one replaces it, which is zeroed, not removed.
+        state.set_replid(0, "next");
+        state.set_replid(0, "next");
+        let output = recorder.handle().render();
+        assert_eq!(rendered_value(&output, &series(&stored)), 0.0);
+        assert_eq!(rendered_value(&output, &series("next")), 1.0);
     }
 
     #[tokio::test]
@@ -1009,6 +2483,19 @@ mod tests {
             "Shard count mismatch: expected 3 shards, found 3 of them. Found shard files beyond \
              num_shards: [3, 4] (change the shard count with `blobasaur shard migrate`)"
         );
+    }
+
+    #[test]
+    fn validate_shard_count_ignores_cluster_state_and_tmp_files() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join(crate::cluster::CLUSTER_STATE_FILE), b"{}").unwrap();
+        fs::write(dir.path().join(".cluster-state.json.tmp.42.0"), b"partial").unwrap();
+
+        validate_shard_count(dir.path().to_str().unwrap(), 2).unwrap();
+
+        // Any other file with missing shards is still treated as a mismatch.
+        fs::write(dir.path().join("unrelated.db"), b"").unwrap();
+        assert!(validate_shard_count(dir.path().to_str().unwrap(), 2).is_err());
     }
 
     #[tokio::test]

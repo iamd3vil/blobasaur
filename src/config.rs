@@ -16,6 +16,7 @@ pub struct Cfg {
     pub write_queue_capacity: Option<usize>,
     pub addr: Option<String>,
     pub cluster: Option<ClusterConfig>,
+    pub replication: Option<ReplicationConfig>,
     pub metrics: Option<MetricsConfig>,
     pub sqlite: Option<SqliteConfig>,
     /// Max seconds to drain in-flight commands and queued writes on SIGINT/SIGTERM.
@@ -31,6 +32,10 @@ pub struct Cfg {
     /// Seconds between background expiry cleanup sweeps of each shard.
     /// Default: 60
     pub cleanup_interval_secs: Option<u64>,
+    /// Set by `serve --new-replid`, never from the config file: start a new
+    /// replication history even if the stored one looks intact.
+    #[serde(skip)]
+    pub new_replid: bool,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -97,6 +102,12 @@ pub struct ClusterConfig {
     #[allow(dead_code)]
     pub gossip_interval_ms: Option<u64>,
     pub advertise_addr: Option<String>,
+    /// Milliseconds without heartbeat progress before a peer is suspected failed,
+    /// and the minority fencing timeout. Default: 15000.
+    pub node_timeout_ms: Option<u64>,
+    /// Multiplier on `node_timeout_ms` bounding how stale a replica may be and
+    /// still run an election. 0 disables the check. Default: 10.
+    pub replica_validity_factor: Option<u64>,
 }
 
 impl ClusterConfig {
@@ -107,6 +118,12 @@ impl ClusterConfig {
         if self.gossip_interval_ms == Some(0) {
             return Err(miette::miette!(
                 "cluster.gossip_interval_ms must be greater than 0"
+            ));
+        }
+
+        if self.node_timeout_ms == Some(0) {
+            return Err(miette::miette!(
+                "cluster.node_timeout_ms must be greater than 0"
             ));
         }
 
@@ -133,6 +150,26 @@ impl ClusterConfig {
 
         Ok(())
     }
+
+    /// Cluster node timeout in milliseconds (default: 15000).
+    pub fn node_timeout_ms(&self) -> u64 {
+        self.node_timeout_ms.unwrap_or(15_000)
+    }
+
+    /// Replica validity factor for elections (default: 10; 0 disables the check).
+    pub fn replica_validity_factor(&self) -> u64 {
+        self.replica_validity_factor.unwrap_or(10)
+    }
+}
+
+/// Replication needs `[cluster]`: replicas find their primary through gossip.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ReplicationConfig {
+    /// Node id of the primary this node replicates. Unset: this node is a primary.
+    pub replica_of: Option<String>,
+    /// Seconds a delete is remembered for replicas that were disconnected.
+    /// A replica away for longer gets a full resync. Default: 86400
+    pub tombstone_retention_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, serde::Deserialize, PartialEq)]
@@ -329,6 +366,34 @@ impl Cfg {
         self.cleanup_interval_secs.unwrap_or(60)
     }
 
+    /// Whether the change index is maintained: the config has a `[replication]`
+    /// section. Without it, writes pay nothing for replication.
+    pub fn replication_enabled(&self) -> bool {
+        self.replication.is_some()
+    }
+
+    /// Node id of the primary this node replicates, if it is a replica.
+    pub fn replica_of(&self) -> Option<&str> {
+        self.replication.as_ref()?.replica_of.as_deref()
+    }
+
+    /// Seconds deletes are remembered for replicas; see `tombstone_retention_secs`.
+    pub fn tombstone_retention_secs(&self) -> u64 {
+        self.replication
+            .as_ref()
+            .and_then(|r| r.tombstone_retention_secs)
+            .unwrap_or(86400)
+    }
+
+    /// What `data` is stored as, which a replica must match: the compression
+    /// algorithm (the level doesn't change how values are read back).
+    pub fn compression_id(&self) -> String {
+        match &self.storage_compression {
+            Some(c) if c.enabled => format!("{:?}", c.algorithm).to_lowercase(),
+            _ => "none".to_string(),
+        }
+    }
+
     pub fn is_compression(&self) -> bool {
         self.storage_compression.as_ref().is_some_and(|c| c.enabled)
     }
@@ -512,6 +577,8 @@ mod tests {
             slot_ranges: Some(vec![SlotRange { start: 1, end: 100 }]),
             gossip_interval_ms: Some(1000),
             advertise_addr: None,
+            node_timeout_ms: None,
+            replica_validity_factor: None,
         }
     }
 
@@ -569,6 +636,32 @@ mod tests {
         let bad = "node_id = \"node1\"\nseeds = []\nport = 7000\ngossip_interval_ms = 0\n";
         assert!(load_with_cluster(&format!("enabled = true\n{bad}")).is_err());
         assert!(load_with_cluster(&format!("enabled = false\n{bad}")).is_ok());
+    }
+
+    #[test]
+    fn cluster_failover_config_defaults_and_validation() {
+        let cfg =
+            load_with_cluster("enabled = true\nnode_id = \"node1\"\nseeds = []\nport = 7000\n")
+                .unwrap();
+        let cluster = cfg.cluster.unwrap();
+        assert_eq!(cluster.node_timeout_ms(), 15_000);
+        assert_eq!(cluster.replica_validity_factor(), 10);
+
+        let custom = load_with_cluster(
+            "enabled = true\nnode_id = \"node1\"\nseeds = []\nport = 7000\n\
+             node_timeout_ms = 5000\nreplica_validity_factor = 0\n",
+        )
+        .unwrap();
+        let cluster = custom.cluster.unwrap();
+        assert_eq!(cluster.node_timeout_ms(), 5_000);
+        assert_eq!(cluster.replica_validity_factor(), 0);
+
+        assert!(
+            load_with_cluster(
+                "enabled = true\nnode_id = \"node1\"\nseeds = []\nport = 7000\nnode_timeout_ms = 0\n"
+            )
+            .is_err()
+        );
     }
 
     fn load_with_compression(compression: &str) -> Result<Cfg> {

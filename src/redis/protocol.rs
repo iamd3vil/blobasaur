@@ -49,6 +49,13 @@ pub enum VacuumCommandMode {
     Full,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterFailoverMode {
+    Default,
+    Force,
+    Takeover,
+}
+
 /// Commands supported by Blobasaur
 #[derive(Debug, Clone, PartialEq)]
 pub enum RedisCommand {
@@ -108,12 +115,15 @@ pub enum RedisCommand {
     Info {
         section: Option<String>,
     },
-    Command,
-    CommandCount,
+    Command {
+        args: Vec<String>,
+    },
     // Cluster commands
+    ClusterMyId,
     ClusterNodes,
     ClusterInfo,
     ClusterSlots,
+    ClusterShards,
     ClusterAddSlots {
         slots: Vec<u16>,
     },
@@ -122,6 +132,12 @@ pub enum RedisCommand {
     },
     ClusterKeySlot {
         key: String,
+    },
+    ClusterFailover {
+        mode: ClusterFailoverMode,
+    },
+    ClusterReplicate {
+        node_id: String,
     },
     Ttl {
         key: String,
@@ -136,6 +152,27 @@ pub enum RedisCommand {
         budget_mb: u64,
         dry_run: bool,
     },
+    /// Per shard `[shard, replid, lsn]`; see `replication::shard_watermark`.
+    BlobasaurWatermark,
+    /// A replica opening the replication stream of one shard; see
+    /// `replication::serve_sync`. `replid` is empty if the replica has none.
+    BlobasaurSync {
+        shard: usize,
+        replid: String,
+        lsn: u64,
+        num_shards: usize,
+        compression: String,
+    },
+    /// Replica election vote request sent to slot-owning primaries.
+    BlobasaurFailoverAuth(crate::cluster::FailoverAuthRequest),
+    /// Coordinated manual failover start sent by a replica to its primary.
+    BlobasaurMfStart {
+        replica_id: String,
+    },
+    /// Best-effort abort sent by a replica to end its primary's write pause early.
+    BlobasaurMfAbort {
+        replica_id: String,
+    },
     Hello {
         protover: Option<u64>,
     },
@@ -145,6 +182,9 @@ pub enum RedisCommand {
     ClientGetName,
     ClientSetName(Bytes),
     Quit,
+    /// Lets a replica serve this connection's reads.
+    ReadOnly,
+    ReadWrite,
     Unknown(String),
 }
 
@@ -165,21 +205,32 @@ impl RedisCommand {
             RedisCommand::HExpireAt { .. } => "HEXPIREAT".to_string(),
             RedisCommand::Ping { .. } => "PING".to_string(),
             RedisCommand::Info { .. } => "INFO".to_string(),
-            RedisCommand::Command | RedisCommand::CommandCount => "COMMAND".to_string(),
+            RedisCommand::Command { .. } => "COMMAND".to_string(),
+            RedisCommand::ClusterMyId => "CLUSTER MYID".to_string(),
             RedisCommand::ClusterNodes => "CLUSTER NODES".to_string(),
             RedisCommand::ClusterInfo => "CLUSTER INFO".to_string(),
             RedisCommand::ClusterSlots => "CLUSTER SLOTS".to_string(),
+            RedisCommand::ClusterShards => "CLUSTER SHARDS".to_string(),
             RedisCommand::ClusterAddSlots { .. } => "CLUSTER ADDSLOTS".to_string(),
             RedisCommand::ClusterDelSlots { .. } => "CLUSTER DELSLOTS".to_string(),
             RedisCommand::ClusterKeySlot { .. } => "CLUSTER KEYSLOT".to_string(),
+            RedisCommand::ClusterFailover { .. } => "CLUSTER FAILOVER".to_string(),
+            RedisCommand::ClusterReplicate { .. } => "CLUSTER REPLICATE".to_string(),
             RedisCommand::Ttl { .. } => "TTL".to_string(),
             RedisCommand::Expire { .. } => "EXPIRE".to_string(),
             RedisCommand::BlobasaurVacuum { .. } => "BLOBASAUR.VACUUM".to_string(),
+            RedisCommand::BlobasaurWatermark => "BLOBASAUR.WATERMARK".to_string(),
+            RedisCommand::BlobasaurSync { .. } => "BLOBASAUR.SYNC".to_string(),
+            RedisCommand::BlobasaurFailoverAuth(_) => "BLOBASAUR.FAILOVER-AUTH".to_string(),
+            RedisCommand::BlobasaurMfStart { .. } => "BLOBASAUR.MFSTART".to_string(),
+            RedisCommand::BlobasaurMfAbort { .. } => "BLOBASAUR.MFABORT".to_string(),
             RedisCommand::Hello { .. } => "HELLO".to_string(),
             RedisCommand::Client { .. }
             | RedisCommand::ClientGetName
             | RedisCommand::ClientSetName(_) => "CLIENT".to_string(),
             RedisCommand::Quit => "QUIT".to_string(),
+            RedisCommand::ReadOnly => "READONLY".to_string(),
+            RedisCommand::ReadWrite => "READWRITE".to_string(),
             RedisCommand::Unknown(cmd) => cmd.clone(),
         }
     }
@@ -418,18 +469,11 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
             Ok(RedisCommand::Info { section })
         }
         "COMMAND" => {
-            if let Some(subcommand) = elements.get(1)
-                && extract_string(subcommand)?.eq_ignore_ascii_case("COUNT")
-            {
-                if elements.len() != 2 {
-                    return Err(ParseError::Invalid(
-                        "wrong number of arguments for 'command|count' command".into(),
-                    ));
-                }
-                Ok(RedisCommand::CommandCount)
-            } else {
-                Ok(RedisCommand::Command)
-            }
+            let args = elements[1..]
+                .iter()
+                .map(extract_string)
+                .collect::<Result<_, _>>()?;
+            Ok(RedisCommand::Command { args })
         }
         "HGET" => {
             if elements.len() != 3 {
@@ -642,9 +686,25 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
             }
             let subcommand = extract_string(&elements[1])?.to_uppercase();
             match subcommand.as_str() {
+                "MYID" => {
+                    if elements.len() != 2 {
+                        return Err(ParseError::Invalid(
+                            "CLUSTER MYID takes no arguments".to_string(),
+                        ));
+                    }
+                    Ok(RedisCommand::ClusterMyId)
+                }
                 "NODES" => Ok(RedisCommand::ClusterNodes),
                 "INFO" => Ok(RedisCommand::ClusterInfo),
                 "SLOTS" => Ok(RedisCommand::ClusterSlots),
+                "SHARDS" => {
+                    if elements.len() != 2 {
+                        return Err(ParseError::Invalid(
+                            "CLUSTER SHARDS takes no arguments".to_string(),
+                        ));
+                    }
+                    Ok(RedisCommand::ClusterShards)
+                }
                 "ADDSLOTS" => {
                     if elements.len() < 3 {
                         return Err(ParseError::Invalid(
@@ -694,6 +754,41 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
                     let key = extract_string(&elements[2])?;
                     Ok(RedisCommand::ClusterKeySlot { key })
                 }
+                "FAILOVER" => match elements.len() {
+                    2 => Ok(RedisCommand::ClusterFailover {
+                        mode: ClusterFailoverMode::Default,
+                    }),
+                    3 => {
+                        let option = extract_string(&elements[2])?.to_uppercase();
+                        let mode = match option.as_str() {
+                            "FORCE" => ClusterFailoverMode::Force,
+                            "TAKEOVER" => ClusterFailoverMode::Takeover,
+                            _ => {
+                                return Err(ParseError::Invalid(
+                                    "CLUSTER FAILOVER option must be FORCE or TAKEOVER".to_string(),
+                                ));
+                            }
+                        };
+                        Ok(RedisCommand::ClusterFailover { mode })
+                    }
+                    _ => Err(ParseError::Invalid(
+                        "wrong number of arguments for 'cluster|failover' command".to_string(),
+                    )),
+                },
+                "REPLICATE" => {
+                    if elements.len() != 3 {
+                        return Err(ParseError::Invalid(
+                            "CLUSTER REPLICATE requires exactly 1 argument".to_string(),
+                        ));
+                    }
+                    let node_id = extract_string(&elements[2])?;
+                    if node_id.is_empty() {
+                        return Err(ParseError::Invalid(
+                            "CLUSTER REPLICATE node id cannot be empty".to_string(),
+                        ));
+                    }
+                    Ok(RedisCommand::ClusterReplicate { node_id })
+                }
                 _ => Ok(RedisCommand::Unknown(format!("CLUSTER {}", subcommand))),
             }
         }
@@ -722,6 +817,18 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
             Ok(RedisCommand::Expire { key, seconds })
         }
         "BLOBASAUR.VACUUM" => parse_blobasaur_vacuum_command(&elements),
+        "BLOBASAUR.SYNC" => parse_blobasaur_sync_command(&elements),
+        "BLOBASAUR.FAILOVER-AUTH" => parse_blobasaur_failover_auth_command(&elements),
+        "BLOBASAUR.MFSTART" => parse_blobasaur_mfstart_command(&elements),
+        "BLOBASAUR.MFABORT" => parse_blobasaur_mfabort_command(&elements),
+        "BLOBASAUR.WATERMARK" => {
+            if elements.len() != 1 {
+                return Err(ParseError::Invalid(
+                    "BLOBASAUR.WATERMARK takes no arguments".to_string(),
+                ));
+            }
+            Ok(RedisCommand::BlobasaurWatermark)
+        }
         "HELLO" => {
             let protover = if elements.len() > 1 {
                 let ver_str = extract_string(&elements[1])?;
@@ -760,8 +867,113 @@ fn parse_command_array(elements: Vec<BytesFrame>) -> Result<RedisCommand, ParseE
             }
         }
         "QUIT" => Ok(RedisCommand::Quit),
+        "READONLY" => Ok(RedisCommand::ReadOnly),
+        "READWRITE" => Ok(RedisCommand::ReadWrite),
         _ => Ok(RedisCommand::Unknown(command_name)),
     }
+}
+
+fn parse_blobasaur_sync_command(elements: &[BytesFrame]) -> Result<RedisCommand, ParseError> {
+    if elements.len() != 6 {
+        return Err(ParseError::Invalid(
+            "BLOBASAUR.SYNC syntax: BLOBASAUR.SYNC <shard> <replid> <lsn> <num_shards> <compression>"
+                .to_string(),
+        ));
+    }
+    fn number<T: std::str::FromStr>(value: &BytesFrame, what: &str) -> Result<T, ParseError> {
+        let text = extract_string(value)?;
+        text.parse()
+            .map_err(|_| ParseError::Invalid(format!("Invalid {what} '{text}'")))
+    }
+    Ok(RedisCommand::BlobasaurSync {
+        shard: number(&elements[1], "shard")?,
+        replid: extract_string(&elements[2])?,
+        lsn: number(&elements[3], "lsn")?,
+        num_shards: number(&elements[4], "num_shards")?,
+        compression: extract_string(&elements[5])?,
+    })
+}
+
+fn parse_blobasaur_failover_auth_command(
+    elements: &[BytesFrame],
+) -> Result<RedisCommand, ParseError> {
+    if elements.len() != 6 && elements.len() != 7 {
+        return Err(ParseError::Invalid(
+            "BLOBASAUR.FAILOVER-AUTH syntax: BLOBASAUR.FAILOVER-AUTH <candidate> <epoch> <failed-primary> <primary-config-epoch> <slot-ranges> [MANUAL]"
+                .to_string(),
+        ));
+    }
+    let candidate = extract_string(&elements[1])?;
+    if candidate.is_empty() {
+        return Err(ParseError::Invalid("candidate cannot be empty".to_string()));
+    }
+    let epoch_str = extract_string(&elements[2])?;
+    let epoch: u64 = epoch_str
+        .parse()
+        .map_err(|_| ParseError::Invalid(format!("Invalid epoch '{epoch_str}'")))?;
+    let failed_primary = extract_string(&elements[3])?;
+    if failed_primary.is_empty() {
+        return Err(ParseError::Invalid(
+            "failed-primary cannot be empty".to_string(),
+        ));
+    }
+    let p_epoch_str = extract_string(&elements[4])?;
+    let primary_config_epoch: u64 = p_epoch_str.parse().map_err(|_| {
+        ParseError::Invalid(format!("Invalid primary-config-epoch '{p_epoch_str}'"))
+    })?;
+    let slot_ranges = extract_string(&elements[5])?;
+    let slots = crate::cluster::parse_slot_ranges(&slot_ranges).map_err(ParseError::Invalid)?;
+    let manual = if elements.len() == 7 {
+        let flag = extract_string(&elements[6])?;
+        if !flag.eq_ignore_ascii_case("MANUAL") {
+            return Err(ParseError::Invalid(format!(
+                "Invalid BLOBASAUR.FAILOVER-AUTH flag '{flag}', expected MANUAL"
+            )));
+        }
+        true
+    } else {
+        false
+    };
+    Ok(RedisCommand::BlobasaurFailoverAuth(
+        crate::cluster::FailoverAuthRequest {
+            candidate,
+            epoch,
+            failed_primary,
+            primary_config_epoch,
+            slots,
+            manual,
+        },
+    ))
+}
+
+fn parse_blobasaur_mfstart_command(elements: &[BytesFrame]) -> Result<RedisCommand, ParseError> {
+    if elements.len() != 2 {
+        return Err(ParseError::Invalid(
+            "BLOBASAUR.MFSTART syntax: BLOBASAUR.MFSTART <replica-id>".to_string(),
+        ));
+    }
+    let replica_id = extract_string(&elements[1])?;
+    if replica_id.is_empty() {
+        return Err(ParseError::Invalid(
+            "replica-id cannot be empty".to_string(),
+        ));
+    }
+    Ok(RedisCommand::BlobasaurMfStart { replica_id })
+}
+
+fn parse_blobasaur_mfabort_command(elements: &[BytesFrame]) -> Result<RedisCommand, ParseError> {
+    if elements.len() != 2 {
+        return Err(ParseError::Invalid(
+            "BLOBASAUR.MFABORT syntax: BLOBASAUR.MFABORT <replica-id>".to_string(),
+        ));
+    }
+    let replica_id = extract_string(&elements[1])?;
+    if replica_id.is_empty() {
+        return Err(ParseError::Invalid(
+            "replica-id cannot be empty".to_string(),
+        ));
+    }
+    Ok(RedisCommand::BlobasaurMfAbort { replica_id })
 }
 
 fn parse_blobasaur_vacuum_command(elements: &[BytesFrame]) -> Result<RedisCommand, ParseError> {
@@ -1528,6 +1740,162 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_blobasaur_watermark_command() {
+        assert_eq!(
+            parse_command(command_frame(&["blobasaur.watermark"])).unwrap(),
+            RedisCommand::BlobasaurWatermark
+        );
+        assert!(parse_command(command_frame(&["BLOBASAUR.WATERMARK", "0"])).is_err());
+    }
+
+    #[test]
+    fn test_parse_blobasaur_mfstart_command() {
+        let cmd = parse_command(command_frame(&["blobasaur.mfstart", "r1"])).unwrap();
+        assert_eq!(cmd.name(), "BLOBASAUR.MFSTART");
+        assert_eq!(
+            cmd,
+            RedisCommand::BlobasaurMfStart {
+                replica_id: "r1".to_string(),
+            }
+        );
+        for bad in [
+            &["BLOBASAUR.MFSTART"][..],
+            &["BLOBASAUR.MFSTART", ""][..],
+            &["BLOBASAUR.MFSTART", "r1", "extra"][..],
+        ] {
+            assert!(parse_command(command_frame(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn test_parse_blobasaur_mfabort_command() {
+        let cmd = parse_command(command_frame(&["blobasaur.mfabort", "r1"])).unwrap();
+        assert_eq!(cmd.name(), "BLOBASAUR.MFABORT");
+        assert_eq!(
+            cmd,
+            RedisCommand::BlobasaurMfAbort {
+                replica_id: "r1".to_string(),
+            }
+        );
+        for bad in [
+            &["BLOBASAUR.MFABORT"][..],
+            &["BLOBASAUR.MFABORT", ""][..],
+            &["BLOBASAUR.MFABORT", "r1", "extra"][..],
+        ] {
+            assert!(parse_command(command_frame(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn test_parse_blobasaur_sync_command() {
+        let command = parse_command(command_frame(&[
+            "blobasaur.sync",
+            "2",
+            "",
+            "17",
+            "4",
+            "zstd",
+        ]))
+        .unwrap();
+        assert_eq!(
+            command,
+            RedisCommand::BlobasaurSync {
+                shard: 2,
+                replid: String::new(),
+                lsn: 17,
+                num_shards: 4,
+                compression: "zstd".to_string(),
+            }
+        );
+        for bad in [
+            &["BLOBASAUR.SYNC", "0", "id", "0", "1"][..],
+            &["BLOBASAUR.SYNC", "x", "id", "0", "1", "none"][..],
+            &["BLOBASAUR.SYNC", "0", "id", "-1", "1", "none"][..],
+        ] {
+            assert!(parse_command(command_frame(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn test_parse_blobasaur_failover_auth() {
+        let cmd = parse_command(command_frame(&[
+            "BLOBASAUR.FAILOVER-AUTH",
+            "r1",
+            "5",
+            "p1",
+            "2",
+            "0-3,10",
+        ]))
+        .unwrap();
+        assert_eq!(cmd.name(), "BLOBASAUR.FAILOVER-AUTH");
+        match cmd {
+            RedisCommand::BlobasaurFailoverAuth(req) => {
+                assert_eq!(req.candidate, "r1");
+                assert_eq!(req.epoch, 5);
+                assert_eq!(req.failed_primary, "p1");
+                assert_eq!(req.primary_config_epoch, 2);
+                assert_eq!(req.slots, [0, 1, 2, 3, 10].into_iter().collect());
+                assert!(!req.manual);
+            }
+            other => panic!("expected BlobasaurFailoverAuth, got {other:?}"),
+        }
+
+        let manual_cmd = parse_command(command_frame(&[
+            "BLOBASAUR.FAILOVER-AUTH",
+            "r1",
+            "6",
+            "p1",
+            "2",
+            "0-5",
+            "manual",
+        ]))
+        .unwrap();
+        match manual_cmd {
+            RedisCommand::BlobasaurFailoverAuth(req) => assert!(req.manual),
+            other => panic!("expected BlobasaurFailoverAuth, got {other:?}"),
+        }
+
+        for bad in [
+            &["BLOBASAUR.FAILOVER-AUTH", "r1", "5", "p1", "2"][..],
+            &["BLOBASAUR.FAILOVER-AUTH", "", "5", "p1", "2", "0-5"][..],
+            &[
+                "BLOBASAUR.FAILOVER-AUTH",
+                "r1",
+                "notanint",
+                "p1",
+                "2",
+                "0-5",
+            ][..],
+            &["BLOBASAUR.FAILOVER-AUTH", "r1", "5", "", "2", "0-5"][..],
+            &["BLOBASAUR.FAILOVER-AUTH", "r1", "5", "p1", "bad", "0-5"][..],
+            &["BLOBASAUR.FAILOVER-AUTH", "r1", "5", "p1", "2", ""][..],
+            &["BLOBASAUR.FAILOVER-AUTH", "r1", "5", "p1", "2", "10-5"][..],
+            &["BLOBASAUR.FAILOVER-AUTH", "r1", "5", "p1", "2", "16384"][..],
+            &[
+                "BLOBASAUR.FAILOVER-AUTH",
+                "r1",
+                "5",
+                "p1",
+                "2",
+                "0-5",
+                "EXTRA",
+            ][..],
+            &[
+                "BLOBASAUR.FAILOVER-AUTH",
+                "r1",
+                "5",
+                "p1",
+                "2",
+                "0-5",
+                "MANUAL",
+                "X",
+            ][..],
+        ] {
+            assert!(parse_command(command_frame(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn test_parse_blobasaur_vacuum_command_all_full() {
         let command = parse_command(command_frame(&[
             "blobasaur.vacuum",
@@ -1719,11 +2087,24 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_readonly_readwrite() {
+        assert_eq!(parse(&["READONLY"]).unwrap(), RedisCommand::ReadOnly);
+        assert_eq!(parse(&["readwrite"]).unwrap(), RedisCommand::ReadWrite);
+    }
+
+    #[test]
     fn test_parse_command_command() {
         let input = b"*1\r\n$7\r\nCOMMAND\r\n";
         let (resp, _) = parse_resp_with_remaining(input).unwrap();
         let command = parse_command(resp).unwrap();
-        assert_eq!(command, RedisCommand::Command);
+        assert_eq!(command, RedisCommand::Command { args: vec![] });
+
+        assert_eq!(
+            parse(&["COMMAND", "INFO", "get"]).unwrap(),
+            RedisCommand::Command {
+                args: vec!["INFO".to_string(), "get".to_string()]
+            }
+        );
     }
 
     #[test]
@@ -1789,6 +2170,17 @@ mod tests {
         let (resp, _) = parse_resp_with_remaining(input).unwrap();
         let command = parse_command(resp).unwrap();
         assert_eq!(command, RedisCommand::ClusterNodes);
+    }
+
+    #[test]
+    fn test_parse_cluster_myid_and_shards_commands() {
+        let myid = parse_command(command_frame(&["CLUSTER", "MYID"])).unwrap();
+        assert_eq!(myid, RedisCommand::ClusterMyId);
+        assert!(parse_command(command_frame(&["CLUSTER", "MYID", "extra"])).is_err());
+
+        let shards = parse_command(command_frame(&["CLUSTER", "SHARDS"])).unwrap();
+        assert_eq!(shards, RedisCommand::ClusterShards);
+        assert!(parse_command(command_frame(&["CLUSTER", "SHARDS", "extra"])).is_err());
     }
 
     #[test]
@@ -2242,5 +2634,45 @@ mod tests {
         ]);
         let serialized = serialize_frame(&value);
         assert_eq!(serialized.as_ref(), b"*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n");
+    }
+
+    #[test]
+    fn test_parse_cluster_failover_and_replicate() {
+        assert_eq!(
+            parse(&["CLUSTER", "FAILOVER"]).unwrap(),
+            RedisCommand::ClusterFailover {
+                mode: ClusterFailoverMode::Default
+            }
+        );
+        assert_eq!(
+            parse(&["cluster", "failover", "force"]).unwrap(),
+            RedisCommand::ClusterFailover {
+                mode: ClusterFailoverMode::Force
+            }
+        );
+        assert_eq!(
+            parse(&["CLUSTER", "FAILOVER", "TAKEOVER"]).unwrap(),
+            RedisCommand::ClusterFailover {
+                mode: ClusterFailoverMode::Takeover
+            }
+        );
+        assert_parse_error(&["CLUSTER", "FAILOVER", "INVALID"], "FORCE or TAKEOVER");
+        assert_parse_error(
+            &["CLUSTER", "FAILOVER", "FORCE", "EXTRA"],
+            "wrong number of arguments",
+        );
+
+        assert_eq!(
+            parse(&["CLUSTER", "REPLICATE", "node-1"]).unwrap(),
+            RedisCommand::ClusterReplicate {
+                node_id: "node-1".to_string()
+            }
+        );
+        assert_parse_error(&["CLUSTER", "REPLICATE"], "requires exactly 1 argument");
+        assert_parse_error(
+            &["CLUSTER", "REPLICATE", "a", "b"],
+            "requires exactly 1 argument",
+        );
+        assert_parse_error(&["CLUSTER", "REPLICATE", ""], "cannot be empty");
     }
 }

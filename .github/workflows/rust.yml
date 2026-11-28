@@ -29,6 +29,11 @@ jobs:
     - name: Clippy
       run: cargo clippy --all-targets --locked -- -D warnings
     - name: Run tests
+      # Test data on tmpfs: the in-process cluster tests fsync a few hundred
+      # times each, and the runner's disk sometimes takes seconds per fsync.
+      # The tests kill processes but never simulate power loss through fsync.
+      env:
+        TMPDIR: /dev/shm
       run: cargo test --locked --verbose
 
   tla:
@@ -36,7 +41,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [async-write, async-barrier, cluster-and-negatives]
+        suite: [async-write, async-barrier, cluster-and-negatives, replication, failover]
 
     steps:
     - uses: actions/checkout@v4

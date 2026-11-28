@@ -60,6 +60,8 @@ async fn start_cluster_node(
             slot_ranges: Some(vec![slot_range]),
             gossip_interval_ms: Some(100),
             advertise_addr: Some(addr.to_string()),
+            node_timeout_ms: None,
+            replica_validity_factor: None,
         }),
         metrics: None,
         sqlite: None,
@@ -67,6 +69,8 @@ async fn start_cluster_node(
         max_request_size_mb: None,
         cleanup_chunk_size: None,
         cleanup_interval_secs: None,
+        new_replid: false,
+        replication: None,
     };
 
     let shutdown = CancellationToken::new();
@@ -355,12 +359,15 @@ async fn known_peer_slot_still_returns_moved() {
     )
     .await;
 
-    // Wait for gossip convergence so node A discovers node B.
+    // Wait for gossip convergence so node A discovers node B and its claimed slots.
     let mut discovered = false;
     for _ in 0..50 {
         if let Some(nodes) = node_a.call_bulk(&[b"CLUSTER", b"NODES"]).await {
             let text = String::from_utf8_lossy(&nodes);
-            if text.contains("node-b") {
+            if text
+                .lines()
+                .any(|line| line.starts_with("node-b ") && line.contains("8192-16383"))
+            {
                 discovered = true;
                 break;
             }

@@ -38,7 +38,8 @@ port = 7000
 # If not set, clients will use the connection address
 advertise_addr = "192.168.1.100:6379"
 
-# Hash slots assigned to this node
+# Hash slots assigned to this node (bootstrap only: once <data_dir>/cluster-state.json
+# exists, the persisted state wins over slot_ranges/slots and replica_of)
 # Redis cluster has 16384 total slots (0-16383)
 # You can use EITHER slot_ranges OR slots (not both)
 
@@ -52,6 +53,28 @@ end = 5460
 
 # Gossip interval in milliseconds (optional, default: 1000)
 gossip_interval_ms = 1000
+
+# Failure detection and minority fencing timeout in milliseconds (optional, default: 15000)
+# node_timeout_ms = 15000
+
+# Multiplier on node_timeout_ms for replica election eligibility (optional, default: 10;
+# 0 disables the staleness check)
+# replica_validity_factor = 10
+
+# ============================================================================
+# Replication (optional, see REPLICATION.md)
+# ============================================================================
+# A replica is a cluster node with no slots that copies one primary. It finds
+# the primary's address through gossip. num_shards and storage_compression must
+# match the primary's.
+#
+# Replication is on only when this section exists, on a primary too (an empty
+# section is enough). Without it, writes keep no replication change index.
+# Turning it off and on again makes replicas resync.
+#
+# [replication]
+# replica_of = "node1"             # bootstrap only: node id of the primary; ignored once cluster-state.json exists
+# tombstone_retention_secs = 86400 # a replica away for longer gets a full resync
 
 # ============================================================================
 # Example 3-node cluster setup:

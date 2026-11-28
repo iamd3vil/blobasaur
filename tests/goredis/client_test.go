@@ -10,7 +10,9 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -217,6 +219,26 @@ func TestCommandErrorsKeepConnection(t *testing.T) {
 	})
 }
 
+// Cluster clients read COMMAND to route by key position and to send only
+// readonly commands to replicas.
+func TestCommandMetadata(t *testing.T) {
+	forEachProtocol(t, func(t *testing.T, rdb *redis.Client, p string) {
+		cmds, err := rdb.Command(ctx).Result()
+		if err != nil {
+			t.Fatalf("COMMAND: %v", err)
+		}
+		for name, readOnly := range map[string]bool{"get": true, "hget": true, "set": false, "hset": false} {
+			info := cmds[name]
+			if info == nil || info.ReadOnly != readOnly {
+				t.Fatalf("%s: got %+v, want readonly=%v", name, info, readOnly)
+			}
+		}
+		if cmds["hget"].FirstKeyPos != 2 || cmds["hsetex"].FirstKeyPos != 1 {
+			t.Fatalf("hash key positions: hget=%d hsetex=%d", cmds["hget"].FirstKeyPos, cmds["hsetex"].FirstKeyPos)
+		}
+	})
+}
+
 func TestPipeline(t *testing.T) {
 	forEachProtocol(t, func(t *testing.T, rdb *redis.Client, p string) {
 		pipe := rdb.Pipeline()
@@ -369,5 +391,214 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 			t.Fatalf("%s: condition not met within 2s", what)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// A ReadOnly cluster client reads from the replica listed in CLUSTER SLOTS.
+// Run by tests/replication_test.rs, which sets BLOBASAUR_ADDR to the primary and
+// BLOBASAUR_REPLICA_KEY to a key whose value only the replica's DB holds.
+func TestClusterReadOnlyReadsFromReplica(t *testing.T) {
+	primary, key := os.Getenv("BLOBASAUR_ADDR"), os.Getenv("BLOBASAUR_REPLICA_KEY")
+	if primary == "" || key == "" {
+		t.Skip("needs a primary with a replica; run via tests/replication_test.rs")
+	}
+	rdb := redis.NewClusterClient(&redis.ClusterOptions{Addrs: []string{primary}, ReadOnly: true})
+	t.Cleanup(func() { rdb.Close() })
+
+	expect(t, "GET from the replica", rdb.Get(ctx, key), "from-replica")
+	// Writes still go to the primary.
+	expect(t, "SET", rdb.Set(ctx, "written", "v", 0), "OK")
+}
+
+// A ClusterClient keeps reading and writing across a runtime CLUSTER FAILOVER TAKEOVER.
+// Run by tests/failover_runtime_test.rs.
+func TestClusterClientSurvivesTakeover(t *testing.T) {
+	addrsEnv := os.Getenv("BLOBASAUR_CLUSTER_ADDRS")
+	replicaAddr := os.Getenv("BLOBASAUR_TAKEOVER_REPLICA")
+	slotKey := os.Getenv("BLOBASAUR_SLOT_KEY")
+	if addrsEnv == "" || replicaAddr == "" || slotKey == "" {
+		t.Skip("needs a cluster; run via tests/failover_runtime_test.rs")
+	}
+
+	cluster := redis.NewClusterClient(&redis.ClusterOptions{
+		Addrs: strings.Split(addrsEnv, ","),
+	})
+	t.Cleanup(func() { cluster.Close() })
+
+	// Write before takeover on the failing-over shard and verify replication reaches the replica.
+	expect(t, "SET pre-takeover", cluster.Set(ctx, slotKey, "before-takeover", 0), "OK")
+	expect(t, "GET pre-takeover", cluster.Get(ctx, slotKey), "before-takeover")
+
+	replica := redis.NewClient(&redis.Options{Addr: replicaAddr})
+	t.Cleanup(func() { replica.Close() })
+	expect(t, "READONLY on replica", replica.Do(ctx, "READONLY"), "OK")
+	waitFor(t, "replica to receive pre-takeover key", func() bool {
+		v, err := replica.Get(ctx, slotKey).Result()
+		return err == nil && v == "before-takeover"
+	})
+
+	// Trigger runtime TAKEOVER on the replica.
+	expect(t, "CLUSTER FAILOVER TAKEOVER", replica.Do(ctx, "CLUSTER", "FAILOVER", "TAKEOVER"), "OK")
+
+	// Wait until gossip delivers the new epoch to the old primary so ClusterClient
+	// receives MOVED, reloads its slot map, and routes writes to the promoted replica.
+	probeKey := "{" + slotKey + "}:probe"
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if err := cluster.Set(ctx, probeKey, "routed-to-winner", 0).Err(); err == nil {
+			if v, err := replica.Get(ctx, probeKey).Result(); err == nil && v == "routed-to-winner" {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("ClusterClient did not route writes to promoted replica within 10s")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Once routed to the new primary, subsequent reads and writes hit it directly.
+	afterKey := "{" + slotKey + "}:after"
+	expect(t, "SET post-takeover", cluster.Set(ctx, afterKey, "after-takeover", 0), "OK")
+	expect(t, "GET pre-takeover after failover", cluster.Get(ctx, slotKey), "before-takeover")
+	expect(t, "GET post-takeover", cluster.Get(ctx, afterKey), "after-takeover")
+	expect(t, "GET directly on promoted replica", replica.Get(ctx, afterKey), "after-takeover")
+}
+
+// A ClusterClient reads pre-failover keys and writes/reads new keys on a failed-over
+// primary's slots after automatic failover. Run by tests/failover_elect_test.rs.
+func TestClusterClientAfterAutoFailover(t *testing.T) {
+	addrsEnv := os.Getenv("BLOBASAUR_CLUSTER_ADDRS")
+	slotKey := os.Getenv("BLOBASAUR_SLOT_KEY")
+	expectedVal := os.Getenv("BLOBASAUR_EXPECT_VAL")
+	if addrsEnv == "" || slotKey == "" || expectedVal == "" {
+		t.Skip("needs a cluster; run via tests/failover_elect_test.rs")
+	}
+
+	cluster := redis.NewClusterClient(&redis.ClusterOptions{
+		Addrs: strings.Split(addrsEnv, ","),
+	})
+	t.Cleanup(func() { cluster.Close() })
+
+	expect(t, "GET pre-failover key", cluster.Get(ctx, slotKey), expectedVal)
+	afterKey := "{" + slotKey + "}:goredis-after"
+	expect(t, "SET post-failover key", cluster.Set(ctx, afterKey, "after-auto-failover", 0), "OK")
+	expect(t, "GET post-failover key", cluster.Get(ctx, afterKey), "after-auto-failover")
+}
+
+// A ClusterClient keeps writing across a coordinated zero-loss CLUSTER FAILOVER
+// (default mode), following MOVED once the primary demotes, with zero write loss.
+// Run by tests/failover_manual_test.rs.
+func TestClusterClientSurvivesManualFailover(t *testing.T) {
+	addrsEnv := os.Getenv("BLOBASAUR_CLUSTER_ADDRS")
+	replicaAddr := os.Getenv("BLOBASAUR_MANUAL_REPLICA")
+	slotKey := os.Getenv("BLOBASAUR_SLOT_KEY")
+	if addrsEnv == "" || replicaAddr == "" || slotKey == "" {
+		t.Skip("needs a cluster; run via tests/failover_manual_test.rs")
+	}
+
+	cluster := redis.NewClusterClient(&redis.ClusterOptions{
+		Addrs: strings.Split(addrsEnv, ","),
+	})
+	t.Cleanup(func() { cluster.Close() })
+
+	replica := redis.NewClient(&redis.Options{Addr: replicaAddr})
+	t.Cleanup(func() { replica.Close() })
+
+	type kv struct {
+		key string
+		val string
+	}
+	acked := make([]kv, 0, 200)
+	stopCh := make(chan struct{})
+	preReady := make(chan struct{})
+	errCh := make(chan error, 1)
+	doneCh := make(chan []kv, 1)
+	var writtenCount int64
+
+	go func() {
+		local := make([]kv, 0, 200)
+		for i := 0; ; i++ {
+			select {
+			case <-stopCh:
+				doneCh <- local
+				return
+			default:
+			}
+			k := fmt.Sprintf("{%s}:w%d", slotKey, i)
+			v := fmt.Sprintf("val-%d", i)
+			if err := cluster.Set(ctx, k, v, 0).Err(); err != nil {
+				errCh <- fmt.Errorf("SET %s failed during manual failover: %w", k, err)
+				return
+			}
+			local = append(local, kv{key: k, val: v})
+			if len(local) == 10 {
+				close(preReady)
+			}
+			atomic.StoreInt64(&writtenCount, int64(len(local)))
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	case <-preReady:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for initial writes before CLUSTER FAILOVER")
+	}
+	expect(t, "CLUSTER FAILOVER", replica.Do(ctx, "CLUSTER", "FAILOVER"), "OK")
+
+	// Wait until replica owns the slots and answers direct GETs without MOVED.
+	// Manual failover has a 5 s deadline (CLUSTER_MF_TIMEOUT), so allow up to 10 s
+	// under parallel test load instead of waitFor's 2 s timeout.
+	promoDeadline := time.Now().Add(10 * time.Second)
+	for {
+		nodes, err := replica.ClusterNodes(ctx).Result()
+		promoted := false
+		if err == nil {
+			for _, line := range strings.Split(nodes, "\n") {
+				fields := strings.Fields(line)
+				if len(fields) >= 9 && strings.Contains(fields[2], "myself") && strings.Contains(fields[2], "master") {
+					promoted = true
+					break
+				}
+			}
+		}
+		if promoted {
+			break
+		}
+		if time.Now().After(promoDeadline) {
+			info, _ := replica.Do(ctx, "CLUSTER", "INFO").Result()
+			t.Fatalf("replica not promoted by CLUSTER FAILOVER within 10s\nCLUSTER NODES:\n%s\nCLUSTER INFO:\n%v", nodes, info)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	afterBase := atomic.LoadInt64(&writtenCount)
+	postDeadline := time.Now().Add(10 * time.Second)
+	for atomic.LoadInt64(&writtenCount) < afterBase+10 {
+		select {
+		case err := <-errCh:
+			t.Fatal(err)
+		default:
+		}
+		if time.Now().After(postDeadline) {
+			t.Fatalf("post-failover writes did not reach %d within 10s (got %d)", afterBase+10, atomic.LoadInt64(&writtenCount))
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	close(stopCh)
+
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	case acked = <-doneCh:
+	}
+
+	if len(acked) < 20 {
+		t.Fatalf("expected at least 20 acknowledged writes, got %d", len(acked))
+	}
+	for _, entry := range acked {
+		expect(t, "GET on promoted replica "+entry.key, replica.Get(ctx, entry.key), entry.val)
 	}
 }
