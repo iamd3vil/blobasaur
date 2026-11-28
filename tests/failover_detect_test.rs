@@ -19,6 +19,11 @@ use tokio_util::sync::CancellationToken;
 
 const NODE_TIMEOUT_MS: u64 = 1000;
 
+/// Each test runs several nodes in-process with a 1 s `node_timeout` (the
+/// default is 15 s). Run in parallel on a 4-vCPU CI runner, they starved each
+/// other's gossip past that timeout, so the tests take turns.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn free_udp_port() -> u16 {
     static ISSUED: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
     loop {
@@ -218,6 +223,7 @@ fn node_status(nodes: &str, node_id: &str) -> Option<(String, String)> {
 
 #[tokio::test]
 async fn three_primaries_detect_fail_and_clear_on_restart() {
+    let _serial = SERIAL.lock().await;
     let dir1 = TempDir::new().unwrap();
     let dir2 = TempDir::new().unwrap();
     let dir3 = TempDir::new().unwrap();
@@ -402,6 +408,7 @@ async fn three_primaries_detect_fail_and_clear_on_restart() {
 
 #[tokio::test]
 async fn minority_primary_and_replica_fence_until_majority_returns() {
+    let _serial = SERIAL.lock().await;
     let dir1 = TempDir::new().unwrap();
     let dir2 = TempDir::new().unwrap();
     let dir3 = TempDir::new().unwrap();

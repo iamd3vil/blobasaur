@@ -23,6 +23,11 @@ use tokio_util::sync::CancellationToken;
 const SHARDS: usize = 2;
 const NODE_TIMEOUT_MS: u64 = 1000;
 
+/// Each test runs several nodes in-process with a 1 s `node_timeout` (the
+/// default is 15 s). Run in parallel on a 4-vCPU CI runner, they starved each
+/// other's gossip past that timeout, so the tests take turns.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn free_udp_port() -> u16 {
     static ISSUED: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
     loop {
@@ -251,6 +256,7 @@ async fn all_shards_synced(dir: &Path) -> bool {
 
 #[tokio::test]
 async fn auto_failover_promotes_one_replica_repoints_sibling_and_demotes_returning_primary() {
+    let _serial = SERIAL.lock().await;
     let d1 = TempDir::new().unwrap();
     let d2 = TempDir::new().unwrap();
     let d3 = TempDir::new().unwrap();
@@ -547,6 +553,7 @@ async fn auto_failover_promotes_one_replica_repoints_sibling_and_demotes_returni
 
 #[tokio::test]
 async fn unsynced_replica_never_stands_for_election() {
+    let _serial = SERIAL.lock().await;
     let d1 = TempDir::new().unwrap();
     let d2 = TempDir::new().unwrap();
     let d3 = TempDir::new().unwrap();
@@ -679,6 +686,7 @@ async fn unsynced_replica_never_stands_for_election() {
 
 #[tokio::test]
 async fn partition_leaving_primary_reachable_from_majority_does_not_failover() {
+    let _serial = SERIAL.lock().await;
     let d1 = TempDir::new().unwrap();
     let d2 = TempDir::new().unwrap();
     let d3 = TempDir::new().unwrap();
@@ -827,6 +835,7 @@ async fn partition_leaving_primary_reachable_from_majority_does_not_failover() {
 
 #[tokio::test]
 async fn cluster_failover_force_promotes_while_primary_alive_and_demotes_primary() {
+    let _serial = SERIAL.lock().await;
     let d1 = TempDir::new().unwrap();
     let d2 = TempDir::new().unwrap();
     let d3 = TempDir::new().unwrap();
